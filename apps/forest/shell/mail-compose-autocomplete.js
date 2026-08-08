@@ -1,0 +1,245 @@
+/* Shea's Forest — the App Shell · shell/mail-compose-autocomplete.js
+   THE WEAVE · edge E2 — contact autocomplete in compose (L1 Google-parity).
+
+   THE VIEW. As the owner types into a compose recipient field (To / Cc / Bcc),
+   this offers name->address matches read from their OWN contacts, exactly where
+   Google puts them. Picking a suggestion drops that person's address into the
+   field; a raw address the owner types by hand is ALWAYS still accepted (the
+   inputs stay ordinary inputs — the dropdown is purely additive). This is the
+   "access contacts in the email app in the right places" ask.
+
+   THE SEAM. It reads `GET /api/contact/api/contacts/search?q=` through the shell's
+   thin contacts client (`window.ForestShell.contactsRest.makeClient().search`),
+   which forwards in-process to the bundled loopcontact tool's FTS5 search. The
+   search route returns `{ results: [ { id, display_name, primary_email, ... } ] }`.
+
+   TC-1 (the load-bearing thin-client discipline). This module carries NO contact
+   business logic. It does NOT rank, match, normalize, dedup, or score — the TOOL's
+   FTS5 does all matching; the client SENDS the typed token and RENDERS the tool's
+   rows verbatim. The only string work here is UI-layer: splitting the field's
+   comma list to find the token being typed, and swapping that token for a chosen
+   address. That is presentation, not contact logic — if you feel the urge to
+   decide *which* contact matches here, it belongs in the tool.
+
+   HONEST (Real-or-Made / flag-don't-fake). A contact with no `primary_email` is
+   never offered (you cannot insert an address that does not exist). A failed or
+   empty read simply shows nothing — the dropdown never renders a fabricated or
+   stale suggestion, and a down seam degrades the field to a plain input.
+
+   COLD-SAFE. Absent the `block` atom, the document, or the `contactsRest` read
+   seam (or an injected `searchFn`), `attach` is a no-op that returns
+   `{ wired: false }` and leaves the input exactly as it is today. No error, no
+   throw, no stall — the compose surface is unchanged when the weave can't reach.
+
+   INJECTION-SAFE. Every node is built via `block.el` (createElement + textContent /
+   setAttribute) — never innerHTML — so a contact's name or address can never inject
+   markup into the dropdown.
+
+   Plain script (no ES module) — attaches to window.ForestShell.mailComposeAutocomplete.
+   Injectable searchFn (opts.searchFn) so it is unit-testable with no network,
+   cold-safe. Read at composeView build time by mail-renderer.js. */
+(function () {
+  "use strict";
+  var root = (window.ForestShell = window.ForestShell || {});
+
+  function elOf() { return root.block && root.block.el; }
+
+  // activeToken(value, caret) -> the recipient token being typed. Recipients are a
+  // comma list; the active token is the slice after the last comma before the caret,
+  // up to the next comma (or end). Pure UI string-slicing — NOT contact logic (TC-1):
+  // it finds WHAT to query the tool on, it does not decide who matches.
+  function activeToken(value, caret) {
+    var v = String(value == null ? "" : value);
+    var c = (caret == null || caret < 0 || caret > v.length) ? v.length : caret;
+    var start = v.lastIndexOf(",", c - 1) + 1;        // char after the last comma before the caret
+    var end = v.indexOf(",", c);
+    if (end === -1) end = v.length;
+    return { start: start, end: end, text: v.slice(start, end).trim() };
+  }
+
+  // replaceToken(value, token, address) -> { value, caret }. Swaps the active token
+  // for `address` and leaves a trailing ", " so the next recipient starts clean
+  // (Gmail's behavior after a chip). Pure string surgery on the comma list.
+  function replaceToken(value, token, address) {
+    var v = String(value == null ? "" : value);
+    // `before` runs up to (and includes) the comma that opened this token — so it is
+    // "" (first recipient) or "...prev@x.com," (later one). token.start sits just AFTER
+    // that comma, so any separator space lives INSIDE the token span; rebuild it cleanly
+    // as ", " rather than letting it be swallowed with the replaced token.
+    var before = v.slice(0, token.start).replace(/\s+$/, "");
+    var sep = before ? " " : "";
+    var after = v.slice(token.end).replace(/^\s*,?\s*/, ""); // drop the immediate comma/space we re-add
+    var insert = sep + String(address) + ", ";
+    return { value: before + insert + after, caret: (before + insert).length };
+  }
+
+  // defaultSearchFn(opts) -> a searchFn built from the live contactsRest seam, or
+  // null when the seam is absent (cold-safe: attach then no-ops the wiring).
+  function defaultSearchFn(opts) {
+    var cr = root.contactsRest;
+    if (!cr || typeof cr.makeClient !== "function") return null;
+    var client = cr.makeClient(opts.restOpts || {});
+    return function (q) {
+      return client.search(q).then(function (env) {
+        // TC-1: unwrap the honest envelope and return the tool's rows verbatim.
+        if (!env || !env.ok || !env.data) return [];
+        var d = env.data;
+        return d.results || d.contacts || [];         // search route emits { results }; be tolerant
+      });
+    };
+  }
+
+  // attach(input, opts) -> wires autocomplete onto one recipient input. Returns a
+  // handle { wired, query, close, pick, detach }. opts:
+  //   doc?        the document (defaults to input.ownerDocument)
+  //   searchFn?   q -> Promise<contact[]> (test seam; defaults to the contactsRest seam)
+  //   restOpts?   passed to contactsRest.makeClient for the default seam
+  //   minChars?   minimum token length before querying (default 1 — Gmail-parity)
+  //   debounceMs? keystroke debounce (default 140)
+  //   onPick?     callback(contact) after a pick
+  function attach(input, opts) {
+    opts = opts || {};
+    var el = elOf();
+    var doc = opts.doc || (input && input.ownerDocument);
+    if (!input || !el || !doc) return { wired: false, detach: function () {} };
+
+    var searchFn = typeof opts.searchFn === "function" ? opts.searchFn : defaultSearchFn(opts);
+    if (!searchFn) return { wired: false, detach: function () {} };   // no read seam -> plain input
+
+    var minChars = opts.minChars != null ? opts.minChars : 1;
+    var debounceMs = opts.debounceMs != null ? opts.debounceMs : 140;
+
+    var row = input.parentNode || input;
+    if (row.classList) row.classList.add("mail-compose__field--ac");
+    var menuId = "ac-" + Math.random().toString(36).slice(2, 8);
+    var menu = el(doc, "div", "mail-compose__ac", { role: "listbox", hidden: "hidden", "aria-label": "Contact suggestions" });
+    menu.id = menuId;
+    row.appendChild(menu);
+
+    input.setAttribute("role", "combobox");
+    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-expanded", "false");
+    input.setAttribute("aria-controls", menuId);
+    input.setAttribute("autocomplete", "off");
+
+    var items = [];      // [{ el, contact }]
+    var active = -1;
+    var open = false;
+    var timer = null;
+    var lastReq = 0;
+
+    function close() {
+      open = false; active = -1; items = [];
+      while (menu.firstChild) menu.removeChild(menu.firstChild);
+      menu.setAttribute("hidden", "hidden");
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+    }
+
+    function pick(contact) {
+      var addr = contact && contact.primary_email ? String(contact.primary_email) : "";
+      if (!addr) { close(); return; }                 // flag-don't-fake: no address, no insert
+      var tok = activeToken(input.value, input.selectionStart);
+      var r = replaceToken(input.value, tok, addr);
+      input.value = r.value;
+      try { input.setSelectionRange(r.caret, r.caret); } catch (e) { /* jsdom-less env */ }
+      if (typeof input.focus === "function") input.focus();
+      if (typeof opts.onPick === "function") opts.onPick(contact);
+      close();
+    }
+
+    function render(contacts) {
+      while (menu.firstChild) menu.removeChild(menu.firstChild);
+      items = [];
+      (contacts || []).forEach(function (c, i) {
+        if (!c || !c.primary_email) return;           // only offer pickable (has an address) — honest
+        var it = el(doc, "div", "mail-compose__ac-item",
+          { role: "option", id: menuId + "-" + i, "aria-selected": "false" });
+        it.appendChild(el(doc, "span", "mail-compose__ac-name", { text: c.display_name || "(no name)" }));
+        it.appendChild(el(doc, "span", "mail-compose__ac-email", { text: c.primary_email }));
+        // mousedown (not click) fires before the input's blur that would otherwise close the menu first.
+        it.addEventListener("mousedown", function (ev) {
+          if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+          pick(c);
+        });
+        menu.appendChild(it);
+        items.push({ el: it, contact: c });
+      });
+      if (!items.length) { close(); return; }
+      open = true; active = -1;
+      menu.removeAttribute("hidden");
+      input.setAttribute("aria-expanded", "true");
+    }
+
+    function setActive(i) {
+      if (!items.length) return;
+      if (i < 0) i = items.length - 1;
+      if (i >= items.length) i = 0;
+      items.forEach(function (it, idx) {
+        var on = idx === i;
+        it.el.setAttribute("aria-selected", on ? "true" : "false");
+        if (it.el.classList) it.el.classList.toggle("is-active", on);
+      });
+      active = i;
+      input.setAttribute("aria-activedescendant", items[i].el.id);
+    }
+
+    function query() {
+      var tok = activeToken(input.value, input.selectionStart);
+      if (!tok.text || tok.text.length < minChars) { close(); return; }
+      var req = ++lastReq;
+      Promise.resolve(searchFn(tok.text)).then(function (contacts) {
+        if (req !== lastReq) return;                  // a newer keystroke superseded this read
+        render(contacts || []);
+      }).catch(function () { close(); });             // honest: a failed read shows nothing
+    }
+
+    function onInput() {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(query, debounceMs);
+    }
+
+    function onKeydown(ev) {
+      if (!open) {
+        if (ev.key === "ArrowDown") { query(); }      // open the menu from a filled field
+        return;
+      }
+      if (ev.key === "ArrowDown") { if (ev.preventDefault) ev.preventDefault(); setActive(active + 1); }
+      else if (ev.key === "ArrowUp") { if (ev.preventDefault) ev.preventDefault(); setActive(active - 1); }
+      else if (ev.key === "Enter") {
+        if (active >= 0 && items[active]) { if (ev.preventDefault) ev.preventDefault(); pick(items[active].contact); }
+      }
+      else if (ev.key === "Escape") { if (ev.preventDefault) ev.preventDefault(); close(); }
+      else if (ev.key === "Tab") { close(); }         // let Tab move focus on, but close the menu
+    }
+
+    function onBlur() { setTimeout(close, 120); }     // delay so a mousedown-pick lands first
+
+    input.addEventListener("input", onInput);
+    input.addEventListener("keydown", onKeydown);
+    input.addEventListener("blur", onBlur);
+
+    return {
+      wired: true,
+      query: query,            // test seam: force a synchronous-ish query
+      close: close,
+      pick: pick,
+      isOpen: function () { return open; },
+      detach: function () {
+        input.removeEventListener("input", onInput);
+        input.removeEventListener("keydown", onKeydown);
+        input.removeEventListener("blur", onBlur);
+        close();
+        if (row.classList) row.classList.remove("mail-compose__field--ac");
+        if (menu.parentNode) menu.parentNode.removeChild(menu);
+      }
+    };
+  }
+
+  root.mailComposeAutocomplete = {
+    _version: "1.0",
+    attach: attach,
+    activeToken: activeToken,     // exported pure helpers for unit testing
+    replaceToken: replaceToken
+  };
+})();
