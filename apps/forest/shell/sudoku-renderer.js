@@ -4,7 +4,7 @@
    THE PLAY FOLD (S20). This renderer paints the forest-tab FACE of the dual-expression
    body's PLAY engine. It holds NO sudoku rule-logic (SWX / TC-1): generate, candidates,
    conflicts, win-detection, and the "why?" all come from window.SudokuPlay
-   (projects/dual-expression/core/app/play-engine.js, purity_lint PURE), served under
+   (projects/dual-expression/internal, purity_lint PURE), served under
    /sudoku/. This file is a SKIN — it owns the pane DOM, the input, and the Forest-token
    paint; the board reasoning stays in the guarded core. The Garden phone view is the same
    engine under a Canvas skin (the second face — the dual-expression thesis, on play).
@@ -24,7 +24,7 @@
   var root = (window.ForestShell = window.ForestShell || {});
 
   var ASSET = "sudoku/";
-  var SCRIPTS = [ASSET + "core/app/play-engine.js"]; // sets window.SudokuPlay
+  var SCRIPTS = [ASSET + "internal"]; // sets window.SudokuPlay
 
   var STORE_KEY = "forest:sudoku:v1";
   var STYLE_ID = "sudoku-pane-styles";

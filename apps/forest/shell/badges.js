@@ -1,5 +1,5 @@
 /* Shea's Forest — the App Shell · shell/badges.js
-   STEP 6 of the shell build. See sessions/01.1230-spunky-whistle-pt1h9t/BUILD-DIRECTIVE-v1.md §3.6.
+   STEP 6 of the shell build. See internal §3.6.
 
    The honest-badge fold — OFF by default + the toggle. This module answers ONE
    question per tab: "what is the calm weather on this capability right now?" and

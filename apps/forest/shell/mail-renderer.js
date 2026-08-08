@@ -790,7 +790,7 @@
    * change (so mail-model parity holds by CONSTRUCTION — the leg-16 read-later discipline), no    *
    * new block (sections render through the existing `row` grammar). One key function per view;    *
    * paint() folds the already-filtered+sorted list into ordered sections. View-words operator-    *
-   * ratified (design/email-app-christening-record-05.2208.md). Undated / senderless / *
+   * ratified (internal). Undated / senderless / *
    * uncategorized never fabricate a bucket — they sink to a last group (flag-don't-fake, mirroring *
    * sortMailbox's undated-last rule). The order WITHIN each group is the incoming sort order.     */
 

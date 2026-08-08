@@ -1,5 +1,5 @@
 /* Shea's Forest — the App Shell · shell/view-config.js
-   STEP 1 of the shell build (the spine). See sessions/.../BUILD-DIRECTIVE-v1.md.
+   STEP 1 of the shell build (the spine). See internal
 
    The view-config is the per-user store that SELECTS and ORDERS capabilities into
    tabs. It is DISJOINT from the obligation graph — it never stores an obligation,
@@ -65,7 +65,7 @@
   }
 
   // Calendar-type COLOR OVERRIDES — the sparse-override half of the color seam
-  // (design/forest-calendar-type-manager-direction-v1.md §DECIDED). A map of
+  // (internal §DECIDED). A map of
   // calendarId -> Grove-palette SLOT INDEX (an integer, NOT a hex): an override is
   // palette-relative, so it can never be off-brand, a palette retune still moves it,
   // and revert = delete the key. ABSENT/EMPTY is the resting state — every type keeps
@@ -222,7 +222,7 @@
   }
 
   // Contacts DECLARED GROUPS — the existence half of the Groups seam
-  // (sessions/20.1753 groups-v1-build-ready-design §"the crux"). A contact
+  // (internal groups-v1-build-ready-design §"the crux"). A contact
   // LABEL exists only as a membership row, so an empty managed group has no home
   // — the contacts rail hides empty labels on purpose. But a managed group must
   // persist WHILE EMPTY (you make "Ultimate" before adding anyone), the way a

@@ -51,7 +51,7 @@ This is a curated read, so a few things are deliberately left out:
 - **The Butcher app** — Forest's shell can host a separate order-management app; that app
   is published on its own at `apps/butcher-constellation/`, so its files aren't duplicated here.
 - **Bundled games** (a falling-block game and a sudoku) — separate apps served alongside Forest, not part of the personal-data story.
-- **Deploy scripts, build output, and internal design/witness folders** — server-side and
+- **Deploy scripts, build output, and internal internal folders** — server-side and
   build-time material that isn't the app's readable surface.
 
 ## License

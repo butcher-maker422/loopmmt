@@ -2,7 +2,7 @@
    window.ForestShell.settingsFrame
 
    WHAT THIS IS (§6-a — the MODULE route's build half).
-   The Forest Settings Pattern (design/forest-settings-pattern-plan-v1.md) named a
+   The Forest Settings Pattern (internal) named a
    MODULE-level gap: mail HAS a settings surface, butcher/calendar/contacts lack one,
    so the common bones extract to a SHARED frame every app's render<App>Settings
    composes — not per-app copies. This is that frame. It carries the bones the two

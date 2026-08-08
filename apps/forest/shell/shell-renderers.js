@@ -1,7 +1,7 @@
 /* Shea's Forest — the App Shell · shell/shell-renderers.js
    STEP 3 follow-on. The live pane renderers — the guts each capability KIND
    registers with pane.registerRenderer so a selected tab shows REAL Forest data
-   instead of a calm PENDING pane. See sessions/01.1336-quiet-saxophone-htnn27/
+   instead of a calm PENDING pane. See internal
    eod-handoff (the STEP 3 follow-on: "register app.js's canopy/soil/horizon
    renderers with pane.registerRenderer").
 

@@ -221,7 +221,7 @@
   }
 
   /* THE CALENDAR DATE COLUMN IS `start_at`. Read from the bytes, not guessed:
-     _tools/loopcalendar.js's event rows carry `start_at` — there is no `start_date`, no
+     internal's event rows carry `start_at` — there is no `start_date`, no
      `starts_at`, no `start`. This normaliser shipped in leg 1 with three plausible names
      and not the real one, and its 33/33 suite stayed green because the FIXTURES CARRIED
      THE GUESS. A boundary tested from the inside is a mirror, not a measurement. The three

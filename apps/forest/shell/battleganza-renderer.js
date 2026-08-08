@@ -44,7 +44,7 @@
   /* LOAD_ORDER — test-w5a.js §A, mirrored from the standalone page's chain. Order is
      load-bearing: each module registers onto window.Battleganza for the next. */
   var SCRIPTS = [
-    "sudoku/core/app/play-engine.js",
+    "sudoku/internal",
     ASSET + "boundary.js",
     ASSET + "rules.js",
     ASSET + "match.js",

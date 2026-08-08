@@ -301,7 +301,7 @@
      * reads. An extractor's silence is not evidence of conformance — the cruise
      * says so in its own docstring, and it was right to refuse to call it a pass.
      *
-     * The fix is CONFORM, not widen (`_tools/cruise/test_indirection.py` carries
+     * The fix is CONFORM, not widen (`internal` carries
      * the standing "when the next idiom shows up, do not widen" warning). So the
      * mount parent is split in two, exactly as mail's conforming compose does it:
      *

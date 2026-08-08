@@ -504,7 +504,7 @@
      tool and cannot be picked — offering a picker for one would be a lie about what
      the button does. This list is a mirror of a substrate array, which is exactly the
      copy-drift the line keeps finding; so it is FOLDED, not copied: contacts-merge.test.js
-     reads `_tools/loopcontact.js`, parses the real `scalarFields` array, and fails loud
+     reads `internal`, parses the real `scalarFields` array, and fails loud
      if these two ever disagree. The test IS the wire. */
   var MERGE_SCALAR_FIELDS = ["display_name", "given_name", "family_name",
     "organization", "title", "primary_email", "primary_phone", "notes"];
@@ -917,7 +917,7 @@
     // lit. The rail's rule — a lit slot the rows do not obey is unreachable — is held here
     // by construction rather than by a client-side filter that has no data to filter on.
     var labelVocab = null;
-    // GROUPS V1 — declared managed groups (sessions/20.1753 groups-v1-build-ready-design).
+    // GROUPS V1 — declared managed groups (internal groups-v1-build-ready-design).
     // A contact LABEL exists only as a membership row, so an empty label has no home and the
     // rail hides it. A managed GROUP must persist while empty — so its existence+order+colour
     // live in view-config (the calOrder precedent), while membership rides the existing label
@@ -2006,7 +2006,7 @@
   /* ---- W1: THE RECORD WRITE PATH (§5 W1) ------------------------------ *
    * Every verb below rides a route that ALREADY answered — the write half lives    *
    * inside the byte-frozen substrate and always did (§2b v3; receipt: *
-   * _tools/test-loopcontact-write-path.js, 16/16). What was missing was exactly     *
+   * internal, 16/16). What was missing was exactly     *
    * this: a control. No tool change, no re-bless, no golden gate.                   *
    *                                                                                 *
    * TC-1 holds: these send typed intent and re-read the record on land (`reopen`) — *
@@ -3428,7 +3428,7 @@
     // slot 07 — the merge surfaces, exported for contacts-merge.test.js. Fourth instance
     // of the renderRail/renderRecord/renderList precedent: the surface the suite must pin lives
     // inside this builder. `MERGE_SCALAR_FIELDS` is exported for one reason only — so the suite
-    // can FOLD it against `_tools/loopcontact.js`'s real `scalarFields` array instead of trusting
+    // can FOLD it against `internal`'s real `scalarFields` array instead of trusting
     // a comment. It is a mirror of a substrate constant, and every hand-kept mirror on this line
     // has drifted; this one is checked by a test that reads the substrate (M-E3).
     _test: {

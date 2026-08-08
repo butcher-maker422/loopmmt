@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 // forest — markdown.js — one Markdown AST, pure emitters (the "one source, three shadows" compiler).
 //
-// Parked-line design record: sessions/10.1450-rascal-disco-mj4bd5/parallax-rcr-markdown-body-solution-space-10.1450.md
+// Parked-line design record: internal
 //   THE ANSWER — source -> parse() -> AST -> { toDOM, toHTML, toPlainText }. Three sinks, one root.
 //   Preview≡send is a UNIVERSAL PROPERTY of the shared AST (Chen Wei/Tamar), provable by an
 //   AST-corpus fold-twice test — not a discipline anyone has to remember.

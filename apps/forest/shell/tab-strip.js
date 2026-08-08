@@ -1,5 +1,5 @@
 /* Shea's Forest — the App Shell · shell/tab-strip.js
-   STEP 2 of the shell build. See sessions/01.1230-spunky-whistle-pt1h9t/BUILD-DIRECTIVE-v1.md §3.2.
+   STEP 2 of the shell build. See internal §3.2.
 
    The tab-strip is a PURE FOLD of the view-config into the two-tier tab chrome:
    pinned tabs small/icon on the LEFT, open tabs named on the RIGHT, then the "+".
@@ -402,7 +402,7 @@
    * The calendar has this beat (calendar-renderer.js flipReschedule); the strip *
    * lacked it, so a reordered tab TELEPORTED to its new slot instead of sliding *
    * — the change-blindness discontinuity the Carry-Agnostic Feel Contract       *
-   * (design/forest-drag-feel-contract-v1.md §2) names as the strip's one real   *
+   * (internal §2) names as the strip's one real   *
    * delta. This is flipReschedule GENERALIZED to the strip's className idiom:    *
    * classList-OPTIONAL by construction (it uses addClass/removeClass, never      *
    * .classList — several of the shell's DOM doubles do not implement it, §3).   *

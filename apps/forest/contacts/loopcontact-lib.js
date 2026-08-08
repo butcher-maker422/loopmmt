@@ -1,7 +1,7 @@
 'use strict';
 /*
  * loopcontact-lib — a require()-safe, in-process loader for the byte-frozen Contact registry
- * (_tools/loopcontact.js), the People Soil.
+ * (internal), the People Soil.
  *
  * WHY THIS EXISTS — AND WHAT IS NO LONGER TRUE (corrected, Snag).
  * This loader was written when loopcontact carried its shebang on LINE 2 (after its SPDX comment),
@@ -14,7 +14,7 @@
  * this very shebang fix) -> 8d0fad06 (, the K6-A label filter).
  * So: if you need a change in loopcontact, the path is a BLESS, not another in-memory workaround.
  * NEVER copy the sha into a comment. It lives in golden/{contact,calendar}/bless.json ->
- * reuses.contact_substrate.sha256, and the seal guard (_tools/test-loopcontact-write-path.js)
+ * reuses.contact_substrate.sha256, and the seal guard (internal)
  * DERIVES it from there. Two hand-kept copies in this header went stale exactly as that guard's own
  * hardcoded copy did — FOLD, do not COPY.
  * The shebang strip below is retained as a harmless no-op / defence-in-depth (a legal line-1 shebang
@@ -29,7 +29,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const Module = require('node:module');
 
-const SOURCE_PATH = path.resolve(__dirname, '../../../_tools/loopcontact.js');
+const SOURCE_PATH = path.resolve(__dirname, '../../../internal');
 
 function loadLoopContact() {
   const raw = fs.readFileSync(SOURCE_PATH, 'utf8');

@@ -1,6 +1,6 @@
 /* Shea's Forest — the App Shell · shell/connector-items.js
    STEP 5 A of the shell build — the connector-item PROJECTION core.
-   See sessions/01.1230-spunky-whistle-pt1h9t/BUILD-DIRECTIVE-v1.md item 5
+   See internal item 5
    ("wire live tool-tabs — Gmail/Calendar/Contacts/Files panes over the live
    connectors").
 

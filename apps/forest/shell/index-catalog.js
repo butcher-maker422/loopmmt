@@ -1,6 +1,6 @@
 /* Shea's Forest — the App Shell · shell/index-catalog.js
    STEP 4 (the last piece of the tab system): the "+" catalog. See
-   sessions/01.1230-spunky-whistle-pt1h9t/BUILD-DIRECTIVE-v1.md §3.4 —
+   internal §3.4 —
    "glob(trees) ⊔ list(horizontals ∪ connectors) → a pick list → pin() writes
    view-config, strip re-renders."
 

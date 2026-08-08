@@ -353,7 +353,7 @@
   }
 
   /* ---- the color seam: deterministic-default + sparse-override --------------- *
-   * (design/forest-calendar-type-manager-direction-v1.md §DECIDED, color seam A) *
+   * (internal §DECIDED, color seam A) *
    * calHue above is the born-with DEFAULT ENGINE, unchanged. resolveCalColor is  *
    * the override-aware FRONT DOOR every color read goes through: when the owner   *
    * has recolored a type, its override (a Grove-palette SLOT INDEX, never a hex)  *
@@ -481,7 +481,7 @@
    * things stay syntax, because both are things the user MEANT:                      *
    *   · `column:value` on a REAL column (title/description/location/category) —      *
    *     this IS P5. Categories get filtering with no category UI at all, because     *
-   *     the FTS5 table already indexes the column (_tools/loopcalendar.js:292).      *
+   *     the FTS5 table already indexes the column (internal:292).      *
    *     An unreal column (`re:`) is not syntax, it is someone typing an email        *
    *     subject line, and it degrades to a literal token rather than "no such column".*
    *   · a trailing `*` — prefix search, and worth keeping: it is how you find        *
@@ -1904,7 +1904,7 @@
   function renderNewForm(host, ctx, api, state, back, existing) {
     var doc = host.ownerDocument;
     var isEdit = !!(existing && existing.id);
-    // SL-1 — GENESIS OPENS A PANE (method/the-shape-law-register-v1.md §4; the Cruise's
+    // SL-1 — GENESIS OPENS A PANE (internal §4; the Cruise's
     // SHAPE-LAW-BREACH grade, `cruise.py --plan plans/forest.json`). This function used to
     // open with `host.textContent = ""`: the grid — the person's whole context — was
     // DESTROYED to make one event, and a `back` callback rebuilt it. Mail had this exact bug
@@ -3616,7 +3616,7 @@
      * you page. Mail's chip is honest because mail-model tallies over an already-      *
      * complete set. Calendar has a window, not a set. I don't have mail's premise, so  *
      * I don't get mail's chip. (Earned back by a non-window-scoped count route — the   *
-     * countEvents fn already exists in _tools/loopcalendar.js, unrouted. Tool change.) */
+     * countEvents fn already exists in internal, unrouted. Tool change.) */
     function activate(node, fn) {
       node.addEventListener("click", function () { fn(); });
       node.addEventListener("keydown", function (ev) {

@@ -1,7 +1,7 @@
 'use strict';
 /*
  * loopcalendar-lib — a require()-safe, in-process loader for the Calendar time-hub
- * (_tools/loopcalendar.js).
+ * (internal).
  *
  * WHY THIS EXISTS. loopcalendar is a Five-Rules single-file tool. It previously carried its shebang
  * on line 2 (after its SPDX comment), where `#!` is invalid JS — node threw
@@ -25,7 +25,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const Module = require('node:module');
 
-const SOURCE_PATH = path.resolve(__dirname, '../../../_tools/loopcalendar.js');
+const SOURCE_PATH = path.resolve(__dirname, '../../../internal');
 
 function loadLoopCalendar() {
   const raw = fs.readFileSync(SOURCE_PATH, 'utf8');
@@ -99,18 +99,18 @@ function wrapSeam(exp) {
   const addFn = exp && exp.addAttendee;
   // P6 "Un-invite" (Slice 3). NOTE, because it is the opposite of what the addAttendee
   // comment above says and the comment is what will mislead you: `removeAttendee` IS in the
-  // tool's real `module.exports` block (_tools/loopcalendar.js:2669 — `addAttendee,
+  // tool's real `module.exports` block (internal:2669 — `addAttendee,
   // removeAttendee,`). A plain require() reaches it; the source-preamble augmentation above is
   // NOT needed for it, and adding one would be a no-op guarded by `!module.exports.<verb>`.
   // (That preamble line for addAttendee is itself vestigial for the same reason — kept because
-  // it is inert and _tools/loopcalendar.js is golden-frozen, so proving it dead is not worth a
+  // it is inert and internal is golden-frozen, so proving it dead is not worth a
   // byte of churn in a file we may not touch.) What the tool does NOT have, exactly as with
   // add, is a ROUTE: its handleApiRequest knows /api/events/:id for GET/PUT/DELETE and then
   // 405s, so a DELETE to /api/events/:id/attendees/:aid never reaches removeAttendee. The door
   // is THIS seam's door.
   const removeFn = exp && exp.removeAttendee;
   // verb 6 (calendar-type-manager delete-merge). Like removeAttendee, BOTH verbs this arm
-  // needs are already in the tool's real `module.exports` block (_tools/loopcalendar.js:2844
+  // needs are already in the tool's real `module.exports` block (internal:2844
   // — `updateEvent` and `listEvents` among them), so a plain require() reaches them and the
   // in-memory source augmentation above is NOT needed. `updateFn` reassigns an event to the
   // UNASSIGNED bucket (patch `calendarId: null`) through the tool's honest write path — which
@@ -123,7 +123,7 @@ function wrapSeam(exp) {
   // its cost blocked the single event loop on a large calendar, tripping the watchdog restart
   // (the "delete-merge crash": 502 + uptime reset + rollback, never an uncaughtException). One
   // `calendar.deleted` proof entry (proofFn) records the whole op — operator ratified A,.
-  // See sessions/19.1940-ruddy-koala-htqpw4/finding-delete-merge-crash-mechanism-v1.md.
+  // See internal
   const proofFn = exp && exp.writeProofChainEntry;
   // Cold-safe: without the base handler there is nothing to wrap. Each intercept below is
   // then guarded on ITS OWN verb, so a missing iCal verb no longer skips the attendee route
@@ -224,7 +224,7 @@ function wrapSeam(exp) {
 
     // DELETE /api/events/:id/attendees/:attendeeId -> the tool's removeAttendee (P6 "Un-invite").
     // The exact mirror of the POST arm above, and it exists for the exact same reason: the verb
-    // is real (_tools/loopcalendar.js:1034 — DELETE FROM event_attendees, plus the has_attendee
+    // is real (internal:1034 — DELETE FROM event_attendees, plus the has_attendee
     // graph-edge retraction and a proof-chain entry) and the route is not. The tool's own
     // /api/events/:id branch DOES answer DELETE — which is the trap: a DELETE to the deeper
     // attendee path must be caught HERE, above the tool, or it falls into a branch that would
@@ -265,7 +265,7 @@ function wrapSeam(exp) {
     // WHY HERE, and why BOTH a reassign AND a row-delete. The byte-frozen tool serves
     // GET + POST on /api/calendars (list + id-keyed upsert — verbs 1/2 rename/create write the
     // table) but 405s DELETE and has no /api/calendars/:id route and NO deleteCalendar primitive
-    // (_tools/loopcalendar.js:2207 / :2844). The client sources its calList from that table
+    // (internal:2207 / :2844). The client sources its calList from that table
     // VERBATIM (calendar-renderer.js:2906), so a delete that reassigned events but left the row
     // would leave a ghost calendar the tool keeps serving. The tool being frozen, the row-delete
     // terminus lives HERE — the same seam door that already reaches runtimeState.database for the
@@ -325,7 +325,7 @@ function wrapSeam(exp) {
     }
 
     /* ===== SEARCH CONTAINMENT (Slice 4) — the outage this closes ========= *
-     * GET /api/events?q= routes to the tool's searchEvents (_tools/loopcalendar.js  *
+     * GET /api/events?q= routes to the tool's searchEvents (internal  *
      * :1378), which hands the query VERBATIM to `WHERE events_fts MATCH ?`. FTS5    *
      * MATCH is a QUERY LANGUAGE, not a string compare — so an apostrophe, an        *
      * unbalanced quote, a bare hyphen, a stray paren, a colon, or a bare AND is not *
@@ -341,7 +341,7 @@ function wrapSeam(exp) {
      * The tool is golden-frozen, so the guard goes HERE — the same door every other *
      * calendar route came through. THE SIBLING TOOL ALREADY DOES THIS: loopcontact's *
      * searchContacts wraps its own MATCH in try/catch and returns an error envelope  *
-     * (_tools/loopcontact.js:1562). Contacts got it right; calendar never did. This  *
+     * (internal:1562). Contacts got it right; calendar never did. This  *
      * is not a new posture — it is the house posture, applied where it was missing.  *
      *                                                                               *
      * 400, NOT an empty 200. "Your query did not parse" and "there are no matching  *

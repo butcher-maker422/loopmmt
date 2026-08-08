@@ -2403,7 +2403,7 @@
  SURFACE — renderSettings(doc, config, opts) · leg 26 / 
 
      The FIRST instance of the Forest Settings Pattern
-     (design/forest-settings-pattern-plan-v1.md). A PURE config-editor panel:
+     (internal). A PURE config-editor panel:
      it reads the live dwell config (or the labeled placeholder when unset),
      paints per-stage editable watch/late day pairs, and hands every edit back
      through the host via `opts.onConfigChange` — the HOST owns the write, which

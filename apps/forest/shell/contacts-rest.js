@@ -184,7 +184,7 @@
       // route below ALREADY answers on the tool and ALREADY passes the seam (which
       // is a generic pass-through with idempotency handling for mutating methods) —
       // v2's F2 claimed they did not exist at any layer; that was false, and
-      // the receipt is _tools/test-loopcontact-write-path.js (16/16, zero substrate
+      // the receipt is internal (16/16, zero substrate
       // bytes changed). TC-1 holds throughout: these SEND typed intent and return the
       // tool's JSON. No validation math, no normalization, no primary-election logic —
       // the tool owns all of it (it recomputes content_hash and journals every write).

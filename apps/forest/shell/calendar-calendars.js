@@ -4,7 +4,7 @@
    family one, the birthdays feed Google injects). The connector already fans out
    over every one of them (forest/connectors/sources/calendar.js — defaultFetchEvents
    is parameterized by calendarId; it was hardcoded to 'primary' once and is not
-   anymore) and the tool already stores the identity (_tools/loopcalendar.js — a
+   anymore) and the tool already stores the identity (internal — a
    `calendars` table and an `events.calendar_id` column, with a live ALTER migration).
    Only the UI was flat. This module is the missing half: given the calendars in hand
    and the set the owner has CHECKED, return the events that belong on screen.
