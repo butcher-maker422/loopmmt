@@ -20,19 +20,12 @@ To use a different port:
 PORT=8080 node server.js
 ```
 
-## Running Tests
+## Tests
 
-```
-npm test
-```
-
-Or directly:
-
-```
-node tests/run-all.js
-```
-
-612 tests across 8 tiers: bus infrastructure, vault operations, input gates, signal loops, compute, workflows, and end-to-end.
+The system was built against a suite of 612 tests across 8 tiers — bus
+infrastructure, vault operations, input gates, signal loops, compute, workflows,
+and end-to-end. The tests are not included in this published snapshot; this is
+the runnable app plus its source.
 
 ## File Structure
 
@@ -40,17 +33,7 @@ node tests/run-all.js
 constellation.js   — Core system: buses, routing, vaults, loops (4,721 lines)
 server.js          — HTTP server, SSE, config seed (655 lines)
 dashboard.html     — Operator UI (1,911 lines)
-package.json       — Start/test scripts
-tests/
-  run-all.js       — Test runner
-  tier0.test.js    — Bus infrastructure, routing, ledger
-  tier1-vault-config.test.js  — Config vault
-  tier1-all-vaults.test.js    — All vaults
-  tier2-input-gates.test.js   — Input validation
-  tier3-signal-loops.test.js  — Signal loops
-  tier4-compute.test.js       — Pricing, daily scan, reports
-  tier5-workflow.test.js      — Order lifecycle workflows
-  tier7-e2e.test.js           — End-to-end scenarios
+package.json       — Start script
 ```
 
 ## Important Notes
