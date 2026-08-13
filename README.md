@@ -22,7 +22,7 @@ of one. The result is this: real apps, a real corpus, built in a one-room place 
 
 ---
 
-## Three ways in
+## Four ways in
 
 **Run something.** Every app in [`apps/`](apps/) has a working example and its full
 source. Start with [`apps/loop21/`](apps/loop21/) — an 18,000-line flow computer in a
@@ -39,6 +39,11 @@ system produces on its own at the end of every session — a handoff, a near-mis
 close bundle, a work timesheet derived from the git record. They prove the work is real
 by being honest, including about the mistakes.
 
+**Take something.** Three small tools in [`gifts/`](gifts/) — a structure-vs-random smell
+test, self-healing multi-store git redundancy, and a status board that won't go green on
+hope. Standalone, no methodology inside, released **MIT** so you can use them in anything,
+including something you sell. Each one prints its own honest limits. They're yours.
+
 ---
 
 ## The map
@@ -46,10 +51,12 @@ by being honest, including about the mistakes.
 ```
 README.md            you are here
 apps/                every app: full source, a per-app README, a working example
+gifts/               three standalone tools, MIT-licensed, yours to use anywhere
 corpus/              the shared corpus, in the same form the site shares it
 site/                the built website, exactly as it's served
 LICENSE-corpus       the writing is CC BY-NC 4.0
 LICENSE-apps         the code is AGPLv3
+LICENSE-gifts        the gifts are MIT
 index.json           the machine-readable map of everything here
 ```
 
@@ -84,6 +91,10 @@ it, quote it, build on it, teach with it; just don't sell it, and say where it c
 
 The **code** in `apps/` is released under the **GNU Affero General Public License v3**
 (`LICENSE-apps`). Use it, change it, run it; keep it open.
+
+The three tools in `gifts/` are released under the **MIT License** (`LICENSE-gifts`) — the
+most permissive of the three, on purpose. The apps are shared but copyleft; the gifts are
+simply given away. Use them in anything, commercial included, no strings.
 
 ---
 
