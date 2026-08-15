@@ -1,0 +1,73 @@
+# publish.yml — the loopmmt.com air-gapped publish Action.
+#
+# HOME: this file belongs in the PUBLIC repo at .github/workflows/publish.yml on
+# butcher-maker422/loopmmt. It is delivered here (in the private repo, under
+# projects/loopmmt-website/ci/) as an operator-installed artifact — the session
+# NEVER writes it into the deploy content, so a compromised session cannot weaken
+# the CI that checks it (§5.3). deploy.sh preserves .github/ as chrome.
+#
+# WHAT IT DOES: the session pushes the gated tree to `staging` (deploy.sh --stage).
+# This Action, running in clean CI with zero private context, re-runs the leak gate
+# against its OWN hardcoded baseline (.github/ci-leak-gate.py), and only on a clean
+# scan fast-forwards staging -> main. Pages serves main. No stored PAT anywhere in
+# CI — the flip uses the ephemeral, per-run GITHUB_TOKEN.
+#
+# The one thing that matters (no private leak reaches live) is checked TWICE, in two
+# trust contexts: predeploy_gate.sh session-side, ci-leak-gate.py here.
+
+name: publish
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch: {}      # manual override; not the steady path (§5.1)
+
+# Only the flip step needs write; least-privilege by default.
+permissions:
+  contents: write
+
+concurrency:
+  # one publish at a time; a newer staging push supersedes an in-flight run.
+  group: loopmmt-publish
+  cancel-in-progress: true
+
+jobs:
+  gate-and-flip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out staging (gated tree only — zero private context)
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+          fetch-depth: 0          # need history to fast-forward main
+
+      - name: Independent leak re-gate (hardcoded baseline, session cannot weaken)
+        run: |
+          set -euo pipefail
+          if [ ! -f .github/ci-leak-gate.py ]; then
+            echo "::error::.github/ci-leak-gate.py missing — the independent baseline is the whole point; refusing." >&2
+            exit 1
+          fi
+          python3 .github/ci-leak-gate.py .
+
+      - name: Fast-forward staging -> main (ephemeral GITHUB_TOKEN; never force)
+        run: |
+          set -euo pipefail
+          git config user.name  "loopmmt-publish[bot]"
+          git config user.email "publish@users.noreply.github.com"
+          # HEAD is the staging tip (checked out above). Push it to main as a
+          # STRICT fast-forward: GitHub rejects a non-FF, so main only ever
+          # advances from a gate-cleared staging and is NEVER force-updated.
+          git push origin "HEAD:refs/heads/main"
+          echo "flipped: staging -> main (fast-forward). Pages will serve in ~40s."
+
+      - name: Live smoke (advisory — never fails the publish)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          echo "waiting ~45s for Pages to serve the new main ..."
+          sleep 45
+          for url in "https://loopmmt.com/site/" "https://loopmmt.com/"; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' -L "$url" || echo 000)"
+            echo "smoke: $url -> HTTP $code"
+          done
