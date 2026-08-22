@@ -28,19 +28,24 @@ You can also run it live on the site: **http://loopmmt.com/apps/loop21/loop21-bu
 ```
 loop21-build333.html   — the whole machine: one file, no dependencies
 docs/
-  l21-operators-manual-v1-2.md        — how to drive it, control by control
-  l21-technical-reference-v1.md        — developer guide: internals, wiring
-  l21-computing-first-principles-v1.md — computing built up from nothing
-  l21-complete-record-v1.md            — the full build record of Loop 2.1
+  getting-started.html    — first steps: open it and drive it
+  philosophy.html         — on flow, transparency, and control
+  field-guide.html        — the operator's field guide, control by control
+  keyboard-guide.html     — every keyboard control
+  coding-standards.html   — architecture & coding-standards guide: internals, wiring
+  course-outline.html     — a CS 1XX course outline built around the machine
+  99-challenges.html      — 99 challenges
+  99-solutions.html       — 99 solutions, the teacher's guide
+  complete-record.html    — the full build record of Loop 2.1
 ```
 
 ## Reading the code
 
-The machine is self-contained in `loop21-build333.html`. Start with the
-**Operator's Manual** to learn what the controls do, then the **Technical
-Reference** for how the internals are wired. **Computing from First Principles**
-is the standalone essay on the ideas underneath; **The Complete Record** is the
-long-form account of how it was built.
+The machine is self-contained in `loop21-build333.html`. Start with
+**Getting Started** and the **Field Guide** to learn what the controls do, then
+the **Coding Standards & Architecture Guide** for how the internals are wired.
+**Philosophy** is the standalone essay on the ideas underneath; **The Complete
+Record** is the long-form account of how it was built.
 
 ## Notes
 
