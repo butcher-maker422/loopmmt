@@ -1,8 +1,366 @@
-# Loop MMT — corpus shard 30/30
+# Loop MMT — corpus shard 30/31
 
-> Bundle 30 of 30 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 30 of 31 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/mint/, /gifts/plumb/, /gifts/vclock/, /gifts/ward/)
+Nodes in this shard: 4 (/gifts/grain/, /gifts/mint/, /gifts/plumb/, /gifts/vclock/)
+
+---
+
+# Grain — a Loop MMT gift
+https://loopmmt.com/gifts/grain/
+[coverage: optional · branch: gifts]
+
+Structure Smell Test smell ← all gifts
+
+Grain
+
+Compress your data, compare the ratio against a size-matched random null model drawn live, and get a self-calibrating reading of how much structure vs. noise — no hand-set threshold. Snapshot it over time and it becomes a cheap drift alarm.
+
+The honest edge
+
+It's a smell, not a proof — a smoke alarm, not an arson investigator. Great for staleness and homogenization drift; not a data-rot or dead-link checker.
+
+Run it
+
+python3 grain.py --help
+test_grain.py (5/5)
+Python stdlib only
+
+The code — every file that ships
+
+grain.py 273 lines on GitHub →
+#!/usr/bin/env python3
+"""
+grain.py — a self-calibrating structure & drift smell test for any corpus.
+
+Does this text/relation have *grain* — real structure — or is it slurry?
+
+WHAT IT DOES
+It compresses your data with zlib (a Kolmogorov UPPER bound: DEFLATE finds
+repeated substructure) and compares the compression ratio against a
+size-matched, deterministically-seeded RANDOM NULL MODEL built from your own
+data's own symbols. If your data compresses clearly *more* than random
+arrangements of the same symbols, it carries structure a random baseline does
+not — a rule, a template, a hub, a repetition. The threshold is drawn LIVE
+from the null model, so there is no magic number to hand-tune as your data
+grows. That self-calibration is the whole trick.
+
+WHAT IT IS GOOD FOR (graded honestly)
+* Corpus staleness / homogenization drift — its BEST fit. Snapshot the grain
+signature over time; a drift is a near-free staleness/homogenization alarm.
+No labels, no model, no training. (see: --drift)
+* "AI slop" smell — YES, as a SMELL, not a classifier.
+Machine-generated text trends more templated/redundant; rising structure
+against the null is a cheap smoke alarm. A smoke alarm, not an investigator.
+* Detecting a generating rule leaking into a published relation (hub / label
+reuse) — the original use this was extracted from. (see: --relation)
+
+WHAT IT IS *NOT* GOOD FOR
+* Data rot (dead links, broken references, bit-decay). Wrong tool — that is a
+reference-integrity problem; this measures structure, not reachability.
+* A proof of anything. It is a lower-bound SMELL. zlib is an upper bound on
+complexity, so a low ratio proves compressibility, not a specific cause; and
+it is WEAK on chain-shaped rules (a chain reuses each symbol ~twice, like a
+sparse random graph), so a clean reading is not a certificate of "no rule."
+
+Stdlib only. Deterministic (seeded). No dependencies. MIT licensed.
+
+Origin: extracted and generalized from the "non-compressibility gate" in the
+Loop MMT corpus-map builder. The specific application (generator-leak detection
+in a published edge graph) stayed home; this is the general kernel, given away.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import statistics
+import sys
+import zlib
+
+# --- the one documented knob ------------------------------------------------
+Z_CUT = 2.0 # flag STRUCTURED when the real ratio is > Z sd below the
+# null MEAN — more compressible than random arrangements of
+# its own symbols, beyond normal variation. Self-calibrating
+# (mean+sd drawn live); no absolute number to drift.
+NULL_TRIALS = 64 # deterministic sample size of the random baseline
+NULL_SEED = 0xC0DE # fixed seed => folds-twice-identical (reproducible)
+MIN_SD = 1e-6 # sd-floor: below this the baseline is degenerate and the
+# z-cut is meaningless, so fall back to a coarse fraction.
+DEGENERATE_FRACTION = 0.5 # backstop only when the null baseline has ~no spread
+
+def _zlib_ratio(raw: bytes) -> float:
+"""rho = compressed_len / raw_len at max level. LOW rho => compressible => structure."""
+if not raw:
+return 1.0
+return len(zlib.compress(raw, 9)) / len(raw)
+
+def _serialize(tokens) -> bytes:
+"""
+Canonical bytes for a token sequence: newline-joined, real symbols kept.
+We keep the REAL tokens (never remap to a dense integer alphabet): structure
+manifests as repeated real tokens, and that reuse is exactly the compressible
+signal to catch. The null is serialized identically, so any per-token length
+effect cancels between actual and null.
+"""
+return "\n".join(tokens).encode("utf-8")
+
+def _null_stats(n_tokens, null_draw):
+"""
+zlib-ratio DISTRIBUTION of `NULL_TRIALS` size-matched RANDOM draws from the
+data's own alphabet — NOT a permutation of the same multiset. Drawing fresh
+from the alphabet is what lets a real rule stand out: the actual reuses a hub
+label (`x -> glossary` many times) far more than a uniform draw over the
+alphabet does, so the actual compresses more and its z_score drops. (A
+same-multiset permutation would hold that reuse INSIDE the null and detect
+nothing — the exact bug this replaced.) Deterministic (seeded). Returns
+(mean, population_sd) over the draws.
+
+`null_draw(rng, n)` returns one random size-n token list from the alphabet.
+"""
+if n_tokens < 2:
+return 1.0, 0.0
+rng = random.Random(NULL_SEED)
+ratios = [_zlib_ratio(_serialize(null_draw(rng, n_tokens)))
+for _ in range(NULL_TRIALS)]
+return statistics.mean(ratios), statistics.pstdev(ratios)
+
+def _alphabet_draw(alphabet):
+"""Default null: draw n symbols uniformly (with replacement) from `alphabet`."""
+pool = list(alphabet)
+return lambda rng, n: [rng.choice(pool) for _ in range(n)]
+
+def signature(tokens, null_draw=None):
+"""
+The grain signature of a token sequence, self-calibrated against a size-matched
+uniform draw from its own alphabet. `z_score` is sigma below (negative) / above
+the null mean: strongly negative => structured (compresses more than a random
+draw of its size does). Pass `null_draw` to supply a domain-specific null (see
+the relation path); default is a uniform draw over the distinct tokens.
+"""
+tokens = list(tokens)
+if null_draw is None:
+null_draw = _alphabet_draw(set(tokens) or {""})
+rho_actual = _zlib_ratio(_serialize(tokens))
+mean_null, sd_null = _null_stats(len(tokens), null_draw)
+rel = (rho_actual / mean_null) if mean_null else 1.0
+z = ((rho_actual - mean_null) / sd_null) if sd_null > MIN_SD else 0.0
+degenerate = sd_null <= MIN_SD
+if not tokens:
+structured = False
+elif degenerate:
+structured = rho_actual < DEGENERATE_FRACTION * mean_null
+else:
+structured = z < -Z_CUT
+return {
+"tokens": len(tokens),
+"rho_actual": round(rho_actual, 4),
+"mean_null": round(mean_null, 4),
+"sd_null": round(sd_null, 4),
+"rel_to_null": round(rel, 4),
+"z_score": round(z, 3),
+"z_cut": Z_CUT,
+"null_trials": NULL_TRIALS,
+"degenerate_baseline": degenerate,
+"verdict": "STRUCTURED" if structured else "IDIOSYNCRATIC",
+}
+
+# --- input modes ------------------------------------------------------------
+
+def tokens_from_text(text, mode="lines"):
+if mode == "lines":
+return [ln for ln in text.splitlines() if ln.strip()]
+if mode == "words":
+return text.split()
+raise ValueError(f"unknown text mode: {mode}")
+
+def tokens_from_relation(text):
+"""Each non-empty line is an edge `a->b` or `a<TAB>b`; kept as a real token."""
+out = []
+for ln in text.splitlines():
+ln = ln.strip()
+if not ln:
+continue
+if "->" in ln:
+a, b = ln.split("->", 1)
+elif "\t" in ln:
+a, b = ln.split("\t", 1)
+else:
+a, b = ln, ""
+out.append(f"{a.strip()}->{b.strip()}")
+return sorted(out) # canonical order, like the original relation serializer
+
+def relation_null_draw(edge_tokens):
+"""
+Faithful relation null (from the original gate): the alphabet is the NODE set,
+and each null draw is `n` random DISTINCT directed pairs from it. A rule-leak
+(a hub reusing one target node across many edges) sits far below this uniform-
+pair baseline; a genuinely idiosyncratic dependency graph sits inside it.
+"""
+nodes = set()
+for tok in edge_tokens:
+if "->" in tok:
+a, b = tok.split("->", 1)
+nodes.add(a.strip())
+nodes.add(b.strip())
+nodes = sorted(nodes)
+all_pairs = [(a, b) for a in nodes for b in nodes if a != b]
+
+def draw(rng, n):
+k = min(n, len(all_pairs))
+return [f"{a}->{b}" for a, b in sorted(rng.sample(all_pairs, k))] if k > 0 else []
+
+return draw
+
+def _read(path):
+if path == "-":
+return sys.stdin.read()
+with open(path, "r", encoding="utf-8", errors="replace") as fh:
+return fh.read()
+
+HONEST_CEILING = (
+"note: a lower-bound SMELL, never a proof. zlib is an upper bound on "
+"complexity, so a low ratio proves compressibility, not a specific cause; "
+"it is weak on chain-shaped rules; and it says nothing about data rot "
+"(broken references) — that is a different tool."
+)
+
+def main(argv=None):
+p = argparse.ArgumentParser(
+description="Self-calibrating structure & drift smell test for any corpus.",
+epilog=HONEST_CEILING,
+)
+p.add_argument("path", help="file to read, or '-' for stdin")
+p.add_argument("--relation", action="store_true",
+help="treat each line as an edge (a->b) instead of prose")
+p.add_argument("--words", action="store_true",
+help="tokenize prose by words instead of lines")
+p.add_argument("--drift", metavar="BASELINE.json",
+help="compare this input's signature against a saved baseline "
+"and report the change (the staleness alarm)")
+p.add_argument("--save", metavar="OUT.json",
+help="write this input's signature to OUT.json as a baseline")
+p.add_argument("--json", action="store_true", help="machine-readable output")
+args = p.parse_args(argv)
+
+text = _read(args.path)
+if args.relation:
+toks = tokens_from_relation(text)
+sig = signature(toks, null_draw=relation_null_draw(toks))
+else:
+toks = tokens_from_text(text, "words" if args.words else "lines")
+sig = signature(toks)
+
+if args.save:
+with open(args.save, "w", encoding="utf-8") as fh:
+json.dump(sig, fh, indent=2, sort_keys=True)
+
+if args.drift:
+with open(args.drift, "r", encoding="utf-8") as fh:
+base = json.load(fh)
+delta_z = round(sig["z_score"] - base.get("z_score", 0.0), 3)
+delta_rel = round(sig["rel_to_null"] - base.get("rel_to_null", 1.0), 4)
+drift = {
+"baseline_z": base.get("z_score"),
+"current_z": sig["z_score"],
+"delta_z": delta_z,
+"delta_rel_to_null": delta_rel,
+# more structure than before => drift toward homogenization/staleness
+"reading": ("MORE STRUCTURED than baseline (homogenizing/staling)"
+if delta_z < -0.5 else
+"LESS STRUCTURED than baseline (diversifying)"
+if delta_z > 0.5 else
+"stable (within noise)"),
+}
+if args.json:
+print(json.dumps({"signature": sig, "drift": drift}, indent=2, sort_keys=True))
+else:
+print(f"grain drift: {drift['reading']} (delta_z={delta_z})")
+print(HONEST_CEILING)
+return 0
+
+if args.json:
+print(json.dumps(sig, indent=2, sort_keys=True))
+else:
+print(f"grain: {sig['verdict']} "
+f"(z={sig['z_score']} vs cut -{sig['z_cut']}; "
+f"{sig['tokens']} tokens; rho={sig['rho_actual']} vs null {sig['mean_null']})")
+print(HONEST_CEILING)
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_grain.py 71 lines on GitHub →
+#!/usr/bin/env python3
+"""Tests for grain.py — the discrimination must be real, not a no-op."""
+import json
+import subprocess
+import sys
+import tempfile
+import os
+
+import grain
+
+def test_structured_vs_idiosyncratic():
+# A hub/template: every line reuses the same target token — a generator leak.
+structured = [f"class_{i}->glossary" for i in range(60)]
+# Idiosyncratic: distinct random-ish pairs, little reuse.
+import random
+rng = random.Random(1)
+nodes = [f"n{i}" for i in range(60)]
+idio = sorted({f"{rng.choice(nodes)}->{rng.choice(nodes)}" for _ in range(60)})
+s_struct = grain.signature(structured, null_draw=grain.relation_null_draw(structured))
+s_idio = grain.signature(idio, null_draw=grain.relation_null_draw(idio))
+# The structured set must read more compressible (lower z) than the idiosyncratic.
+assert s_struct["z_score"] < s_idio["z_score"], (s_struct, s_idio)
+assert s_struct["verdict"] == "STRUCTURED", s_struct
+
+def test_determinism():
+toks = [f"a{i}->b{i%7}" for i in range(50)]
+a = grain.signature(toks)
+b = grain.signature(toks)
+assert a == b, "signature must fold-twice-identical (seeded)"
+
+def test_empty_is_not_structured():
+s = grain.signature([])
+assert s["verdict"] == "IDIOSYNCRATIC", s
+
+def test_drift_detects_homogenization():
+diverse = [f"n{i}->m{i}" for i in range(60)] # low structure
+homogd = [f"n{i}->glossary" for i in range(60)] # high structure (hub)
+base = grain.signature(diverse, null_draw=grain.relation_null_draw(diverse))
+now = grain.signature(homogd, null_draw=grain.relation_null_draw(homogd))
+# Homogenized corpus is MORE structured => z drops.
+assert now["z_score"] < base["z_score"]
+
+def test_cli_json_and_honest_ceiling():
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+fh.write("\n".join(f"class_{i}->glossary" for i in range(40)))
+path = fh.name
+try:
+out = subprocess.run(
+[sys.executable, "grain.py", path, "--relation", "--json"],
+capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+)
+assert out.returncode == 0, out.stderr
+data = json.loads(out.stdout)
+assert "verdict" in data and "z_score" in data
+finally:
+os.unlink(path)
+
+if __name__ == "__main__":
+n = 0
+for name, fn in sorted(globals().items()):
+if name.startswith("test_") and callable(fn):
+fn()
+print(f"ok {name}")
+n += 1
+print(f"\n{n}/{n} passed")
+
+Take the whole folder →
+MIT
+Python stdlib only
 
 ---
 
@@ -1397,325 +1755,5 @@ unittest.main(argv=argv, verbosity=verbosity)
 Take the whole folder →
 MIT
 Python stdlib only
-
----
-
-# Ward — a Loop MMT gift
-https://loopmmt.com/gifts/ward/
-[coverage: optional · branch: gifts]
-
-Self-Verifying Integrity Badge refuse ← all gifts
-
-Ward
-
-A status badge that will not go solid on hope. Every filled cell carries a witness beneath it — a file that must exist, a file that must contain a string, or a command that must exit 0 — and renders solid only when that witness agrees right now. Any claim whose witness is missing or disagrees renders a hollow ring, never a silent solid.
-
-The honest edge
-
-You cannot make a cell lie by asserting harder — but Ward checks the witness agrees, not that you chose the right witness. A meaningful witness is still your call.
-
-Run it
-
-python3 ward.py badge.json --root .
-smoke_test.py
-Python stdlib only, ~200 lines
-
-The code — every file that ships
-
-ward.py 219 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-ward — a self-verifying integrity badge that will not go solid on hope.
-
-THE IDEA.
-A status badge is a grid of cells, one per claim you want to show as "done".
-The temptation with any badge is to colour a cell in because you BELIEVE the
-thing is finished. `ward` refuses to. A cell renders SOLID only when its claim
-is backed by a witness that actually agrees right now; any claim whose witness
-is missing, disagrees, or is malformed renders as a HOLLOW RING — never a
-silent solid. The badge's own honesty is the feature: you cannot make a cell
-lie by asserting harder.
-
-It is the badge-shaped sibling of a "status board that won't go green on hope":
-same principle (a claim needs a witness), rendered as a compact grid you can
-drop into a README, a terminal, or an HTML page.
-
-WITNESS KINDS (per cell).
-file:PATH solid iff PATH exists
-contains:PATH::TEXT solid iff PATH exists AND contains TEXT
-cmd:SHELL solid iff `SHELL` exits 0
-(no witness) a cell with no witness is DECLARED-only -> renders as a
-ring, because a claim with nothing beneath it is exactly
-what this tool exists to expose.
-
-THE COERCE WELD (the load-bearing honesty rule).
-Every cell state is routed through one gate: an unknown, missing, or errored
-witness result can only ever become a RING. There is no code path from a bad
-witness to a solid cell. That is what makes the badge trustworthy — not that
-it is always green, but that green always means something.
-
-OUTPUT.
---format text a 3x3 (or NxM) grid of glyphs + a legend + a presence caveat
---format html an HTML fragment (cells carry data-state so you can style them)
---format json the resolved cells, for piping
-
-EXIT CODES.
-0 every declared claim resolved SOLID (a fully-earned badge)
-1 at least one claim rendered as a RING (unearned) -- LOUD, by design
-2 usage / IO error
-
-HONEST EDGE.
-`ward` checks that a witness EXISTS AND AGREES, never that it is the RIGHT
-witness. Point a cell at the wrong file and it will happily go solid — choosing
-a meaningful witness is your job. Presence is not proof of substance. Python
-stdlib only, offline, deterministic.
-"""
-import argparse
-import json
-import os
-import subprocess
-import sys
-
-RING = "ring" # hollow — unearned; the only state a bad witness can reach
-SOLID = "solid" # filled — witness exists and agrees
-
-_GLYPH = {SOLID: "\u25c9", RING: "\u25cb"} # ◉ solid ring-dot / ○ hollow ring
-
-def _resolve_witness(spec, root):
-"""Return True (earn SOLID) only on a clean, agreeing witness. Any error,
-miss, or malformed spec returns False -> the coerce weld renders a RING.
-There is deliberately no path here that returns True on uncertainty."""
-if not spec:
-return False
-try:
-if spec.startswith("file:"):
-path = spec[len("file:"):]
-return os.path.exists(os.path.join(root, path))
-if spec.startswith("contains:"):
-body = spec[len("contains:"):]
-if "::" not in body:
-return False
-path, text = body.split("::", 1)
-full = os.path.join(root, path)
-if not os.path.exists(full):
-return False
-with open(full, encoding="utf-8", errors="replace") as fh:
-return text in fh.read()
-if spec.startswith("cmd:"):
-shell = spec[len("cmd:"):]
-r = subprocess.run(shell, shell=True, cwd=root,
-stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-return r.returncode == 0
-except Exception:
-return False # the weld: any error is a RING, never a solid
-return False # unknown witness kind -> RING
-
-def resolve(cells, root):
-"""cells: list of {label, witness}. Returns list of {label, state, witness}.
-The coerce weld lives here: state is SOLID iff the witness cleanly agreed."""
-out = []
-for c in cells:
-earned = _resolve_witness(c.get("witness", ""), root)
-out.append({
-"label": c.get("label", ""),
-"witness": c.get("witness", ""),
-"state": SOLID if earned else RING,
-})
-return out
-
-def _grid(resolved, cols):
-rows = []
-for i in range(0, len(resolved), cols):
-rows.append(resolved[i:i + cols])
-return rows
-
-def render_text(resolved, cols):
-lines = []
-for row in _grid(resolved, cols):
-lines.append(" " + " ".join(_GLYPH[c["state"]] for c in row))
-legend = f"\n {_GLYPH[SOLID]} earned (witness agrees) {_GLYPH[RING]} unearned (ring \u2014 no green on hope)"
-caveat = "\n note: a solid cell means its witness EXISTS AND AGREES, not that the witness is the RIGHT one."
-labels = "\n".join(
-f" {_GLYPH[c['state']]} {c['label']}" + ("" if c["witness"] else " [no witness \u2014 declared only]")
-for c in resolved
-)
-return "\n".join(lines) + "\n" + labels + legend + caveat
-
-def render_html(resolved, cols):
-out = ['<div class="ward" role="img" aria-label="integrity badge">']
-for row in _grid(resolved, cols):
-out.append(' <div class="ward__row">')
-for c in row:
-out.append(
-f' <span class="ward__cell" data-state="{c["state"]}" '
-f'title="{c["label"]}">{_GLYPH[c["state"]]}</span>'
-)
-out.append(' </div>')
-out.append(' <p class="ward__caveat">A solid cell means its witness exists and agrees, '
-'never that the witness is the right one.</p>')
-out.append('</div>')
-return "\n".join(out)
-
-def load_cells(path):
-with open(path, encoding="utf-8") as fh:
-data = json.load(fh)
-if isinstance(data, dict):
-data = data.get("cells", [])
-if not isinstance(data, list):
-raise ValueError("badge spec must be a list of cells, or {\"cells\": [...]}")
-return data
-
-def main(argv=None):
-argv = argv if argv is not None else sys.argv[1:]
-ap = argparse.ArgumentParser(
-prog="ward",
-description="A self-verifying integrity badge that will not go solid on hope.")
-ap.add_argument("spec", nargs="?", help="path to a JSON badge spec (list of {label, witness})")
-ap.add_argument("--root", default=".", help="root the witnesses resolve against (default: .)")
-ap.add_argument("--cols", type=int, default=3, help="grid columns (default: 3 -> a 3x3 ward)")
-ap.add_argument("--format", choices=("text", "html", "json"), default="text")
-ap.add_argument("--selftest", action="store_true", help="prove the coerce weld (no bad witness -> solid)")
-args = ap.parse_args(argv)
-
-if args.selftest:
-return _selftest()
-if not args.spec:
-ap.print_help()
-return 2
-try:
-cells = load_cells(args.spec)
-except Exception as e:
-print(f"ward: cannot read spec: {e}", file=sys.stderr)
-return 2
-
-resolved = resolve(cells, args.root)
-if args.format == "json":
-print(json.dumps(resolved, indent=2))
-elif args.format == "html":
-print(render_html(resolved, args.cols))
-else:
-print(render_text(resolved, args.cols))
-
-unearned = [c for c in resolved if c["state"] == RING]
-return 1 if unearned else 0
-
-def _selftest():
-"""Non-vacuity: the weld must hold. A missing file, a failing command, a
-malformed witness, and an absent witness must ALL render RING; only a real,
-agreeing witness earns SOLID."""
-import tempfile
-ok = True
-with tempfile.TemporaryDirectory() as d:
-with open(os.path.join(d, "present.txt"), "w") as f:
-f.write("the witness text is here")
-cases = [
-("real file", "file:present.txt", SOLID),
-("missing file", "file:nope.txt", RING),
-("contains hit", "contains:present.txt::witness", SOLID),
-("contains miss", "contains:present.txt::absent", RING),
-("cmd pass", "cmd:true", SOLID),
-("cmd fail", "cmd:false", RING),
-("malformed contains", "contains:present.txt", RING),
-("unknown kind", "wat:present.txt", RING),
-("no witness", "", RING),
-]
-cells = [{"label": lbl, "witness": w} for lbl, w, _ in cases]
-resolved = resolve(cells, d)
-for (lbl, _w, want), got in zip(cases, resolved):
-good = got["state"] == want
-ok = ok and good
-print(f" [selftest] {lbl:18s} -> {got['state']:5s} (want {want}) -> {'PASS' if good else 'FAIL'}")
-# the weld, stated as an assertion: NOTHING but a clean witness reaches SOLID
-print(f"\nward selftest: {'ALL PASS' if ok else 'FAILURE'} (the coerce weld holds)" if ok
-else "\nward selftest: FAILURE")
-return 0 if ok else 1
-
-if __name__ == "__main__":
-sys.exit(main())
-
-smoke_test.py 81 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""smoke_test for ward — proves the coerce weld and the three witness kinds.
-
-Run: python3 smoke_test.py (exit 0 = all pass)
-
-The point of these tests is the WELD: there must be no path from a missing,
-failing, malformed, or absent witness to a SOLID cell. If any such path existed,
-the badge could lie, and the whole tool would be pointless.
-"""
-import os
-import tempfile
-import sys
-
-import ward
-
-_PASS = 0
-_FAIL = 0
-
-def check(name, got, want):
-global _PASS, _FAIL
-if got == want:
-_PASS += 1
-print(f"ok {name}")
-else:
-_FAIL += 1
-print(f"XX {name}: got {got!r}, want {want!r}")
-
-def main():
-with tempfile.TemporaryDirectory() as d:
-with open(os.path.join(d, "here.txt"), "w") as f:
-f.write("alpha beta gamma")
-
-# file: witness
-r = ward.resolve([{"label": "f", "witness": "file:here.txt"}], d)
-check("file present -> solid", r[0]["state"], ward.SOLID)
-r = ward.resolve([{"label": "f", "witness": "file:gone.txt"}], d)
-check("file missing -> ring", r[0]["state"], ward.RING)
-
-# contains: witness
-r = ward.resolve([{"label": "c", "witness": "contains:here.txt::beta"}], d)
-check("contains hit -> solid", r[0]["state"], ward.SOLID)
-r = ward.resolve([{"label": "c", "witness": "contains:here.txt::omega"}], d)
-check("contains miss -> ring", r[0]["state"], ward.RING)
-r = ward.resolve([{"label": "c", "witness": "contains:here.txt"}], d)
-check("contains malformed -> ring", r[0]["state"], ward.RING)
-
-# cmd: witness
-r = ward.resolve([{"label": "x", "witness": "cmd:true"}], d)
-check("cmd pass -> solid", r[0]["state"], ward.SOLID)
-r = ward.resolve([{"label": "x", "witness": "cmd:false"}], d)
-check("cmd fail -> ring", r[0]["state"], ward.RING)
-
-# the weld: unknown + absent witness -> ring, never solid
-r = ward.resolve([{"label": "u", "witness": "mystery:here.txt"}], d)
-check("unknown kind -> ring", r[0]["state"], ward.RING)
-r = ward.resolve([{"label": "n", "witness": ""}], d)
-check("no witness -> ring", r[0]["state"], ward.RING)
-
-# exit-code contract: any ring -> main returns 1
-import json
-spec = os.path.join(d, "spec.json")
-with open(spec, "w") as f:
-json.dump([{"label": "ok", "witness": "file:here.txt"},
-{"label": "bad", "witness": "file:gone.txt"}], f)
-rc = ward.main([spec, "--root", d, "--format", "json"])
-check("one ring -> exit 1", rc, 1)
-
-with open(spec, "w") as f:
-json.dump([{"label": "ok", "witness": "file:here.txt"}], f)
-rc = ward.main([spec, "--root", d, "--format", "json"])
-check("all solid -> exit 0", rc, 0)
-
-print(f"\n{_PASS}/{_PASS + _FAIL} green")
-return 0 if _FAIL == 0 else 1
-
-if __name__ == "__main__":
-sys.exit(main())
-
-Take the whole folder →
-MIT
-Python stdlib only, ~200 lines
 
 ---
