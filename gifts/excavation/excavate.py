@@ -26,18 +26,19 @@ What is PROVEN: the config surface, the _branch generalization, and the
 declared-core-set mechanism (a foreign run with no core-set.txt emits a loud note
 and collapses to one tier rather than silently mis-sharding).
 
-What is NOT YET PROVEN, and is the next build beat by design: the manifest builder
-currently imports loopmmt's own toolchain (build_machine_digest for the single
-sitemap walk; redact + disclosure_gate for its publish gates). A stranger's tree
-does not carry those. Full standalone independence — swapping the loopmmt walk for
-a self-contained local-walk enumerator and dropping the disclosure gate the
-stranger has no map for — is the acceptance beat: it is earned by running against a
-REAL foreign fixture and letting what breaks define the last of the config surface,
-never by asserting it here. Until that beat lands, this driver runs correctly in a
-tree that carries the builders and their helpers; pointed at a bare stranger tree
-it will fail loudly on the missing imports — which is the honest failure that the
-fixture beat converts into the final extraction. Do not paper over that gap; it is
-the seam the acceptance test is written against.
+STANDALONE INDEPENDENCE — PROVEN (DP-039 s7 beat 5, the acceptance gate). The
+in-tree builders (build_corpus_manifest + siblings) still import loopmmt's own
+toolchain (build_machine_digest for the sitemap walk; redact + disclosure_gate for
+the publish gates) — that path stays byte-identical on the home site. A stranger's
+bare tree carries none of those, so this driver no longer dies on the missing
+imports: it falls back to `excavate_standalone.py`, a self-contained builder that
+does a local .html walk (replacing the sitemap walk), extracts title/desc/body with
+stdlib re+html (replacing the digest helpers), and DROPS the two publish gates —
+loopmmt.com publish controls keyed to loopmmt's private-signature set and
+disclosure map, a safety a stranger's own served tree does not need and this gift
+must not falsely assert. Earned the way the beat required: by running against a
+REAL non-loopmmt fixture (test-fixture/) under smoke_test.sh and letting the
+missing-import failure define the seam. See excavate_standalone.py + smoke_test.sh.
 """
 import os
 import sys
@@ -102,16 +103,19 @@ def main():
     cfg = parse_config(os.path.join(HERE, CONFIG_NAME))
     core = read_core_set(os.path.join(HERE, CORE_SET_NAME))
 
-    # Inject config into the generalized builder's _CFG before it builds. The
-    # builder lives in the site's build tree; a standalone extraction of the
-    # local-walk enumerator is the acceptance beat (see the HONEST STATUS header).
+    # Two builder paths, chosen by what the tree carries:
+    #   * IN-TREE (loopmmt.com) — build_corpus_manifest.py + siblings are present;
+    #     inject config into their _CFG and run them (byte-identical home output).
+    #   * STANDALONE (a stranger's bare tree) — those builders are absent; run the
+    #     self-contained excavate_standalone.py, which does a local walk with zero
+    #     loopmmt deps. This is the fixture-proven acceptance beat (DP-039 s7 b5):
+    #     the missing-import failure is no longer fatal — it routes to standalone.
     try:
         import build_corpus_manifest as manifest
-    except ImportError as exc:
-        _die("cannot import the excavation builders (%s).\n"
-             "  This driver runs inside a tree that carries build_corpus_manifest.py\n"
-             "  and its siblings. Standalone-on-a-bare-tree is the fixture-proven\n"
-             "  acceptance beat, not yet landed — see the HONEST STATUS header." % exc, code=2)
+    except ImportError:
+        import excavate_standalone as standalone
+        standalone.main()
+        return
 
     manifest._CFG["base_url"] = cfg["base_url"]
     manifest._CFG["site_name"] = cfg.get("site_name", cfg["base_url"])
