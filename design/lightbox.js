@@ -79,7 +79,11 @@
       cap.textContent = caption;
       cap.style.display = caption ? '' : 'none';
       lastTrigger = img;
-      /*MUT*/
+      // reveal the overlay — the CSS gates visibility on [data-open="true"]
+      // (shell.css: #img-lightbox is display:none until this is set), and the
+      // Esc / backdrop close paths key off the same attribute. Without it the
+      // click locks scroll behind an overlay that never shows. (was: /*MUT*/)
+      overlay.setAttribute('data-open', 'true');
       // fixed overlay → no layout shift; lock scroll behind it.
       document.documentElement.style.overflow = 'hidden';
       overlay.querySelector('.img-lightbox-close').focus();
