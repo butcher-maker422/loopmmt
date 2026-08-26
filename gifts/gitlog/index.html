@@ -210,7 +210,7 @@ HAIL:A:END -->
         <section class="zone" aria-label="The code">
           <div class="zone-label">The code &mdash; every file that ships</div>
           <details class="code-fold">
-            <summary><code class="fname">gitlog.py</code><span class="lines">257 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/gitlog/gitlog.py">on GitHub &rarr;</a></summary>
+            <summary><code class="fname">gitlog.py</code><span class="lines">269 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/gitlog/gitlog.py">on GitHub &rarr;</a></summary>
             <pre class="code"><code>#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 &quot;&quot;&quot;gitlog.py — turn a git history into one JSON object per commit, on stdout.
@@ -264,11 +264,15 @@ import subprocess
 import sys
 
 
-# ASCII unit/record separators: safe inside commit text, so a subject line
-# containing newlines or pipes cannot break the parse. Same technique the
-# existing folds use.
-UNIT = &quot;\x1f&quot;
-REC = &quot;\x1e&quot;
+# GIFT-013: field/record framing must use a byte that CANNOT occur in commit
+# text. The old 0x1f/0x1e (ASCII unit/record separators) were assumed &quot;safe
+# inside commit text&quot; but are not — git permits those control bytes inside a
+# subject or author name, so a crafted commit split one record into many
+# (&quot;malformed log record: expected 7 fields, got 8&quot;). NUL is the only byte git
+# guarantees absent from commit content (its objects are NUL-terminated
+# C-strings): fields are joined with %x00 and each record is terminated by
+# `git log -z`, so no field value can ever break the frame.
+NUL = &quot;\x00&quot;
 
 # The per-commit fields, in emit order. (placeholder, json_key) pairs.
 FIELDS = [
@@ -333,8 +337,9 @@ def read_commits(repo, ref=&quot;HEAD&quot;, paths=None, since=None, until=None,
                 return []  # unborn default HEAD -&gt; empty history, per contract
             # not a git repo / unreadable -&gt; fall through; _run_git raises properly.
 
-    fmt = UNIT.join(p for p, _ in FIELDS) + REC
-    args = [&quot;log&quot;, ref, &quot;--format=%s&quot; % fmt]
+    # Fields joined by a literal NUL (%x00); `-z` NUL-terminates each record.
+    fmt = &quot;%x00&quot;.join(p for p, _ in FIELDS)
+    args = [&quot;log&quot;, ref, &quot;-z&quot;, &quot;--format=%s&quot; % fmt]
     if reverse:
         args.append(&quot;--reverse&quot;)
     if since:
@@ -350,20 +355,27 @@ def read_commits(repo, ref=&quot;HEAD&quot;, paths=None, since=None, until=None,
         args.extend(paths)
 
     raw = _run_git(args, repo)
+    # -z terminates every record (including the last) with a NUL, and fields are
+    # NUL-joined, so the whole stream is NUL-separated tokens: every len(FIELDS)
+    # tokens is one record. Drop the single trailing empty left by the final
+    # terminator; interior empty tokens (e.g. an empty subject) are preserved.
+    tokens = raw.split(NUL)
+    if tokens and tokens[-1] == &quot;&quot;:
+        tokens.pop()
+    if not tokens:
+        return []
+    n = len(FIELDS)
+    if len(tokens) % n != 0:
+        # A malformed stream is a fault, not a silent drop.
+        raise GitLogError(
+            &quot;malformed log stream: %d field tokens is not a multiple of %d&quot;
+            % (len(tokens), n),
+            2,
+        )
     records = []
-    for chunk in raw.split(REC):
-        chunk = chunk.strip(&quot;\n&quot;)
-        if not chunk:
-            continue
-        parts = chunk.split(UNIT)
-        if len(parts) != len(FIELDS):
-            # A malformed record is a fault, not a silent drop.
-            raise GitLogError(
-                &quot;malformed log record: expected %d fields, got %d&quot;
-                % (len(FIELDS), len(parts)),
-                2,
-            )
-        rec = {key: parts[i] for i, (_, key) in enumerate(FIELDS)}
+    for i in range(0, len(tokens), n):
+        group = tokens[i:i + n]
+        rec = {key: group[j] for j, (_, key) in enumerate(FIELDS)}
         records.append(rec)
     return records
 
@@ -671,7 +683,7 @@ if __name__ == &quot;__main__&quot;:
         <p class="footer-docs">Documents: <a href="/site/corpus.html">Creed, PiF, Glossary &amp; the full corpus &rarr;</a></p>
         <div class="footer-mark">
           <img src="/site/assets/wordmark.svg" alt="Loop MMT" style="height:19px;width:auto;">
-          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.115</span>
+          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.116</span>
         </div>
         <p><a href="mailto:shea@loopmmt.com">shea@loopmmt.com</a></p>
       </div>

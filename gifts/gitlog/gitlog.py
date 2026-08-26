@@ -51,11 +51,15 @@ import subprocess
 import sys
 
 
-# ASCII unit/record separators: safe inside commit text, so a subject line
-# containing newlines or pipes cannot break the parse. Same technique the
-# existing folds use.
-UNIT = "\x1f"
-REC = "\x1e"
+# GIFT-013: field/record framing must use a byte that CANNOT occur in commit
+# text. The old 0x1f/0x1e (ASCII unit/record separators) were assumed "safe
+# inside commit text" but are not — git permits those control bytes inside a
+# subject or author name, so a crafted commit split one record into many
+# ("malformed log record: expected 7 fields, got 8"). NUL is the only byte git
+# guarantees absent from commit content (its objects are NUL-terminated
+# C-strings): fields are joined with %x00 and each record is terminated by
+# `git log -z`, so no field value can ever break the frame.
+NUL = "\x00"
 
 # The per-commit fields, in emit order. (placeholder, json_key) pairs.
 FIELDS = [
@@ -120,8 +124,9 @@ def read_commits(repo, ref="HEAD", paths=None, since=None, until=None,
                 return []  # unborn default HEAD -> empty history, per contract
             # not a git repo / unreadable -> fall through; _run_git raises properly.
 
-    fmt = UNIT.join(p for p, _ in FIELDS) + REC
-    args = ["log", ref, "--format=%s" % fmt]
+    # Fields joined by a literal NUL (%x00); `-z` NUL-terminates each record.
+    fmt = "%x00".join(p for p, _ in FIELDS)
+    args = ["log", ref, "-z", "--format=%s" % fmt]
     if reverse:
         args.append("--reverse")
     if since:
@@ -137,20 +142,27 @@ def read_commits(repo, ref="HEAD", paths=None, since=None, until=None,
         args.extend(paths)
 
     raw = _run_git(args, repo)
+    # -z terminates every record (including the last) with a NUL, and fields are
+    # NUL-joined, so the whole stream is NUL-separated tokens: every len(FIELDS)
+    # tokens is one record. Drop the single trailing empty left by the final
+    # terminator; interior empty tokens (e.g. an empty subject) are preserved.
+    tokens = raw.split(NUL)
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+    if not tokens:
+        return []
+    n = len(FIELDS)
+    if len(tokens) % n != 0:
+        # A malformed stream is a fault, not a silent drop.
+        raise GitLogError(
+            "malformed log stream: %d field tokens is not a multiple of %d"
+            % (len(tokens), n),
+            2,
+        )
     records = []
-    for chunk in raw.split(REC):
-        chunk = chunk.strip("\n")
-        if not chunk:
-            continue
-        parts = chunk.split(UNIT)
-        if len(parts) != len(FIELDS):
-            # A malformed record is a fault, not a silent drop.
-            raise GitLogError(
-                "malformed log record: expected %d fields, got %d"
-                % (len(FIELDS), len(parts)),
-                2,
-            )
-        rec = {key: parts[i] for i, (_, key) in enumerate(FIELDS)}
+    for i in range(0, len(tokens), n):
+        group = tokens[i:i + n]
+        rec = {key: group[j] for j, (_, key) in enumerate(FIELDS)}
         records.append(rec)
     return records
 

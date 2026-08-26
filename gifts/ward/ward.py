@@ -49,9 +49,35 @@ HONEST EDGE.
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import html
+
+# GIFT-010: a command witness that never finishes must not hang the badge. A
+# witness that does not complete within this bound is uncertainty -> RING (never
+# a solid), and its whole process group is killed so grandchildren don't survive.
+WITNESS_TIMEOUT_S = 30
+
+
+def _run_shell_bounded(shell_cmd, cwd, timeout):
+    """Run a shell command in its own process group; kill the group on timeout.
+    Returns (returncode, timed_out): returncode is None when timed_out is True."""
+    proc = subprocess.Popen(
+        shell_cmd, shell=True, cwd=cwd,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        proc.wait(timeout=timeout)
+        return proc.returncode, False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()
+        return None, True
 
 RING = "ring"          # hollow — unearned; the only state a bad witness can reach
 SOLID = "solid"        # filled — witness exists and agrees
@@ -59,10 +85,11 @@ SOLID = "solid"        # filled — witness exists and agrees
 _GLYPH = {SOLID: "\u25c9", RING: "\u25cb"}   # ◉ solid ring-dot / ○ hollow ring
 
 
-def _resolve_witness(spec, root):
+def _resolve_witness(spec, root, timeout=WITNESS_TIMEOUT_S):
     """Return True (earn SOLID) only on a clean, agreeing witness. Any error,
-    miss, or malformed spec returns False -> the coerce weld renders a RING.
-    There is deliberately no path here that returns True on uncertainty."""
+    miss, malformed spec, or `cmd:` witness that exceeds `timeout` seconds returns
+    False -> the coerce weld renders a RING. There is deliberately no path here
+    that returns True on uncertainty (a hang is uncertainty)."""
     if not spec:
         return False
     try:
@@ -81,20 +108,21 @@ def _resolve_witness(spec, root):
                 return text in fh.read()
         if spec.startswith("cmd:"):
             shell = spec[len("cmd:"):]
-            r = subprocess.run(shell, shell=True, cwd=root,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return r.returncode == 0
+            rc, timed_out = _run_shell_bounded(shell, root, timeout)
+            if timed_out:
+                return False   # uncertainty -> RING; never a solid on a hang
+            return rc == 0
     except Exception:
         return False   # the weld: any error is a RING, never a solid
     return False       # unknown witness kind -> RING
 
 
-def resolve(cells, root):
+def resolve(cells, root, timeout=WITNESS_TIMEOUT_S):
     """cells: list of {label, witness}. Returns list of {label, state, witness}.
     The coerce weld lives here: state is SOLID iff the witness cleanly agreed."""
     out = []
     for c in cells:
-        earned = _resolve_witness(c.get("witness", ""), root)
+        earned = _resolve_witness(c.get("witness", ""), root, timeout)
         out.append({
             "label": c.get("label", ""),
             "witness": c.get("witness", ""),
