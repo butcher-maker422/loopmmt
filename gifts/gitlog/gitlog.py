@@ -101,6 +101,25 @@ def read_commits(repo, ref="HEAD", paths=None, since=None, until=None,
     The list is git's default order (reverse-chronological) unless reverse=True.
     An empty history returns [] and is NOT an error.
     """
+    # GIFT-014: an unborn repository (git init, zero commits) has no valid HEAD,
+    # so `git log HEAD` fatals. The contract says an empty history returns [] and
+    # is not an error. When the ref is the DEFAULT HEAD, detect the unborn case
+    # with a quiet verify and honor that contract. An invalid EXPLICIT ref
+    # (ref != "HEAD") still errors, and stays distinguishable from an unborn HEAD.
+    if ref == "HEAD":
+        probe = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+        )
+        if probe.returncode != 0:
+            inside = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "--git-dir"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+            )
+            if inside.returncode == 0:
+                return []  # unborn default HEAD -> empty history, per contract
+            # not a git repo / unreadable -> fall through; _run_git raises properly.
+
     fmt = UNIT.join(p for p, _ in FIELDS) + REC
     args = ["log", ref, "--format=%s" % fmt]
     if reverse:

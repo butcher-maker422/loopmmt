@@ -99,8 +99,17 @@ def _null_stats(n_tokens, null_draw):
 
 
 def _alphabet_draw(alphabet):
-    """Default null: draw n symbols uniformly (with replacement) from `alphabet`."""
-    pool = list(alphabet)
+    """Default null: draw n symbols uniformly (with replacement) from `alphabet`.
+
+    The pool is `sorted`, not a bare `list(alphabet)`: a set's iteration order is
+    randomized per process (PYTHONHASHSEED), so an unsorted pool made the fixed
+    PRNG seed index a differently-ordered pool in every process — same input, two
+    processes, different z-score (GIFT-006). Determinism is a whole-pipeline
+    property; the seed alone is not enough if upstream ordering is not canonical.
+    The relation path already sorts its node pool; this brings the token path to
+    the same footing.
+    """
+    pool = sorted(alphabet)
     return lambda rng, n: [rng.choice(pool) for _ in range(n)]
 
 

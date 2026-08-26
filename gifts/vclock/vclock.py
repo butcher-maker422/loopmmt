@@ -69,6 +69,10 @@ def _normalize(clock):
     for actor, count in clock.items():
         if isinstance(count, bool) or not isinstance(count, int):
             raise ValueError(f"clock component {actor!r} is not an integer: {count!r}")
+        if count < 0:
+            raise ValueError(
+                f"clock component {actor!r} is negative: {count!r} "
+                "(vector-clock counts are event tallies and are never < 0)")
         if count != 0:
             out[actor] = count
     return out

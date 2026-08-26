@@ -6,8 +6,8 @@
 #   1  failover clone skips a dead store and clones from the next live one
 #   2  a distinct-class fan-out push succeeds when >= threshold classes confirm
 #   3  two SAME-class stores count ONCE — below threshold => loud fail (exit 1)
-#   4  reconverge adopts the MAX head when heads are comparable (a laggard)
-#   5  reconverge refuses to merge INCOMPARABLE heads => divergence (exit 2)
+#   4  frontier REPORTS the MAX head (read-only) when heads are comparable
+#   5  frontier records INCOMPARABLE heads as divergence (exit 2), moves nothing
 #
 # Run:  bash smoke_test.sh    (expect: 5/5 passed)
 set -uo pipefail
@@ -90,7 +90,7 @@ EOF
   fi
 }
 
-# --- 4: reconverge adopts the max comparable head ---------------------------
+# --- 4: frontier REPORTS the max comparable head (read-only) ----------------
 t4() {
   local d="$ROOT/t4"; mkdir -p "$d"
   mk_source "$d/src"
@@ -106,16 +106,23 @@ threshold = 2
 a | cloud-A | 1 | $d/a.git | true
 b | cloud-B | 2 | $d/b.git | true
 EOF
-  local out
-  out="$( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" reconverge 2>&1 )"
-  if [ "$?" -eq 0 ] && printf '%s' "$out" | grep -q "$ahead"; then
-    ok "reconverge adopts the max comparable head (frontier = the ahead store)"
+  # frontier is DISCOVERY-ONLY: it must REPORT the ahead head, RECORD it under
+  # refs/cairn/heads/, and MOVE NOTHING. Assert by inspecting refs, never by
+  # accepting printed prose as proof of adoption (the false-green this fixes).
+  local before; before="$( cd "$d/recon"; git rev-parse HEAD )"
+  local out rc
+  out="$( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" frontier 2>&1 )"; rc=$?
+  local reported; reported="$( printf '%s' "$out" | sed -n 's/.*frontier=\([0-9a-f]\{7,\}\).*/\1/p' | head -1 )"
+  local after;  after="$(  cd "$d/recon"; git rev-parse HEAD )"
+  local recorded; recorded="$( cd "$d/recon"; git rev-parse refs/cairn/heads/a 2>/dev/null )"
+  if [ "$rc" -eq 0 ] && [ "$reported" = "$ahead" ] && [ "$after" = "$before" ] && [ "$recorded" = "$ahead" ]; then
+    ok "frontier reports the max comparable head, records it under refs/cairn/heads/, and does NOT move local HEAD (read-only)"
   else
-    bad "reconverge adopt-max" "frontier was not the ahead head; out=[$out]"
+    bad "frontier discovery" "rc=$rc reported=$reported ahead=$ahead before=$before after=$after recorded=$recorded"
   fi
 }
 
-# --- 5: reconverge refuses incomparable heads (divergence) ------------------
+# --- 5: frontier records incomparable heads as divergence (moves nothing) ---
 t5() {
   local d="$ROOT/t5"; mkdir -p "$d"
   mk_source "$d/base"
@@ -133,14 +140,14 @@ threshold = 2
 a | cloud-A | 1 | $d/a.git | true
 b | cloud-B | 2 | $d/b.git | true
 EOF
-  ( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" reconverge ) >/dev/null 2>&1
+  ( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" frontier ) >/dev/null 2>&1
   local rc=$?
   local divs
   divs="$(git_q -C "$d/recon" for-each-ref --format='%(refname)' 'refs/cairn/divergence/' | wc -l)"
   if [ "$rc" -eq 2 ] && [ "$divs" -ge 2 ]; then
-    ok "reconverge records incomparable heads as a divergence, never merges (exit 2)"
+    ok "frontier records incomparable heads as a divergence, never merges (exit 2)"
   else
-    bad "reconverge divergence" "expected exit 2 with recorded divergence refs; rc=$rc divs=$divs"
+    bad "frontier divergence" "expected exit 2 with recorded divergence refs; rc=$rc divs=$divs"
   fi
 }
 

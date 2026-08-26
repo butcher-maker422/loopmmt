@@ -147,15 +147,15 @@ HAIL:A:END -->
         <nav aria-label="Site sections">
         <a href="/site/index.html">Home</a>
         <a href="/site/the-thesis.html">The Thesis</a>
-        <a href="/site/timeline.html">Timeline</a>
-        <a href="/site/apps.html">Apps</a>
-        <a href="/site/prompts.html">The Prompts</a>
-        <a href="/site/gifts.html" aria-current="page">Gifts</a>
-        <a href="/site/discoveries.html">Discoveries</a>
         <a href="/site/case.html">The Case</a>
+        <a href="/site/timeline.html">Timeline</a>
         <a href="/site/corpus.html">The Corpus</a>
-        <a href="/site/who.html">Who</a>
+        <a href="/site/apps.html">The Apps</a>
+        <a href="/site/prompts.html">The Prompts</a>
+        <a href="/site/discoveries.html">Discoveries</a>
+        <a href="/site/gifts.html" aria-current="page">Gifts</a>
         <a href="/site/kp.html">Knowledge</a>
+        <a href="/site/who.html">Who</a>
       </nav>
         </details>
     </header>
@@ -210,7 +210,7 @@ HAIL:A:END -->
         <section class="zone" aria-label="The code">
           <div class="zone-label">The code &mdash; every file that ships</div>
           <details class="code-fold">
-            <summary><code class="fname">mint.py</code><span class="lines">250 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/mint/mint.py">on GitHub &rarr;</a></summary>
+            <summary><code class="fname">mint.py</code><span class="lines">321 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/mint/mint.py">on GitHub &rarr;</a></summary>
             <pre class="code"><code>#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 &quot;&quot;&quot;mint.py — hand out IDs that are never reused, and prove it before returning.
@@ -218,27 +218,33 @@ HAIL:A:END -->
 A mint stamps a coin once and never stamps that number again. This does the same
 for identifiers: every ID it issues is strictly above every ID it has ever issued
 before, so a number that was retired can never be pointed at a second thing. That
-&quot;never reused&quot; property is not checked after the fact — it is structural: the mint
-keeps a single **high-water mark** and only ever hands out `high_water + 1`, then
-persists the bumped mark *before* it returns. A crash right after issuing cannot
-re-issue the same number, because the mark already moved.
+&quot;never reused&quot; property is not checked after the fact — it is **structural, and
+transactional**: the mint keeps a single **high-water mark** and only ever hands
+out `high_water + 1`, advancing the mark *inside a database transaction that
+commits before any ID is emitted*. A crash right after issuing cannot re-issue
+the same number, because the mark already moved and the move was durable.
 
 Why you&#x27;d want that: any time an ID collision would let one record be mistaken for
 another — a retired user&#x27;s ID reassigned to a new user, a recycled trace ID
 threading two unrelated events — monotonic allocation makes the mistake
 impossible rather than merely unlikely. Retirement is recorded (so you can audit
-what was let go) but a retired ID is **not** returned to the pool without an
-explicit override, because silent recycling is the whole failure this refuses.
+what was let go) but a retired ID is **never** returned to the pool: silent
+recycling is the whole failure this refuses, so there is no recycle switch.
 
-STATE is two things and one rule (persisted as JSON at the state path):
-    high_water : the last ID issued (or floor-1 when empty)
-    retired    : the set of IDs recorded retired
-    the rule   : the free pool is [high_water+1 ..]; a retired ID re-enters it
-                 ONLY with --allow-recycle (off by default — named, not silent).
+STATE lives in a SQLite database at `&lt;root&gt;/mint.db` (Python stdlib `sqlite3`):
+    meta.high_water : the last ID issued (or floor-1 when empty), one row
+    retired         : an append-only table of IDs recorded retired
+    the rule        : the free pool is [high_water+1 ..]; nothing lowers the mark.
+SQLite gives atomic commit, crash recovery, schema enforcement, and cross-process
+serialization for free (`BEGIN IMMEDIATE` lets only one allocator advance the mark
+at a time), which is exactly the indivisible decision &quot;allocate and persist&quot; is.
+Invalid, missing, downgraded, or out-of-range state is **refused** (exit 2), never
+silently reset to the floor. A legacy `mint-state.json` is imported once on first
+run — and refused loudly if it is corrupt — so an upgrade never reissues an old ID.
 
 THE GATE, checked at allocation time, before an ID is returned:
     in range         floor &lt;= id &lt;= ceil
-    monotonic        id &gt; high_water            (never issued before)
+    monotonic        id &gt; high_water            (structural: id = high_water + 1)
     not live         id not in --live SET       (not held right now)
 A gate failure is a refusal with a reason, never a silent second-best.
 
@@ -248,21 +254,23 @@ The JSON-lines contract (so this composes in a pipe):
     stdout — a record you can pipe into the next tool.
   - `mint alloc -n K` emits K lines, one per freshly-minted ID, in order.
   - `--live -` reads a set of currently-held IDs from stdin, one JSON object or
-    bare integer per line (field `--live-field`, default &quot;id&quot;), so a reader
-    upstream can tell the mint what is already in use.
+    bare integer per line (field `--live-field`, default &quot;id&quot;).
   - errors go to stderr; stdout stays clean JSON-lines.
 
 Exit codes:
     0   the operation succeeded
     1   a gate refusal (out of range / not monotonic / id live)
-    2   state could not be read or written (don&#x27;t trust the reading)
+    2   state could not be read, is invalid/out-of-range, or could not be written
     3   usage / bad input
 &quot;&quot;&quot;
 
 import argparse
 import json
 import os
+import sqlite3
 import sys
+
+SCHEMA_VERSION = 1
 
 
 class MintError(Exception):
@@ -273,35 +281,87 @@ class MintError(Exception):
         self.code = code
 
 
-def _state_path(root):
-    return os.path.join(root, &quot;mint-state.json&quot;)
+def _db_path(root):
+    return os.path.join(root, &quot;mint.db&quot;)
 
 
-def load_state(root, floor):
-    &quot;&quot;&quot;Read the two bits of state. An empty mint sits one below the floor.&quot;&quot;&quot;
-    path = _state_path(root)
-    if not os.path.exists(path):
-        return {&quot;high_water&quot;: floor - 1, &quot;retired&quot;: []}
+def _legacy_seed(root, floor, ceil):
+    &quot;&quot;&quot;One-time seed from a legacy mint-state.json, if present. Returns the mark.
+    Refuses (exit 2) rather than resetting: a corrupt or out-of-range legacy mark
+    is a fault to surface, never a silent fall back to the floor (the fail-open
+    this store exists to kill). An absent legacy file seeds the empty sentinel.&quot;&quot;&quot;
+    legacy = os.path.join(root, &quot;mint-state.json&quot;)
+    if not os.path.exists(legacy):
+        return floor - 1
     try:
-        with open(path, &quot;r&quot;, encoding=&quot;utf-8&quot;) as fh:
+        with open(legacy, &quot;r&quot;, encoding=&quot;utf-8&quot;) as fh:
             raw = json.load(fh)
     except (OSError, ValueError) as exc:
-        raise MintError(&quot;cannot read state at %s: %s&quot; % (path, exc), 2)
-    hw = raw.get(&quot;high_water&quot;)
-    retired = raw.get(&quot;retired&quot;)
-    return {
-        &quot;high_water&quot;: hw if isinstance(hw, int) else floor - 1,
-        &quot;retired&quot;: list(retired) if isinstance(retired, list) else [],
-    }
+        raise MintError(
+            &quot;legacy mint-state.json is unreadable; refusing to reset (import by hand): %s&quot;
+            % exc, 2)
+    hw = raw.get(&quot;high_water&quot;) if isinstance(raw, dict) else None
+    if isinstance(hw, bool) or not isinstance(hw, int):
+        raise MintError(
+            &quot;legacy mint-state.json high_water is not an integer (%r); refusing to reset&quot;
+            % (hw,), 2)
+    if hw &lt; floor - 1 or hw &gt; ceil:
+        raise MintError(
+            &quot;legacy high_water %d is out of range [%d, %d]; refusing to reset&quot;
+            % (hw, floor - 1, ceil), 2)
+    return hw
 
 
-def save_state(root, state):
+def _connect(root, floor, ceil):
+    &quot;&quot;&quot;Open (creating + seeding on first use) the SQLite store. Validates the
+    persisted mark on every open; a downgraded schema or non-int/out-of-range
+    mark is a loud refusal, never a silent default.&quot;&quot;&quot;
     try:
         os.makedirs(root, exist_ok=True)
-        with open(_state_path(root), &quot;w&quot;, encoding=&quot;utf-8&quot;) as fh:
-            json.dump(state, fh, indent=2, sort_keys=True)
-    except OSError as exc:
-        raise MintError(&quot;cannot write state to %s: %s&quot; % (root, exc), 2)
+        conn = sqlite3.connect(_db_path(root), timeout=30.0, isolation_level=None)
+    except (OSError, sqlite3.Error) as exc:
+        raise MintError(&quot;cannot open mint store at %s: %s&quot; % (root, exc), 2)
+    try:
+        conn.execute(&quot;PRAGMA busy_timeout=30000&quot;)
+        conn.execute(
+            &quot;CREATE TABLE IF NOT EXISTS meta (&quot;
+            &quot; id INTEGER PRIMARY KEY CHECK(id = 1),&quot;
+            &quot; high_water INTEGER NOT NULL,&quot;
+            &quot; schema_version INTEGER NOT NULL)&quot;)
+        conn.execute(
+            &quot;CREATE TABLE IF NOT EXISTS retired (&quot;
+            &quot; id INTEGER PRIMARY KEY,&quot;
+            &quot; retired_at TEXT NOT NULL DEFAULT (datetime(&#x27;now&#x27;)))&quot;)
+        row = conn.execute(
+            &quot;SELECT high_water, schema_version FROM meta WHERE id = 1&quot;).fetchone()
+        if row is None:
+            seed = _legacy_seed(root, floor, ceil)
+            conn.execute(
+                &quot;INSERT INTO meta (id, high_water, schema_version) VALUES (1, ?, ?)&quot;,
+                (seed, SCHEMA_VERSION))
+        else:
+            hw, sv = row
+            if not isinstance(hw, int) or isinstance(hw, bool):
+                raise MintError(&quot;persisted high_water is not an integer (%r)&quot; % (hw,), 2)
+            if sv != SCHEMA_VERSION:
+                raise MintError(
+                    &quot;mint store schema %r != supported %d (downgraded/upgraded); refusing&quot;
+                    % (sv, SCHEMA_VERSION), 2)
+            if hw &lt; floor - 1 or hw &gt; ceil:
+                raise MintError(
+                    &quot;persisted high_water %d is out of range [%d, %d]; refusing&quot;
+                    % (hw, floor - 1, ceil), 2)
+    except sqlite3.Error as exc:
+        conn.close()
+        raise MintError(&quot;mint store is unusable: %s&quot; % exc, 2)
+    except MintError:
+        conn.close()
+        raise
+    return conn
+
+
+def _read_hw(conn):
+    return conn.execute(&quot;SELECT high_water FROM meta WHERE id = 1&quot;).fetchone()[0]
 
 
 def assert_allocatable(uid, high_water, live, floor, ceil):
@@ -309,54 +369,69 @@ def assert_allocatable(uid, high_water, live, floor, ceil):
     if not isinstance(uid, int) or uid &lt; floor or uid &gt; ceil:
         return &quot;E_RANGE: %r is outside %d-%d&quot; % (uid, floor, ceil)
     if uid &lt;= high_water:
-        return (
-            &quot;E_NOT_MONOTONIC: %d is at/below the high-water mark %d &quot;
-            &quot;(recycling is off without --allow-recycle)&quot; % (uid, high_water)
-        )
+        return (&quot;E_NOT_MONOTONIC: %d is at/below the high-water mark %d&quot;
+                % (uid, high_water))
     if uid in live:
         return &quot;E_LIVE: %d is held by a live holder&quot; % uid
     return None
 
 
 def allocate(root, live, floor, ceil, count):
-    &quot;&quot;&quot;Draw `count` IDs monotonically. Persists the bumped mark BEFORE returning
-    each, so a crash after allocation never re-issues the same ID.&quot;&quot;&quot;
+    &quot;&quot;&quot;Draw `count` IDs monotonically inside one transaction. The bumped mark is
+    committed BEFORE any ID is emitted, so a crash never re-issues. On a gate
+    failure mid-batch the successfully-minted prefix is committed (never lost),
+    then the reason is raised.&quot;&quot;&quot;
+    conn = _connect(root, floor, ceil)
     minted = []
-    state = load_state(root, floor)
-    for _ in range(count):
-        uid = state[&quot;high_water&quot;] + 1
-        reason = assert_allocatable(
-            uid, state[&quot;high_water&quot;], live, floor, ceil
-        )
-        if reason is not None:
-            # Persist any IDs already minted in this batch before failing — they
-            # were genuinely issued and the mark for them must not be lost.
-            if minted:
-                save_state(root, state)
-            raise MintError(reason, 1)
-        state[&quot;high_water&quot;] = uid
-        save_state(root, state)  # mark moves up before the id is handed back
-        live = live | {uid}      # a freshly minted id is live for the rest of the batch
-        minted.append(uid)
-    return minted, state
+    reason = None
+    try:
+        conn.execute(&quot;BEGIN IMMEDIATE&quot;)
+        hw = _read_hw(conn)
+        for _ in range(count):
+            uid = hw + 1
+            reason = assert_allocatable(uid, hw, live, floor, ceil)
+            if reason is not None:
+                break
+            hw = uid
+            live = live | {uid}
+            minted.append(uid)
+        if minted:
+            conn.execute(&quot;UPDATE meta SET high_water = ? WHERE id = 1&quot;, (hw,))
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        conn.close()
+        raise MintError(&quot;allocation could not persist: %s&quot; % exc, 2)
+    conn.close()
+    if reason is not None and not minted:
+        raise MintError(reason, 1)
+    return minted, reason
 
 
-def retire(root, uid, floor, allow_recycle):
-    &quot;&quot;&quot;Record an ID retired. It does NOT return to the pool unless --allow-recycle,
-    in which case the high-water mark is left untouched (monotonic is preserved:
-    recycling lowers nothing — it only permits the id to be re-drawn if it were
-    ever below the mark, which under pure monotonic it never is). Recycling here
-    is the explicit escape hatch, recorded as used.&quot;&quot;&quot;
-    state = load_state(root, floor)
-    if uid not in state[&quot;retired&quot;]:
-        state[&quot;retired&quot;].append(uid)
-        state[&quot;retired&quot;].sort()
-    save_state(root, state)
-    return {
-        &quot;retired&quot;: uid,
-        &quot;recycled_into_pool&quot;: bool(allow_recycle),
-        &quot;high_water&quot;: state[&quot;high_water&quot;],
-    }
+def retire(root, uid, floor, ceil):
+    &quot;&quot;&quot;Record an ID retired (append-only). It does NOT return to the pool — the
+    mark is never lowered, so nothing this records is ever re-issued.&quot;&quot;&quot;
+    conn = _connect(root, floor, ceil)
+    try:
+        conn.execute(&quot;BEGIN IMMEDIATE&quot;)
+        conn.execute(&quot;INSERT OR IGNORE INTO retired (id) VALUES (?)&quot;, (uid,))
+        hw = _read_hw(conn)
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        conn.close()
+        raise MintError(&quot;retire could not persist: %s&quot; % exc, 2)
+    conn.close()
+    return {&quot;retired&quot;: uid, &quot;high_water&quot;: hw}
+
+
+def peek(root, floor, ceil):
+    conn = _connect(root, floor, ceil)
+    hw = _read_hw(conn)
+    retired = [r[0] for r in conn.execute(&quot;SELECT id FROM retired ORDER BY id&quot;)]
+    conn.close()
+    return {&quot;high_water&quot;: hw, &quot;retired&quot;: retired, &quot;next&quot;: hw + 1,
+            &quot;floor&quot;: floor, &quot;ceil&quot;: ceil}
 
 
 def _read_live(stream, field):
@@ -370,14 +445,16 @@ def _read_live(stream, field):
             obj = json.loads(line)
         except ValueError:
             raise MintError(&quot;live input line is not JSON: %r&quot; % line, 3)
+        if isinstance(obj, bool):
+            raise MintError(&quot;live line is a boolean, not an id: %r&quot; % line, 3)
         if isinstance(obj, int):
             live.add(obj)
-        elif isinstance(obj, dict) and field in obj and isinstance(obj[field], int):
+        elif isinstance(obj, dict) and field in obj and isinstance(obj[field], int) \
+                and not isinstance(obj[field], bool):
             live.add(obj[field])
         else:
             raise MintError(
-                &quot;live line has no integer %r field: %r&quot; % (field, line), 3
-            )
+                &quot;live line has no integer %r field: %r&quot; % (field, line), 3)
     return live
 
 
@@ -388,12 +465,11 @@ def _emit(obj):
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog=&quot;mint&quot;,
-        description=&quot;hand out IDs that are never reused, and prove it before returning.&quot;,
-    )
+        description=&quot;hand out IDs that are never reused, and prove it before returning.&quot;)
     p.add_argument(&quot;op&quot;, choices=[&quot;alloc&quot;, &quot;peek&quot;, &quot;retire&quot;],
                    help=&quot;alloc: mint new id(s). peek: show state. retire: record an id retired.&quot;)
     p.add_argument(&quot;--root&quot;, default=&quot;.mint&quot;,
-                   help=&quot;directory holding mint-state.json (default: .mint)&quot;)
+                   help=&quot;directory holding mint.db (default: .mint)&quot;)
     p.add_argument(&quot;--floor&quot;, type=int, default=100000,
                    help=&quot;lowest issuable id (default: 100000)&quot;)
     p.add_argument(&quot;--ceil&quot;, type=int, default=999999,
@@ -405,8 +481,6 @@ def main(argv=None):
     p.add_argument(&quot;--live-field&quot;, default=&quot;id&quot;,
                    help=&quot;field carrying the id in --live objects (default: id)&quot;)
     p.add_argument(&quot;--id&quot;, type=int, help=&quot;the id to retire (retire only)&quot;)
-    p.add_argument(&quot;--allow-recycle&quot;, action=&quot;store_true&quot;,
-                   help=&quot;permit a retired id back into the pool (off by default — the escape hatch)&quot;)
     args = p.parse_args(argv)
 
     if args.floor &gt; args.ceil:
@@ -423,31 +497,28 @@ def main(argv=None):
                     live = _read_live(fh, args.live_field)
 
         if args.op == &quot;peek&quot;:
-            state = load_state(args.root, args.floor)
-            _emit({
-                &quot;op&quot;: &quot;peek&quot;,
-                &quot;high_water&quot;: state[&quot;high_water&quot;],
-                &quot;retired&quot;: sorted(state[&quot;retired&quot;]),
-                &quot;next&quot;: state[&quot;high_water&quot;] + 1,
-                &quot;floor&quot;: args.floor,
-                &quot;ceil&quot;: args.ceil,
-            })
+            state = peek(args.root, args.floor, args.ceil)
+            state[&quot;op&quot;] = &quot;peek&quot;
+            _emit(state)
             return 0
 
         if args.op == &quot;alloc&quot;:
             if args.count &lt; 1:
                 sys.stderr.write(&quot;mint: -n must be &gt;= 1\n&quot;)
                 return 3
-            minted, _ = allocate(args.root, live, args.floor, args.ceil, args.count)
+            minted, reason = allocate(args.root, live, args.floor, args.ceil, args.count)
             for uid in minted:
                 _emit({&quot;op&quot;: &quot;alloc&quot;, &quot;id&quot;: uid})
+            if reason is not None:
+                sys.stderr.write(&quot;mint: %s\n&quot; % reason)
+                return 1
             return 0
 
         if args.op == &quot;retire&quot;:
             if args.id is None:
                 sys.stderr.write(&quot;mint: retire needs --id\n&quot;)
                 return 3
-            rec = retire(args.root, args.id, args.floor, args.allow_recycle)
+            rec = retire(args.root, args.id, args.floor, args.ceil)
             rec[&quot;op&quot;] = &quot;retire&quot;
             _emit(rec)
             return 0
@@ -619,22 +690,21 @@ if __name__ == &quot;__main__&quot;:
       <div class="footer-nav">
         <a href="/site/index.html">Home</a>
         <a href="/site/the-thesis.html">The Thesis</a>
-        <a href="/site/timeline.html">Timeline</a>
-        <a href="/site/apps.html">Apps</a>
-        <a href="/site/prompts.html">The Prompts</a>
-        <a href="/site/gifts.html">Gifts</a>
-        <a href="/site/discoveries.html">Discoveries</a>
         <a href="/site/case.html">The Case</a>
-        <a href="/site/corpus.html">The Corpus</a>
-        <a href="/site/who.html">Who</a>
+        <a href="/site/timeline.html">Timeline</a>
+        <a href="/site/apps.html">The Apps</a>
+        <a href="/site/prompts.html">The Prompts</a>
+        <a href="/site/discoveries.html">Discoveries</a>
+        <a href="/site/gifts.html">Gifts</a>
         <a href="/site/kp.html">Knowledge</a>
+        <a href="/site/who.html">Who</a>
       </div>
       <div class="footer-rows">
-        <p>Loop MMT is pre-launch and unlisted. Not for redistribution.</p>
+        <p>The surrounding Loop MMT site is pre-launch and unlisted. The code in this Gift is <strong>MIT-licensed</strong> and may be copied, modified, redistributed, and sold under that license &mdash; the full text ships as <code>LICENSE</code> in the folder.</p>
         <p class="footer-docs">Documents: <a href="/site/corpus.html">Creed, PiF, Glossary &amp; the full corpus &rarr;</a></p>
         <div class="footer-mark">
           <img src="/site/assets/wordmark.svg" alt="Loop MMT" style="height:19px;width:auto;">
-          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.114</span>
+          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.115</span>
         </div>
         <p><a href="mailto:shea@loopmmt.com">shea@loopmmt.com</a></p>
       </div>

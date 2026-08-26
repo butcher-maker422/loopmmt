@@ -18,8 +18,10 @@ when enough independent classes confirm it; two repos on the same provider count
 once, because the day that provider goes down they both go with it. Cold-boot is
 a **priority-ordered failover clone** — try each store in turn, the first live
 one wins, and it only gives up when *all* of them are dead. Catching a lagging
-mirror back up is **reconverge** — adopt the newest head among heads that are
-comparable (a laggard is just behind). And the one thing it will never do
+mirror back up is **frontier** — it REPORTS the newest head among heads that are
+comparable (a laggard is just behind), read-only: it records the discovered
+heads and prints the frontier SHA, and moves nothing. You adopt it yourself with
+`git fetch && git merge --ff-only <frontier>`. And the one thing it will never do
 quietly is paper over a real fork: two *incomparable* heads are surfaced as a
 divergence and left for you to resolve by hand.
 
@@ -44,7 +46,7 @@ cairn.sh push                   # ref defaults to HEAD -> main
 cairn.sh push main
 
 # catch a lagging mirror up (run inside a working clone)
-cairn.sh reconverge
+cairn.sh frontier
 ```
 
 The threshold and the store list live in `stores`, never in the script. Edit the
@@ -68,9 +70,9 @@ store — the same independence the class model buys. See the comments in
   meets threshold.
 - **Cold-boot on a fresh machine when you don't know what's up.** The failover
   clone tries stores in order and takes the first that answers.
-- **Catching a mirror up after an outage.** `reconverge` adopts the newest
-  comparable head; laggards heal on the next push. No manual `git remote`
-  juggling.
+- **Finding the newest head after an outage.** `frontier` reports the newest
+  comparable head (read-only); you fast-forward to it and `cairn push` fans it
+  back out. No guessing which mirror is ahead.
 - **Refusing to hide a fork.** Two incomparable heads become a recorded,
   loud divergence — the one case you *must* see, made impossible to miss.
 
@@ -109,7 +111,7 @@ Extracted and generalized from the multi-store git fabric that keeps a private
 methodology repo alive across a public host, a second public host, and a
 self-hosted box. The specific stores, hosts, and credentials stayed home; this is
 the general kernel — the failover clone, the distinct-class push, the max-head
-reconverge, and the call-time credential discipline — given away.
+frontier, and the call-time credential discipline — given away.
 
 ## License
 

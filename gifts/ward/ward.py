@@ -51,6 +51,7 @@ import json
 import os
 import subprocess
 import sys
+import html
 
 RING = "ring"          # hollow — unearned; the only state a bad witness can reach
 SOLID = "solid"        # filled — witness exists and agrees
@@ -129,7 +130,7 @@ def render_html(resolved, cols):
         for c in row:
             out.append(
                 f'    <span class="ward__cell" data-state="{c["state"]}" '
-                f'title="{c["label"]}">{_GLYPH[c["state"]]}</span>'
+                f'title="{html.escape(str(c["label"]), quote=True)}">{_GLYPH[c["state"]]}</span>'
             )
         out.append('  </div>')
     out.append('  <p class="ward__caveat">A solid cell means its witness exists and agrees, '

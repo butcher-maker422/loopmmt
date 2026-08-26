@@ -18,9 +18,13 @@
 #               A store that fails is a "laggard": noted, never fatal, as long as
 #               the class threshold is met. A laggard is behind, not wrong.
 #
-#   reconverge  Probe every store's main head, adopt the MAX head among the ones
+#   frontier    Probe every store's main head and REPORT the MAX head among ones
 #               that are comparable (one is an ancestor of the other — a laggard
-#               just catches up). If two heads are INCOMPARABLE — a real fork,
+#               just catches up). READ-ONLY: it records discovered heads under
+#               refs/cairn/heads/ and reports the frontier SHA — it moves nothing
+#               (no main, no HEAD, no laggard heal). To adopt, run yourself:
+#               git fetch && git merge --ff-only <frontier>. If two heads are
+#               INCOMPARABLE — a real fork,
 #               neither an ancestor of the other — that is a DIVERGENCE: it is
 #               recorded under refs/cairn/divergence/<utc>/ and surfaced LOUD, and
 #               is NEVER auto-merged. Divergence is a human decision.
@@ -41,14 +45,14 @@
 # Usage:
 #   cairn.sh clone <dest>          # failover clone into <dest>
 #   cairn.sh push [ref]            # fan-out push (ref default: HEAD)
-#   cairn.sh reconverge            # adopt max comparable head; loud on divergence
+#   cairn.sh frontier             # REPORT max comparable head (read-only); loud on divergence
 #   cairn.sh doctor                # validate the stores config
 #
 # Config resolution:  $CAIRN_STORES (default: ./stores)
 # Knobs (env):        CAIRN_TIMEOUT (per-store seconds, default 10)
 #
 # Exit codes:  0 ok · 1 loud failure (below threshold / all stores dead) ·
-#              2 reconverge divergence · 3 config problem
+#              2 frontier divergence · 3 config problem
 set -euo pipefail
 
 CAIRN_STORES="${CAIRN_STORES:-stores}"
@@ -108,7 +112,11 @@ cmd_doctor() {
   fi
   [ "$problems" -eq 0 ] && echo "  ok."
   echo "$CEILING"
-  return 0
+  # GIFT-005: doctor is a validation gate, not a pretty-printer. A below-threshold
+  # or duplicate-priority config makes the durability contract impossible/ambiguous
+  # -> loud failure (exit 1, per the documented convention above), never exit 0.
+  [ "$problems" -eq 0 ] && return 0
+  return 1
 }
 
 # --- clone: priority-ordered failover ---------------------------------------
@@ -186,10 +194,10 @@ EOF
   return 1
 }
 
-# --- reconverge: adopt max comparable head, loud on divergence ---------------
-cmd_reconverge() {
+# --- frontier: REPORT max comparable head (read-only), loud on divergence ----
+cmd_frontier() {
   _require_config
-  git rev-parse --git-dir >/dev/null 2>&1 || die "reconverge must run inside a git repo (it fetches store heads into refs/cairn/heads/)"
+  git rev-parse --git-dir >/dev/null 2>&1 || die "frontier must run inside a git repo (it fetches store heads into refs/cairn/heads/)"
   local stores name class prio url sha names="" a b
   declare -A HEAD
   stores="$(_enabled_stores "$CAIRN_STORES")"
@@ -216,7 +224,7 @@ cmd_reconverge() {
 $stores
 EOF
 
-  [ -n "$names" ] || die "reconverge: no servable store heads found."
+  [ -n "$names" ] || die "frontier: no servable store heads found."
 
   # find a store whose head is a descendant-or-equal of every other head
   local best="" dominates
@@ -232,7 +240,7 @@ EOF
   done
 
   if [ -n "$best" ]; then
-    echo "cairn reconverge: frontier=${HEAD[$best]} (from $best); comparable stores adopt it. Laggards heal on the next push."
+    echo "cairn frontier: frontier=${HEAD[$best]} (from $best). READ-ONLY report — nothing was moved. To adopt: git fetch && git merge --ff-only ${HEAD[$best]}"
     echo "$CEILING"
     return 0
   fi
@@ -242,8 +250,8 @@ EOF
   for a in $names; do
     git update-ref "refs/cairn/divergence/$ts/$a" "${HEAD[$a]}"
   done
-  echo "cairn reconverge LOUD: incomparable store heads — this is a FORK, not a lag." >&2
-  echo "cairn reconverge: divergence recorded at refs/cairn/divergence/$ts/* — NOT auto-merged; resolve by hand." >&2
+  echo "cairn frontier LOUD: incomparable store heads — this is a FORK, not a lag." >&2
+  echo "cairn frontier: divergence recorded at refs/cairn/divergence/$ts/* — NOT auto-merged; resolve by hand." >&2
   echo "$CEILING" >&2
   return 2
 }
@@ -254,12 +262,13 @@ main() {
   case "$cmd" in
     clone)      cmd_clone "$@" ;;
     push)       cmd_push "$@" ;;
-    reconverge) cmd_reconverge "$@" ;;
+    frontier)   cmd_frontier "$@" ;;
+    reconverge) die "reconverge was renamed to 'frontier': it reports the max comparable head but never moved main or touched other stores (the old name overpromised). Use 'cairn frontier'." ;;
     doctor)     cmd_doctor "$@" ;;
     ""|-h|--help|help)
       sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
       ;;
-    *) die "unknown command '$cmd' (try: clone | push | reconverge | doctor)" ;;
+    *) die "unknown command '$cmd' (try: clone | push | frontier | doctor)" ;;
   esac
 }
 
