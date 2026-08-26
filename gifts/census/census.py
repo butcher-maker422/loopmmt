@@ -46,23 +46,64 @@ DEFAULT_EXTS = [
     ".html", ".htm", ".css", ".md", ".sh", ".yaml", ".yml",
 ]
 
-# Comment spans, by the syntaxes that actually bury text. Order does not matter;
-# a position inside ANY of these is "buried". These cover the vast majority of
-# source files without needing a per-language parser (which would be the wrong
+# Comment spans, by the syntaxes that actually bury text. These cover the vast
+# majority of source files without a per-language parser (which would be the wrong
 # amount of machinery for "is this in a comment").
-_COMMENT_PATTERNS = [
-    re.compile(r"<!--.*?-->", re.DOTALL),      # html/xml/markdown
-    re.compile(r"/\*.*?\*/", re.DOTALL),        # c/js/css block
-    re.compile(r"(?m)//[^\n]*"),                # c/js line
-    re.compile(r"(?m)#[^\n]*"),                 # shell/python/yaml line
-]
+#
+# GIFT-012: the openers are recognised by a SINGLE-PASS, STRING-AWARE scanner, not
+# by raw regexes. The old regexes (`#[^\n]*`, `//[^\n]*`) matched a comment opener
+# even INSIDE a string literal, so `label = "widget # TODO"` or `url = "http://x/TODO"`
+# opened a false comment span and a LIVE marker read as buried-in-a-comment — the
+# exact inversion census exists to catch. The scanner walks the text once, tracking
+# whether it is inside a quote ('...' "..." `...`, with \ escapes); a comment opener
+# is only honoured OUTSIDE a string. It is quote-state + comment-state, NOT a parser.
+_LINE_OPENERS = ("//", "#")               # run to end of line
+_BLOCK_OPENERS = (("<!--", "-->"), ("/*", "*/"))  # run to their closer
+_QUOTES = ("'", '"', "`")
 
 
 def _comment_spans(text):
     spans = []
-    for pat in _COMMENT_PATTERNS:
-        for m in pat.finditer(text):
-            spans.append((m.start(), m.end()))
+    i, n = 0, len(text)
+    in_str = None  # the open quote char, or None when outside any string
+    while i < n:
+        ch = text[i]
+        if in_str is not None:
+            # inside a string: consume escapes, look only for the matching close
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        # not in a string — a block comment opener?
+        matched = False
+        for open_tok, close_tok in _BLOCK_OPENERS:
+            if text.startswith(open_tok, i):
+                end = text.find(close_tok, i + len(open_tok))
+                end = (end + len(close_tok)) if end != -1 else n
+                spans.append((i, end))
+                i = end
+                matched = True
+                break
+        if matched:
+            continue
+        # a line comment opener?
+        for open_tok in _LINE_OPENERS:
+            if text.startswith(open_tok, i):
+                end = text.find("\n", i)
+                end = end if end != -1 else n
+                spans.append((i, end))
+                i = end
+                matched = True
+                break
+        if matched:
+            continue
+        # a quote opening a string region?
+        if ch in _QUOTES:
+            in_str = ch
+        i += 1
     return spans
 
 

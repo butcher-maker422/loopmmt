@@ -149,10 +149,11 @@ HAIL:A:END -->
         <a href="/site/the-thesis.html">The Thesis</a>
         <a href="/site/case.html">The Case</a>
         <a href="/site/timeline.html">Timeline</a>
-        <a href="/site/corpus.html">The Corpus</a>
+        <a href="/site/corpus.html">Corpus</a>
         <a href="/site/apps.html">The Apps</a>
         <a href="/site/prompts.html">The Prompts</a>
         <a href="/site/discoveries.html">Discoveries</a>
+        <a href="/site/threads.html">The Threads</a>
         <a href="/site/gifts.html" aria-current="page">Gifts</a>
         <a href="/site/kp.html">Knowledge</a>
         <a href="/site/who.html">Who</a>
@@ -535,20 +536,26 @@ if __name__ == &quot;__main__&quot;:
 </code></pre>
           </details>
           <details class="code-fold">
-            <summary><code class="fname">test_mint.py</code><span class="lines">137 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/mint/test_mint.py">on GitHub &rarr;</a></summary>
+            <summary><code class="fname">test_mint.py</code><span class="lines">142 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/mint/test_mint.py">on GitHub &rarr;</a></summary>
             <pre class="code"><code>#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-&quot;&quot;&quot;test_mint.py — non-vacuous tests for mint.py.
+&quot;&quot;&quot;test_mint.py — non-vacuous tests for mint.py (SQLite store).
 
 Every test asserts a SPECIFIC behaviour, and the suite carries a mutation check
-(t_mutation_no_op_would_fail) so a mint that always returned the same id, or
-never persisted, could not pass green. Run: python3 test_mint.py
+(test 12) so a mint that always returned the same id, or never persisted, could
+not pass green. Run: python3 test_mint.py
+
+Updated for the SQLite rewrite (GIFT-001): state now lives in &lt;root&gt;/mint.db and
+is read back through peek() (a fresh DB read), not the retired load_state() JSON
+helper. &quot;Crash-safety&quot; is tested the way the store actually guarantees it — the
+high-water mark is committed to the DB before any id is emitted, so a fresh
+peek() (equivalent to a cold restart re-reading the db) already sees the bumped
+mark.
 &quot;&quot;&quot;
 
 import io
 import json
 import os
-import subprocess
 import sys
 import tempfile
 
@@ -594,9 +601,10 @@ def main():
         ok(code == 0 and ids == [100001, 100002, 100003],
            &quot;next allocs are strictly increasing (100001,2,3) — monotonic&quot;)
 
-        # 3. Crash-safety: the mark is persisted, so a NEW process never re-issues.
-        #    (Simulated by re-reading state fresh, as a cold restart would.)
-        st = mint.load_state(root, 100000)
+        # 3. Crash-safety: the mark is committed to the DB before emit, so a
+        #    fresh read (a cold restart re-reading mint.db) already sees it and
+        #    never re-issues. peek() IS that fresh read.
+        st = mint.peek(root, 100000, 999999)
         ok(st[&quot;high_water&quot;] == 100003,
            &quot;high-water mark persisted at 100003 (a restart cannot re-issue)&quot;)
         code, lines = run(root, &quot;alloc&quot;, &quot;--floor&quot;, &quot;100000&quot;)
@@ -608,7 +616,7 @@ def main():
         ok(code == 0 and lines[0][&quot;high_water&quot;] == 100004 and lines[0][&quot;next&quot;] == 100005,
            &quot;peek shows high_water=100004, next=100005, issuing nothing&quot;)
         code2, _ = run(root, &quot;peek&quot;, &quot;--floor&quot;, &quot;100000&quot;)
-        st2 = mint.load_state(root, 100000)
+        st2 = mint.peek(root, 100000, 999999)
         ok(st2[&quot;high_water&quot;] == 100004, &quot;peek did not advance the mark (pure read)&quot;)
 
         # 5. Gate: range refusal.
@@ -630,13 +638,11 @@ def main():
         ok(mint.assert_allocatable(101, high_water=100, live={200}, floor=1, ceil=999) is None,
            &quot;gate passes an in-range, above-mark, not-live id&quot;)
 
-        # 9. --live from stdin is honoured (skips a held id is NOT the contract —
-        #    monotonic means we never draw below the mark; but a live id EQUAL to
-        #    next must refuse rather than collide).
+        # 9. --live from stdin is honoured: an alloc whose next id is declared
+        #    live must refuse rather than collide.
         root2 = os.path.join(d, &quot;m2&quot;)
-        # prime to 100000
         run(root2, &quot;alloc&quot;, &quot;--floor&quot;, &quot;100000&quot;)            # issues 100000, mark=100000
-        # next would be 100001; declare it live -&gt; refusal
+        # next would be 100001; declare it live -&gt; refusal (exit 1, no output)
         code, lines = run(root2, &quot;alloc&quot;, &quot;--floor&quot;, &quot;100000&quot;,
                           &quot;--live&quot;, &quot;-&quot;, stdin=&#x27;{&quot;id&quot;: 100001}\n&#x27;)
         ok(code == 1 and lines == [],
@@ -644,23 +650,23 @@ def main():
 
         # 10. retire records the id, does not recycle by default.
         code, lines = run(root2, &quot;retire&quot;, &quot;--id&quot;, &quot;100000&quot;, &quot;--floor&quot;, &quot;100000&quot;)
-        ok(code == 0 and lines[0][&quot;retired&quot;] == 100000
-           and lines[0][&quot;recycled_into_pool&quot;] is False,
-           &quot;retire records the id and does NOT recycle it by default&quot;)
-        st = mint.load_state(root2, 100000)
+        ok(code == 0 and lines[0][&quot;retired&quot;] == 100000 and lines[0][&quot;op&quot;] == &quot;retire&quot;,
+           &quot;retire records the id (and never lowers the mark)&quot;)
+        st = mint.peek(root2, 100000, 999999)
         ok(100000 in st[&quot;retired&quot;] and st[&quot;high_water&quot;] == 100000,
            &quot;retire adds to the retired set and never lowers the mark&quot;)
 
-        # 11. bare-integer live lines are accepted.
+        # 11. bare-integer live lines are accepted alongside {id:...} objects.
         live = mint._read_live(io.StringIO(&quot;5\n{\&quot;id\&quot;: 7}\n# c\n\n9\n&quot;), &quot;id&quot;)
-        ok(live == {5, 7, 9}, &quot;--live reads both bare ints and {id:...} objects, skips blanks/comments&quot;)
+        ok(live == {5, 7, 9},
+           &quot;--live reads both bare ints and {id:...} objects, skips blanks/comments&quot;)
 
         # 12. MUTATION CHECK — a mint that ignored the mark (always issued the
-        #     floor) would fail test 2/3. Prove the suite BITES by constructing
-        #     that mutant inline and asserting it diverges.
+        #     floor) would fail test 2/3. Prove the suite BITES by running that
+        #     mutant inline and asserting it diverges from the real monotonic run.
         def broken_allocate(root_, live_, floor_, ceil_, count_):
-            # the no-op mutant: never advances the mark
-            return [floor_] * count_, {&quot;high_water&quot;: floor_ - 1, &quot;retired&quot;: []}
+            # the no-op mutant: never advances the mark, always issues the floor
+            return [floor_] * count_, None
         mutant_ids, _ = broken_allocate(root, set(), 100000, 999999, 3)
         real_ids = [100000, 100001, 100002]  # what a correct monotonic mint gives
         ok(mutant_ids != real_ids,
@@ -692,9 +698,11 @@ if __name__ == &quot;__main__&quot;:
         <a href="/site/the-thesis.html">The Thesis</a>
         <a href="/site/case.html">The Case</a>
         <a href="/site/timeline.html">Timeline</a>
+        <a href="/site/corpus.html">Corpus</a>
         <a href="/site/apps.html">The Apps</a>
         <a href="/site/prompts.html">The Prompts</a>
         <a href="/site/discoveries.html">Discoveries</a>
+        <a href="/site/threads.html">The Threads</a>
         <a href="/site/gifts.html">Gifts</a>
         <a href="/site/kp.html">Knowledge</a>
         <a href="/site/who.html">Who</a>
@@ -704,7 +712,7 @@ if __name__ == &quot;__main__&quot;:
         <p class="footer-docs">Documents: <a href="/site/corpus.html">Creed, PiF, Glossary &amp; the full corpus &rarr;</a></p>
         <div class="footer-mark">
           <img src="/site/assets/wordmark.svg" alt="Loop MMT" style="height:19px;width:auto;">
-          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.116</span>
+          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.117</span>
         </div>
         <p><a href="mailto:shea@loopmmt.com">shea@loopmmt.com</a></p>
       </div>

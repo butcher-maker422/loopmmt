@@ -117,14 +117,29 @@ def parse_board(text):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        fields = [f.strip() for f in line.split("|")]
-        if len(fields) == 2:
-            name, status, wexpr = fields[0], "assert", fields[1]
-        elif len(fields) == 3:
-            name, status, wexpr = fields[0], fields[1].lower(), fields[2]
+        # GIFT-009: parse NAME-first with a bounded left split, so a `cmd:` witness
+        # that legitimately contains shell pipes (`... | wc -l`) is NOT torn apart.
+        # The old `line.split("|")` counted every pipe as a field boundary, so a
+        # piped command produced 4+ fields and hit the "2 or 3 fields" error — the
+        # command was lost purely for containing a pipe. The grammar is unchanged
+        # for the reader (name | [status] | witness); only the SPLIT is bounded:
+        # field 0 is the name, an optional bare-status field 1, and EVERYTHING after
+        # is the witness, rejoined verbatim (interior pipes preserved).
+        head = [f.strip() for f in line.split("|", 2)]
+        if len(head) == 2:
+            name, status, wexpr = head[0], "assert", head[1]
+        elif len(head) == 3:
+            # 3 raw segments: field 1 is the status ONLY if it's a bare status
+            # keyword; otherwise it belongs to a 2-field claim whose witness itself
+            # carried a pipe, so fold field 1 back into the witness.
+            if head[1].lower() in ("assert", "todo"):
+                name, status, wexpr = head[0], head[1].lower(), head[2]
+            else:
+                name, status, wexpr = head[0], "assert", head[1] + " | " + head[2]
         else:
             claims.append({"name": line, "status": "assert", "line": lineno,
-                           "parse_error": f"a claim has 2 or 3 |-fields, got {len(fields)}"})
+                           "parse_error": "a claim needs a name and a witness "
+                                          "(name | witness  or  name | status | witness)"})
             continue
         if not name:
             claims.append({"name": "(unnamed)", "status": status, "line": lineno,

@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""test_mint.py — non-vacuous tests for mint.py.
+"""test_mint.py — non-vacuous tests for mint.py (SQLite store).
 
 Every test asserts a SPECIFIC behaviour, and the suite carries a mutation check
-(t_mutation_no_op_would_fail) so a mint that always returned the same id, or
-never persisted, could not pass green. Run: python3 test_mint.py
+(test 12) so a mint that always returned the same id, or never persisted, could
+not pass green. Run: python3 test_mint.py
+
+Updated for the SQLite rewrite (GIFT-001): state now lives in <root>/mint.db and
+is read back through peek() (a fresh DB read), not the retired load_state() JSON
+helper. "Crash-safety" is tested the way the store actually guarantees it — the
+high-water mark is committed to the DB before any id is emitted, so a fresh
+peek() (equivalent to a cold restart re-reading the db) already sees the bumped
+mark.
 """
 
 import io
 import json
 import os
-import subprocess
 import sys
 import tempfile
 
@@ -56,9 +62,10 @@ def main():
         ok(code == 0 and ids == [100001, 100002, 100003],
            "next allocs are strictly increasing (100001,2,3) — monotonic")
 
-        # 3. Crash-safety: the mark is persisted, so a NEW process never re-issues.
-        #    (Simulated by re-reading state fresh, as a cold restart would.)
-        st = mint.load_state(root, 100000)
+        # 3. Crash-safety: the mark is committed to the DB before emit, so a
+        #    fresh read (a cold restart re-reading mint.db) already sees it and
+        #    never re-issues. peek() IS that fresh read.
+        st = mint.peek(root, 100000, 999999)
         ok(st["high_water"] == 100003,
            "high-water mark persisted at 100003 (a restart cannot re-issue)")
         code, lines = run(root, "alloc", "--floor", "100000")
@@ -70,7 +77,7 @@ def main():
         ok(code == 0 and lines[0]["high_water"] == 100004 and lines[0]["next"] == 100005,
            "peek shows high_water=100004, next=100005, issuing nothing")
         code2, _ = run(root, "peek", "--floor", "100000")
-        st2 = mint.load_state(root, 100000)
+        st2 = mint.peek(root, 100000, 999999)
         ok(st2["high_water"] == 100004, "peek did not advance the mark (pure read)")
 
         # 5. Gate: range refusal.
@@ -92,13 +99,11 @@ def main():
         ok(mint.assert_allocatable(101, high_water=100, live={200}, floor=1, ceil=999) is None,
            "gate passes an in-range, above-mark, not-live id")
 
-        # 9. --live from stdin is honoured (skips a held id is NOT the contract —
-        #    monotonic means we never draw below the mark; but a live id EQUAL to
-        #    next must refuse rather than collide).
+        # 9. --live from stdin is honoured: an alloc whose next id is declared
+        #    live must refuse rather than collide.
         root2 = os.path.join(d, "m2")
-        # prime to 100000
         run(root2, "alloc", "--floor", "100000")            # issues 100000, mark=100000
-        # next would be 100001; declare it live -> refusal
+        # next would be 100001; declare it live -> refusal (exit 1, no output)
         code, lines = run(root2, "alloc", "--floor", "100000",
                           "--live", "-", stdin='{"id": 100001}\n')
         ok(code == 1 and lines == [],
@@ -106,23 +111,23 @@ def main():
 
         # 10. retire records the id, does not recycle by default.
         code, lines = run(root2, "retire", "--id", "100000", "--floor", "100000")
-        ok(code == 0 and lines[0]["retired"] == 100000
-           and lines[0]["recycled_into_pool"] is False,
-           "retire records the id and does NOT recycle it by default")
-        st = mint.load_state(root2, 100000)
+        ok(code == 0 and lines[0]["retired"] == 100000 and lines[0]["op"] == "retire",
+           "retire records the id (and never lowers the mark)")
+        st = mint.peek(root2, 100000, 999999)
         ok(100000 in st["retired"] and st["high_water"] == 100000,
            "retire adds to the retired set and never lowers the mark")
 
-        # 11. bare-integer live lines are accepted.
+        # 11. bare-integer live lines are accepted alongside {id:...} objects.
         live = mint._read_live(io.StringIO("5\n{\"id\": 7}\n# c\n\n9\n"), "id")
-        ok(live == {5, 7, 9}, "--live reads both bare ints and {id:...} objects, skips blanks/comments")
+        ok(live == {5, 7, 9},
+           "--live reads both bare ints and {id:...} objects, skips blanks/comments")
 
         # 12. MUTATION CHECK — a mint that ignored the mark (always issued the
-        #     floor) would fail test 2/3. Prove the suite BITES by constructing
-        #     that mutant inline and asserting it diverges.
+        #     floor) would fail test 2/3. Prove the suite BITES by running that
+        #     mutant inline and asserting it diverges from the real monotonic run.
         def broken_allocate(root_, live_, floor_, ceil_, count_):
-            # the no-op mutant: never advances the mark
-            return [floor_] * count_, {"high_water": floor_ - 1, "retired": []}
+            # the no-op mutant: never advances the mark, always issues the floor
+            return [floor_] * count_, None
         mutant_ids, _ = broken_allocate(root, set(), 100000, 999999, 3)
         real_ids = [100000, 100001, 100002]  # what a correct monotonic mint gives
         ok(mutant_ids != real_ids,

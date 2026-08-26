@@ -47,6 +47,15 @@ import statistics
 import sys
 import zlib
 
+
+class GrainInputError(Exception):
+    """A clean, user-facing input error (bad path, unreadable baseline).
+
+    Raised instead of letting an OSError traceback escape, so adversarial I/O
+    fails with a one-line message and a nonzero exit (exit 2) rather than a
+    stack trace."""
+
+
 # --- the one documented knob ------------------------------------------------
 Z_CUT = 2.0           # flag STRUCTURED when the real ratio is > Z sd below the
 #                       null MEAN — more compressible than random arrangements of
@@ -202,8 +211,13 @@ def relation_null_draw(edge_tokens):
 def _read(path):
     if path == "-":
         return sys.stdin.read()
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        return fh.read()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except (OSError, IOError) as exc:
+        # A clean one-line refusal instead of a traceback: missing file,
+        # a directory given as a file, permission denied, etc.
+        raise GrainInputError("cannot read %r: %s" % (path, exc.strerror or exc))
 
 
 HONEST_CEILING = (
@@ -232,6 +246,14 @@ def main(argv=None):
     p.add_argument("--json", action="store_true", help="machine-readable output")
     args = p.parse_args(argv)
 
+    try:
+        return _run(args)
+    except GrainInputError as exc:
+        sys.stderr.write("grain: %s\n" % exc)
+        return 2
+
+
+def _run(args):
     text = _read(args.path)
     if args.relation:
         toks = tokens_from_relation(text)
@@ -241,12 +263,23 @@ def main(argv=None):
         sig = signature(toks)
 
     if args.save:
-        with open(args.save, "w", encoding="utf-8") as fh:
-            json.dump(sig, fh, indent=2, sort_keys=True)
+        try:
+            with open(args.save, "w", encoding="utf-8") as fh:
+                json.dump(sig, fh, indent=2, sort_keys=True)
+        except (OSError, IOError) as exc:
+            raise GrainInputError("cannot write %r: %s"
+                                  % (args.save, exc.strerror or exc))
 
     if args.drift:
-        with open(args.drift, "r", encoding="utf-8") as fh:
-            base = json.load(fh)
+        try:
+            with open(args.drift, "r", encoding="utf-8") as fh:
+                base = json.load(fh)
+        except (OSError, IOError) as exc:
+            raise GrainInputError("cannot read baseline %r: %s"
+                                  % (args.drift, exc.strerror or exc))
+        except ValueError as exc:
+            raise GrainInputError("baseline %r is not valid JSON: %s"
+                                  % (args.drift, exc))
         delta_z = round(sig["z_score"] - base.get("z_score", 0.0), 3)
         delta_rel = round(sig["rel_to_null"] - base.get("rel_to_null", 1.0), 4)
         drift = {
