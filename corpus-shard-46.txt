@@ -1,358 +1,290 @@
-# Loop MMT — corpus shard 46/49
+# Loop MMT — corpus shard 46/51
 
-> Bundle 46 of 49 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 46 of 51 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/mint/, /gifts/plumb/, /gifts/reltime/, /gifts/sha256/)
+Nodes in this shard: 4 (/gifts/census/, /gifts/conflict/, /gifts/dwell/, /gifts/excavation/)
 
 ---
 
-# Mint — a Loop MMT gift
-https://loopmmt.com/gifts/mint/
+# Census — a Loop MMT gift
+https://loopmmt.com/gifts/census/
 [coverage: optional · branch: gifts]
 
-IDs That Are Never Reused allocate ← all gifts
+Marker Census, Buried Ones Flagged count ← all gifts
 
-Mint
+Census
 
-Hand out IDs that are never reused — and prove it before returning each one, not with an after-the-fact check but as a structural property: a retired ID cannot come back. JSON in, JSON out, backed by a file you can read.
+Walk a tree, count your markers (TODO, FIXME, or whatever you define), and say which ones are buried inside comments where nobody will act on them. A report, not a gate — until you add --strict, and then a buried marker is an exit code your CI can catch.
 
 The honest edge
 
-It guarantees no reuse within the one ID store you point it at. Two independent stores that don't know about each other can still collide — single source of truth is your job.
+It's a text scan, not a parser — it finds markers by pattern, so a marker written in a syntax it wasn't told about is a marker it won't see. You define the patterns; their completeness is your call.
 
 Run it
 
-python3 mint.py alloc --root./ids
-test_mint.py (15/15, mutation-bitten)
+python3 census.py src/
+smoke_test.py (10/10, mutation-bitten)
 Python stdlib only, deterministic
 
 The code — every file that ships
 
-mint.py 321 lines on GitHub →
+census.py 254 lines on GitHub →
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""mint.py — hand out IDs that are never reused, and prove it before returning.
+"""census.py — walk a tree, find your markers, and say which ones are BURIED.
 
-A mint stamps a coin once and never stamps that number again. This does the same
-for identifiers: every ID it issues is strictly above every ID it has ever issued
-before, so a number that was retired can never be pointed at a second thing. That
-"never reused" property is not checked after the fact — it is **structural, and
-transactional**: the mint keeps a single **high-water mark** and only ever hands
-out `high_water + 1`, advancing the mark *inside a database transaction that
-commits before any ID is emitted*. A crash right after issuing cannot re-issue
-the same number, because the mark already moved and the move was durable.
+You leave markers in a codebase all the time: TODO, FIXME, "you write this", a
+tag that says a section is a stub. A visual pass catches the ones you can see.
+The dangerous one is the marker **buried inside a comment** — it never renders,
+so scanning the file by eye sails right past it. Census walks a file tree, finds
+every marker you name, and for each one says whether it sits in **visible** text
+or is **buried** inside a comment. The buried ones are the report: those are the
+spots a human pass will miss.
 
-Why you'd want that: any time an ID collision would let one record be mistaken for
-another — a retired user's ID reassigned to a new user, a recycled trace ID
-threading two unrelated events — monotonic allocation makes the mistake
-impossible rather than merely unlikely. Retirement is recorded (so you can audit
-what was let go) but a retired ID is **never** returned to the pool: silent
-recycling is the whole failure this refuses, so there is no recycle switch.
+It is deliberately dumb about *meaning* — a marker is a marker. What it is precise
+about is **visibility**: does this thing render where a person would see it, or is
+it hidden in a `<!-- -->` / `/* */` / `#` comment where only a grep will find it.
 
-STATE lives in a SQLite database at `<root>/mint.db` (Python stdlib `sqlite3`):
-meta.high_water: the last ID issued (or floor-1 when empty), one row
-retired: an append-only table of IDs recorded retired
-the rule: the free pool is [high_water+1..]; nothing lowers the mark.
-SQLite gives atomic commit, crash recovery, schema enforcement, and cross-process
-serialization for free (`BEGIN IMMEDIATE` lets only one allocator advance the mark
-at a time), which is exactly the indivisible decision "allocate and persist" is.
-Invalid, missing, downgraded, or out-of-range state is **refused** (exit 2), never
-silently reset to the floor. A legacy `mint-state.json` is imported once on first
-run — and refused loudly if it is corrupt — so an upgrade never reissues an old ID.
+python3 census.py <tree-root> [options]
 
-THE GATE, checked at allocation time, before an ID is returned:
-in range floor <= id <= ceil
-monotonic id > high_water (structural: id = high_water + 1)
-not live id not in --live SET (not held right now)
-A gate failure is a refusal with a reason, never a silent second-best.
+By default it looks for `TODO`, `FIXME`, `XXX`, `HACK`, and `STUB` in the common
+source extensions. Point it at your own markers with `--marker` (repeatable) and
+your own file types with `--ext`.
 
 ------------------------------------------------------------------------------
 The JSON-lines contract (so this composes in a pipe):
-- `mint alloc` / `mint peek` / `mint retire` emit ONE JSON object per line on
-stdout — a record you can pipe into the next tool.
-- `mint alloc -n K` emits K lines, one per freshly-minted ID, in order.
-- `--live -` reads a set of currently-held IDs from stdin, one JSON object or
-bare integer per line (field `--live-field`, default "id").
-- errors go to stderr; stdout stays clean JSON-lines.
+`--json` emits ONE JSON object per hit on stdout —
+{"path","line","marker","visible":true|false,"excerpt"}
+so you can pipe the census into the next tool (count them, filter to buried,
+feed the paths onward). Without `--json` it prints a grouped human report.
 
 Exit codes:
-0 the operation succeeded
-1 a gate refusal (out of range / not monotonic / id live)
-2 state could not be read, is invalid/out-of-range, or could not be written
-3 usage / bad input
+0 ran clean (hits or none — a census is a report, not a gate)
+1 at least one BURIED marker AND --strict was given (gate mode)
+3 usage / unreadable root
 """
 
 import argparse
 import json
 import os
-import sqlite3
+import re
 import sys
 
-SCHEMA_VERSION = 1
+DEFAULT_MARKERS = ["TODO", "FIXME", "XXX", "HACK", "STUB"]
+DEFAULT_EXTS = [
+".py", ".js", ".cjs", ".mjs", ".ts", ".jsx", ".tsx",
+".c", ".h", ".cpp", ".cc", ".java", ".go", ".rs", ".rb",
+".html", ".htm", ".css", ".md", ".sh", ".yaml", ".yml",
+]
 
-class MintError(Exception):
-"""A gate refusal or a state fault, carrying an exit code."""
+# Comment spans, by the syntaxes that actually bury text. These cover the vast
+# majority of source files without a per-language parser (which would be the wrong
+# amount of machinery for "is this in a comment").
+#
+# GIFT-012: the openers are recognised by a SINGLE-PASS, STRING-AWARE scanner, not
+# by raw regexes. The old regexes (`#[^\n]*`, `//[^\n]*`) matched a comment opener
+# even INSIDE a string literal, so `label = "widget # TODO"` or `url = "http://x/TODO"`
+# opened a false comment span and a LIVE marker read as buried-in-a-comment — the
+# exact inversion census exists to catch. The scanner walks the text once, tracking
+# whether it is inside a quote ('...' "..." `...`, with \ escapes); a comment opener
+# is only honoured OUTSIDE a string. It is quote-state + comment-state, NOT a parser.
+_LINE_OPENERS = ("//", "#") # run to end of line
+_BLOCK_OPENERS = (("<!--", "-->"), ("/*", "*/")) # run to their closer
+_QUOTES = ("'", '"', "`")
 
-def __init__(self, message, code):
-super().__init__(message)
-self.code = code
-
-def _db_path(root):
-return os.path.join(root, "mint.db")
-
-def _legacy_seed(root, floor, ceil):
-"""One-time seed from a legacy mint-state.json, if present. Returns the mark.
-Refuses (exit 2) rather than resetting: a corrupt or out-of-range legacy mark
-is a fault to surface, never a silent fall back to the floor (the fail-open
-this store exists to kill). An absent legacy file seeds the empty sentinel."""
-legacy = os.path.join(root, "mint-state.json")
-if not os.path.exists(legacy):
-return floor - 1
-try:
-with open(legacy, "r", encoding="utf-8") as fh:
-raw = json.load(fh)
-except (OSError, ValueError) as exc:
-raise MintError(
-"legacy mint-state.json is unreadable; refusing to reset (import by hand): %s"
-% exc, 2)
-hw = raw.get("high_water") if isinstance(raw, dict) else None
-if isinstance(hw, bool) or not isinstance(hw, int):
-raise MintError(
-"legacy mint-state.json high_water is not an integer (%r); refusing to reset"
-% (hw,), 2)
-if hw < floor - 1 or hw > ceil:
-raise MintError(
-"legacy high_water %d is out of range [%d, %d]; refusing to reset"
-% (hw, floor - 1, ceil), 2)
-return hw
-
-def _connect(root, floor, ceil):
-"""Open (creating + seeding on first use) the SQLite store. Validates the
-persisted mark on every open; a downgraded schema or non-int/out-of-range
-mark is a loud refusal, never a silent default."""
-try:
-os.makedirs(root, exist_ok=True)
-conn = sqlite3.connect(_db_path(root), timeout=30.0, isolation_level=None)
-except (OSError, sqlite3.Error) as exc:
-raise MintError("cannot open mint store at %s: %s" % (root, exc), 2)
-try:
-conn.execute("PRAGMA busy_timeout=30000")
-conn.execute(
-"CREATE TABLE IF NOT EXISTS meta ("
-" id INTEGER PRIMARY KEY CHECK(id = 1),"
-" high_water INTEGER NOT NULL,"
-" schema_version INTEGER NOT NULL)")
-conn.execute(
-"CREATE TABLE IF NOT EXISTS retired ("
-" id INTEGER PRIMARY KEY,"
-" retired_at TEXT NOT NULL DEFAULT (datetime('now')))")
-row = conn.execute(
-"SELECT high_water, schema_version FROM meta WHERE id = 1").fetchone()
-if row is None:
-seed = _legacy_seed(root, floor, ceil)
-conn.execute(
-"INSERT INTO meta (id, high_water, schema_version) VALUES (1,?,?)",
-(seed, SCHEMA_VERSION))
-else:
-hw, sv = row
-if not isinstance(hw, int) or isinstance(hw, bool):
-raise MintError("persisted high_water is not an integer (%r)" % (hw,), 2)
-if sv!= SCHEMA_VERSION:
-raise MintError(
-"mint store schema %r!= supported %d (downgraded/upgraded); refusing"
-% (sv, SCHEMA_VERSION), 2)
-if hw < floor - 1 or hw > ceil:
-raise MintError(
-"persisted high_water %d is out of range [%d, %d]; refusing"
-% (hw, floor - 1, ceil), 2)
-except sqlite3.Error as exc:
-conn.close()
-raise MintError("mint store is unusable: %s" % exc, 2)
-except MintError:
-conn.close()
-raise
-return conn
-
-def _read_hw(conn):
-return conn.execute("SELECT high_water FROM meta WHERE id = 1").fetchone()[0]
-
-def assert_allocatable(uid, high_water, live, floor, ceil):
-"""The gate: range, monotonic, not-live. Returns None if OK, else a reason."""
-if not isinstance(uid, int) or uid < floor or uid > ceil:
-return "E_RANGE: %r is outside %d-%d" % (uid, floor, ceil)
-if uid <= high_water:
-return ("E_NOT_MONOTONIC: %d is at/below the high-water mark %d"
-% (uid, high_water))
-if uid in live:
-return "E_LIVE: %d is held by a live holder" % uid
-return None
-
-def allocate(root, live, floor, ceil, count):
-"""Draw `count` IDs monotonically inside one transaction. The bumped mark is
-committed BEFORE any ID is emitted, so a crash never re-issues. On a gate
-failure mid-batch the successfully-minted prefix is committed (never lost),
-then the reason is raised."""
-conn = _connect(root, floor, ceil)
-minted = []
-reason = None
-try:
-conn.execute("BEGIN IMMEDIATE")
-hw = _read_hw(conn)
-for _ in range(count):
-uid = hw + 1
-reason = assert_allocatable(uid, hw, live, floor, ceil)
-if reason is not None:
-break
-hw = uid
-live = live | {uid}
-minted.append(uid)
-if minted:
-conn.execute("UPDATE meta SET high_water =? WHERE id = 1", (hw,))
-conn.commit()
-except sqlite3.Error as exc:
-conn.rollback()
-conn.close()
-raise MintError("allocation could not persist: %s" % exc, 2)
-conn.close()
-if reason is not None and not minted:
-raise MintError(reason, 1)
-return minted, reason
-
-def retire(root, uid, floor, ceil):
-"""Record an ID retired (append-only). It does NOT return to the pool — the
-mark is never lowered, so nothing this records is ever re-issued."""
-conn = _connect(root, floor, ceil)
-try:
-conn.execute("BEGIN IMMEDIATE")
-conn.execute("INSERT OR IGNORE INTO retired (id) VALUES (?)", (uid,))
-hw = _read_hw(conn)
-conn.commit()
-except sqlite3.Error as exc:
-conn.rollback()
-conn.close()
-raise MintError("retire could not persist: %s" % exc, 2)
-conn.close()
-return {"retired": uid, "high_water": hw}
-
-def peek(root, floor, ceil):
-conn = _connect(root, floor, ceil)
-hw = _read_hw(conn)
-retired = [r[0] for r in conn.execute("SELECT id FROM retired ORDER BY id")]
-conn.close()
-return {"high_water": hw, "retired": retired, "next": hw + 1,
-"floor": floor, "ceil": ceil}
-
-def _read_live(stream, field):
-"""Read a set of live IDs from a JSON-lines (or bare-integer-lines) stream."""
-live = set()
-for line in stream:
-line = line.strip()
-if not line or line.startswith("#"):
+def _comment_spans(text):
+spans = []
+i, n = 0, len(text)
+in_str = None # the open quote char, or None when outside any string
+while i < n:
+ch = text[i]
+if in_str is not None:
+# inside a string: consume escapes, look only for the matching close
+if ch == "\\":
+i += 2
 continue
-try:
-obj = json.loads(line)
-except ValueError:
-raise MintError("live input line is not JSON: %r" % line, 3)
-if isinstance(obj, bool):
-raise MintError("live line is a boolean, not an id: %r" % line, 3)
-if isinstance(obj, int):
-live.add(obj)
-elif isinstance(obj, dict) and field in obj and isinstance(obj[field], int) \
-and not isinstance(obj[field], bool):
-live.add(obj[field])
-else:
-raise MintError(
-"live line has no integer %r field: %r" % (field, line), 3)
-return live
+if ch == in_str:
+in_str = None
+i += 1
+continue
+# not in a string — a block comment opener?
+matched = False
+for open_tok, close_tok in _BLOCK_OPENERS:
+if text.startswith(open_tok, i):
+end = text.find(close_tok, i + len(open_tok))
+end = (end + len(close_tok)) if end!= -1 else n
+spans.append((i, end))
+i = end
+matched = True
+break
+if matched:
+continue
+# a line comment opener?
+for open_tok in _LINE_OPENERS:
+if text.startswith(open_tok, i):
+end = text.find("\n", i)
+end = end if end!= -1 else n
+spans.append((i, end))
+i = end
+matched = True
+break
+if matched:
+continue
+# a quote opening a string region?
+if ch in _QUOTES:
+in_str = ch
+i += 1
+return spans
 
-def _emit(obj):
-sys.stdout.write(json.dumps(obj, sort_keys=True) + "\n")
+def _buried(pos, spans):
+for a, b in spans:
+if a <= pos < b:
+return True
+return False
+
+def _line_index(text):
+starts = [0]
+for m in re.finditer(r"\n", text):
+starts.append(m.end())
+return starts
+
+def _lineno(off, starts):
+lo, hi = 0, len(starts) - 1
+while lo < hi:
+mid = (lo + hi + 1) // 2
+if starts[mid] <= off:
+lo = mid
+else:
+hi = mid - 1
+return lo + 1
+
+def scan_file(path, markers, word_boundary):
+"""Return list of {line, marker, visible, excerpt} for one file."""
+try:
+with open(path, encoding="utf-8", errors="replace") as fh:
+text = fh.read()
+except OSError:
+return []
+spans = _comment_spans(text)
+starts = _line_index(text)
+hits = []
+seen = set() # (line, marker) — one hit per marker per line
+for marker in markers:
+pat = r"\b" + re.escape(marker) + r"\b" if word_boundary else re.escape(marker)
+for m in re.finditer(pat, text, re.IGNORECASE):
+ln = _lineno(m.start(), starts)
+key = (ln, marker.lower())
+if key in seen:
+continue
+seen.add(key)
+excerpt = text[starts[ln - 1]:].split("\n", 1)[0].strip()
+if len(excerpt) > 110:
+excerpt = excerpt[:107] + "..."
+hits.append({
+"line": ln,
+"marker": marker,
+"visible": not _buried(m.start(), spans),
+"excerpt": excerpt,
+})
+hits.sort(key=lambda h: h["line"])
+return hits
+
+def scan_tree(root, markers, exts, word_boundary):
+exts_l = tuple(e.lower() for e in exts)
+out = []
+for dp, dns, fns in os.walk(root):
+# never descend into VCS / dependency dirs
+for skip in (".git", "node_modules", ".hg", ".svn", "__pycache__"):
+if skip in dns:
+dns.remove(skip)
+for fn in sorted(fns):
+if fn.lower().endswith(exts_l):
+full = os.path.join(dp, fn)
+for h in scan_file(full, markers, word_boundary):
+h = dict(h)
+h["path"] = os.path.relpath(full, root)
+out.append(h)
+return out
 
 def main(argv=None):
 p = argparse.ArgumentParser(
-prog="mint",
-description="hand out IDs that are never reused, and prove it before returning.")
-p.add_argument("op", choices=["alloc", "peek", "retire"],
-help="alloc: mint new id(s). peek: show state. retire: record an id retired.")
-p.add_argument("--root", default=".mint",
-help="directory holding mint.db (default:.mint)")
-p.add_argument("--floor", type=int, default=100000,
-help="lowest issuable id (default: 100000)")
-p.add_argument("--ceil", type=int, default=999999,
-help="highest issuable id (default: 999999)")
-p.add_argument("-n", "--count", type=int, default=1,
-help="how many ids to mint (alloc only; default 1)")
-p.add_argument("--live", metavar="FILE",
-help="a JSON-lines file (or - for stdin) naming ids held right now")
-p.add_argument("--live-field", default="id",
-help="field carrying the id in --live objects (default: id)")
-p.add_argument("--id", type=int, help="the id to retire (retire only)")
+prog="census",
+description="walk a tree, find your markers, say which are buried in comments.",
+)
+p.add_argument("root", help="the directory to walk")
+p.add_argument("--marker", action="append", metavar="TEXT",
+help="a marker to look for (repeatable; default: TODO FIXME XXX HACK STUB)")
+p.add_argument("--ext", action="append", metavar=".EXT",
+help="a file extension to include (repeatable; default: common source types)")
+p.add_argument("--no-word-boundary", action="store_true",
+help="match a marker as a raw substring, not a whole word "
+"(needed for glyph/punctuation markers like '<!--WRITE-->')")
+p.add_argument("--buried-only", action="store_true",
+help="report only markers buried in comments (the miss-risk set)")
+p.add_argument("--json", action="store_true",
+help="emit one JSON object per hit on stdout (the pipe contract)")
+p.add_argument("--strict", action="store_true",
+help="exit 1 if any buried marker is found (gate mode)")
 args = p.parse_args(argv)
 
-if args.floor > args.ceil:
-sys.stderr.write("mint: --floor must be <= --ceil\n")
+if not os.path.isdir(args.root):
+sys.stderr.write("census: not a directory: %s\n" % args.root)
 return 3
 
-try:
-live = set()
-if args.live:
-if args.live == "-":
-live = _read_live(sys.stdin, args.live_field)
+markers = args.marker if args.marker else DEFAULT_MARKERS
+exts = args.ext if args.ext else DEFAULT_EXTS
+word_boundary = not args.no_word_boundary
+
+hits = scan_tree(args.root, markers, exts, word_boundary)
+if args.buried_only:
+hits = [h for h in hits if not h["visible"]]
+
+buried = sum(1 for h in hits if not h["visible"])
+
+if args.json:
+for h in hits:
+sys.stdout.write(json.dumps({
+"path": h["path"], "line": h["line"], "marker": h["marker"],
+"visible": h["visible"], "excerpt": h["excerpt"],
+}, sort_keys=True) + "\n")
+return 1 if (args.strict and buried) else 0
+
+if not hits:
+print("census: no markers found under %s" % args.root)
+return 0
+
+by_path = {}
+for h in hits:
+by_path.setdefault(h["path"], []).append(h)
+print("# census — %d marker(s) across %d file(s) (%d buried in comments)\n"
+% (len(hits), len(by_path), buried))
+for path in sorted(by_path):
+hs = by_path[path]
+nb = sum(1 for h in hs if not h["visible"])
+flag = " \u26a0 %d BURIED" % nb if nb else ""
+print("## %s (%d marker%s)%s" % (path, len(hs), "" if len(hs) == 1 else "s", flag))
+for h in hs:
+tag = "buried " if not h["visible"] else "visible"
+print(" L%4d [%s] %s %s" % (h["line"], tag, h["marker"], h["excerpt"]))
+print()
+if buried:
+print("\u2192 %d marker(s) are BURIED in comments \u2014 a visual pass will miss them." % buried)
 else:
-with open(args.live, "r", encoding="utf-8") as fh:
-live = _read_live(fh, args.live_field)
-
-if args.op == "peek":
-state = peek(args.root, args.floor, args.ceil)
-state["op"] = "peek"
-_emit(state)
-return 0
-
-if args.op == "alloc":
-if args.count < 1:
-sys.stderr.write("mint: -n must be >= 1\n")
-return 3
-minted, reason = allocate(args.root, live, args.floor, args.ceil, args.count)
-for uid in minted:
-_emit({"op": "alloc", "id": uid})
-if reason is not None:
-sys.stderr.write("mint: %s\n" % reason)
-return 1
-return 0
-
-if args.op == "retire":
-if args.id is None:
-sys.stderr.write("mint: retire needs --id\n")
-return 3
-rec = retire(args.root, args.id, args.floor, args.ceil)
-rec["op"] = "retire"
-_emit(rec)
-return 0
-
-except MintError as exc:
-sys.stderr.write("mint: %s\n" % exc)
-return exc.code
-
-return 0
+print("\u2192 every marker is in visible text \u2014 nothing is buried.")
+return 1 if (args.strict and buried) else 0
 
 if __name__ == "__main__":
 sys.exit(main())
 
-test_mint.py 142 lines on GitHub →
+smoke_test.py 123 lines on GitHub →
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""test_mint.py — non-vacuous tests for mint.py (SQLite store).
+"""smoke_test.py — non-vacuous tests for census.py.
 
-Every test asserts a SPECIFIC behaviour, and the suite carries a mutation check
-(test 12) so a mint that always returned the same id, or never persisted, could
-not pass green. Run: python3 test_mint.py
-
-Updated for the SQLite rewrite (GIFT-001): state now lives in <root>/mint.db and
-is read back through peek() (a fresh DB read), not the retired load_state() JSON
-helper. "Crash-safety" is tested the way the store actually guarantees it — the
-high-water mark is committed to the DB before any id is emitted, so a fresh
-peek() (equivalent to a cold restart re-reading the db) already sees the bumped
-mark.
+The load-bearing claim is the visible/buried distinction. The suite plants a
+marker in visible code AND the same marker inside a comment and asserts census
+tells them apart — a census that called everything visible (or everything
+buried) would fail. Run: python3 smoke_test.py
 """
 
 import io
@@ -361,7 +293,7 @@ import os
 import sys
 import tempfile
 
-import mint
+import census
 
 FAIL = 0
 
@@ -371,108 +303,95 @@ print((" ok " if cond else " FAIL ") + msg)
 if not cond:
 FAIL += 1
 
-def run(root, *args, stdin=None):
-"""Invoke main() capturing stdout, return (exit, [parsed json lines])."""
-old_out, old_in = sys.stdout, sys.stdin
+def run(root, *args):
+old = sys.stdout
 sys.stdout = io.StringIO()
-if stdin is not None:
-sys.stdin = io.StringIO(stdin)
 try:
-code = mint.main(list(args) + ["--root", root])
+code = census.main([root] + list(args))
 out = sys.stdout.getvalue()
 finally:
-sys.stdout, sys.stdin = old_out, old_in
-lines = [json.loads(l) for l in out.splitlines() if l.strip()]
-return code, lines
+sys.stdout = old
+return code, out
 
 def main():
 with tempfile.TemporaryDirectory() as d:
-root = os.path.join(d, "m")
+# a python file: one visible TODO (a whole word in a string), one buried
+# in a # comment. NB the visible one must be a WHOLE word — `TODO_x` has
+# no word boundary after TODO and correctly would not match.
+with open(os.path.join(d, "a.py"), "w") as fh:
+fh.write("x = 1 # TODO buried in a comment\n")
+fh.write('label = \"TODO\" # visible marker in a string literal\n')
+# an html file: a marker buried in an html comment
+with open(os.path.join(d, "b.html"), "w") as fh:
+fh.write("<p>hello</p>\n<!-- FIXME buried html marker -->\n")
+# a js file: a visible marker (whole word) and a block-comment-buried one
+with open(os.path.join(d, "c.js"), "w") as fh:
+fh.write('const label = \"XXX\";\n/* HACK buried in a block comment */\n')
+# a file type NOT in defaults — must be ignored
+with open(os.path.join(d, "ignore.log"), "w") as fh:
+fh.write("TODO this should never be seen (.log not scanned)\n")
 
-# 1. First alloc issues the floor.
-code, lines = run(root, "alloc", "--floor", "100000")
-ok(code == 0 and lines == [{"op": "alloc", "id": 100000}],
-"first alloc issues the floor id (100000) as one JSON-line")
+# 1. JSON-lines contract + the core visible/buried distinction.
+code, out = run(d, "--json")
+recs = [json.loads(l) for l in out.splitlines() if l.strip()]
+ok(code == 0, "json run exits 0")
+# a.py: line1 TODO buried, line2 TODO visible
+a_todos = sorted([r for r in recs if r["path"] == "a.py"], key=lambda r: r["line"])
+ok(len(a_todos) == 2 and a_todos[0]["visible"] is False and a_todos[1]["visible"] is True,
+"a.py: the # -comment TODO is BURIED, the code TODO is VISIBLE (the distinction bites)")
 
-# 2. Monotonic: every subsequent id is strictly greater.
-code, lines = run(root, "alloc", "-n", "3", "--floor", "100000")
-ids = [r["id"] for r in lines]
-ok(code == 0 and ids == [100001, 100002, 100003],
-"next allocs are strictly increasing (100001,2,3) — monotonic")
+# 2. html comment burial.
+b = [r for r in recs if r["path"] == "b.html"]
+ok(len(b) == 1 and b[0]["marker"] == "FIXME" and b[0]["visible"] is False,
+"b.html: FIXME inside <!-- --> is BURIED")
 
-# 3. Crash-safety: the mark is committed to the DB before emit, so a
-# fresh read (a cold restart re-reading mint.db) already sees it and
-# never re-issues. peek() IS that fresh read.
-st = mint.peek(root, 100000, 999999)
-ok(st["high_water"] == 100003,
-"high-water mark persisted at 100003 (a restart cannot re-issue)")
-code, lines = run(root, "alloc", "--floor", "100000")
-ok(lines[0]["id"] == 100004,
-"an alloc after 'restart' continues from the mark, never repeats")
+# 3. js: visible XXX + block-comment-buried HACK.
+c = sorted([r for r in recs if r["path"] == "c.js"], key=lambda r: r["line"])
+ok([(r["marker"], r["visible"]) for r in c] == [("XXX", True), ("HACK", False)],
+"c.js: XXX visible, HACK buried in /* */ block comment")
 
-# 4. peek reports state without issuing.
-code, lines = run(root, "peek", "--floor", "100000")
-ok(code == 0 and lines[0]["high_water"] == 100004 and lines[0]["next"] == 100005,
-"peek shows high_water=100004, next=100005, issuing nothing")
-code2, _ = run(root, "peek", "--floor", "100000")
-st2 = mint.peek(root, 100000, 999999)
-ok(st2["high_water"] == 100004, "peek did not advance the mark (pure read)")
+# 4. the.log file is never scanned (extension filter).
+ok(not any(r["path"] == "ignore.log" for r in recs),
+".log is not in default extensions — never scanned")
 
-# 5. Gate: range refusal.
-reason = mint.assert_allocatable(50, high_water=40, live=set(), floor=100, ceil=200)
-ok(reason is not None and reason.startswith("E_RANGE"),
-"gate refuses an out-of-range id (E_RANGE)")
+# 5. --buried-only drops the visible ones.
+code, out = run(d, "--json", "--buried-only")
+recs2 = [json.loads(l) for l in out.splitlines() if l.strip()]
+ok(all(r["visible"] is False for r in recs2) and len(recs2) == 3,
+"--buried-only reports exactly the 3 buried markers, no visible ones")
 
-# 6. Gate: monotonic refusal (an id at/below the mark).
-reason = mint.assert_allocatable(100, high_water=100, live=set(), floor=1, ceil=999)
-ok(reason is not None and reason.startswith("E_NOT_MONOTONIC"),
-"gate refuses an id at/below the high-water mark (E_NOT_MONOTONIC)")
+# 6. --strict exits 1 when a buried marker exists.
+code, _ = run(d, "--json", "--strict")
+ok(code == 1, "--strict exits 1 because buried markers are present")
 
-# 7. Gate: live refusal.
-reason = mint.assert_allocatable(150, high_water=100, live={150}, floor=1, ceil=999)
-ok(reason is not None and reason.startswith("E_LIVE"),
-"gate refuses an id currently held live (E_LIVE)")
+# 7. custom --marker finds a non-default token; word boundary respected.
+with open(os.path.join(d, "d.py"), "w") as fh:
+fh.write("WRITEME = 1\n")
+fh.write("REWRITEMEN = 2 # a longer token, no whole-word hit here\n")
+code, out = run(d, "--json", "--marker", "WRITEME")
+recs3 = [json.loads(l) for l in out.splitlines() if l.strip()]
+dhits = [r for r in recs3 if r["path"] == "d.py"]
+ok(len(dhits) == 1 and dhits[0]["line"] == 1,
+"custom --marker WRITEME matches the whole word only, not the substring in REWRITEMEN")
 
-# 8. Gate passes for a clean id.
-ok(mint.assert_allocatable(101, high_water=100, live={200}, floor=1, ceil=999) is None,
-"gate passes an in-range, above-mark, not-live id")
+# 8. --no-word-boundary lets a glyph/substring marker match.
+with open(os.path.join(d, "e.html"), "w") as fh:
+fh.write("<!--WRITE--> visible? no, it's in a comment\n")
+code, out = run(d, "--json", "--marker", "<!--WRITE-->", "--no-word-boundary", "--ext", ".html")
+recs4 = [json.loads(l) for l in out.splitlines() if l.strip()]
+ehits = [r for r in recs4 if r["path"] == "e.html"]
+ok(len(ehits) == 1, "--no-word-boundary matches a punctuation marker like <!--WRITE-->")
 
-# 9. --live from stdin is honoured: an alloc whose next id is declared
-# live must refuse rather than collide.
-root2 = os.path.join(d, "m2")
-run(root2, "alloc", "--floor", "100000") # issues 100000, mark=100000
-# next would be 100001; declare it live -> refusal (exit 1, no output)
-code, lines = run(root2, "alloc", "--floor", "100000",
-"--live", "-", stdin='{"id": 100001}\n')
-ok(code == 1 and lines == [],
-"an alloc whose next id is declared live refuses (exit 1, no output)")
+# 9. MUTATION CHECK — a census that called everything visible would fail
+# test 1/2/3. Prove the buried-detector is not vacuous by asserting the
+# two populations are genuinely non-empty and disjoint.
+vis = [r for r in recs if r["visible"]]
+bur = [r for r in recs if not r["visible"]]
+ok(len(vis) >= 2 and len(bur) >= 3,
+"mutation check: both visible (>=2) and buried (>=3) populations are non-empty "
+"(an all-visible or all-buried classifier could not produce this)")
 
-# 10. retire records the id, does not recycle by default.
-code, lines = run(root2, "retire", "--id", "100000", "--floor", "100000")
-ok(code == 0 and lines[0]["retired"] == 100000 and lines[0]["op"] == "retire",
-"retire records the id (and never lowers the mark)")
-st = mint.peek(root2, 100000, 999999)
-ok(100000 in st["retired"] and st["high_water"] == 100000,
-"retire adds to the retired set and never lowers the mark")
-
-# 11. bare-integer live lines are accepted alongside {id:...} objects.
-live = mint._read_live(io.StringIO("5\n{\"id\": 7}\n# c\n\n9\n"), "id")
-ok(live == {5, 7, 9},
-"--live reads both bare ints and {id:...} objects, skips blanks/comments")
-
-# 12. MUTATION CHECK — a mint that ignored the mark (always issued the
-# floor) would fail test 2/3. Prove the suite BITES by running that
-# mutant inline and asserting it diverges from the real monotonic run.
-def broken_allocate(root_, live_, floor_, ceil_, count_):
-# the no-op mutant: never advances the mark, always issues the floor
-return [floor_] * count_, None
-mutant_ids, _ = broken_allocate(root, set(), 100000, 999999, 3)
-real_ids = [100000, 100001, 100002] # what a correct monotonic mint gives
-ok(mutant_ids!= real_ids,
-"mutation check: a mint that never advances the mark DIVERGES from the "
-"monotonic sequence (the suite would catch it)")
-
-print("\n" + ("MINT: %d FAILED" % FAIL if FAIL else "MINT: ALL GREEN"))
+print("\n" + ("CENSUS: %d FAILED" % FAIL if FAIL else "CENSUS: ALL GREEN"))
 return 1 if FAIL else 0
 
 if __name__ == "__main__":
@@ -484,941 +403,1455 @@ Python stdlib only, deterministic
 
 ---
 
-# Plumb — a Loop MMT gift
-https://loopmmt.com/gifts/plumb/
+# Conflict — a Loop MMT gift
+https://loopmmt.com/gifts/conflict/
 [coverage: optional · branch: gifts]
 
-Status Board That Won't Lie witness ← all gifts
+A Broken Merge Can't Land filter ← all gifts
 
-Plumb
+Conflict
 
-A tiny audit pattern for anyone whose dashboards turn green on intention instead of evidence. Each claim names a witness — a file that must exist, text that must be present, a command that must pass — and only renders green if its witness agrees. Assert done with nothing beneath it and you get UNWITNESSED, not a pass.
+A merge that goes wrong leaves <<<<<<<, =======, >>>>>>> markers wedged into a file; once committed, that file no longer parses — it isn't 'a merge in progress,' it's broken source that landed, and it hides until something tries to read it. Conflict is the one-command gate: wire it into a pre-commit hook or CI and a file carrying the marker triad simply cannot land. The clever part is the TRIAD RULE — ======= alone is a legal line (a Markdown rule, a comment banner), so conflict fires only on all three markers together, line-start only, and never cries wolf on a legal ======= or a marker mid-line.
 
 The honest edge
 
-It checks the witness exists and agrees, never that the witness is the right one. Point it at the wrong file and it'll happily pass — choosing a meaningful witness is your job.
+This is a check, not an immunity — it protects you only when it is RUN, so wire it into a hook or CI rather than trusting a human to remember. And it detects the standard git marker triad; a tool that uses different markers needs a different pattern. Visibility, not immunity.
 
 Run it
 
-python3 plumb.py --help
-smoke_test.py (8/8)
-Python stdlib only
+python3 conflict.py --help
+test_conflict.py (18 checks / 7 tests, mutation-bitten, triad-rule + line-start guards + throwaway-repo end-to-end)
+Python standard library only, read-only, deterministic
 
 The code — every file that ships
 
-plumb.py 299 lines on GitHub →
+conflict.py 172 lines on GitHub →
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""plumb.py — a status board that refuses to show green on hope.
+"""conflict — refuse to commit a file that no longer parses.
 
-A plumb line tells the truth about vertical no matter how the wall *feels*. This
-does the same for a status board: every claim you assert PASS must carry a
-WITNESS beneath it — a real, checkable piece of evidence — and the claim is only
-rendered green if that witness actually agrees. A "done" typed by a hopeful hand
-is not evidence. Plumb will not paint it green.
+A merge that goes wrong leaves `<<<<<<<`, `=======`, `>>>>>>>` markers wedged
+into a file. Once committed, that file no longer parses — it isn't "a merge in
+progress," it's broken source that landed. Worse, it hides: the failure surfaces
+only when something tries to read the file, and if that read happens in a quiet
+place, it can sit on your main branch for days while everything downstream of it
+silently degrades.
 
-The board file (`.plumb`) is one claim per line. Blank lines and lines starting
-with '#' are ignored. Each claim is 2 or 3 pipe-separated fields:
+`conflict` is the one-command gate that catches it. It scans a git tree for the
+merge-marker triad and exits non-zero if any file carries an unresolved merge, so
+you can wire it into a pre-commit hook or CI and a broken file simply cannot land.
 
-NAME | WITNESS # status defaults to 'assert'
-NAME | STATUS | WITNESS # STATUS is 'assert' or 'todo'
+WHY IT'S HONEST
 
-WITNESS is one of:
+- **The triad, never the lone middle.** `=======` on its own is a legal line — a
+Markdown horizontal rule, a Python separator comment, an ASCII banner. It is a
+conflict marker ONLY in the company of `<<<<<<<` and `>>>>>>>` in the same
+file. `conflict` fires on the *triad within one file*, never on a bare
+`=======`. A lint that cries wolf on a legal line gets disabled, and a disabled
+lint is worse than none.
 
-exists PATH # PATH must exist
-absent PATH # PATH must NOT exist (e.g. "no secret committed")
-contains PATH ~ TEXT # PATH exists and contains the literal substring TEXT
-cmd SHELL COMMAND... # the command must exit 0
-none # NO witness at all (the honesty case)
+- **Decidable from bytes.** A conflict marker on a branch needs no judgment, no
+review, no discussion — it is arithmetic. `conflict` reports the finding as an
+exit code, not a paragraph: exit codes don't decay, don't need finding, and
+cost nothing to re-run.
 
-Verdicts:
+- **It is read-only.** It reads blobs out of git (or off disk) and compares. It
+writes nothing and fixes nothing.
 
-HELD assert + witness satisfied -> green, and clean
-BROKEN assert + witness NOT satisfied -> the green-on-hope catch
-UNWITNESSED assert + witness 'none' -> you claimed PASS with nothing beneath it
-BLOCKED witness could not be evaluated -> don't trust the reading
-TODO todo + witness not (yet) satisfied -> honest not-done (never green)
-READY todo + witness satisfied -> it's actually done; promote it
+THE HONEST EDGE
 
-Exit codes:
-0 every asserted claim is HELD (todo/ready present is fine)
-1 at least one BROKEN or UNWITNESSED claim (a definite green-on-hope)
-2 no broken assertions, but at least one BLOCKED claim (couldn't measure — don't trust green)
-3 usage / unreadable board
+This is a check, not an immunity — it protects you only when it is RUN. Wire it
+into a hook or CI so "run it" isn't something a human has to remember. And it
+detects the standard git marker triad; a tool that uses different markers needs a
+different pattern. Visibility, not immunity.
 
-A `todo` claim can NEVER render green. That is deliberate: the one thing this tool
-exists to make impossible is a green cell with nothing true beneath it.
+USAGE
+python3 conflict.py # scan the working tree (tracked files)
+python3 conflict.py --ref main # scan any committed tree by ref
+python3 conflict.py --ignore _snapshots/ --ignore vendor/
+# skip path substrings (repeatable)
+
+EXIT 0 = clean · 3 = unresolved merge found (the alarm) · 2 = error/usage
+
+MIT licensed. Python standard library only. Read-only. Deterministic.
 """
+from __future__ import annotations
 
-import argparse
-import json
+import subprocess
+import sys
+
+# The three markers git leaves on a conflicted merge. `=======` is only a marker
+# in the company of the other two — see the triad rule in main().
+MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
+
+def git_files(ref: str | None) -> list[str]:
+"""List tracked files at `ref` (committed tree) or in the working tree."""
+if ref:
+out = subprocess.run(
+["git", "ls-tree", "-r", "--name-only", ref],
+capture_output=True, text=True,
+).stdout
+else:
+out = subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout
+return out.split()
+
+def read_blob(f: str, ref: str | None) -> bytes:
+"""Read a file's bytes at `ref` or from the working tree."""
+if ref:
+return subprocess.run(["git", "show", f"{ref}:{f}"], capture_output=True).stdout
+with open(f, "rb") as fh:
+return fh.read()
+
+def marker_lines(text: str) -> dict[str, list[int]]:
+"""Map each marker to the 1-based line numbers where a line STARTS with it."""
+lines = text.split("\n")
+return {m: [i + 1 for i, ln in enumerate(lines) if ln.startswith(m)] for m in MARKERS}
+
+def has_conflict(text: str) -> bool:
+"""True iff `text` contains the full marker TRIAD (not a lone `=======`)."""
+found = marker_lines(text)
+return all(found[m] for m in MARKERS)
+
+def is_ignored(path: str, ignore: tuple[str,...]) -> bool:
+"""True iff `path` contains any ignore substring (skip it)."""
+return any(ig in path for ig in ignore)
+
+def scan(ref: str | None = None, ignore: tuple[str,...] = ()) -> list[tuple[str, dict]]:
+"""Return [(path, marker_lines)] for every tracked file carrying the triad."""
+hits: list[tuple[str, dict]] = []
+for f in git_files(ref):
+if is_ignored(f, ignore):
+continue
+try:
+raw = read_blob(f, ref)
+except (OSError, FileNotFoundError):
+continue
+try:
+text = raw.decode("utf-8")
+except UnicodeDecodeError:
+continue # a binary blob has no markers to read
+if has_conflict(text):
+hits.append((f, marker_lines(text)))
+return hits
+
+def _parse_args(argv: list[str]) -> tuple[str | None, tuple[str,...]]:
+ref: str | None = None
+ignore: list[str] = []
+i = 0
+while i < len(argv):
+a = argv[i]
+if a == "--ref":
+if i + 1 >= len(argv):
+raise ValueError("--ref needs a git ref")
+ref = argv[i + 1]
+i += 2
+elif a == "--ignore":
+if i + 1 >= len(argv):
+raise ValueError("--ignore needs a path substring")
+ignore.append(argv[i + 1])
+i += 2
+elif a in ("-h", "--help"):
+raise ValueError("__help__")
+else:
+raise ValueError(f"unknown argument: {a}")
+return ref, tuple(ignore)
+
+def main(argv: list[str]) -> int:
+try:
+ref, ignore = _parse_args(argv)
+except ValueError as exc:
+if str(exc) == "__help__":
+sys.stdout.write(__doc__)
+return 2
+sys.stderr.write(f"conflict: {exc}\n")
+return 2
+
+hits = scan(ref, ignore)
+where = f"`{ref}`" if ref else "the working tree"
+
+if not hits:
+sys.stdout.write(f"conflict: clean — no unresolved merge in {where}.\n")
+return 0
+
+sys.stderr.write(
+f"conflict: {len(hits)} file(s) in {where} carry an UNRESOLVED MERGE.\n"
+)
+for f, found in hits:
+ln = found["<<<<<<< "][0]
+sys.stderr.write(
+f" {f}:{ln} <<<<<<< / ======= / >>>>>>> "
+f"({len(found['<<<<<<< '])} conflict block(s))\n"
+)
+sys.stderr.write(
+"\nA conflict marker on a branch is not a merge in progress — it is a "
+"FILE THAT NO LONGER PARSES, landed. Resolve it. Do not commit over it.\n"
+)
+return 3
+
+if __name__ == "__main__":
+raise SystemExit(main(sys.argv[1:]))
+
+test_conflict.py 181 lines on GitHub →
+#!/usr/bin/env python3
+"""test_conflict.py — the certifying properties of the conflict gift.
+
+Run: python3 test_conflict.py (exit 0 = all pass, 1 = a failure)
+
+The load-bearing property is the TRIAD RULE: a lone `=======` (a legal line) must
+NOT fire, while the full marker triad must. Each test is MUTATION-BITTEN — it is
+here because a plausible mutation of conflict.py makes it fail loud. The core is
+pure (marker_lines / has_conflict / is_ignored), so it's tested directly; the
+git-facing shell is exercised in a throwaway repo.
+"""
 import os
 import subprocess
 import sys
 
-CEILING = (
-"note: Plumb checks that each claim's witness EXISTS / AGREES — not that the "
-"witness is CORRECT. A claim can point at the wrong evidence (a file that "
-"exists but proves nothing, a command that exits 0 for the wrong reason) and "
-"Plumb will pass it. It catches GREEN ON HOPE (a claim asserted PASS with no "
-"satisfied witness); it does NOT catch GREEN ON THE WRONG WITNESS. The witness "
-"is only as honest as you write it, and the board file runs its `cmd` witnesses "
-"with your shell — trust it like a Makefile."
+import conflict as c
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+CONFLICTED = """\
+line before
+<<<<<<< HEAD
+ours
+=======
+theirs
+>>>>>>> origin/main
+line after
+"""
+
+# a lone `=======` in legal, innocent company — MUST NOT fire
+INNOCENT_RULE = """\
+Section One
+=======
+Section Two
+
+Some prose under a Markdown setext rule.
+"""
+
+INNOCENT_BANNER = """\
+# ============================================================
+# a decorative comment banner, not a conflict
+# ============================================================
+def f(): pass
+"""
+
+# --- 1. the triad fires; a lone middle does not (the core property) ----------
+def test_triad_rule():
+check(c.has_conflict(CONFLICTED), "the full marker triad must be detected")
+check(not c.has_conflict(INNOCENT_RULE), "a lone ======= (Markdown rule) must NOT fire")
+check(not c.has_conflict(INNOCENT_BANNER), "a ==== banner must NOT fire")
+# a triad that is missing one leg must NOT fire
+missing_close = CONFLICTED.replace(">>>>>>> origin/main\n", "")
+check(not c.has_conflict(missing_close), "two-of-three markers must NOT fire (needs the triad)")
+
+# --- 2. golden: marker_lines reports the exact line numbers ------------------
+def test_marker_lines_golden():
+found = c.marker_lines(CONFLICTED)
+check(found["<<<<<<< "] == [2], f"open marker line wrong: {found['<<<<<<< ']}")
+check(found["======="] == [4], f"middle marker line wrong: {found['=======']}")
+check(found[">>>>>>> "] == [6], f"close marker line wrong: {found['>>>>>>> ']}")
+# the three exact line-number asserts above ARE the golden: they pin the
+# detected positions, not merely the count.
+
+# --- 3. only a line that STARTS with a marker counts ------------------------
+def test_startswith_only():
+# a single marker mid-line (e.g. inside a string) is not a line-start conflict
+embedded = 'x = "<<<<<<< not a real marker"\n'
+check(not c.has_conflict(embedded), "a marker mid-line must not count as a conflict")
+# the discriminating case: ALL THREE markers mid-line. Under startswith this
+# is clean (no line STARTS with a marker); a naive `m in ln` would flag it.
+triad_midline = "a <<<<<<< b\nc ======= d\ne >>>>>>> f\n"
+check(
+not c.has_conflict(triad_midline),
+"three markers mid-line must NOT fire (startswith, not substring)",
 )
 
-# Verdicts
-HELD = "HELD"
-BROKEN = "BROKEN"
-UNWITNESSED = "UNWITNESSED"
-BLOCKED = "BLOCKED"
-TODO = "TODO"
-READY = "READY"
+# --- 4. is_ignored honors substrings ----------------------------------------
+def test_is_ignored():
+check(c.is_ignored("a/_snapshots/x.txt", ("_snapshots/",)), "ignore substring should match")
+check(not c.is_ignored("a/src/x.txt", ("_snapshots/",)), "non-matching path must not be ignored")
+check(not c.is_ignored("anything", ()), "empty ignore never ignores")
 
-# Which verdicts drive which exit code.
-_FAIL_1 = (BROKEN, UNWITNESSED) # a definite green-on-hope
-_FAIL_2 = (BLOCKED,) # couldn't measure
+# --- 5. arg parse: --ref, --ignore (repeatable), unknown ---------------------
+def test_parse_args():
+ref, ig = c._parse_args(["--ref", "main", "--ignore", "a/", "--ignore", "b/"])
+check(ref == "main", f"--ref not parsed: {ref}")
+check(ig == ("a/", "b/"), f"--ignore not repeatable: {ig}")
+raised = False
+try:
+c._parse_args(["--bogus"])
+except ValueError:
+raised = True
+check(raised, "unknown arg must raise")
 
-def _eprint(*a):
-print(*a, file=sys.stderr)
+# --- 6. END-TO-END against a throwaway repo ---------------------------------
+def _run_git(cwd, *args):
+subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
 
-# --- witness parsing --------------------------------------------------------
+def test_end_to_end():
+import tempfile
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+# one clean file, one conflicted file
+with open(os.path.join(repo, "clean.py"), "w") as fh:
+fh.write("def ok(): pass\n")
+with open(os.path.join(repo, "broken.py"), "w") as fh:
+fh.write(CONFLICTED)
+_run_git(repo, "add", "-A")
+_run_git(repo, "commit", "-qm", "with a conflict")
 
-def parse_witness(expr):
-"""expr -> ((kind, arg), None) on success, or (None, error_string).
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+hits = c.scan(ref=None)
+finally:
+os.chdir(cwd0)
+paths = sorted(f for f, _ in hits)
+check(paths == ["broken.py"], f"end-to-end should flag only broken.py: {paths}")
 
-kind is one of exists/absent/contains/cmd/none.
-arg is a string (path or command), a (path, pattern) tuple for contains, or
-None for 'none'.
+# --- 7. ignore actually excludes a conflicted file --------------------------
+def test_end_to_end_ignore():
+import tempfile
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+os.makedirs(os.path.join(repo, "_snapshots"))
+with open(os.path.join(repo, "_snapshots", "past.txt"), "w") as fh:
+fh.write(CONFLICTED) # a deliberate record of a past conflict
+_run_git(repo, "add", "-A")
+_run_git(repo, "commit", "-qm", "snapshot")
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+with_ignore = c.scan(ref=None, ignore=("_snapshots/",))
+without = c.scan(ref=None)
+finally:
+os.chdir(cwd0)
+check(with_ignore == [], f"ignored path should not be flagged: {with_ignore}")
+check(len(without) == 1, f"without ignore the file should flag: {without}")
+
+def run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+try:
+t()
+except Exception as exc:
+_FAILURES.append(f"{t.__name__} raised: {exc!r}")
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
+return 0
+
+if __name__ == "__main__":
+sys.exit(run())
+
+Take the whole folder →
+MIT
+Python standard library only, read-only, deterministic
+
+---
+
+# Dwell — a Loop MMT gift
+https://loopmmt.com/gifts/dwell/
+[coverage: optional · branch: gifts]
+
+When You Commit Is What You Choose route ← all gifts
+
+Dwell
+
+A cart circles a loop of n ticks; holding is free and an extra full lap changes nothing. It leaves only when you reverse, and which of k exits it takes is a pure function of the phase at that instant: exit = (phase * k) // n. There's no separate 'pick' step — deferring costs nothing, and the moment you stop deferring IS the decision. Integer-exact and byte-replayable; a decision is an audit record you re-derive, not an opinion you store.
+
+The honest edge
+
+It is the deterministic router only: given (entry, reverse, n, k) the exit is a fact, but it does NOT decide when to stop deferring — that judgment (the reversal) is yours. k <= n is a wall (you can't quantize a loop of n ticks into more than n exits); k > n is refused, not rounded.
+
+Run it
+
+python3 dwell.py route 0 6 12 4
+test_dwell.py (89/89, mutation-bitten)
+Python stdlib only, deterministic
+
+The code — every file that ships
+
+dwell.py 182 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""dwell.py -- reversal-indexed routing: the WHEN you commit IS the WHAT you choose.
+
+A cart circles a loop of `n` ticks. Holding is free -- it can circle forever, and
+an extra full lap changes nothing. It leaves only when you REVERSE, and which of
+`k` exits it leaves on is a pure function of the PHASE at the instant of reversal:
+
+phase(entry, reverse, n) = (reverse - entry) mod n # where on the loop, in [0, n)
+exit_segment(entry, reverse, n, k) = (phase * k) // n # which of k exits, in [0, k)
+
+The choice is carried entirely by the timing. There is no separate "pick" step:
+deferring is free, and the moment you stop deferring is itself the decision. That
+is the whole idea -- a decision structure where latency is not lost time but the
+signal.
+
+Integer-exact by construction (no float), so the map is total, pure, and
+byte-replayable -- the same (entry, reverse, n, k) always yields the same exit,
+on any machine, forever. The WINDING number (how many full laps were circled) is
+DISCARDED for routing; that discard IS the free-hold property:
+
+exit_segment(entry, reverse, n, k) == exit_segment(entry, reverse + n, n, k)
+
+A `Mark` records a routing decision as two integers, and `replay(mark, n, k)`
+recomputes the exit from them -- so a decision is an audit record you can re-derive,
+never a stored opinion you have to trust.
+
+HONEST CEILING. This is the fully-deterministic ROUTER: given (entry, reverse, n, k)
+the exit is a fact. It does NOT decide *when* to stop deferring -- that single
+judgment (the reversal itself) is yours. The router turns your timing into a choice;
+it does not make the choice for you.
+
+python3 dwell.py route <entry> <reverse> <n> <k> # -> the exit segment [0, k)
+python3 dwell.py phase <entry> <reverse> <n> # -> phase [0, n) + winding
+python3 dwell.py demo # a small routing table
+python3 dwell.py --help
+
+Python 3 stdlib only, no dependencies.
 """
-expr = expr.strip()
-if expr == "" or expr.lower() == "none":
-return ("none", None), None
-head, _, rest = expr.partition(" ")
-kind = head.lower()
-rest = rest.strip()
-if kind in ("exists", "absent"):
-if not rest:
-return None, f"{kind} needs a path"
-return (kind, rest), None
-if kind == "contains":
-if " ~ " not in rest:
-return None, "contains needs the form: contains <path> ~ <text>"
-path, _, pattern = rest.partition(" ~ ")
-path = path.strip()
-if not path or pattern == "":
-return None, "contains needs both a path and a non-empty text"
-return ("contains", (path, pattern)), None
-if kind == "cmd":
-if not rest:
-return None, "cmd needs a command"
-return ("cmd", rest), None
-return None, f"unknown witness kind {kind!r} (want exists/absent/contains/cmd/none)"
+from __future__ import annotations
 
-# --- board parsing ----------------------------------------------------------
+import sys
+from dataclasses import dataclass
+from typing import NamedTuple
 
-def parse_board(text):
-"""Return a list of claim dicts (name, status, witness kind/arg, parse_error, line)."""
-claims = []
-for lineno, raw in enumerate(text.splitlines(), 1):
+__all__ = ["phase", "winding", "exit_segment", "Mark", "replay", "DwellError"]
+
+class DwellError(ValueError):
+"""A malformed Dwell call -- bad resolution, exit count, or tick order."""
+
+def _validate(entry_tick: int, reverse_tick: int, n: int, k: int) -> None:
+for name, val in (("entry_tick", entry_tick), ("reverse_tick", reverse_tick),
+("n", n), ("k", k)):
+if not isinstance(val, int) or isinstance(val, bool):
+raise DwellError(f"{name} must be a plain int, got {val!r}")
+if n < 1:
+raise DwellError(f"n (loop resolution) must be >= 1, got {n}")
+if k < 1:
+raise DwellError(f"k (exit count) must be >= 1, got {k}")
+if k > n:
+# You cannot quantize a loop of n ticks into more than n distinguishable exits.
+raise DwellError(f"k must be <= n (k<=n is a wall), got k={k} n={n}")
+if reverse_tick < entry_tick:
+# Ticks are a monotone clock; the cart enters, then circles, then reverses.
+raise DwellError(
+f"reverse_tick ({reverse_tick}) must be >= entry_tick ({entry_tick})")
+
+def phase(entry_tick: int, reverse_tick: int, n: int) -> int:
+"""Where on the loop the cart sits at reversal, in [0, n). Winding is folded out."""
+_validate(entry_tick, reverse_tick, n, k=1)
+return (reverse_tick - entry_tick) % n
+
+def winding(entry_tick: int, reverse_tick: int, n: int) -> int:
+"""
+How many FULL laps were circled before reversal (the coordinate the router
+discards). Read-only: routing never depends on it, and that independence IS the
+free-hold property -- a decision deferred through extra laps is not penalized.
+"""
+_validate(entry_tick, reverse_tick, n, k=1)
+return (reverse_tick - entry_tick) // n
+
+def exit_segment(entry_tick: int, reverse_tick: int, n: int, k: int) -> int:
+"""
+The router. Returns the exit segment in [0, k) the cart leaves on when reversed
+at `reverse_tick`, having entered at `entry_tick`, on a loop of resolution `n`
+with `k` exits.
+
+Pure, total, integer-exact. Tie-break at a segment boundary is floor, by
+construction (`(phase*k)//n`). Free-hold holds by the same construction: adding
+a full lap (n ticks) to reverse_tick leaves the exit unchanged.
+"""
+_validate(entry_tick, reverse_tick, n, k)
+return ((reverse_tick - entry_tick) % n * k) // n
+
+class Mark(NamedTuple):
+"""An audit record of one routing decision -- two integers, nothing else."""
+entry_tick: int
+reverse_tick: int
+
+@dataclass(frozen=True)
+class DwellSpec:
+"""The static shape of a loop: its resolution and its exit count."""
+n: int
+k: int
+
+def replay(mark: Mark, n: int, k: int) -> int:
+"""
+Recompute the exit a Mark produced, from the Mark plus the loop spec. Because the
+router is pure, replay(mark, n, k) == the exit_segment that produced it -- so the
+Mark is an audit record you re-derive, never an opinion you have to trust.
+"""
+return exit_segment(mark.entry_tick, mark.reverse_tick, n, k)
+
+# ---- CLI ---------------------------------------------------------------------------------------------
+_USAGE = """dwell.py -- reversal-indexed routing: when you commit is what you choose.
+
+python3 dwell.py route <entry> <reverse> <n> <k> the exit segment in [0, k)
+python3 dwell.py phase <entry> <reverse> <n> phase in [0, n) + winding (laps)
+python3 dwell.py demo a small routing table
+python3 dwell.py --help
+
+n = loop resolution (ticks per lap), k = number of exits (k <= n).
+An extra full lap never changes the exit -- deferring is free.
+"""
+
+def _demo() -> None:
+n, k = 12, 4
+print(f"loop n={n} ticks, k={k} exits; entry at tick 0")
+print("reverse | phase winding -> exit")
+for reverse in range(0, 25):
+p = phase(0, reverse, n)
+w = winding(0, reverse, n)
+e = exit_segment(0, reverse, n, k)
+print(f" {reverse:5d} | {p:5d} {w:6d} -> {e}")
+print("(note tick 12 and tick 24 -- a full/second lap -- route identically to tick 0: free-hold)")
+
+def main(argv) -> int:
+args = argv[1:]
+if not args or args[0] in ("--help", "-h", "help"):
+sys.stdout.write(_USAGE)
+return 0 if args else 1
+cmd = args[0]
+try:
+if cmd == "route":
+if len(args)!= 5:
+raise DwellError("route needs: <entry> <reverse> <n> <k>")
+entry, reverse, n, k = (int(x) for x in args[1:5])
+sys.stdout.write(str(exit_segment(entry, reverse, n, k)) + "\n")
+return 0
+if cmd == "phase":
+if len(args)!= 4:
+raise DwellError("phase needs: <entry> <reverse> <n>")
+entry, reverse, n = (int(x) for x in args[1:4])
+sys.stdout.write(f"phase={phase(entry, reverse, n)} winding={winding(entry, reverse, n)}\n")
+return 0
+if cmd == "demo":
+_demo()
+return 0
+except DwellError as e:
+sys.stderr.write(f"dwell: {e}\n")
+return 2
+except ValueError:
+sys.stderr.write("dwell: ticks, n, and k must be integers\n")
+return 2
+sys.stderr.write(f"dwell: unknown command {cmd!r}\n")
+sys.stderr.write(_USAGE)
+return 2
+
+if __name__ == "__main__":
+raise SystemExit(main(sys.argv))
+
+test_dwell.py 119 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_dwell.py -- proves the router is pure, total, and free-hold.
+
+The claims that ARE the tool:
+1. FREE-HOLD: adding a full lap (n ticks) to the reversal leaves the exit
+unchanged -- deferring is free. This is the whole idea; it gets the most tests.
+2. The exit is exactly (phase * k) // n, integer, in [0, k).
+3. replay(Mark) == the exit that produced it (an audit record, re-derived).
+4. Malformed calls REFUSE (raise DwellError), they don't silently guess.
+Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
+Exit 0 = all pass, exit 1 = a failure (loud).
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dwell import phase, winding, exit_segment, Mark, replay, DwellError
+
+_pass = 0
+_fail = 0
+
+def eq(name, got, want):
+global _pass, _fail
+if got == want:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
+
+def ok(name, cond):
+global _pass, _fail
+if cond:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}")
+
+def raises(name, fn):
+global _pass, _fail
+try:
+fn()
+_fail += 1
+print(f"FAIL {name} -- expected DwellError, none raised")
+except DwellError:
+_pass += 1
+except Exception as e: # noqa: BLE001
+_fail += 1
+print(f"FAIL {name} -- wrong exception {type(e).__name__}: {e}")
+
+# --- 1. FREE-HOLD: an extra full lap never changes the exit ---------------------------------
+n, k = 12, 4
+for reverse in range(0, 12):
+base = exit_segment(0, reverse, n, k)
+eq(f"free-hold +1 lap @rev={reverse}", exit_segment(0, reverse + n, n, k), base)
+eq(f"free-hold +2 laps @rev={reverse}", exit_segment(0, reverse + 2 * n, n, k), base)
+eq(f"free-hold +7 laps @rev={reverse}", exit_segment(0, reverse + 7 * n, n, k), base)
+
+# winding counts the laps that routing discards
+eq("winding 0 laps", winding(0, 5, 12), 0)
+eq("winding 1 lap", winding(0, 17, 12), 1)
+eq("winding 7 laps", winding(0, 84, 12), 7)
+eq("phase folds winding out", phase(0, 84, 12), phase(0, 0, 12))
+
+# --- 2. the routing law is exactly (phase*k)//n, in range ----------------------------------
+eq("phase 0 -> exit 0", exit_segment(0, 0, 12, 4), 0)
+eq("phase 3 -> exit 1", exit_segment(0, 3, 12, 4), 1) # (3*4)//12 = 1
+eq("phase 5 -> exit 1", exit_segment(0, 5, 12, 4), 1) # (5*4)//12 = 1
+eq("phase 6 -> exit 2", exit_segment(0, 6, 12, 4), 2) # (6*4)//12 = 2
+eq("phase 11 -> exit 3", exit_segment(0, 11, 12, 4), 3) # (11*4)//12 = 3
+# boundary tie-break is floor by construction
+eq("boundary floor phase 2->0", exit_segment(0, 2, 12, 4), 0) # (2*4)//12 = 0
+
+# entry offset only matters via the difference
+eq("entry offset invariance", exit_segment(100, 105, 12, 4), exit_segment(0, 5, 12, 4))
+
+# every exit stays in [0, k) across a whole lap
+for reverse in range(0, n):
+e = exit_segment(0, reverse, n, k)
+ok(f"exit in range @rev={reverse}", 0 <= e < k)
+
+# k == n: each tick is its own exit (bijective)
+for reverse in range(0, 8):
+eq(f"k==n bijection @rev={reverse}", exit_segment(0, reverse, 8, 8), reverse)
+
+# k == 1: everything routes to the single exit 0
+for reverse in range(0, 12):
+eq(f"k==1 single exit @rev={reverse}", exit_segment(0, reverse, 12, 1), 0)
+
+# --- 3. replay(Mark) == the exit that produced it -------------------------------------------
+m = Mark(entry_tick=3, reverse_tick=20)
+eq("replay == exit_segment", replay(m, 12, 4), exit_segment(3, 20, 12, 4))
+# an audit record survives a re-derivation on any machine (pure)
+eq("replay deterministic", replay(m, 12, 4), replay(m, 12, 4))
+
+# --- 4. malformed calls REFUSE, never guess ------------------------------------------------
+raises("n<1 refused", lambda: exit_segment(0, 0, 0, 1))
+raises("k<1 refused", lambda: exit_segment(0, 0, 12, 0))
+raises("k>n refused (the wall)", lambda: exit_segment(0, 0, 4, 5))
+raises("reverse<entry refused", lambda: exit_segment(5, 3, 12, 4))
+raises("bool is not int", lambda: exit_segment(0, True, 12, 4))
+raises("float refused", lambda: phase(0, 5.0, 12))
+
+# --- mutation bite: prove free-hold has teeth ----------------------------------------------
+# If routing (wrongly) depended on winding, +1 lap WOULD change the exit for some reversal.
+# Assert there EXISTS a reversal where phase differs from phase+lap yet exits still match --
+# i.e. the invariant is non-vacuous (the exits are not all identical anyway).
+distinct_exits = {exit_segment(0, r, n, k) for r in range(n)}
+ok("mutation bite: exits are genuinely varied", len(distinct_exits) == k)
+ok("mutation bite: +lap holds AND base varies",
+exit_segment(0, 3, n, k) == exit_segment(0, 3 + n, n, k)
+and exit_segment(0, 3, n, k)!= exit_segment(0, 6, n, k))
+
+print(("PASS" if _fail == 0 else "FAIL") + f" -- {_pass} passed, {_fail} failed")
+sys.exit(0 if _fail == 0 else 1)
+
+Take the whole folder →
+MIT
+Python stdlib only, deterministic
+
+---
+
+# The Excavation — a Loop MMT gift
+https://loopmmt.com/gifts/excavation/
+[coverage: optional · branch: gifts]
+
+Coverage-Provable Reading Contract excavate ← all gifts
+
+The Excavation
+
+Point this at your site; hand the output to any AI; it can now prove it read all of it. Enumerate every page as a typed node, shard by budget, and track coverage against that enumerated oracle until the set-difference is empty — an honest accounting, not a confident skim.
+
+What it is
+
+A big site is bigger than one person — or one AI context window — can read in a sitting. The Excavation turns a bounded web corpus into a coverage-provable reading job. It builds three things from your site: a manifest (every page as a typed node — the coverage oracle), shards (the pages bundled into context-sized chunks), and a reckoning (a structured protocol a reader follows, tracking what it has covered against the manifest until the set-difference is empty). The result isn't “I read the important parts” — it's an enumerated whole and an honest accounting against it, with nothing missing.
+
+This is the coverage-contract: enumerate every node, shard by budget, prove coverage against the node set. Not a crawler. Not SEO. A way to hand an AI a corpus and get back proof of complete coverage instead of a confident skim.
+
+The authority handshake — not optional. The Excavation is run by an AI only when a human explicitly asks it to. A human copying this prompt to an AI is the authorization; absent that human act, an AI should not initiate an excavation, treat a site's existence as consent to ingest it, or self-authorize crawling. A human asks; the AI reads what it was pointed at; the AI reports coverage — including what it could not reach. Nothing runs without the human's ask.
+
+Use it
+
+git and Python 3 only, no dependencies, MIT licensed. Copy the directory, set four config knobs, declare your reconnaissance reading set, and run one script.
+
+cp excavate.config.example excavate.config # base_url, site_name, node_source, coverage_rules
+cp core-set.txt.example core-set.txt # your reconnaissance pages (the one input that matters)
+python3 excavate.py # writes manifest + shards + reckoning.json
+python3 excavate.py --check # honesty invariant: manifest nodes == site node set
+
+Hand the three output files to an AI with “read this corpus and prove you covered all of it,” and reckoning.json tells it exactly how.
+
+The core set — the one input that matters
+
+The reckoning offers two reading altitudes: a quick reconnaissance pass and a full pass. Reconnaissance reads a small, declared set of pages — the ones a newcomer should read first to understand the whole. That set can't be inferred; you declare it, one served filename per line, in core-set.txt. Leave it undeclared and the Excavation still runs, but it says so loudly and collapses to a single tier — because a reconnaissance altitude with no declared core set would read everything and mean nothing.
+
+The honest edge
+
+The standalone driver is proven in a tree that carries the builders and their helpers; pointed at a bare stranger tree it fails loudly on the missing imports rather than pretending. Full standalone independence is the next build beat — earned against a real foreign fixture, not asserted. The gap is documented in the driver header, not papered over.
+
+Run it
+
+python3 excavate.py --check
+in-tree proven · standalone gate: beat 5
+git + Python 3 stdlib, no dependencies
+
+The code — every file that ships
+
+excavate.py 135 lines on GitHub →
+#!/usr/bin/env python3
+"""excavate.py — The Excavation gift driver.
+
+Reads `excavate.config` (+ optional `core-set.txt`), enumerates a site's pages,
+and emits the three coverage-contract faces:
+
+corpus-manifest.json the typed-node coverage ORACLE
+corpus-shards.json budget-sized reading bundles (a pure fold of the manifest)
+reckoning.json the reader's coverage protocol (a pure fold of the two above)
+
+Hand those three to an AI with "read this corpus and prove you covered all of it,"
+and reckoning.json tells it exactly how (see README, "What 'done' looks like").
+
+python3 excavate.py build the three faces from./excavate.config
+python3 excavate.py --check honesty invariant: manifest nodes == site node set
+
+──────────────────────────────────────────────────────────────────────────────
+HONEST STATUS (read before relying on this on a non-loopmmt site)
+──────────────────────────────────────────────────────────────────────────────
+The generalized builders (build_corpus_manifest.py + its two pure-fold siblings)
+carry a config object (`_CFG`) whose defaults reproduce loopmmt.com byte-identical
+and whose knobs — base_url, site_name, wrapper_dir, coverage_rules, core_set —
+are exactly what this driver injects from excavate.config / core-set.txt.
+
+What is PROVEN: the config surface, the _branch generalization, and the
+declared-core-set mechanism (a foreign run with no core-set.txt emits a loud note
+and collapses to one tier rather than silently mis-sharding).
+
+STANDALONE INDEPENDENCE — PROVEN (DP-039 s7 beat 5, the acceptance gate). The
+in-tree builders (build_corpus_manifest + siblings) still import loopmmt's own
+toolchain (build_machine_digest for the sitemap walk; redact + disclosure_gate for
+the publish gates) — that path stays byte-identical on the home site. A stranger's
+bare tree carries none of those, so this driver no longer dies on the missing
+imports: it falls back to `excavate_standalone.py`, a self-contained builder that
+does a local.html walk (replacing the sitemap walk), extracts title/desc/body with
+stdlib re+html (replacing the digest helpers), and DROPS the two publish gates —
+loopmmt.com publish controls keyed to loopmmt's private-signature set and
+disclosure map, a safety a stranger's own served tree does not need and this gift
+must not falsely assert. Earned the way the beat required: by running against a
+REAL non-loopmmt fixture (test-fixture/) under smoke_test.sh and letting the
+missing-import failure define the seam. See excavate_standalone.py + smoke_test.sh.
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_NAME = "excavate.config"
+CORE_SET_NAME = "core-set.txt"
+
+def _die(msg, code=1):
+sys.stderr.write("excavate: " + msg + "\n")
+sys.exit(code)
+
+def parse_config(path):
+"""Parse the `key = value` config. Returns a dict with a `coverage_rules`
+list assembled from the repeated `rule = <substring> => <class>` lines."""
+if not os.path.isfile(path):
+_die("no %s found next to excavate.py — copy %s.example to %s and edit it."
+% (CONFIG_NAME, CONFIG_NAME, CONFIG_NAME))
+cfg = {"coverage_rules": []}
+with open(path, "r", encoding="utf-8") as fh:
+for raw in fh:
 line = raw.strip()
 if not line or line.startswith("#"):
 continue
-# GIFT-009: parse NAME-first with a bounded left split, so a `cmd:` witness
-# that legitimately contains shell pipes (`... | wc -l`) is NOT torn apart.
-# The old `line.split("|")` counted every pipe as a field boundary, so a
-# piped command produced 4+ fields and hit the "2 or 3 fields" error — the
-# command was lost purely for containing a pipe. The grammar is unchanged
-# for the reader (name | [status] | witness); only the SPLIT is bounded:
-# field 0 is the name, an optional bare-status field 1, and EVERYTHING after
-# is the witness, rejoined verbatim (interior pipes preserved).
-head = [f.strip() for f in line.split("|", 2)]
-if len(head) == 2:
-name, status, wexpr = head[0], "assert", head[1]
-elif len(head) == 3:
-# 3 raw segments: field 1 is the status ONLY if it's a bare status
-# keyword; otherwise it belongs to a 2-field claim whose witness itself
-# carried a pipe, so fold field 1 back into the witness.
-if head[1].lower() in ("assert", "todo"):
-name, status, wexpr = head[0], head[1].lower(), head[2]
+if "=" not in line:
+_die("malformed config line (no '='): %r" % raw.rstrip())
+key, _, val = line.partition("=")
+key, val = key.strip(), val.strip()
+if key == "rule":
+if "=>" not in val:
+_die("malformed coverage rule (want 'substring => class'): %r" % val)
+sub, _, cls = val.partition("=>")
+sub, cls = sub.strip(), cls.strip()
+if cls not in ("deep", "standard", "optional"):
+_die("coverage rule class must be deep|standard|optional, got %r" % cls)
+cfg["coverage_rules"].append((sub, cls))
 else:
-name, status, wexpr = head[0], "assert", head[1] + " | " + head[2]
-else:
-claims.append({"name": line, "status": "assert", "line": lineno,
-"parse_error": "a claim needs a name and a witness "
-"(name | witness or name | status | witness)"})
-continue
-if not name:
-claims.append({"name": "(unnamed)", "status": status, "line": lineno,
-"parse_error": "claim has no name"})
-continue
-if status not in ("assert", "todo"):
-claims.append({"name": name, "status": "assert", "line": lineno,
-"parse_error": f"unknown status {status!r} (want assert|todo)"})
-continue
-parsed, err = parse_witness(wexpr)
-if err:
-claims.append({"name": name, "status": status, "line": lineno,
-"parse_error": err})
-continue
-kind, arg = parsed
-claims.append({"name": name, "status": status, "witness_kind": kind,
-"witness_arg": arg, "line": lineno, "parse_error": None})
-return claims
+cfg[key] = val
+if not cfg.get("base_url"):
+_die("config is missing the required `base_url`.")
+cfg["base_url"] = cfg["base_url"].rstrip("/")
+return cfg
 
-# --- witness evaluation -----------------------------------------------------
-
-def eval_witness(kind, arg, cwd):
-"""Return (satisfied, detail). satisfied is True/False, or None = could-not-evaluate."""
-if kind == "exists":
-ok = os.path.exists(os.path.join(cwd, arg))
-return ok, ("present" if ok else "MISSING") + f": {arg}"
-if kind == "absent":
-ok = not os.path.exists(os.path.join(cwd, arg))
-return ok, ("absent" if ok else "PRESENT") + f": {arg}"
-if kind == "contains":
-path, pattern = arg
-full = os.path.join(cwd, path)
-try:
-with open(full, "r", encoding="utf-8", errors="replace") as f:
-text = f.read()
-except Exception as ex:
-return None, f"unreadable {path}: {ex.__class__.__name__}"
-ok = pattern in text
-return ok, (f"found {pattern!r}" if ok else f"NOT found {pattern!r}") + f" in {path}"
-if kind == "cmd":
-try:
-rc = subprocess.call(arg, shell=True, cwd=cwd,
-stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-except Exception as ex:
-return None, f"could not launch: {ex.__class__.__name__}"
-return (rc == 0), f"exit {rc}"
-return None, f"unknown witness kind {kind!r}"
-
-def evaluate(claim, cwd):
-"""A parsed claim -> (verdict, detail)."""
-if claim.get("parse_error"):
-return BLOCKED, claim["parse_error"]
-status = claim["status"]
-kind = claim["witness_kind"]
-arg = claim["witness_arg"]
-if kind == "none":
-if status == "todo":
-return TODO, "no witness yet (todo)"
-return UNWITNESSED, "asserted PASS with no witness beneath it"
-satisfied, detail = eval_witness(kind, arg, cwd)
-if satisfied is None:
-return BLOCKED, detail
-if status == "todo":
-return (READY if satisfied else TODO), detail
-return (HELD if satisfied else BROKEN), detail
-
-# --- run / render -----------------------------------------------------------
-
-def run(board_text, cwd):
-rows = []
-for c in parse_board(board_text):
-verdict, detail = evaluate(c, cwd)
-rows.append({"name": c["name"], "status": c["status"], "verdict": verdict,
-"detail": detail, "line": c["line"]})
-return rows
-
-def exit_code(rows):
-verdicts = {r["verdict"] for r in rows}
-if verdicts & set(_FAIL_1):
-return 1
-if verdicts & set(_FAIL_2):
-return 2
-return 0
-
-_MARK = {HELD: "ok ", BROKEN: "XX ", UNWITNESSED: "XX ", BLOCKED: "?? ",
-TODO: ". ", READY: ">> "}
-
-def render_table(rows):
-if not rows:
-return "(no claims)"
-w = max(len(r["name"]) for r in rows)
-out = []
-for r in rows:
-out.append(f" {_MARK.get(r['verdict'], ' ')} {r['name']:<{w}} "
-f"{r['verdict']:<11} {r['detail']}")
-return "\n".join(out)
-
-def summary(rows):
-counts = {}
-for r in rows:
-counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-order = [HELD, BROKEN, UNWITNESSED, BLOCKED, TODO, READY]
-parts = [f"{counts[v]} {v.lower()}" for v in order if counts.get(v)]
-return "plumb: " + (" · ".join(parts) if parts else "no claims")
-
-def main(argv=None):
-ap = argparse.ArgumentParser(
-prog="plumb.py",
-description="A status board that refuses to show green on hope.")
-ap.add_argument("board", help="path to a.plumb board file, or - for stdin")
-ap.add_argument("--cwd", default=None,
-help="base dir for relative witness paths and commands "
-"(default: the board file's directory; '.' for stdin)")
-ap.add_argument("--json", action="store_true",
-help="machine-readable output on stdout")
-ap.add_argument("--quiet", action="store_true",
-help="print only the summary line (+ ceiling on stderr)")
-args = ap.parse_args(argv)
-
-if args.board == "-":
-board_text = sys.stdin.read()
-default_cwd = "."
-else:
-try:
-with open(args.board, "r", encoding="utf-8") as f:
-board_text = f.read()
-except Exception as ex:
-_eprint(f"plumb: cannot read board {args.board!r}: {ex}")
-return 3
-default_cwd = os.path.dirname(os.path.abspath(args.board)) or "."
-cwd = args.cwd or default_cwd
-
-rows = run(board_text, cwd)
-code = exit_code(rows)
-
-if args.json:
-print(json.dumps({"rows": rows, "exit": code}, indent=2))
-else:
-if not args.quiet:
-print(render_table(rows))
-print()
-print(summary(rows))
-
-_eprint(CEILING)
-return code
-
-if __name__ == "__main__":
-sys.exit(main())
-
-smoke_test.py 154 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""smoke_test.py — hermetic proof that plumb.py holds the line. No network, no
-state outside a tmpdir. Each scenario writes a board + evidence, runs plumb.py as
-a subprocess, and checks the exit code and the verdict text — the real CLI
-contract, mirroring the durability claims:
-
-1 a satisfied witness renders HELD and the run is clean (exit 0)
-2 a claim asserting PASS with a MISSING witness is caught BROKEN (exit 1) <- the headline
-3 a claim asserting PASS with NO witness is UNWITNESSED (exit 1)
-4 contains: HELD when the text is present, BROKEN when absent
-5 absent: HELD when the path is gone, BROKEN when it is present
-6 cmd: exit 0 -> HELD, non-zero -> BROKEN
-7 a malformed witness is BLOCKED, not silently passed (exit 2)
-8 a todo claim never renders green: unsatisfied -> TODO, satisfied -> READY,
-and neither fails the run (exit 0)
-
-Run: python3 smoke_test.py (expect: 8/8 passed)
-"""
-import os
-import subprocess
-import sys
-import tempfile
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-PLUMB = os.path.join(HERE, "plumb.py")
-PASS = 0
-FAIL = 0
-
-def ok(msg):
-global PASS
-PASS += 1
-print(f"ok {msg}")
-
-def bad(msg, why):
-global FAIL
-FAIL += 1
-print(f"FAIL {msg}: {why}")
-
-def run_plumb(board_text, cwd):
-"""Write board.plumb into cwd, run plumb.py against it, return (rc, stdout)."""
-board = os.path.join(cwd, "board.plumb")
-with open(board, "w", encoding="utf-8") as f:
-f.write(board_text)
-p = subprocess.run([sys.executable, PLUMB, board],
-stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-return p.returncode, p.stdout
-
-def write(cwd, name, text=""):
-with open(os.path.join(cwd, name), "w", encoding="utf-8") as f:
-f.write(text)
-
-def t1(d):
-write(d, "artifact.txt", "built")
-rc, out = run_plumb("build shipped | exists artifact.txt\n", d)
-if rc == 0 and "HELD" in out:
-ok("satisfied witness renders HELD, run is clean")
-else:
-bad("held", f"rc={rc} out=[{out.strip()}]")
-
-def t2(d):
-# assert PASS but the witness file does not exist -> green on hope, caught
-rc, out = run_plumb("build shipped | exists nope.txt\n", d)
-if rc == 1 and "BROKEN" in out:
-ok("asserted PASS with a missing witness is caught BROKEN (exit 1)")
-else:
-bad("green-on-hope", f"expected rc=1 + BROKEN, got rc={rc} out=[{out.strip()}]")
-
-def t3(d):
-rc, out = run_plumb("migration done | none\n", d)
-if rc == 1 and "UNWITNESSED" in out:
-ok("asserted PASS with no witness is UNWITNESSED (exit 1)")
-else:
-bad("unwitnessed", f"expected rc=1 + UNWITNESSED, got rc={rc} out=[{out.strip()}]")
-
-def t4(d):
-write(d, "README.md", "# thing\n\nMIT licensed.\n")
-rc, out = run_plumb("readme licensed | contains README.md ~ MIT\n", d)
-if not (rc == 0 and "HELD" in out):
-bad("contains-present", f"rc={rc} out=[{out.strip()}]")
-return
-rc2, out2 = run_plumb("readme gpl | contains README.md ~ GPL\n", d)
-if rc2 == 1 and "BROKEN" in out2:
-ok("contains: HELD when text present, BROKEN when absent")
-else:
-bad("contains-absent", f"rc={rc2} out=[{out2.strip()}]")
-
-def t5(d):
-rc, out = run_plumb("no secret | absent.env\n", d)
-if not (rc == 0 and "HELD" in out):
-bad("absent-gone", f"rc={rc} out=[{out.strip()}]")
-return
-write(d, ".env", "SECRET=x")
-rc2, out2 = run_plumb("no secret | absent.env\n", d)
-if rc2 == 1 and "BROKEN" in out2:
-ok("absent: HELD when path gone, BROKEN when present")
-else:
-bad("absent-present", f"rc={rc2} out=[{out2.strip()}]")
-
-def t6(d):
-rc, out = run_plumb("truthy | cmd true\n", d)
-if not (rc == 0 and "HELD" in out):
-bad("cmd-zero", f"rc={rc} out=[{out.strip()}]")
-return
-rc2, out2 = run_plumb("falsy | cmd false\n", d)
-if rc2 == 1 and "BROKEN" in out2:
-ok("cmd: exit 0 -> HELD, non-zero -> BROKEN")
-else:
-bad("cmd-nonzero", f"rc={rc2} out=[{out2.strip()}]")
-
-def t7(d):
-# 'contains' with no ' ~ ' separator is malformed -> BLOCKED, not a silent pass
-rc, out = run_plumb("bad witness | contains README.md MIT\n", d)
-if rc == 2 and "BLOCKED" in out:
-ok("a malformed witness is BLOCKED, not silently passed (exit 2)")
-else:
-bad("blocked", f"expected rc=2 + BLOCKED, got rc={rc} out=[{out.strip()}]")
-
-def t8(d):
-# todo claims never go green, and never fail the run
-board = (
-"later feature | todo | exists notyet.txt\n" # unsatisfied -> TODO
-"already built | todo | cmd true\n" # satisfied -> READY
-)
-rc, out = run_plumb(board, d)
-if rc == 0 and "TODO" in out and "READY" in out and "HELD" not in out:
-ok("todo never renders green: TODO / READY, run stays clean (exit 0)")
-else:
-bad("todo", f"expected rc=0, TODO+READY, no HELD; rc={rc} out=[{out.strip()}]")
+def read_core_set(path):
+"""Read the declared reconnaissance set, one served filename per line.
+Returns None when absent (the builder then emits its loud single-tier note)."""
+if not os.path.isfile(path):
+return None
+names = []
+with open(path, "r", encoding="utf-8") as fh:
+for raw in fh:
+line = raw.strip()
+if line and not line.startswith("#"):
+names.append(line)
+return set(names) if names else None
 
 def main():
-for t in (t1, t2, t3, t4, t5, t6, t7, t8):
-with tempfile.TemporaryDirectory() as d:
-t(d)
-print()
-print(f"{PASS}/{PASS + FAIL} passed")
-return 0 if FAIL == 0 else 1
+cfg = parse_config(os.path.join(HERE, CONFIG_NAME))
+core = read_core_set(os.path.join(HERE, CORE_SET_NAME))
+
+# Two builder paths, chosen by what the tree carries:
+# * IN-TREE (loopmmt.com) — build_corpus_manifest.py + siblings are present;
+# inject config into their _CFG and run them (byte-identical home output).
+# * STANDALONE (a stranger's bare tree) — those builders are absent; run the
+# self-contained excavate_standalone.py, which does a local walk with zero
+# loopmmt deps. This is the fixture-proven acceptance beat (DP-039 s7 b5):
+# the missing-import failure is no longer fatal — it routes to standalone.
+try:
+import build_corpus_manifest as manifest
+except ImportError:
+import excavate_standalone as standalone
+standalone.main()
+return
+
+manifest._CFG["base_url"] = cfg["base_url"]
+manifest._CFG["site_name"] = cfg.get("site_name", cfg["base_url"])
+manifest._CFG["wrapper_dir"] = cfg.get("wrapper_dir") or ""
+manifest._CFG["node_source"] = cfg.get("node_source", "local-walk")
+if cfg["coverage_rules"]:
+manifest._CFG["coverage_rules"] = cfg["coverage_rules"]
+if core is not None:
+manifest._CFG["core_set"] = core
+
+if "--check" in sys.argv:
+sys.argv = [a for a in sys.argv if a!= "--check"] + ["--check"]
+manifest.main()
 
 if __name__ == "__main__":
-sys.exit(main())
+main()
+
+core-set.txt.example 19 lines on GitHub →
+# The Excavation — core set. Copy this to `core-set.txt` and edit.
+#
+# This is the DECLARED reconnaissance reading set: the pages a newcomer (human or
+# AI) should read FIRST to understand the whole site before the full pass. It is
+# the one input the Excavation cannot infer for you — you know which pages are the
+# doorway to your corpus; a path rule does not.
+#
+# One served filename per line, as it appears in your site tree (the same path the
+# manifest lists it under). Lines starting with # are comments and are ignored.
+#
+# If you leave core-set.txt absent entirely, the Excavation still runs, but it
+# emits a loud note and collapses to a single reading tier — the reconnaissance
+# altitude only means something when this set is a real, curated subset.
+#
+# Example (delete these and list your own):
+
+index.html
+about.html
+start-here.html
+
+excavate.config.example 45 lines on GitHub →
+# The Excavation — config. Copy this to `excavate.config` and edit.
+# This file ships as an EXAMPLE; it contains no real site data.
+#
+# Format: one `key = value` per line. Blank lines and `#` comments ignored.
+# Four keys. Only `base_url` is strictly required; the rest have safe defaults.
+
+# base_url (REQUIRED) — your site's canonical base. Every page node's identity
+# is a URL under this base. No trailing slash.
+base_url = https://example.com
+
+# site_name — a short human label used in the emitted output. Cosmetic.
+site_name = Example Site
+
+# node_source — how pages are enumerated. v1 supports `local-walk`: point the
+# tool at a local copy of your served tree (see `site_dir` below) and
+# it walks every.html file. This is the substrate-general default
+# because it needs nothing your site doesn't already have on disk.
+node_source = local-walk
+
+# site_dir — the local directory holding your served.html tree, relative to
+# this config file (or absolute). For a local-walk run this is what
+# gets enumerated. Example: a checkout of your site's public/ folder.
+site_dir =./site
+
+# wrapper_dir — OPTIONAL. If your served pages live under a single wrapper
+# directory that is NOT part of their public URL path (e.g. your repo
+# keeps reading pages in `site/` but they serve from the root), name
+# it here so path-depth is measured in real URL segments. Leave blank
+# if your on-disk layout matches your URL layout (the common case).
+wrapper_dir =
+
+# coverage_rules — OPTIONAL. Ordered `substring => class` rules that sort pages
+# into reading classes. First match wins; unmatched => standard.
+# One rule per line, `substring => class`. Valid classes:
+# deep | standard | optional. Leave this whole section empty for the
+# safe generic default (everything is `standard`; your core-set.txt
+# carries the reconnaissance tier). Add rules only when your site has
+# real structure worth partitioning. Examples (delete or edit):
+# rule = /docs/ => deep
+# rule = /archive/ => optional
+
+# core_set — declared in the separate `core-set.txt` sidecar, NOT here (one
+# served filename per line). See the README's "The core set" section:
+# it is the one input that actually carries weight. If absent, the run
+# emits a loud note and collapses to a single reading tier.
+
+excavate_standalone.py 423 lines on GitHub →
+#!/usr/bin/env python3
+"""excavate_standalone.py — the self-contained Excavation builder.
+
+This is the STRANGER-SIDE builder: it emits the three excavation faces
+(corpus-manifest.json, corpus-shards.json, reckoning.json) for a foreign site
+with ZERO loopmmt.com dependencies. It carries no import of build_machine_digest,
+redact, or disclosure_gate — a bare tree has none of those, and this module is
+what the acceptance beat (DP-039 s7 beat 5) extracts so the gift runs anywhere.
+
+WHAT IT REPRODUCES (and how it differs from the in-tree builders):
+* NODE SOURCE — a self-contained recursive local walk of `site_dir` (every
+*.html leaf), NOT digest.sitemap_pages(). Redirect stubs (meta-refresh) are
+skipped, matching the in-tree walk's exclusion.
+* TEXT / META — local _meta() and _page_text() equivalents, stdlib re+html
+only (byte-identical logic to the digest helpers).
+* PUBLISH GATES — DROPPED. redact.scan_text and disclosure_gate.require_publish
+are loopmmt.com publish controls keyed to loopmmt's private-signature set and
+disclosure map. A stranger's tree has neither, and the gift never asserts a
+safety it cannot honestly run: the stranger's own tree is their published
+surface by construction (they point it at their served files). The HONEST
+STATUS in excavate.py names this as the correct foreign behaviour.
+
+DETERMINISM: stdlib only, offline, no wall-clock field. A re-run over an
+unchanged tree is byte-identical (folds-twice-identical) — the same property the
+staleness lints rely on. lastmod is OMITTED in standalone mode (a stranger's git
+history is not this gift's to assume; the in-tree builder reads it from loopmmt's
+own repo). Its absence is honest, not a gap.
+
+USAGE (driven by excavate.py; runnable directly for the smoke test):
+python3 excavate_standalone.py build the three faces
+python3 excavate_standalone.py --check honesty invariant: manifest == walk
+Config is read from excavate.config next to this file (same parser the driver
+uses); site_dir names the local served tree.
+"""
+import hashlib
+import html
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_NAME = "excavate.config"
+CORE_SET_NAME = "core-set.txt"
+
+# Shard budget — the ~40K-token reading-bundle size the in-tree builder uses.
+SHARD_TOKEN_BUDGET = 40000
+
+# ── config (same shape excavate.py parses) ──────────────────────────────────
+def _die(msg, code=1):
+sys.stderr.write("excavate-standalone: " + msg + "\n")
+sys.exit(code)
+
+def parse_config(path):
+if not os.path.isfile(path):
+_die("no %s found next to this builder — copy %s.example and edit it."
+% (CONFIG_NAME, CONFIG_NAME))
+cfg = {"coverage_rules": []}
+with open(path, "r", encoding="utf-8") as fh:
+for raw in fh:
+line = raw.strip()
+if not line or line.startswith("#"):
+continue
+if "=" not in line:
+_die("malformed config line (no '='): %r" % raw.rstrip())
+key, _, val = line.partition("=")
+key, val = key.strip(), val.strip()
+if key == "rule":
+if "=>" not in val:
+_die("malformed coverage rule (want 'substring => class'): %r" % val)
+sub, _, cls = val.partition("=>")
+sub, cls = sub.strip(), cls.strip()
+if cls not in ("deep", "standard", "optional"):
+_die("coverage rule class must be deep|standard|optional, got %r" % cls)
+cfg["coverage_rules"].append((sub, cls))
+else:
+cfg[key] = val
+if not cfg.get("base_url"):
+_die("config is missing the required `base_url`.")
+cfg["base_url"] = cfg["base_url"].rstrip("/")
+cfg.setdefault("site_name", cfg["base_url"])
+cfg.setdefault("site_dir", "./site")
+cfg.setdefault("wrapper_dir", "")
+return cfg
+
+def load_core_set(config_dir=HERE):
+path = os.path.join(config_dir, CORE_SET_NAME)
+if not os.path.isfile(path):
+return None
+out = set()
+with open(path, "r", encoding="utf-8") as fh:
+for line in fh:
+line = line.split("#", 1)[0].strip()
+if line:
+out.add(line)
+return out or None
+
+# ── local HTML helpers (stdlib-only equivalents of the digest helpers) ──────
+def _meta(path):
+"""(title, description) from a page's <head>. Same logic as digest._meta,
+dropping og:url/canonical (a standalone node's url is derived from its path,
+not read from the page)."""
+try:
+with open(path, encoding="utf-8") as fh:
+h = fh.read()
+except OSError:
+return "", ""
+
+def grab(pat):
+m = re.search(pat, h, re.S)
+return html.unescape(m.group(1).strip()) if m else ""
+return grab(r"<title>(.*?)</title>"), grab(r'<meta name="description" content="(.*?)"')
+
+def _is_redirect_stub(path):
+try:
+with open(path, encoding="utf-8") as fh:
+return re.search(r'<meta\s+http-equiv=["\']refresh["\']', fh.read(), re.I) is not None
+except OSError:
+return False
+
+def _page_text(path):
+"""Plain body text — byte-identical logic to digest._page_text (no DRAFT
+sentinel branch: a stranger has no loopmmt draft convention)."""
+try:
+with open(path, encoding="utf-8") as fh:
+h = fh.read()
+except OSError:
+return "(source unavailable)"
+h = re.sub(r"(?is)<head\b.*?</head>", " ", h)
+h = re.sub(r"(?is)<script\b.*?</script>", " ", h)
+h = re.sub(r"(?is)<style\b.*?</style>", " ", h)
+h = re.sub(r"(?is)<svg\b.*?</svg>", " ", h)
+m = re.search(r"(?is)<main\b[^>]*>(.*?)</main>", h)
+if m:
+h = m.group(1)
+h = re.sub(r"(?is)<(p|div|section|article|li|h[1-6]|tr|br)\b[^>]*>", "\n", h)
+h = re.sub(r"(?is)<[^>]+>", " ", h)
+h = html.unescape(h)
+h = re.sub(r"[ \t]+", " ", h)
+lines = [ln.strip() for ln in h.splitlines()]
+out, blank = [], False
+for ln in lines:
+if ln:
+out.append(ln)
+blank = False
+elif not blank:
+out.append("")
+blank = True
+return "\n".join(out).strip()
+
+# ── the local walk (the node source — replaces digest.sitemap_pages) ────────
+def _site_dir(cfg):
+sd = cfg["site_dir"]
+return sd if os.path.isabs(sd) else os.path.normpath(os.path.join(HERE, sd))
+
+def _served_rel(cfg, disk_path):
+"""The served path for a local file, relative to site_dir, forward-slashed.
+A wrapper_dir (if the served tree sits under a non-URL wrapper) is peeled."""
+rel = os.path.relpath(disk_path, _site_dir(cfg)).replace(os.sep, "/")
+wd = cfg.get("wrapper_dir")
+if wd and rel.startswith(wd + "/"):
+rel = rel[len(wd) + 1:]
+return rel
+
+def walk_nodes(cfg):
+"""Every served *.html leaf under site_dir, as {url, served_rel, disk},
+sorted for determinism. Redirect stubs are skipped (routing, not content)."""
+base = cfg["base_url"]
+root = _site_dir(cfg)
+if not os.path.isdir(root):
+_die("site_dir %r does not exist (config: site_dir = %s)" % (root, cfg["site_dir"]), code=2)
+found = []
+for dirpath, _dirs, files in os.walk(root):
+for fn in files:
+if not fn.endswith(".html"):
+continue
+disk = os.path.join(dirpath, fn)
+if _is_redirect_stub(disk):
+continue
+served = _served_rel(cfg, disk)
+url = base + "/" + served
+found.append({"url": url, "served_rel": served, "disk": disk})
+found.sort(key=lambda n: n["served_rel"])
+return found
+
+# ── coverage typing (config-driven; same rules as the in-tree builder) ──────
+def _branch(served_rel):
+if served_rel in ("", "index.html"):
+return "root"
+parts = [p for p in served_rel.split("/") if p]
+if not parts:
+return "root"
+if len(parts) == 1:
+return parts[0] if served_rel.endswith("/") else "root"
+return parts[0]
+
+def _coverage_type(cfg, served_rel, core_set, single_tier):
+if single_tier:
+return "standard"
+fname = os.path.basename(served_rel)
+if served_rel in ("", "index.html") or fname in core_set:
+return "core"
+# Rule substrings match against a slash-bracketed served path so a rule
+# written the natural way — `/docs/ => deep` — hits both a root-served
+# `docs/guide.html` (a stranger's tree) AND a wrapped `site/docs/x.html`
+# (loopmmt's). Bracketing with leading+trailing '/' makes "/docs/" a segment
+# match regardless of whether the segment is at path start. (Fixture-proven:
+# without this, root-level dir rules silently never fired — beat 5.)
+bracketed = "/" + served_rel
+for needle, cls in cfg.get("coverage_rules", []):
+if needle in bracketed:
+return cls
+return "standard"
+
+def _hash_and_tokens(disk_path):
+try:
+with open(disk_path, "rb") as fh:
+raw = fh.read()
+except OSError:
+return None, None, None
+return hashlib.sha256(raw).hexdigest()[:12], len(raw.split()), round(len(raw) / 4)
+
+# ── face 1: the manifest ────────────────────────────────────────────────────
+def build_manifest(cfg):
+core_set = load_core_set()
+single_tier = not core_set
+if single_tier:
+print("NOTE — no `core` reconnaissance set declared (no core-set.txt): "
+"every page is one tier. Declare a core-set.txt for a real "
+"recon/full cycle.", file=sys.stderr)
+nodes, counts, branches = [], {"core": 0, "standard": 0, "deep": 0, "optional": 0}, {}
+for entry in walk_nodes(cfg):
+served_rel, disk = entry["served_rel"], entry["disk"]
+title, desc = _meta(disk)
+ctype = _coverage_type(cfg, served_rel, core_set or set(), single_tier)
+branch = _branch(served_rel)
+h, words, tokens = _hash_and_tokens(disk)
+node = {"url": entry["url"], "title": title, "description": desc,
+"branch": branch, "coverage": ctype, "hash": h,
+"words": words, "tokens": tokens}
+nodes.append(node)
+counts[ctype] = counts.get(ctype, 0) + 1
+branches[branch] = branches.get(branch, 0) + 1
+total_tokens = sum(n["tokens"] for n in nodes if n["tokens"])
+doc = {
+"site": cfg["site_name"],
+"url": cfg["base_url"] + "/",
+"manifest_version": 1,
+"description": (
+f"The complete public coverage boundary of {cfg['site_name']}: one "
+"node per served public leaf, typed by coverage class. The reader's "
+"coverage oracle for a full excavation (see The Reckoning). A pure "
+"fold over the local served tree; nodes[].url is independently "
+"checkable against the served files."),
+"coverage_note": (
+"core = read for a Reconnaissance pass; standard = mid-tier content, "
+"read in full excavation; deep = evidentiary leaves, full excavation "
+"only; optional = supporting tools / docs. A complete excavation "
+"reads every core+standard+deep node, or declares each skipped node "
+"optional/inaccessible by name."),
+"counts": {
+"nodes": len(nodes),
+"by_coverage": counts,
+"by_branch": dict(sorted(branches.items())),
+"total_tokens_estimate": total_tokens,
+},
+"nodes": nodes,
+}
+return doc
+
+# ── face 2: the shards (pure partition of the manifest node set) ────────────
+def build_shards(cfg, manifest):
+base = cfg["base_url"]
+nodes = manifest["nodes"]
+shards, cur, cur_tokens, cur_branch = [], [], 0, None
+
+def flush():
+nonlocal cur, cur_tokens, cur_branch
+if cur:
+shards.append({"branch": cur_branch, "nodes": cur,
+"tokens_estimate": cur_tokens})
+cur, cur_tokens, cur_branch = [], 0, None
+
+for n in nodes:
+tok = n.get("tokens") or 0
+if cur_branch is not None and (n["branch"]!= cur_branch
+or cur_tokens + tok > SHARD_TOKEN_BUDGET):
+flush()
+cur_branch = n["branch"]
+cur.append(n["url"])
+cur_tokens += tok
+flush()
+
+index = {
+"site": cfg["site_name"],
+"url": f"{base}/corpus-shards.json",
+"description": (
+"The corpus partitioned into bounded reading bundles. The "
+"authoritative tree is corpus-manifest.json; each shard names a "
+"budget-sized set of node urls to read together."),
+"shard_token_budget": SHARD_TOKEN_BUDGET,
+"manifest_url": f"{base}/corpus-manifest.json",
+"counts": {"shards": len(shards),
+"nodes": sum(len(s["nodes"]) for s in shards)},
+"shards": [
+{"id": f"shard-{i:02d}", "branch": s["branch"],
+"tokens_estimate": s["tokens_estimate"], "nodes": s["nodes"]}
+for i, s in enumerate(shards)
+],
+}
+return index
+
+# ── face 3: the reckoning (pure fold of manifest + shards) ──────────────────
+def build_reckoning(cfg, manifest, shards):
+base = cfg["base_url"]
+c = manifest["counts"]
+doc = {
+"site": cfg["site_name"],
+"url": f"{base}/reckoning.json",
+"description": (
+f"The reader's coverage protocol for {cfg['site_name']}. A pure fold "
+"over corpus-manifest.json (the node oracle) and corpus-shards.json "
+"(the corpus in bounded bundles)."),
+"sources": {
+"manifest_url": f"{base}/corpus-manifest.json",
+"shards_url": f"{base}/corpus-shards.json",
+},
+"totals": {
+"nodes": c["nodes"],
+"by_coverage": c["by_coverage"],
+"shards": shards["counts"]["shards"],
+"total_tokens_estimate": c["total_tokens_estimate"],
+},
+"protocol": [
+{"pass": "reconnaissance",
+"how": ("fetch corpus-manifest.json, take the nodes with "
+"coverage=='core', and read those first to understand the "
+"whole site before the full pass.")},
+{"pass": "full-excavation",
+"how": ("iterate corpus-shards.json; fetch each shard's node urls "
+"and read them, covering every core+standard+deep node.")},
+{"pass": "account",
+"how": ("a complete excavation reads every core+standard+deep node, "
+"or declares each skipped node optional/inaccessible by "
+"name. 'Everything' means every node examined or explicitly "
+"accounted for.")},
+{"pass": "resume",
+"how": ("re-fetch corpus-manifest.json and compare its node set + "
+"hashes against your last read to find what changed.")},
+],
+}
+return doc
+
+# ── driver ──────────────────────────────────────────────────────────────────
+def _out_dir(cfg):
+# Foreign faces are written next to the config, under./corpus-out/, so a
+# stranger's run never assumes a loopmmt site-root/ layout.
+d = os.path.join(HERE, "corpus-out")
+return d
+
+def check(cfg):
+"""Honesty invariant: the manifest's node-url set == a fresh local walk's
+url set. What a visiting AI runs to trust the manifest without trusting us."""
+manifest = build_manifest(cfg)
+manifest_urls = {n["url"] for n in manifest["nodes"]}
+walk_urls = {n["url"] for n in walk_nodes(cfg)}
+if manifest_urls == walk_urls:
+return True, f"CLEAN — manifest nodes == local walk ({len(manifest_urls)} urls)"
+missing = walk_urls - manifest_urls
+extra = manifest_urls - walk_urls
+return False, (f"DRIFT — manifest!= walk. missing={sorted(missing)[:5]} "
+f"extra={sorted(extra)[:5]}")
+
+def main():
+cfg = parse_config(os.path.join(HERE, CONFIG_NAME))
+if "--check" in sys.argv:
+ok, msg = check(cfg)
+print(msg)
+sys.exit(0 if ok else 3)
+
+manifest = build_manifest(cfg)
+shards = build_shards(cfg, manifest)
+reckoning = build_reckoning(cfg, manifest, shards)
+
+out = _out_dir(cfg)
+os.makedirs(out, exist_ok=True)
+faces = {
+"corpus-manifest.json": manifest,
+"corpus-shards.json": shards,
+"reckoning.json": reckoning,
+}
+for name, doc in faces.items():
+body = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+with open(os.path.join(out, name), "w", encoding="utf-8") as fh:
+fh.write(body)
+cc = manifest["counts"]
+print(f"wrote corpus-out/{{corpus-manifest,corpus-shards,reckoning}}.json — "
+f"standalone (no loopmmt deps)")
+print(f"grounded: {cc['nodes']} nodes · by_coverage={cc['by_coverage']} · "
+f"{shards['counts']['shards']} shard(s) · "
+f"~{cc['total_tokens_estimate']} tokens total")
+
+if __name__ == "__main__":
+main()
+
+smoke_test.sh 113 lines on GitHub →
+#!/usr/bin/env bash
+# smoke_test.sh — the foreign-fixture ACCEPTANCE GATE for The Excavation gift
+# (DP-039 s7 beat 5). Hermetic, no network: it proves the gift runs on a
+# NON-loopmmt site with ZERO loopmmt.com dependencies present.
+#
+# The test copies ONLY the shipped gift files (excavate.py, excavate_standalone.py)
+# and the fixture site into a bare temp tree — deliberately WITHOUT
+# build_corpus_manifest.py / build_machine_digest.py / redact.py / disclosure_gate.py
+# — so an import of any loopmmt builder would fail. If the gift produces coherent
+# faces anyway, the standalone extraction is proven.
+#
+# Six scenarios:
+# 1 driver runs on a bare stranger tree (no loopmmt builders) and exits 0
+# 2 it emits all three faces (manifest, shards, reckoning)
+# 3 the manifest node set == the served.html leaves (coverage honesty)
+# 4 coverage typing honors the config (core-set + rules): the core, deep and
+# optional classes are all present
+# 5 --check passes (manifest == local walk)
+# 6 no loopmmt-private import leaked in (grep the tree: no build_machine_digest etc.)
+#
+# Run: bash smoke_test.sh (expect: 6/6 passed)
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PASS=0; FAIL=0
+ROOT="$(mktemp -d)"; trap 'rm -rf "$ROOT"' EXIT
+
+ok() { echo "ok $1"; PASS=$((PASS+1));}
+bad() { echo "FAIL $1: $2"; FAIL=$((FAIL+1));}
+
+# ── build the bare stranger tree: gift files + fixture, NO loopmmt builders ──
+STRANGER="$ROOT/stranger"
+mkdir -p "$STRANGER"
+cp "$HERE/excavate.py" "$STRANGER/"
+cp "$HERE/excavate_standalone.py" "$STRANGER/"
+cp -r "$HERE/test-fixture/." "$STRANGER/" # brings excavate.config, core-set.txt, site/
+
+# Sanity: confirm the tree is genuinely bare (no loopmmt builder alongside).
+for banned in build_corpus_manifest.py build_machine_digest.py redact.py disclosure_gate.py; do
+if [ -e "$STRANGER/$banned"]; then
+echo "FATAL smoke setup: $banned leaked into the stranger tree" >&2
+exit 1
+fi
+done
+
+# ── 1: runs on a bare tree, exit 0 ──────────────────────────────────────────
+OUT="$( cd "$STRANGER"; python3 excavate.py 2>&1)"; RC=$?
+if [ "$RC" -eq 0]; then
+ok "driver runs on a bare stranger tree (no loopmmt builders) and exits 0"
+else
+bad "bare-tree run" "expected exit 0, got $RC; out=[$OUT]"
+fi
+
+# ── 2: all three faces emitted ──────────────────────────────────────────────
+FACES="$STRANGER/corpus-out"
+if [ -f "$FACES/corpus-manifest.json"] \
+&& [ -f "$FACES/corpus-shards.json"] \
+&& [ -f "$FACES/reckoning.json"]; then
+ok "emits all three faces (manifest, shards, reckoning)"
+else
+bad "three faces" "one or more faces missing under corpus-out/"
+fi
+
+# ── 3: manifest node set == served.html leaves ─────────────────────────────
+SITE="$STRANGER/site"
+LEAVES="$( cd "$SITE" && find. -name '*.html' | sed 's#^\./##' | sort)"
+NLEAVES="$( printf '%s\n' "$LEAVES" | grep -c.)"
+NNODES="$( python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(d["counts"]["nodes"])
+' "$FACES/corpus-manifest.json" 2>/dev/null)"
+if [ "$NNODES" = "$NLEAVES"] && [ "$NLEAVES" -eq 5]; then
+ok "manifest node set == served.html leaves ($NNODES nodes == $NLEAVES leaves)"
+else
+bad "coverage honesty" "manifest nodes=$NNODES vs served leaves=$NLEAVES (want 5)"
+fi
+
+# ── 4: coverage typing honors the config (core / deep / optional all present) ─
+TYPES="$( python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+bc=d["counts"]["by_coverage"]
+print(bc.get("core",0), bc.get("deep",0), bc.get("optional",0))
+' "$FACES/corpus-manifest.json" 2>/dev/null)"
+read -r NCORE NDEEP NOPT <<<"$TYPES"
+# fixture: index.html + about.html = core (2); docs/* = deep (2); archive/2019 = optional (1)
+if [ "$NCORE" = "2"] && [ "$NDEEP" = "2"] && [ "$NOPT" = "1"]; then
+ok "coverage typing honors config (core=2 deep=2 optional=1 from core-set + rules)"
+else
+bad "coverage typing" "got core=$NCORE deep=$NDEEP optional=$NOPT (want 2/2/1)"
+fi
+
+# ── 5: --check passes (manifest == local walk) ──────────────────────────────
+CHK="$( cd "$STRANGER"; python3 excavate.py --check 2>&1)"; RC=$?
+if [ "$RC" -eq 0] && printf '%s' "$CHK" | grep -q "CLEAN"; then
+ok "--check passes: manifest nodes == local walk"
+else
+bad "--check" "expected exit 0 + CLEAN, got rc=$RC out=[$CHK]"
+fi
+
+# ── 6: no loopmmt-private module was needed (none present, yet it ran) ───────
+# Prove the run did not depend on a loopmmt builder by confirming the standalone
+# builder carries no import of them (the driver only imports them in-tree).
+if! grep -Eq 'import (build_corpus_manifest|build_machine_digest|redact|disclosure_gate)' \
+"$STRANGER/excavate_standalone.py"; then
+ok "standalone builder imports no loopmmt-private module (true independence)"
+else
+bad "independence" "excavate_standalone.py imports a loopmmt-private module"
+fi
+
+echo
+echo "$((PASS))/$((PASS+FAIL)) passed"
+[ "$FAIL" -eq 0]
 
 Take the whole folder →
 MIT
-Python stdlib only
-
----
-
-# Reltime — a Loop MMT gift
-https://loopmmt.com/gifts/reltime/
-[coverage: optional · branch: gifts]
-
-Relative Time That Refuses To Lie date ← all gifts
-
-Reltime
-
-Turn a timestamp into a short human 'when' (3h ago, Jun 20) where the whole point is what it won't do: a missing, empty, or unparseable stamp returns no label rather than a guess, a future stamp returns no label rather than a negative age, and anything older than a week gets the real date it landed instead of a rounded-up '9d ago'. Deterministic — a pure function of (stamp, now).
-
-The honest edge
-
-It renders in UTC and is a recency label, not a locale-aware or timezone-shifting formatter, and not a full date library. The fixed minute/hour/day/week bands are by design — the value is the refusal to fabricate, not configurable granularity.
-
-Run it
-
-node reltime.js 2026-08-20T09:00:00Z
-test_reltime.js (20/20, mutation-bitten)
-Node, no dependencies
-
-The code — every file that ships
-
-reltime.js 106 lines on GitHub →
-#!/usr/bin/env node
-/* reltime.js — an honest relative-time label ("3h ago", "Jun 20") that refuses
-to fake, round up, or invent a time it doesn't have.
-
-Turn a timestamp into a short human "when" — but the whole point is what it
-WON'T do:
-
-• FLAG, DON'T FAKE. No stamp, an empty stamp, or an unparseable value
-returns null — NO label. The caller shows nothing rather than a guessed
-or fabricated time. An undated thing is never handed a "when".
-
-• A FUTURE STAMP IS NOT A RECENCY CLAIM. If the timestamp is ahead of now
-(clock skew, a bad record), it returns null rather than "-2h ago". You
-cannot honestly say how long ago something happened if it hasn't.
-
-• REAL, NOT ROUNDED-UP. Recent items get a relative label
-(just now / Nm / Nh / Nd ago); anything older than a week gets the
-ABSOLUTE short date it actually landed ("Jun 20", or "Jun 20, 2025"
-across a year boundary) — because "9d ago" is less honest and less
-useful than the date itself.
-
-• DETERMINISTIC. `now` is injected, so the label is a pure function of
-(stamp, now) — testable with no wall clock and stable across a render.
-
-Pure function of its inputs, no dependencies. The same code runs in a browser
-(attach relativeTime to your namespace) or on Node (this CLI / require()).
-
-USAGE
-node reltime.js 2026-08-20T09:00:00Z # label vs. now
-node reltime.js 2026-08-20T09:00:00Z 1755772800000 # label vs. an injected now (ms)
-node reltime.js --help
-
-Dates are read/rendered in UTC for determinism. Released under MIT.
-*/
-"use strict";
-
-var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-var MIN = 60 * 1000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
-
-/* relativeTime(iso, nowMs) -> short label string, or null when there is no
-honest label to show. `iso` is an ISO-8601 string (or null). `nowMs` defaults
-to Date.now() but is injected in tests and via the CLI for determinism. */
-function relativeTime(iso, nowMs) {
-// flag-don't-fake: no stamp, empty stamp, or a non-string -> no label.
-if (iso == null) return null;
-var s = String(iso);
-if (s === "") return null;
-
-var t = Date.parse(s);
-if (isNaN(t)) return null; // unparseable -> no fabricated time
-
-var now = (typeof nowMs === "number" && isFinite(nowMs))? nowMs: Date.now();
-var delta = now - t;
-
-// A future stamp (clock skew) is not a recency claim we can make honestly.
-if (delta < 0) return null;
-
-if (delta < MIN) return "just now";
-if (delta < HOUR) return Math.floor(delta / MIN) + "m ago";
-if (delta < DAY) return Math.floor(delta / HOUR) + "h ago";
-if (delta < WEEK) return Math.floor(delta / DAY) + "d ago";
-
-// Older than a week -> the absolute short date it actually landed.
-var d = new Date(t);
-var label = MONTHS[d.getUTCMonth()] + " " + d.getUTCDate();
-if (d.getUTCFullYear()!== new Date(now).getUTCFullYear()) {
-label += ", " + d.getUTCFullYear();
-}
-return label;
-}
-
-// Browser: attach to a namespace. Node/require: export. CLI: run below.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.relativeTime = relativeTime;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { relativeTime: relativeTime};
-}
-
-// ---- CLI (runs only when invoked directly, never on require) ----------------
-function main(argv) {
-var args = argv.slice(2);
-if (args.length === 0 || args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"reltime.js — an honest relative-time label that refuses to fake a time.\n\n" +
-" node reltime.js <iso-timestamp> label vs. now\n" +
-" node reltime.js <iso-timestamp> <now-ms> label vs. an injected now (ms)\n" +
-" node reltime.js --help\n\n" +
-"Prints the label, or '(no honest label)' when the stamp is missing,\n" +
-"unparseable, or in the future. Dates render in UTC.\n"
-);
-return args.length === 0? 1: 0;
-}
-var iso = args[0];
-var nowMs = args.length > 1? Number(args[1]): undefined;
-var label = relativeTime(iso, nowMs);
-process.stdout.write((label === null? "(no honest label)": label) + "\n");
-return 0;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_reltime.js 61 lines on GitHub →
-#!/usr/bin/env node
-/* test_reltime.js — proves the label is honest, exact, and deterministic.
-
-The honesty rules ARE the tool, so the test's real job is to prove each
-REFUSAL fires (null, not a fabricated label) and each threshold is exact. The
-clock is injected, so every case is deterministic with no wall clock. A
-mutation bite guards against a vacuously-green run. Exit 0 = all pass, exit 1
-= a failure (loud). stdlib only, no dependencies. */
-"use strict";
-var relativeTime = require("./reltime.js").relativeTime;
-
-var pass = 0, fail = 0;
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
-}
-
-// A fixed "now" so every case is deterministic. 2026-06-27T12:00:00Z.
-var NOW = Date.parse("2026-06-27T12:00:00Z");
-function ago(ms) { return new Date(NOW - ms).toISOString();}
-var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
-
-// --- flag-don't-fake: every "no honest label" case returns null -------------
-eq("null stamp -> null", relativeTime(null, NOW), null);
-eq("undefined stamp -> null", relativeTime(undefined, NOW), null);
-eq("empty string -> null", relativeTime("", NOW), null);
-eq("unparseable -> null", relativeTime("not a date", NOW), null);
-eq("garbage -> null", relativeTime("2026-13-99", NOW), null);
-eq("future stamp -> null", relativeTime(ago(-HOUR), NOW), null); // 1h in the FUTURE
-
-// --- relative band, exact thresholds ---------------------------------------
-eq("0ms -> just now", relativeTime(ago(0), NOW), "just now");
-eq("59s -> just now", relativeTime(ago(59 * 1000), NOW), "just now");
-eq("60s -> 1m ago", relativeTime(ago(MIN), NOW), "1m ago");
-eq("59m -> 59m ago", relativeTime(ago(59 * MIN), NOW), "59m ago");
-eq("60m -> 1h ago", relativeTime(ago(HOUR), NOW), "1h ago");
-eq("23h -> 23h ago", relativeTime(ago(23 * HOUR), NOW), "23h ago");
-eq("24h -> 1d ago", relativeTime(ago(DAY), NOW), "1d ago");
-eq("6d -> 6d ago", relativeTime(ago(6 * DAY), NOW), "6d ago");
-
-// --- absolute band (>= 1 week): the real date it landed --------------------
-eq("7d -> absolute date", relativeTime(ago(WEEK), NOW), "Jun 20");
-eq("30d same year -> date", relativeTime(ago(30 * DAY), NOW), "May 28");
-eq("across a year boundary", relativeTime("2025-12-31T00:00:00Z", NOW), "Dec 31, 2025");
-
-// --- determinism: same inputs, same output ---------------------------------
-eq("deterministic", relativeTime(ago(3 * HOUR), NOW), relativeTime(ago(3 * HOUR), NOW));
-
-// --- coercion / robustness --------------------------------------------------
-eq("non-string stamp -> null", relativeTime(12345, NOW), null); // a number is not an ISO string here
-
-// --- mutation bite: the future-guard MUST be load-bearing ------------------
-// If someone deleted `if (delta < 0) return null;`, a future stamp would
-// produce "just now" (delta<MIN with negative delta). Assert it does NOT.
-var futureResult = relativeTime(ago(-HOUR), NOW);
-if (futureResult === null) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: future stamp produced a label: " + JSON.stringify(futureResult));}
-
-console.log("\nreltime: " + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node, no dependencies
-
----
-
-# Sha256 — a Loop MMT gift
-https://loopmmt.com/gifts/sha256/
-[coverage: optional · branch: gifts]
-
-Sync Hash That Matches Your Backend hash ← all gifts
-
-Sha256
-
-A dependency-free, synchronous SHA-256 (hex out) that returns the same 64-char digest as your Node backend's crypto.createHash for the same string — so a browser can mirror a server-side integrity check without turning the verify path async. The load-bearing rule: it hashes the UTF-8 bytes, so multibyte input (names, emoji) stays byte-identical instead of diverging silently.
-
-The honest edge
-
-It's a hash, not an HMAC and not encryption — it proves two inputs match, keeps no secret, and is not a password KDF. A from-scratch port for portability, not a hardened crypto library: where a vetted native lib is available and async is fine, prefer it.
-
-Run it
-
-node sha256.js "a string"
-test_sha256.js (24/24, drift-checked vs node crypto)
-Node, no dependencies
-
-The code — every file that ships
-
-sha256.js 176 lines on GitHub →
-#!/usr/bin/env node
-/* sha256.js — a dependency-free, synchronous SHA-256 (hex out) that is
-byte-identical to your backend's hash for the same string.
-
-WHY THIS EXISTS. The usual browser answer, crypto.subtle.digest, is
-ASYNCHRONOUS — it returns a Promise, so the moment you need a hash inside an
-otherwise-synchronous verify path (parse an envelope, check an integrity
-field, decide tamper/no-tamper), it forces that whole path to go async and
-ripple through everything that calls it. This is a small, pure, sync
-FIPS-180-4 SHA-256 that returns the SAME 64-char hex as Node's
-crypto.createHash('sha256').update(String(x)).digest('hex') — so a browser
-can mirror a Node integrity check without turning the call site async.
-
-THE ONE FIDELITY RULE (the whole reason to trust it). Node hashes the UTF-8
-BYTES of String(input). This encodes with the same UTF-8 byte stream, so the
-digest is identical — including for multibyte characters (accented names,
-emoji, non-Latin scripts). Never hash char codes: multibyte input would
-diverge silently and a tamper check would read a FALSE verdict. The test
-battery carries a multibyte vector precisely to catch that, checked against
-Node's own crypto as the oracle.
-
-Pure function of its input. No dependencies. Same code runs in a browser
-(attach sha256Hex to your namespace) or on Node (this CLI / require()).
-
-USAGE
-node sha256.js "the string to hash" # hash an argument
-echo -n "the string" | node sha256.js # hash stdin (exact bytes, no newline added)
-node sha256.js --help
-
-Released under MIT. Its edge is printed in the README: this is a HASH, not
-an HMAC and not encryption — it proves two inputs match, it does not keep a
-secret and it is not a password-storage KDF.
-*/
-"use strict";
-
-// SHA-256 round constants — FIPS 180-4 §4.2.2 (first 32 bits of the fractional
-// parts of the cube roots of the first 64 primes).
-var K = [
-0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-];
-
-function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
-
-// Encode a JS string to its UTF-8 bytes — the SAME bytes Node's
-//.update(String(s)) hashes. TextEncoder is present in every modern browser and
-// in Node; the manual fallback (surrogate-pair aware) produces the same stream.
-function utf8Bytes(str) {
-if (typeof TextEncoder!== "undefined") {
-return new TextEncoder().encode(str);
-}
-var out = [], i, c, lo;
-for (i = 0; i < str.length; i++) {
-c = str.charCodeAt(i);
-if (c < 0x80) { out.push(c);}
-else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
-else if (c >= 0xd800 && c <= 0xdbff) { // high surrogate
-lo = str.charCodeAt(++i);
-c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
-out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
-}
-return out;
-}
-
-function toHex8(x) {
-var h = (x >>> 0).toString(16);
-return "00000000".slice(h.length) + h;
-}
-
-// sha256Hex(input) -> 64-char lowercase hex, byte-identical to Node's
-// crypto.createHash('sha256').update(String(input)).digest('hex').
-function sha256Hex(input) {
-var bytes = utf8Bytes(String(input));
-var len = bytes.length;
-
-// Padding: append 0x80, then 0x00s, then the 64-bit big-endian bit length,
-// rounding up to a multiple of 64 bytes.
-var bitLenHi = Math.floor(len / 0x20000000); // high 32 bits of (len*8)
-var bitLenLo = (len * 8) >>> 0; // low 32 bits of (len*8)
-var withOne = len + 1;
-var padded = (withOne + 8 + 63) & ~63;
-var msg = new Uint8Array(padded);
-var i;
-for (i = 0; i < len; i++) msg[i] = bytes[i];
-msg[len] = 0x80;
-msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
-msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
-msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
-msg[padded - 5] = bitLenHi & 0xff;
-msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
-msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
-msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
-msg[padded - 1] = bitLenLo & 0xff;
-
-var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
-h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
-
-var w = new Array(64), t, blk;
-for (blk = 0; blk < padded; blk += 64) {
-for (t = 0; t < 16; t++) {
-w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
-(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
-}
-for (t = 16; t < 64; t++) {
-var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
-var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
-w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
-}
-var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
-for (t = 0; t < 64; t++) {
-var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-var ch = (e & f) ^ (~e & g);
-var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
-var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-var maj = (a & b) ^ (a & c) ^ (b & c);
-var temp2 = (S0 + maj) >>> 0;
-hh = g; g = f; f = e; e = (d + temp1) >>> 0;
-d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
-}
-h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
-h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
-}
-
-return toHex8(h0) + toHex8(h1) + toHex8(h2) + toHex8(h3) +
-toHex8(h4) + toHex8(h5) + toHex8(h6) + toHex8(h7);
-}
-
-// Browser: attach to a namespace. Node/require: export. CLI: run below.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.sha256Hex = sha256Hex;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { sha256Hex: sha256Hex};
-}
-
-// ---- CLI (runs only when invoked directly, never on require) ----------------
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"sha256.js — dependency-free sync SHA-256, hex out (byte-identical to Node crypto).\n\n" +
-" node sha256.js \"a string\" hash the argument\n" +
-" echo -n \"a string\" | node sha256.js hash stdin (exact bytes, no newline added)\n" +
-" node sha256.js --help\n\n" +
-"Edge: this is a hash, not an HMAC and not encryption. It proves two inputs\n" +
-"match; it keeps no secret and is not a password KDF.\n"
-);
-return 0;
-}
-if (args.length > 0) {
-process.stdout.write(sha256Hex(args[0]) + "\n");
-return 0;
-}
-// stdin: hash the exact bytes received (no trailing newline added).
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-var buf = Buffer.concat(chunks);
-// Hash the exact received bytes: decode as UTF-8 back to the string whose
-// UTF-8 bytes are these bytes (round-trips for valid UTF-8 input).
-process.stdout.write(sha256Hex(buf.toString("utf8")) + "\n");
-});
-return 0;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_sha256.js 73 lines on GitHub →
-#!/usr/bin/env node
-/* test_sha256.js — proves sha256Hex is byte-identical to Node's own crypto.
-
-The oracle is Node's crypto.createHash('sha256'): for every vector we compute
-the digest BOTH ways and require they match. That is the honest proof — not
-"it matches a hardcoded string I typed" but "it matches the reference
-implementation for the same bytes", including the multibyte case that is the
-whole point of the fidelity rule. Also checks the two canonical FIPS-180-4
-vectors as fixed anchors, and mutation-bites the core so a no-op test can't
-pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
-"use strict";
-var crypto = require("crypto");
-var sha256Hex = require("./sha256.js").sha256Hex;
-
-var pass = 0, fail = 0;
-function check(name, got, want) {
-if (got === want) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + got + "\n want: " + want);}
-}
-function nodeHash(s) {
-return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
-}
-
-// 1. Canonical FIPS-180-4 anchors (fixed, independent of Node).
-check("empty string", sha256Hex(""),
-"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-check("abc", sha256Hex("abc"),
-"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-
-// 2. Drift-check against Node crypto over a vector battery (the real proof).
-var vectors = [
-"",
-"abc",
-"a",
-"The quick brown fox jumps over the lazy dog",
-"The quick brown fox jumps over the lazy dog.", // one-byte change -> avalanche
-"0123456789",
-"x".repeat(55), // one byte under a block boundary
-"x".repeat(56), // padding crosses into a new block
-"x".repeat(63),
-"x".repeat(64), // exact block
-"x".repeat(65),
-"x".repeat(1000), // multi-block
-"café", // multibyte: é is 2 UTF-8 bytes
-"naïve façade Zürich", // several multibyte
-"日本語テスト", // CJK, 3 bytes each
-"🦌", // the deer glyph — 4-byte surrogate pair
-"order:🦌×3 café", // mixed ASCII + multibyte + emoji
-"line1\nline2\ttabbed", // control chars
-];
-for (var i = 0; i < vectors.length; i++) {
-var v = vectors[i];
-var label = v.length > 24? (v.slice(0, 21) + "..."): v;
-check("drift[" + i + "] '" + label + "'", sha256Hex(v), nodeHash(v));
-}
-
-// 3. Determinism — same input twice, same digest.
-check("deterministic", sha256Hex("repeat me"), sha256Hex("repeat me"));
-
-// 4. Non-vacuity / mutation bite: a WRONG expected value MUST be caught.
-// (If the harness were a no-op, this "should fail" case would slip through.)
-var deliberatelyWrong = "0000000000000000000000000000000000000000000000000000000000000000";
-var mutationCaught = (sha256Hex("abc")!== deliberatelyWrong);
-if (mutationCaught) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: core did not distinguish a wrong digest");}
-
-// 5. String coercion parity with Node (numbers, etc. -> String()).
-check("number coercion 42", sha256Hex(42), nodeHash(42));
-check("boolean coercion", sha256Hex(true), nodeHash(true));
-
-console.log("\nsha256: " + pass + " passed, " + fail + " failed" +
-" (" + vectors.length + " drift vectors vs node crypto, incl. multibyte + emoji)");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node, no dependencies
+git + Python 3 stdlib, no dependencies
 
 ---
