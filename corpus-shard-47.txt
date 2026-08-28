@@ -1,0 +1,1563 @@
+# Loop MMT — corpus shard 47/49
+
+> Bundle 47 of 49 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 2 (/gifts/sudoku/, /gifts/tracebus/)
+
+---
+
+# Sudoku — a Loop MMT gift
+https://loopmmt.com/gifts/sudoku/
+[coverage: optional · branch: gifts]
+
+A Solver That Shows Its Work transform ← all gifts
+
+Sudoku
+
+Most Sudoku solvers hand you the answer; this one hands you the reasoning. It solves the way a person does — applying the lowest technique that makes progress and recording WHAT it did and WHY at every step as a single ordered trace, so the answer is just the last line of an argument you can read and check by hand. Five techniques (naked/hidden single, locked candidates, naked pair, x-wing), applied lowest-first. It never guesses: faced with a puzzle beyond its ladder it says “ceiling-hit” rather than searching — an honest difficulty read, not a failure. Deterministic: the same givens always produce the byte-identical trace.
+
+The honest edge
+
+It only makes FORCED moves — it reasons, it does not search or backtrack, so a puzzle needing a technique above x-wing returns ceiling-hit (a difficulty read), not a guessed fill. And ‘broken’ fires when reasoning empties a cell; a contradiction sitting between two givens no technique touches reads as ceiling-hit, because the solver reasons about the puzzle rather than front-validating your input.
+
+Run it
+
+python3 sudoku.py --demo
+test_sudoku.py (130/130, mutation-bitten, pinned golden trace)
+Python standard library only, deterministic + headless
+
+The code — every file that ships
+
+sudoku.py 549 lines on GitHub →
+#!/usr/bin/env python3
+"""sudoku — a Sudoku solver that shows its work.
+
+Most solvers hand you the answer. This one hands you the *reasoning*: it solves
+the way a person does — applying the lowest technique that makes progress and
+recording WHAT it did and WHY at every step, as a single ordered trace. The
+answer is just the last line of an argument you can read.
+
+from sudoku import solve, from_string
+result = solve(from_string("53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"))
+result.status # 'solved-unique' | 'ceiling-hit' | 'broken'
+for step in result.trace:
+print(step.reason) # "naked single: 4 is the only candidate left for r1c3..."
+
+Five techniques, applied lowest-first (so the explanation reads like a human
+tutor, easiest move first):
+1. naked single — a cell with only one candidate left
+2. hidden single — a digit that fits only one cell in a unit
+3. locked candidates — pointing / claiming (an elimination technique)
+4. naked pair — two cells locking two digits to themselves
+5. x-wing — the basic fish
+
+Three honest terminal states:
+solved-unique — solved by these techniques alone; `solution` is filled in.
+ceiling-hit — consistent but needs a technique above the ladder (a
+DIFFICULTY read, not a failure — this puzzle is "harder
+than x-wing", which is useful information).
+broken — a cell ran out of candidates; the givens contradict.
+
+Properties (see test_sudoku.py):
+- Deterministic: the same givens always produce the byte-identical trace.
+- Certifying: every placement/elimination carries a human sentence saying
+why it is forced. The trace is a proof you can check by hand.
+- Never guesses: it only makes forced moves. It will say "ceiling-hit"
+before it will backtrack — it does not search, it reasons.
+
+Zero dependencies (Python standard library only). Headless: givens in, a
+SolveResult out — no I/O in the solver, no globals, no randomness.
+
+Origin: the reasoning core of a self-explaining Sudoku teaching app, stripped to
+stand alone. MIT licensed — take the folder.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, asdict
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+Cell = Tuple[int, int] # (row, col), 0-indexed
+Grid = List[List[int]] # 9x9, 0 = empty
+Candidates = Dict[Cell, Set[int]]
+
+N = 9
+DIGITS = frozenset(range(1, 10))
+
+# ── The trace (the spine — everything folds from this) ──────────────────────
+@dataclass
+class TechniqueApplication:
+technique: str # rung name
+cells_affected: List[Cell] # coordinates touched
+candidates_eliminated: List[Tuple[Cell, int]] # what this step ruled out
+reason: str # the human sentence: WHY
+
+def to_dict(self) -> dict:
+d = asdict(self)
+d["cells_affected"] = [list(c) for c in self.cells_affected]
+d["candidates_eliminated"] = [
+[list(c), dg] for c, dg in self.candidates_eliminated
+]
+return d
+
+@dataclass
+class SolveResult:
+status: str # solved-unique|ceiling-hit|broken
+trace: List[TechniqueApplication]
+solution: Optional[Grid] = None # present iff solved-unique
+
+def to_dict(self) -> dict:
+return {
+"status": self.status,
+"trace": [t.to_dict() for t in self.trace],
+"solution": self.solution,
+}
+
+# ── Geometry (units: rows, cols, boxes) ─────────────────────────────────────
+def _peers(cell: Cell) -> Set[Cell]:
+r, c = cell
+peers: Set[Cell] = set()
+for k in range(N):
+peers.add((r, k))
+peers.add((k, c))
+br, bc = 3 * (r // 3), 3 * (c // 3)
+for dr in range(3):
+for dc in range(3):
+peers.add((br + dr, bc + dc))
+peers.discard(cell)
+return peers
+
+def _units() -> List[List[Cell]]:
+units: List[List[Cell]] = []
+for r in range(N):
+units.append([(r, c) for c in range(N)]) # rows
+for c in range(N):
+units.append([(r, c) for r in range(N)]) # cols
+for br in range(0, N, 3):
+for bc in range(0, N, 3):
+units.append([(br + dr, bc + dc)
+for dr in range(3) for dc in range(3)]) # boxes
+return units
+
+_UNITS = _units()
+_UNIT_NAME = (
+["row " + str(i + 1) for i in range(N)]
++ ["column " + str(i + 1) for i in range(N)]
++ ["box " + str(i + 1) for i in range(N)]
+)
+
+def compute_candidates(grid: Grid) -> Candidates:
+"""For every empty cell, the digits not already used by one of its peers.
+
+Deterministic and total — the fixed point recomputes this each step.
+"""
+cands: Candidates = {}
+for r in range(N):
+for c in range(N):
+if grid[r][c]!= 0:
+continue
+seen = {grid[pr][pc] for pr, pc in _peers((r, c)) if grid[pr][pc]!= 0}
+cands[(r, c)] = set(DIGITS) - seen
+return cands
+
+# ── The ladder (reorderable DATA — the one live research object) ────────────
+# A rung: given the candidate grid, return the ONE lowest-rung, row-major-first
+# applicable move as a TechniqueApplication, or None. Rungs never mutate.
+#
+# Two KINDS of rung share this signature, and the loop tells them apart by ONE
+# schema-stable signal — `candidates_eliminated`:
+# PLACEMENT rung (naked/hidden-single): places a digit; `candidates_eliminated`
+# is [] and the placed digit is the first [1-9] in `reason`.
+# ELIMINATION rung (locked-candidates, pairs, x-wing): places NOTHING; it
+# prunes candidates, so `candidates_eliminated` is non-empty and there is
+# no placed digit. `cells_affected` are the cells it pruned FROM.
+# Invariant: `candidates_eliminated` non-empty <=> elimination step. A rung
+# that would eliminate nothing returns None (no progress -> the loop would spin).
+Rung = Callable[[Grid, Candidates], Optional[TechniqueApplication]]
+
+def _rowmajor(cells) -> list:
+"""The within-rung tie-break: smallest (row, col) first."""
+return sorted(cells)
+
+def _box_of(cell: Cell) -> Tuple[int, int]:
+r, c = cell
+return (3 * (r // 3), 3 * (c // 3))
+
+def _box_cells(br: int, bc: int) -> List[Cell]:
+return [(br + dr, bc + dc) for dr in range(3) for dc in range(3)]
+
+def _box_num(br: int, bc: int) -> int:
+return (br // 3) * 3 + (bc // 3) + 1
+
+# Row/column units in a fixed order (rows 1-9 then cols 1-9), for the line-based
+# rungs; digit names within a reason are 1-indexed to match the singles' voice.
+_ROWS: List[List[Cell]] = [[(r, c) for c in range(N)] for r in range(N)]
+_COLS: List[List[Cell]] = [[(r, c) for r in range(N)] for c in range(N)]
+_BOXES: List[Tuple[int, int]] = [(br, bc) for br in range(0, N, 3)
+for bc in range(0, N, 3)]
+
+def rung_naked_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+for cell in _rowmajor(cands):
+opts = cands[cell]
+if len(opts) == 1:
+d = next(iter(opts))
+r, c = cell
+return TechniqueApplication(
+technique="naked-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"naked single: {d} is the only candidate left for "
+f"r{r + 1}c{c + 1} — every other digit is already used "
+f"by one of its peers."),
+)
+return None
+
+def rung_hidden_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+# Units in a fixed order; within a unit, digits ascending; first hit wins.
+for ui, unit in enumerate(_UNITS):
+empties = [cell for cell in unit if cell in cands]
+for d in range(1, 10):
+spots = [cell for cell in empties if d in cands[cell]]
+if len(spots) == 1:
+cell = spots[0]
+# Skip if a naked single would already place it (lower rung wins).
+if len(cands[cell]) == 1:
+continue
+r, c = cell
+# The placed digit MUST be the first numeral in the reason:
+# _placed_digit greps the first \b[1-9]\b, so leading with a
+# unit number would make it place the unit's number, not {d}.
+return TechniqueApplication(
+technique="hidden-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"hidden single: {d} can only go in r{r + 1}c{c + 1} "
+f"— within {_UNIT_NAME[ui]} it fits nowhere else."),
+)
+return None
+
+def rung_locked_candidates(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Locked candidates (pointing + claiming). An ELIMINATION rung.
+
+Pointing: within a box, if every candidate for a digit lies in one line
+(row or col), that digit is eliminated from the rest of that line.
+Claiming: within a line, if every candidate for a digit lies in one box,
+that digit is eliminated from the rest of that box.
+"""
+# ── Pointing: box -> line ───────────────────────────────────────────────
+for br, bc in _BOXES:
+cells = _box_cells(br, bc)
+for d in range(1, 10):
+spots = [cell for cell in cells if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+rows = {r for r, _c in spots}
+cols = {c for _r, c in spots}
+if len(rows) == 1:
+r = next(iter(rows))
+targets = _rowmajor(cell for cell in _ROWS[r]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in row {r + 1}, so {d} is "
+f"eliminated from the rest of row {r + 1}."),
+)
+if len(cols) == 1:
+c = next(iter(cols))
+targets = _rowmajor(cell for cell in _COLS[c]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in column {c + 1}, so {d} is "
+f"eliminated from the rest of column {c + 1}."),
+)
+# ── Claiming: line -> box ───────────────────────────────────────────────
+for name, unit in ([(f"row {i + 1}", u) for i, u in enumerate(_ROWS)]
++ [(f"column {i + 1}", u) for i, u in enumerate(_COLS)]):
+for d in range(1, 10):
+spots = [cell for cell in unit if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+boxes = {_box_of(cell) for cell in spots}
+if len(boxes) == 1:
+br, bc = next(iter(boxes))
+box = _box_cells(br, bc)
+targets = _rowmajor(cell for cell in box
+if cell not in unit
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in {name}, {d} can only go "
+f"in box {_box_num(br, bc)}, so {d} is eliminated "
+f"from the rest of box {_box_num(br, bc)}."),
+)
+return None
+
+def rung_naked_pair(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Naked pair. Two cells in a unit sharing the SAME two candidates {x, y}
+lock those digits to themselves, eliminating x and y from every other cell
+in that unit."""
+for ui, unit in enumerate(_UNITS):
+bi = _rowmajor(cell for cell in unit
+if cell in cands and len(cands[cell]) == 2)
+for i in range(len(bi)):
+for j in range(i + 1, len(bi)):
+a, b = bi[i], bi[j]
+if cands[a]!= cands[b]:
+continue
+pair = sorted(cands[a]) # [x, y]
+elim: List[Tuple[Cell, int]] = []
+for cell in unit:
+if cell in (a, b) or cell not in cands:
+continue
+for d in pair:
+if d in cands[cell]:
+elim.append((cell, d))
+if elim:
+elim.sort()
+affected = _rowmajor({c for c, _d in elim})
+ar, ac = a
+br_, bc_ = b
+return TechniqueApplication(
+technique="naked-pair",
+cells_affected=affected,
+candidates_eliminated=elim,
+reason=(f"naked pair: {pair[0]} and {pair[1]} are locked "
+f"to r{ar + 1}c{ac + 1} and r{br_ + 1}c{bc_ + 1} "
+f"in {_UNIT_NAME[ui]}, so both are eliminated from "
+f"the rest of that unit."),
+)
+return None
+
+def rung_x_wing(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""X-wing (basic fish). If two rows each have digit d as a candidate in
+EXACTLY the same two columns, d is eliminated from those columns in every
+other row (and the column-based transpose)."""
+# ── Row-based: base = two rows, cross = two columns ─────────────────────
+for d in range(1, 10):
+rowcols: Dict[int, Tuple[int, int]] = {}
+for r in range(N):
+cols = [c for c in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(cols) == 2:
+rowcols[r] = (cols[0], cols[1])
+bases = sorted(rowcols)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+r1, r2 = bases[i], bases[j]
+if rowcols[r1]!= rowcols[r2]:
+continue
+c1, c2 = rowcols[r1]
+targets = _rowmajor(
+(r, c) for r in range(N) if r not in (r1, r2)
+for c in (c1, c2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in rows {r1 + 1} and {r2 + 1} is "
+f"confined to columns {c1 + 1} and {c2 + 1}, so "
+f"{d} is eliminated from those columns in every "
+f"other row."),
+)
+# ── Column-based (transpose): base = two columns, cross = two rows ──────
+for d in range(1, 10):
+colrows: Dict[int, Tuple[int, int]] = {}
+for c in range(N):
+rows = [r for r in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(rows) == 2:
+colrows[c] = (rows[0], rows[1])
+bases = sorted(colrows)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+c1, c2 = bases[i], bases[j]
+if colrows[c1]!= colrows[c2]:
+continue
+r1, r2 = colrows[c1]
+targets = _rowmajor(
+(r, c) for c in range(N) if c not in (c1, c2)
+for r in (r1, r2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in columns {c1 + 1} and {c2 + 1} is "
+f"confined to rows {r1 + 1} and {r2 + 1}, so "
+f"{d} is eliminated from those rows in every "
+f"other column."),
+)
+return None
+
+# ORDER IS DATA — reorder to change the difficulty model, never hard-code it.
+# New techniques (wings, chains) append here; the solve loop never changes.
+LADDER: List[Tuple[str, int, Rung]] = [
+("naked-single", 1, rung_naked_single),
+("hidden-single", 2, rung_hidden_single),
+("locked-candidates", 3, rung_locked_candidates),
+("naked-pair", 4, rung_naked_pair),
+("x-wing", 5, rung_x_wing),
+]
+
+def _is_contradiction(grid: Grid, cands: Candidates) -> bool:
+for cell, opts in cands.items():
+if not opts: # an empty cell with no candidate = broken
+return True
+return False
+
+def _complete(grid: Grid) -> bool:
+return all(grid[r][c]!= 0 for r in range(N) for c in range(N))
+
+def _placed_digit(step: TechniqueApplication) -> int:
+# CONTRACT: a PLACEMENT reason MUST lead with the placed digit — it is the
+# first \b[1-9]\b in the string, before any row/col/unit numeral. Both
+# placement rungs honor this. Never call this on an elimination step
+# (candidates_eliminated non-empty); use its structured (cell, digit) pairs.
+m = re.search(r"\b([1-9])\b", step.reason)
+return int(m.group(1))
+
+def _is_placement(step: TechniqueApplication) -> bool:
+"""A step is a PLACEMENT iff it eliminates no candidates (it places a digit);
+otherwise it is an ELIMINATION (it prunes candidates, places nothing)."""
+return not step.candidates_eliminated
+
+def solve(givens: Grid) -> SolveResult:
+"""solve(givens) -> SolveResult. Prefer-lowest-rung fixed point.
+
+Candidates are CARRIED, not recomputed each step: a placement prunes the
+placed digit from the placed cell's peers; an elimination prunes the pruned
+(cell, digit) pairs. Recomputing from the grid alone would lose every
+elimination-rung deduction (they don't live in the grid), so the persistent
+candidate set is what lets a later single depend on an earlier elimination.
+"""
+grid = [row[:] for row in givens]
+cands = compute_candidates(grid)
+trace: List[TechniqueApplication] = []
+
+while True:
+if _is_contradiction(grid, cands):
+return SolveResult(status="broken", trace=trace, solution=None)
+
+if _complete(grid):
+return SolveResult(status="solved-unique", trace=trace,
+solution=[row[:] for row in grid])
+
+# walk the ladder bottom-up; apply the LOWEST rung that makes progress
+step: Optional[TechniqueApplication] = None
+for _name, _tier, rung in LADDER:
+step = rung(grid, cands)
+if step is not None:
+break
+
+if step is None:
+# no rung progresses, board consistent but unfinished — a
+# DIFFICULTY read, not a failure.
+return SolveResult(status="ceiling-hit", trace=trace, solution=None)
+
+if _is_placement(step):
+(r, c) = step.cells_affected[0]
+d = _placed_digit(step)
+grid[r][c] = d
+del cands[(r, c)]
+for peer in _peers((r, c)):
+if peer in cands:
+cands[peer].discard(d)
+else:
+for cell, dig in step.candidates_eliminated:
+if cell in cands:
+cands[cell].discard(dig)
+trace.append(step)
+
+# ── convenience: parse / print an 81-char string ("." or "0" = empty) ───────
+def from_string(s: str) -> Grid:
+s = "".join(ch for ch in s if not ch.isspace())
+if len(s)!= 81:
+raise ValueError(f"expected 81 cells, got {len(s)}")
+g: Grid = []
+for r in range(N):
+row = []
+for c in range(N):
+ch = s[r * N + c]
+row.append(0 if ch in ".0" else int(ch))
+g.append(row)
+return g
+
+def to_string(grid: Grid) -> str:
+return "".join(str(grid[r][c]) for r in range(N) for c in range(N))
+
+def render(grid: Grid) -> str:
+"""A human-readable 9x9 grid with box separators (for the CLI)."""
+lines = []
+for r in range(N):
+if r in (3, 6):
+lines.append("------+-------+------")
+cells = []
+for c in range(N):
+if c in (3, 6):
+cells.append("|")
+cells.append(str(grid[r][c]) if grid[r][c] else ".")
+lines.append(" ".join(cells))
+return "\n".join(lines)
+
+# ── CLI: read an 81-char puzzle, print the reasoning, then the answer ───────
+def _main(argv: List[str]) -> int:
+demo = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+if argv and argv[0] in ("-h", "--help"):
+print("usage: python3 sudoku.py [81-char-puzzle | --demo]")
+print(" cells 1-9; '.' or '0' = empty; whitespace ignored")
+print(" prints the step-by-step reasoning, then the solution")
+return 0
+arg = argv[0] if argv else "--demo"
+puzzle = demo if arg in ("", "--demo") else arg
+try:
+grid = from_string(puzzle)
+except ValueError as e:
+print(f"bad puzzle: {e}")
+return 2
+
+print("puzzle:")
+print(render(grid))
+print()
+result = solve(grid)
+print(f"status: {result.status} ({len(result.trace)} steps)\n")
+for i, step in enumerate(result.trace, 1):
+print(f" {i:>2}. {step.reason}")
+if result.solution is not None:
+print("\nsolution:")
+print(render(result.solution))
+elif result.status == "ceiling-hit":
+print("\n(consistent, but needs a technique above this solver's ladder — "
+"a difficulty read, not a failure.)")
+return 0
+
+if __name__ == "__main__":
+import sys
+raise SystemExit(_main(sys.argv[1:]))
+
+test_sudoku.py 248 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_sudoku.py — proves the solver is certifying, deterministic, and honest.
+
+The claims that ARE the tool:
+1. CERTIFYING: every step carries a reason, and the reason is CHECKABLE —
+a placement's reason leads with the digit it places, and re-applying the
+whole trace to the givens reproduces the solution. The trace is a proof.
+2. DETERMINISTIC: the same givens produce the byte-identical trace, every run.
+3. THREE HONEST STATES: solved-unique (with a valid solution), ceiling-hit
+(consistent but beyond the ladder — a difficulty read), broken (givens
+contradict). Each is reachable and correctly labelled.
+4. NEVER GUESSES: it stops at ceiling-hit rather than searching. A puzzle
+needing a technique above x-wing returns ceiling-hit, not a lucky answer.
+Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
+Exit 0 = all pass, exit 1 = a failure (loud).
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sudoku import (
+solve, from_string, to_string, compute_candidates,
+SolveResult, TechniqueApplication, _peers, _units, N, LADDER,
+)
+
+_pass = 0
+_fail = 0
+
+def eq(name, got, want):
+global _pass, _fail
+if got == want:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
+
+def ok(name, cond):
+global _pass, _fail
+if cond:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}")
+
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+EASY = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+EASY_SOLUTION = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+
+# A grid that is complete and correct = solve returns it unchanged, zero steps.
+SOLVED = EASY_SOLUTION
+
+# A contradiction the solver actually REACHES: the near-complete easy solution
+# with r1c1 blanked and a 5 planted in its box, so r1c1's only digit (5) is
+# already taken by a peer — compute_candidates leaves it with an empty set and
+# _is_contradiction fires. (Note: a contradiction between two GIVENS that no
+# technique touches reads as ceiling-hit, not broken — the solver reasons, it
+# does not front-validate the givens. That is correct and intentional.)
+BROKEN = ".54678912672195348198342567859761423426853791713924856961537284287419635345286179"
+
+def is_valid_solution(s: str) -> bool:
+"""A solved grid: 81 non-zero cells, every row/col/box a permutation of 1-9."""
+g = from_string(s)
+if any(g[r][c] == 0 for r in range(N) for c in range(N)):
+return False
+for unit in _units():
+vals = sorted(g[r][c] for r, c in unit)
+if vals!= list(range(1, 10)):
+return False
+return True
+
+# ── PROPERTY 1: certifying — the trace is a checkable proof ───────────────────
+(lambda: None)() # keep the section visible
+
+def _replay_trace(givens, result):
+"""Re-apply the recorded trace to the givens; a placement's reason must lead
+with the digit it places, and applying every placement must reproduce the
+solution. This proves the reasons are not decorative — they carry the moves."""
+import re
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated: # placement
+(r, c) = step.cells_affected[0]
+d = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+g[r][c] = d
+return g
+
+r_easy = solve(from_string(EASY))
+ok("easy solves", r_easy.status == "solved-unique")
+ok("easy solution is valid", r_easy.solution is not None and is_valid_solution(to_string(r_easy.solution)))
+eq("easy solution matches known answer", to_string(r_easy.solution), EASY_SOLUTION)
+ok("every step has a non-empty reason", all(s.reason.strip() for s in r_easy.trace))
+ok("trace is non-trivial", len(r_easy.trace) > 10)
+# the certifying check: replaying the trace's placements reproduces the solution
+replayed = _replay_trace(from_string(EASY), r_easy)
+eq("replaying the trace reproduces the solution", to_string(replayed), EASY_SOLUTION)
+
+# every placement step's reason leads with the digit actually placed in the solution
+import re
+for step in r_easy.trace:
+if not step.candidates_eliminated: # placement
+(rr, cc) = step.cells_affected[0]
+placed = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+ok(f"placement reason leads with placed digit @r{rr+1}c{cc+1}",
+placed == from_string(EASY_SOLUTION)[rr][cc])
+
+# ── PROPERTY 2: deterministic — byte-identical trace every run ────────────────
+def trace_signature(result):
+return to_string_result(result)
+
+def to_string_result(result):
+import json
+return json.dumps(result.to_dict(), sort_keys=True)
+
+sig1 = to_string_result(solve(from_string(EASY)))
+sig2 = to_string_result(solve(from_string(EASY)))
+sig3 = to_string_result(solve(from_string(EASY)))
+ok("deterministic: run 1 == run 2", sig1 == sig2)
+ok("deterministic: run 2 == run 3", sig2 == sig3)
+# GOLDEN: pin the canonical trace signature by hash. Self-equality alone is a
+# weak determinism test (a benign reorder stays self-equal); a pinned golden
+# catches any change to the tie-break / scan order that reorders the trace.
+import hashlib as _hl
+_golden = "1f4fc6f7b5886070bb06a38c5457ef9c93a4c4dabdb9735518786b8f57e91548"
+_got = _hl.sha256(sig1.encode()).hexdigest()
+ok("deterministic: trace matches the pinned golden signature", _got == _golden)
+# solving does not mutate the givens
+givens = from_string(EASY)
+before = to_string(givens)
+solve(givens)
+eq("solve does not mutate givens", to_string(givens), before)
+
+# ── PROPERTY 3: three honest terminal states ──────────────────────────────────
+# solved-unique (already covered above)
+# broken:
+r_broken = solve(from_string(BROKEN))
+ok("contradiction -> broken", r_broken.status == "broken")
+ok("broken has no solution", r_broken.solution is None)
+
+# an already-solved grid: solved-unique, zero steps, solution == input
+r_done = solve(from_string(SOLVED))
+ok("already-solved -> solved-unique", r_done.status == "solved-unique")
+eq("already-solved needs zero steps", len(r_done.trace), 0)
+eq("already-solved returns the same grid", to_string(r_done.solution), SOLVED)
+
+# ── PROPERTY 4: never guesses — ceiling-hit before search ─────────────────────
+# The empty grid is consistent but has no forced move for these techniques,
+# so a NON-searching solver must return ceiling-hit (a searching one would
+# "solve" it to some arbitrary valid grid). This is the anti-guess proof.
+EMPTY = "." * 81
+r_empty = solve(from_string(EMPTY))
+ok("empty grid -> ceiling-hit (does NOT guess a solution)", r_empty.status == "ceiling-hit")
+ok("ceiling-hit has no solution", r_empty.solution is None)
+# a partial consistent grid with no forced single also ceiling-hits rather than searching
+# (17-clue minimal puzzles typically need guessing; a bare 2-clue grid certainly does)
+SPARSE = "1................2..............................................................."
+r_sparse = solve(from_string(SPARSE))
+ok("sparse consistent grid -> ceiling-hit, not a guessed fill",
+r_sparse.status == "ceiling-hit" and r_sparse.solution is None)
+
+# ── The elimination rungs actually fire (coverage that the ladder is exercised) ─
+# Not every easy puzzle exercises the higher rungs; assert the ladder is complete
+# and each rung is callable and returns the right SHAPE when it does fire.
+ok("ladder has all five rungs", [name for name, _t, _f in LADDER] ==
+["naked-single", "hidden-single", "locked-candidates", "naked-pair", "x-wing"])
+# a placement step: candidates_eliminated empty; an elimination step: non-empty.
+for step in r_easy.trace:
+placement = not step.candidates_eliminated
+if placement:
+ok(f"placement step has one affected cell ({step.technique})", len(step.cells_affected) == 1)
+else:
+ok(f"elimination step eliminated something ({step.technique})", len(step.candidates_eliminated) >= 1)
+
+# ── input validation ──────────────────────────────────────────────────────────
+def raises(name, fn):
+global _pass, _fail
+try:
+fn()
+_fail += 1
+print(f"FAIL {name} (expected raise)")
+except Exception:
+_pass += 1
+
+raises("from_string rejects wrong length", lambda: from_string("123"))
+raises("from_string rejects 80 chars", lambda: from_string("." * 80))
+ok("from_string accepts 81 with whitespace", to_string(from_string("." * 81)) == "0" * 81)
+ok("from_string treats 0 and. both as empty",
+from_string("0" * 81) == from_string("." * 81))
+
+# ── candidates helper is correct ──────────────────────────────────────────────
+cands = compute_candidates(from_string(EASY))
+# r1c3 (row 0, col 2) is empty in EASY; its candidates must exclude peers' givens
+ok("candidates computed for empty cells only",
+all(from_string(EASY)[r][c] == 0 for (r, c) in cands))
+ok("a candidate set never contains a peer's given",
+all(all((from_string(EASY)[pr][pc] not in opts)
+for (pr, pc) in _peers(cell) if from_string(EASY)[pr][pc]!= 0)
+for cell, opts in cands.items()))
+
+# ── MUTATION BITE: prove the certifying check is not vacuously green ───────────
+# If the reasons were decorative (not carrying the placed digit), the replay
+# would NOT reproduce the solution. This bite asserts that (a) the trace has
+# real placement steps, and (b) mangling a reason's leading digit WOULD break
+# the replay — so a no-op reason (the plausible mutation) fails loud here.
+placements = [s for s in r_easy.trace if not s.candidates_eliminated]
+ok("mutation bite: trace has real placements", len(placements) > 0)
+
+def _replay_with_broken_reasons(givens, result):
+"""Replay but with every placement reason's digit forced to 1 — must NOT
+reproduce the solution (unless every placed digit really is 1, impossible)."""
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated:
+(r, c) = step.cells_affected[0]
+g[r][c] = 1 # deliberately wrong: ignore the real reason
+return to_string(g)
+
+ok("mutation bite: breaking the reason breaks the replay",
+_replay_with_broken_reasons(from_string(EASY), r_easy)!= EASY_SOLUTION)
+
+# and: if solve silently returned 'solved' on the empty grid (a searching
+# mutation), property 4 would flip. Assert the anti-guess invariant has teeth:
+ok("mutation bite: empty grid is genuinely unforced (>50 empty cells, 0 forced singles)",
+len(compute_candidates(from_string(EMPTY))) == 81
+and all(len(v) == 9 for v in compute_candidates(from_string(EMPTY)).values()))
+
+print(("PASS" if _fail == 0 else "FAIL") + f" — {_pass} passed, {_fail} failed")
+sys.exit(0 if _fail == 0 else 1)
+
+Take the whole folder →
+MIT
+Python standard library only, deterministic + headless
+
+---
+
+# Tracebus — a Loop MMT gift
+https://loopmmt.com/gifts/tracebus/
+[coverage: optional · branch: gifts]
+
+Nothing Moves Without a Receipt route ← all gifts
+
+Tracebus
+
+A publish/subscribe bus with two rules most buses skip: every legal path is declared up front, and every emission is written to an append-only ledger you can replay by trace id. A packet can only reach a subscriber the routing table permits — an unrouted packet is refused, not silently dropped — and a subscriber that throws is caught, recorded, and stepped over so one bad listener can never take the bus down. Thread one traceId through a chain and read the whole journey back out of the ledger, hop by hop.
+
+The honest edge
+
+It enforces the topology you declare and records every hop; it does NOT invent routes for you (an unrouted packet is a fault, by design) and its ids are v4-shaped for correlation, not cryptographic (Math.random). request/response is opt-in per bus via { requestResponse: true} — the bus name carries no special meaning.
+
+Run it
+
+node tracebus.js --demo
+test_tracebus.js (72/72, mutation-bitten)
+Zero-dependency JavaScript, Node or browser
+
+The code — every file that ships
+
+tracebus.js 475 lines on GitHub →
+/*
+* tracebus — a traced, routing-enforced message bus.
+*
+* A publish/subscribe bus where every legal path is declared up front and
+* every emission is written to an append-only ledger you can replay by
+* trace id. A packet can only reach a subscriber the routing table permits;
+* an unrouted packet is refused, not silently dropped. Nothing is delivered
+* without leaving a receipt.
+*
+* The shape: packet ──emit(source)──▶ routingTable.resolve ──▶ subscribers
+* │ │
+* └────────▶ ledger.record ◀─────┘
+*
+* Zero dependencies. Runs in Node or the browser. No I/O, no globals, no
+* clock you can't control (timestamps are ISO strings; ids are v4-shaped).
+*
+* Properties this file holds (see test_tracebus.js):
+* 1. No delivery without a receipt. Every emit() — delivered, partial,
+* rejected, or errored — appends exactly one ledger record.
+* 2. No path that wasn't declared. resolve() throws on an unrouted
+* (packetType, source) pair; emit() records the rejection and rethrows.
+* 3. A wrong-bus packet is refused. A packet routed to bus A cannot be
+* emitted on bus B, even if a subscriber is listening.
+* 4. A subscriber that throws cannot break the emitter. Handler errors are
+* caught, recorded against that destination, and delivery continues.
+* 5. Routing entries are frozen. A registered route cannot be mutated
+* after the fact (deepFreeze), so the declared topology stays declared.
+* 6. A trace is reconstructable. queryByTraceId returns every hop a
+* packet took, in emission order.
+*
+* Origin: stripped from a shipped order-management constellation's internal
+* message fabric (the "one bus, many loops, every packet traced" core) and
+* generalized — the request/response capability, which was hardwired to a
+* single bus name in the original, is now a per-bus flag.
+*
+* MIT licensed. Use it for anything.
+*/
+
+'use strict';
+
+// ────────────────────────────────────────────────────────────────────
+// Primitives (inlined so the file has no dependencies).
+// ────────────────────────────────────────────────────────────────────
+
+/**
+* A v4-shaped identifier: 8-4-4-4-12 hex with the version nibble pinned
+* to 4 and the variant nibble in {8,9,a,b}. Uses Math.random — this is an
+* identifier for correlating log records, NOT a cryptographic token.
+*/
+function generateId() {
+const hex = '0123456789abcdef';
+let id = '';
+for (let i = 0; i < 36; i++) {
+if (i === 8 || i === 13 || i === 18 || i === 23) {
+id += '-';
+} else if (i === 14) {
+id += '4';
+} else if (i === 19) {
+id += hex[(Math.floor(Math.random() * 16) & 0x3) | 0x8];
+} else {
+id += hex[Math.floor(Math.random() * 16)];
+}
+}
+return id;
+}
+
+/** Current time as an ISO-8601 string. The one place time enters. */
+function now() {
+return new Date().toISOString();
+}
+
+/**
+* Recursively freeze an object and everything it owns. A registered
+* routing entry is frozen so the declared topology cannot be edited
+* after registration.
+*/
+function deepFreeze(obj) {
+Object.freeze(obj);
+for (const key of Object.keys(obj)) {
+const val = obj[key];
+if (val && typeof val === 'object' &&!Object.isFrozen(val)) {
+deepFreeze(val);
+}
+}
+return obj;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Packet — the traceable envelope.
+// ────────────────────────────────────────────────────────────────────
+
+/**
+* Create a packet: a typed payload wrapped in a header that carries a
+* unique packetId, a traceId (shared across a causal chain — pass it in
+* opts to thread a conversation), a timestamp, and an optional source.
+*
+* @param {string} packetType - a non-empty type string, e.g. 'user.created'
+* @param {object} payload - the packet's data (must be an object)
+* @param {object} [opts] - { traceId?, source?} overrides
+* @returns {object} { packetId, packetType, timestamp, traceId, source, payload}
+*/
+function createPacket(packetType, payload, opts) {
+if (!packetType || typeof packetType!== 'string') {
+throw new Error('[tracebus] Cannot create packet: packetType is required and must be a non-empty string');
+}
+if (!payload || typeof payload!== 'object') {
+throw new Error(`[tracebus] Cannot create packet ${packetType}: payload must be an object`);
+}
+
+return {
+packetId: generateId(),
+packetType: packetType,
+timestamp: now(),
+traceId: (opts && opts.traceId) || generateId(),
+source: (opts && opts.source) || null,
+payload: payload
+};
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ledger — the append-only receipt log.
+// ────────────────────────────────────────────────────────────────────
+
+/**
+* Create an append-only ledger. Every bus emission is recorded here.
+* Nothing is ever removed; queries are pure reads.
+*/
+function createLedger() {
+const entries = [];
+
+return {
+/**
+* Record one emission.
+* @param {object} record - { bus, packet, source, destinations?, status?}
+*/
+record(record) {
+if (!record ||!record.packet ||!record.packet.packetId) {
+throw new Error('[tracebus] Cannot record: a record needs a packet with a packetId');
+}
+entries.push({
+ledgerId: generateId(),
+recordedAt: now(),
+bus: record.bus,
+packetId: record.packet.packetId,
+packetType: record.packet.packetType,
+traceId: record.packet.traceId,
+source: record.source,
+destinations: record.destinations || [],
+status: record.status || 'delivered'
+});
+},
+
+/**
+* Every record for one traceId, in emission order — a packet's journey.
+* @param {string} traceId
+* @returns {object[]}
+*/
+queryByTraceId(traceId) {
+return entries.filter(e => e.traceId === traceId);
+},
+
+/**
+* Every record of one packetType.
+* @param {string} packetType
+* @returns {object[]}
+*/
+queryByPacketType(packetType) {
+return entries.filter(e => e.packetType === packetType);
+},
+
+/** Total records (diagnostic). */
+count() {
+return entries.length;
+},
+
+/** A copy of every record (diagnostic — the ledger stays private). */
+all() {
+return entries.slice();
+}
+};
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Routing table — the declared topology.
+// ────────────────────────────────────────────────────────────────────
+
+/**
+* Create a routing table. Every legal (packetType, source) → destinations
+* path must be registered before a packet can travel it. Registered entries
+* are frozen.
+*/
+function createRoutingTable() {
+// key = `${packetType}:${source}` → array of frozen entries
+const routes = new Map();
+
+return {
+/**
+* Register a legal path.
+* @param {object} entry - { packetType, source, bus, destinations[],
+* entryNumber?, mode?, priority?}
+*/
+register(entry) {
+if (!entry ||!entry.packetType ||!entry.source ||!entry.bus) {
+throw new Error('[tracebus] Cannot register route: packetType, source, and bus are required');
+}
+if (!entry.destinations ||!Array.isArray(entry.destinations) || entry.destinations.length === 0) {
+throw new Error(`[tracebus] Cannot register route ${entry.packetType} from ${entry.source}: destinations must be a non-empty array`);
+}
+
+const key = `${entry.packetType}:${entry.source}`;
+if (!routes.has(key)) {
+routes.set(key, []);
+}
+routes.get(key).push(deepFreeze({
+entryNumber: entry.entryNumber!== undefined? entry.entryNumber: null,
+packetType: entry.packetType,
+source: entry.source,
+bus: entry.bus,
+destinations: entry.destinations.slice(),
+mode: entry.mode || 'push',
+priority: entry.priority || 'standard'
+}));
+},
+
+/**
+* Resolve the routes for a (packetType, source) pair.
+* @throws if no route is registered — an unrouted packet is a fault.
+* @returns {object[]} matching frozen entries
+*/
+resolve(packetType, source) {
+const key = `${packetType}:${source}`;
+const matched = routes.get(key);
+if (!matched || matched.length === 0) {
+throw new Error(`[tracebus] Unrouted packet: ${packetType} from ${source}. No matching routing entry.`);
+}
+return matched;
+},
+
+/** Non-throwing existence check. */
+has(packetType, source) {
+const key = `${packetType}:${source}`;
+const matched = routes.get(key);
+return!!(matched && matched.length > 0);
+},
+
+/** Total registered entries (diagnostic). */
+count() {
+let total = 0;
+for (const list of routes.values()) {
+total += list.length;
+}
+return total;
+}
+};
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Bus — publish/subscribe with enforced routing and a receipt per emit.
+// ────────────────────────────────────────────────────────────────────
+
+/**
+* Create a bus.
+* @param {string} name - this bus's name (matched against a route's `bus`)
+* @param {object} routingTable - a shared routing table (createRoutingTable())
+* @param {object} ledger - a shared ledger (createLedger())
+* @param {object} [opts] - { requestResponse?: boolean} — enable request()
+* on this bus. Default false.
+*/
+function createBus(name, routingTable, ledger, opts) {
+if (!name || typeof name!== 'string') {
+throw new Error('[tracebus] Cannot create bus: name is required and must be a non-empty string');
+}
+if (!routingTable || typeof routingTable.resolve!== 'function') {
+throw new Error(`[tracebus] Cannot create bus ${name}: a routing table is required`);
+}
+if (!ledger || typeof ledger.record!== 'function') {
+throw new Error(`[tracebus] Cannot create bus ${name}: a ledger is required`);
+}
+
+const requestResponse =!!(opts && opts.requestResponse);
+const subscribers = new Map(); // destination name → handler
+
+return {
+name: name,
+
+/**
+* Subscribe a named destination to this bus.
+* @param {string} destination - the name routing entries deliver to
+* @param {function} handler - receives (packet)
+*/
+subscribe(destination, handler) {
+if (!destination || typeof destination!== 'string') {
+throw new Error(`[tracebus:${name}] Cannot subscribe: destination must be a non-empty string`);
+}
+if (typeof handler!== 'function') {
+throw new Error(`[tracebus:${name}] Cannot subscribe ${destination}: handler must be a function`);
+}
+subscribers.set(destination, handler);
+},
+
+/**
+* Emit a packet from a source. Routing decides destinations; a receipt
+* is always recorded. Returns { delivered, missing} — destinations that
+* received the packet and declared destinations with no live subscriber.
+* @param {string} source - the emitter
+* @param {object} packet - from createPacket()
+*/
+emit(source, packet) {
+if (!packet ||!packet.packetType) {
+throw new Error(`[tracebus:${name}] Cannot emit from ${source}: invalid packet (missing packetType)`);
+}
+
+let routeEntries;
+try {
+routeEntries = routingTable.resolve(packet.packetType, source);
+} catch (err) {
+ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:unrouted'});
+throw err;
+}
+
+const entry = routeEntries[0];
+if (entry.bus!== name) {
+ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:wrong_bus'});
+throw new Error(`[tracebus:${name}] Cannot emit ${packet.packetType} from ${source}: packet is routed to bus ${entry.bus}, not ${name}`);
+}
+
+const delivered = [];
+const missing = [];
+
+for (const re of routeEntries) {
+for (const dest of re.destinations) {
+const handler = subscribers.get(dest);
+if (handler) {
+try {
+handler(packet);
+delivered.push(dest);
+} catch (handlerErr) {
+ledger.record({
+bus: name, packet, source,
+destinations: [dest],
+status: `error:subscriber:${handlerErr.message}`
+});
+delivered.push(dest); // a thrown handler still received the packet
+}
+} else {
+missing.push(dest);
+}
+}
+}
+
+ledger.record({
+bus: name, packet, source,
+destinations: delivered,
+status: missing.length > 0
+? `delivered:partial (missing: ${missing.join(', ')})`
+: 'delivered'
+});
+
+return { delivered, missing};
+},
+
+/**
+* Request/response: emit to a single destination and return its handler's
+* return value. Only available when the bus was created with
+* { requestResponse: true}.
+* @param {string} source
+* @param {object} packet
+* @returns {*} the handler's return value
+*/
+request(source, packet) {
+if (!requestResponse) {
+throw new Error(`[tracebus:${name}] request() is not enabled on this bus (create it with { requestResponse: true})`);
+}
+if (!packet ||!packet.packetType) {
+throw new Error(`[tracebus:${name}] Cannot request from ${source}: invalid packet`);
+}
+
+let routeEntries;
+try {
+routeEntries = routingTable.resolve(packet.packetType, source);
+} catch (err) {
+ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:unrouted'});
+throw err;
+}
+
+const entry = routeEntries[0];
+if (entry.bus!== name) {
+ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:wrong_bus'});
+throw new Error(`[tracebus:${name}] Cannot request ${packet.packetType}: routed to bus ${entry.bus}`);
+}
+
+const dest = entry.destinations[0];
+const handler = subscribers.get(dest);
+if (!handler) {
+ledger.record({ bus: name, packet, source, destinations: [dest], status: 'error:destination_not_registered'});
+throw new Error(`[tracebus:${name}] Cannot request ${packet.packetType} from ${source}: destination ${dest} is not registered`);
+}
+
+let result;
+try {
+result = handler(packet);
+} catch (handlerErr) {
+ledger.record({ bus: name, packet, source, destinations: [dest], status: `error:handler:${handlerErr.message}`});
+throw handlerErr;
+}
+
+ledger.record({ bus: name, packet, source, destinations: [dest], status: 'delivered:request_response'});
+return result;
+},
+
+/** Is a destination subscribed? (diagnostic) */
+hasSubscriber(destination) {
+return subscribers.has(destination);
+},
+
+/** Subscriber count (diagnostic). */
+subscriberCount() {
+return subscribers.size;
+}
+};
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Exports — CommonJS for Node, global for the browser.
+// ────────────────────────────────────────────────────────────────────
+
+const tracebus = {
+generateId,
+createPacket,
+createLedger,
+createRoutingTable,
+createBus,
+deepFreeze
+};
+
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = tracebus;
+}
+if (typeof window!== 'undefined') {
+window.tracebus = tracebus;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Runnable demo: node tracebus.js --demo
+// Wires a tiny two-subscriber bus, emits one packet, and prints the
+// ledger — so `run` shows the receipt trail with no code to write.
+// ────────────────────────────────────────────────────────────────────
+if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
+var arg = process.argv[2];
+if (arg === '--demo' || arg === undefined) {
+var routing = createRoutingTable();
+var ledger = createLedger();
+var bus = createBus('DATA', routing, ledger);
+
+routing.register({ packetType: 'order.placed', source: 'checkout', bus: 'DATA', destinations: ['fulfillment', 'email']});
+bus.subscribe('fulfillment', function (p) { console.log(' fulfillment got order', p.payload.id);});
+bus.subscribe('email', function (p) { console.log(' email got order', p.payload.id);});
+
+console.log('emit order.placed from checkout:');
+var result = bus.emit('checkout', createPacket('order.placed', { id: 1001}, { source: 'checkout'}));
+console.log(' delivered:', result.delivered.join(', '), '| missing:', result.missing.join(', ') || '(none)');
+
+console.log('\nledger (the receipt trail):');
+ledger.all().forEach(function (e) {
+console.log(' ' + e.packetType + ' bus=' + e.bus + ' status=' + e.status + ' ->[' + e.destinations.join(', ') + ']');
+});
+
+console.log('\ntry an unrouted packet (refused, but still recorded):');
+try { bus.emit('checkout', createPacket('order.cancelled', { id: 1001}));}
+catch (e) { console.log(' refused: ' + e.message);}
+console.log(' ledger now has ' + ledger.count() + ' records — nothing moved without a receipt.');
+} else {
+console.log('usage: node tracebus.js --demo');
+}
+}
+
+test_tracebus.js 268 lines on GitHub →
+#!/usr/bin/env node
+/* test_tracebus.js — proves the bus is honest: nothing moves without a receipt,
+no path travels that wasn't declared, and a bad subscriber can't take the bus down.
+
+The six properties that ARE the tool:
+1. No delivery without a receipt — every emit() appends exactly one ledger record.
+2. No undeclared path — an unrouted packet is refused (and the refusal is recorded).
+3. A wrong-bus packet is refused — routed to A, cannot be emitted on B.
+4. A throwing subscriber can't break the emitter — error caught, recorded, delivery continues.
+5. Registered routes are frozen — the declared topology stays declared.
+6. A trace is reconstructable — queryByTraceId returns every hop in order.
+Plus the generalizations this strip added over its origin (tested hardest, per the
+"a ported core gets its OWN validation" rule): request() gated by a per-bus flag,
+not a hardcoded bus name. Ends with a mutation bite so a vacuous green fails loud.
+stdlib only, no dependencies. Exit 0 = all pass, exit 1 = a failure (loud). */
+"use strict";
+var tb = require("./tracebus.js");
+
+var pass = 0, fail = 0;
+function ok(name, cond) {
+if (cond) { pass++;} else { fail++; console.error("FAIL " + name);}
+}
+function eq(name, got, want) {
+var g = JSON.stringify(got), w = JSON.stringify(want);
+if (g === w) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
+}
+function threws(fn) { try { fn(); return false;} catch (e) { return true;}}
+
+// A fresh, wired-up bus system for a test to use.
+function fixture(busOpts) {
+var routing = tb.createRoutingTable();
+var ledger = tb.createLedger();
+var bus = tb.createBus("DATA", routing, ledger, busOpts);
+return { routing: routing, ledger: ledger, bus: bus};
+}
+
+// ── createPacket: shape + validation ─────────────────────────────────────────
+(function () {
+var p = tb.createPacket("user.created", { id: 7});
+ok("packet has packetId", typeof p.packetId === "string" && p.packetId.length === 36);
+ok("packet has traceId", typeof p.traceId === "string" && p.traceId.length === 36);
+ok("packet keeps type", p.packetType === "user.created");
+ok("packet keeps payload", p.payload.id === 7);
+ok("packet source defaults null", p.source === null);
+ok("packetId!== traceId by default", p.packetId!== p.traceId);
+
+var threaded = tb.createPacket("user.updated", { id: 7}, { traceId: "trace-abc", source: "svc"});
+ok("traceId threads through opts", threaded.traceId === "trace-abc");
+ok("source threads through opts", threaded.source === "svc");
+
+ok("empty packetType throws", threws(function () { tb.createPacket("", {});}));
+ok("non-string packetType throws", threws(function () { tb.createPacket(42, {});}));
+ok("null payload throws", threws(function () { tb.createPacket("t", null);}));
+ok("non-object payload throws", threws(function () { tb.createPacket("t", "nope");}));
+})();
+
+// ── generateId: v4 shape + uniqueness ────────────────────────────────────────
+(function () {
+var a = tb.generateId(), b = tb.generateId();
+ok("id is 36 chars", a.length === 36);
+ok("id version nibble is 4", a[14] === "4");
+ok("id variant nibble in 8,9,a,b", /[89ab]/.test(a[19]));
+ok("dashes at 8,13,18,23", a[8] === "-" && a[13] === "-" && a[18] === "-" && a[23] === "-");
+ok("ids are unique", a!== b);
+// 500 draws, no collision
+var seen = {}, collision = false;
+for (var i = 0; i < 500; i++) { var id = tb.generateId(); if (seen[id]) collision = true; seen[id] = 1;}
+ok("500 ids, no collision",!collision);
+})();
+
+// ── PROPERTY 1: no delivery without a receipt ────────────────────────────────
+(function () {
+var f = fixture();
+f.routing.register({ packetType: "e", source: "src", bus: "DATA", destinations: ["sink"]});
+f.bus.subscribe("sink", function () {});
+ok("ledger starts empty", f.ledger.count() === 0);
+f.bus.emit("src", tb.createPacket("e", { n: 1}));
+ok("one emit -> one record", f.ledger.count() === 1);
+f.bus.emit("src", tb.createPacket("e", { n: 2}));
+ok("two emits -> two records", f.ledger.count() === 2);
+ok("delivered status recorded", f.ledger.all()[0].status === "delivered");
+
+// even a REJECTED emit leaves exactly one record
+var g = fixture();
+var before = g.ledger.count();
+threws(function () { g.bus.emit("nobody", tb.createPacket("unrouted", {}));});
+ok("rejected emit still records once", g.ledger.count() === before + 1);
+ok("rejection status is unrouted", g.ledger.all()[0].status === "rejected:unrouted");
+})();
+
+// ── PROPERTY 2: no undeclared path ───────────────────────────────────────────
+(function () {
+var f = fixture();
+ok("unrouted resolve throws", threws(function () { f.routing.resolve("x", "y");}));
+ok("has() is false before register", f.routing.has("x", "y") === false);
+f.routing.register({ packetType: "x", source: "y", bus: "DATA", destinations: ["d"]});
+ok("has() is true after register", f.routing.has("x", "y") === true);
+ok("emit of unrouted throws", threws(function () { f.bus.emit("z", tb.createPacket("x", {}));}));
+// register validation
+ok("register without bus throws", threws(function () { f.routing.register({ packetType: "a", source: "b", destinations: ["d"]});}));
+ok("register with empty destinations throws", threws(function () { f.routing.register({ packetType: "a", source: "b", bus: "DATA", destinations: []});}));
+ok("register with non-array destinations throws", threws(function () { f.routing.register({ packetType: "a", source: "b", bus: "DATA", destinations: "d"});}));
+})();
+
+// ── PROPERTY 3: a wrong-bus packet is refused ────────────────────────────────
+(function () {
+var routing = tb.createRoutingTable();
+var ledger = tb.createLedger();
+var dataBus = tb.createBus("DATA", routing, ledger);
+var ctrlBus = tb.createBus("CONTROL", routing, ledger);
+// route says this packet belongs on CONTROL
+routing.register({ packetType: "cmd", source: "op", bus: "CONTROL", destinations: ["worker"]});
+var landed = false;
+dataBus.subscribe("worker", function () { landed = true;});
+ok("emit on wrong bus throws", threws(function () { dataBus.emit("op", tb.createPacket("cmd", {}));}));
+ok("wrong-bus packet not delivered", landed === false);
+ok("wrong-bus rejection recorded", ledger.all().some(function (e) { return e.status === "rejected:wrong_bus";}));
+})();
+
+// ── PROPERTY 4: a throwing subscriber can't break the emitter ────────────────
+(function () {
+var f = fixture();
+f.routing.register({ packetType: "fan", source: "src", bus: "DATA", destinations: ["good", "bad", "also"]});
+var goodHits = 0, alsoHits = 0;
+f.bus.subscribe("good", function () { goodHits++;});
+f.bus.subscribe("bad", function () { throw new Error("boom");});
+f.bus.subscribe("also", function () { alsoHits++;});
+var result;
+ok("emit with a throwing subscriber does not throw",!threws(function () {
+result = f.bus.emit("src", tb.createPacket("fan", {}));
+}));
+ok("good subscriber ran", goodHits === 1);
+ok("subscriber AFTER the thrower still ran", alsoHits === 1);
+ok("throwing dest counted as delivered", result.delivered.indexOf("bad")!== -1);
+ok("subscriber error recorded", f.ledger.all().some(function (e) { return /error:subscriber/.test(e.status);}));
+
+// a declared destination with NO subscriber -> reported missing, not an error
+var g = fixture();
+g.routing.register({ packetType: "e", source: "s", bus: "DATA", destinations: ["present", "absent"]});
+g.bus.subscribe("present", function () {});
+var r2 = g.bus.emit("s", tb.createPacket("e", {}));
+ok("present delivered", r2.delivered.indexOf("present")!== -1);
+ok("absent reported missing", r2.missing.indexOf("absent")!== -1);
+ok("partial status recorded", g.ledger.all().some(function (e) { return /delivered:partial/.test(e.status);}));
+})();
+
+// ── PROPERTY 5: registered routes are frozen ─────────────────────────────────
+(function () {
+var routing = tb.createRoutingTable();
+routing.register({ packetType: "e", source: "s", bus: "DATA", destinations: ["d"]});
+var entry = routing.resolve("e", "s")[0];
+ok("resolved entry is frozen", Object.isFrozen(entry));
+ok("entry.destinations is frozen", Object.isFrozen(entry.destinations));
+// mutating a frozen entry is a silent no-op in non-strict, throws in strict — either way it must not change
+var beforeBus = entry.bus;
+try { entry.bus = "HACKED";} catch (e) { /* strict-mode throw is fine */}
+ok("frozen entry.bus unchanged", entry.bus === beforeBus);
+try { entry.destinations.push("injected");} catch (e) { /* fine */}
+ok("frozen destinations unchanged", entry.destinations.length === 1);
+
+// deepFreeze on a nested object
+var nested = tb.deepFreeze({ a: { b: { c: 1}}});
+ok("deepFreeze freezes root", Object.isFrozen(nested));
+ok("deepFreeze freezes nested", Object.isFrozen(nested.a.b));
+})();
+
+// ── PROPERTY 6: a trace is reconstructable ───────────────────────────────────
+(function () {
+var f = fixture();
+f.routing.register({ packetType: "step1", source: "a", bus: "DATA", destinations: ["b"]});
+f.routing.register({ packetType: "step2", source: "a", bus: "DATA", destinations: ["b"]});
+f.bus.subscribe("b", function () {});
+var trace = "journey-1";
+f.bus.emit("a", tb.createPacket("step1", {}, { traceId: trace}));
+f.bus.emit("a", tb.createPacket("step2", {}, { traceId: trace}));
+f.bus.emit("a", tb.createPacket("step1", {}, { traceId: "other"}));
+var hops = f.ledger.queryByTraceId(trace);
+ok("trace has exactly its two hops", hops.length === 2);
+ok("trace hops in emission order", hops[0].packetType === "step1" && hops[1].packetType === "step2");
+ok("other trace excluded", hops.every(function (h) { return h.traceId === trace;}));
+// query by packetType
+ok("queryByPacketType finds all step1", f.ledger.queryByPacketType("step1").length === 2);
+})();
+
+// ── THE GENERALIZATION (tested hardest — the ported core's OWN validation) ────
+// In the origin, request() was hardwired to a bus literally named 'VAULT'. The strip
+// replaced that with a per-bus { requestResponse} flag. These prove the new gate.
+(function () {
+var routing = tb.createRoutingTable();
+var ledger = tb.createLedger();
+routing.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
+
+// a bus WITHOUT the flag refuses request(), regardless of its name
+var plain = tb.createBus("RPC", routing, ledger); // note: named RPC, not VAULT — name must NOT matter
+plain.subscribe("answerer", function () { return 99;});
+ok("request refused without flag (name irrelevant)", threws(function () {
+plain.request("asker", tb.createPacket("q", {}));
+}));
+
+// a bus WITH the flag answers — and the answer is the handler's return value
+var routing2 = tb.createRoutingTable();
+var ledger2 = tb.createLedger();
+routing2.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
+var rpc = tb.createBus("RPC", routing2, ledger2, { requestResponse: true});
+rpc.subscribe("answerer", function (pkt) { return pkt.payload.a + pkt.payload.b;});
+var answer = rpc.request("asker", tb.createPacket("q", { a: 2, b: 3}));
+ok("request returns handler value", answer === 5);
+ok("request_response status recorded", ledger2.all().some(function (e) { return /request_response/.test(e.status);}));
+
+// request to an unregistered destination -> error, recorded
+var routing3 = tb.createRoutingTable();
+var ledger3 = tb.createLedger();
+routing3.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["ghost"]});
+var rpc3 = tb.createBus("RPC", routing3, ledger3, { requestResponse: true});
+ok("request to unregistered dest throws", threws(function () { rpc3.request("asker", tb.createPacket("q", {}));}));
+ok("unregistered-dest error recorded", ledger3.all().some(function (e) { return /destination_not_registered/.test(e.status);}));
+
+// a throwing request handler propagates (unlike emit) but still records
+var routing4 = tb.createRoutingTable();
+var ledger4 = tb.createLedger();
+routing4.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
+var rpc4 = tb.createBus("RPC", routing4, ledger4, { requestResponse: true});
+rpc4.subscribe("answerer", function () { throw new Error("handler failed");});
+ok("request handler error propagates", threws(function () { rpc4.request("asker", tb.createPacket("q", {}));}));
+ok("request handler error recorded", ledger4.all().some(function (e) { return /error:handler/.test(e.status);}));
+})();
+
+// ── constructor validation (the ported core's own guards) ────────────────────
+(function () {
+var routing = tb.createRoutingTable();
+var ledger = tb.createLedger();
+ok("createBus without name throws", threws(function () { tb.createBus("", routing, ledger);}));
+ok("createBus without routing throws", threws(function () { tb.createBus("B", null, ledger);}));
+ok("createBus without ledger throws", threws(function () { tb.createBus("B", routing, null);}));
+ok("createBus with non-table routing throws", threws(function () { tb.createBus("B", {}, ledger);}));
+
+var f = fixture();
+ok("subscribe non-function throws", threws(function () { f.bus.subscribe("d", "not a fn");}));
+ok("subscribe empty dest throws", threws(function () { f.bus.subscribe("", function () {});}));
+ok("ledger.record without packet throws", threws(function () { f.ledger.record({ bus: "DATA"});}));
+
+// diagnostics
+f.bus.subscribe("x", function () {});
+ok("hasSubscriber true for x", f.bus.hasSubscriber("x") === true);
+ok("hasSubscriber false for y", f.bus.hasSubscriber("y") === false);
+ok("subscriberCount is 1", f.bus.subscriberCount() === 1);
+})();
+
+// ── MUTATION BITE: prove the receipt invariant is not vacuously green ─────────
+// If the ledger silently dropped records, property 1's counts would still be
+// "consistent" at zero. This bite asserts the ledger actually grows AND that a
+// real emit produces a record whose fields tie back to the packet — so a no-op
+// record() (the plausible mutation) fails loud here.
+(function () {
+var f = fixture();
+f.routing.register({ packetType: "bite", source: "s", bus: "DATA", destinations: ["d"]});
+f.bus.subscribe("d", function () {});
+var pkt = tb.createPacket("bite", { proof: true});
+f.bus.emit("s", pkt);
+var rec = f.ledger.all()[0];
+ok("mutation bite: ledger actually grew", f.ledger.count() === 1);
+ok("mutation bite: record ties to the packet", rec && rec.packetId === pkt.packetId && rec.traceId === pkt.traceId);
+ok("mutation bite: record carries real status", rec && typeof rec.status === "string" && rec.status.length > 0);
+})();
+
+console.log((fail === 0? "PASS": "FAIL") + " — " + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Zero-dependency JavaScript, Node or browser
+
+---

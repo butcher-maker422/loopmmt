@@ -18,15 +18,17 @@
    *   tag    — element tagName
    *   src    — the raw src attribute
    *   inMain — true iff the element is inside the page body content region (<main>)
-   * Eligible = an <img> with a raster (jpg/png) src inside <main>. Chrome SVGs
-   * (wordmark, nav mark, icons) fail the raster test; header/nav/footer images
-   * fail the inMain test. Both exclusions are load-bearing (see the test). */
+   * Eligible = an <img> with a raster (jpg/png/webp) src inside <main>. Chrome
+   * SVGs (wordmark, nav mark, icons) fail the raster test; header/nav/footer
+   * images fail the inMain test. Both exclusions are load-bearing. webp was
+   * added (NOTE-27.1935-5) so raster webp images pop like jpg/png — the resume
+   * b&w closing image is .webp and must Lightbox in parity with the .jpg. */
   function isEligibleLightboxImage(desc) {
     if (!desc) return false;
     if (String(desc.tag).toLowerCase() !== 'img') return false;
     if (!desc.inMain) return false;
     var src = String(desc.src || '');
-    return /\.(jpe?g|png)(\?|#|$)/i.test(src);
+    return /\.(jpe?g|png|webp)(\?|#|$)/i.test(src);
   }
 
   /* ---- DOM layer (skipped entirely when this file is require()'d in node) ---- */
