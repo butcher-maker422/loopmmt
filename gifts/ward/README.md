@@ -56,6 +56,15 @@ The glyphs: `◉` solid (witness agrees) · `○` ring (unearned). Exit `0` only
 every cell is solid; any ring exits `1`, by design — an unearned badge is a
 failure, not a decoration.
 
+Every resolved cell also carries a **`reason`** — a short token naming *why* it
+resolved as it did: `ok` for a solid, and `missing-file`, `contains-miss`,
+`cmd-fail`, `timeout`, `malformed`, `unknown-kind`, `no-witness`, or `error` for
+the specific way a ring rang. It rides the `--format json` output, a
+`data-reason` attribute on each HTML cell, and a `[ring: …]` tail in the text
+render. It is purely additive — it names the diagnosis and never changes the
+state — so a wall of rings tells you which witness to fix instead of just that
+one is broken.
+
 ## The coerce weld — the one load-bearing rule
 
 Every cell state is routed through a single gate, and an unknown, missing, or

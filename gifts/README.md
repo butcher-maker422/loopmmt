@@ -1,9 +1,9 @@
 # Gifts
 
-**Thirteen small tools, given away. Take them.**
+**Twenty small tools, given away. Take them.**
 
 Most of what Loop MMT built is shared here to *read* and *run* — the apps under their
-copyleft license, the corpus under its non-commercial one. These thirteen are different.
+copyleft license, the corpus under its non-commercial one. These twenty are different.
 They're standalone, they carry no methodology, and they're released under the **MIT
 license** — the most permissive one there is. Use them in anything, including something
 you sell. No attribution required, though it's always kind.
@@ -164,11 +164,60 @@ outward. This one doesn't.
 correctness-and-ergonomics tool, not a constant-time / side-channel-hardened primitive.
 Dependency-free JavaScript. `window.ForestGifts.sha256Hex(str)`.
 
+## [`sudoku/`](sudoku/) — a solver that shows its work
+
+Most Sudoku solvers hand you the answer. This one hands you the **reasoning** — it solves
+the way a person does, applying the *lowest* technique that makes progress and recording, at
+every step, what it did and why, so the answer is the last line of an argument you can check
+by hand. Python stdlib only. `python3 sudoku.py --demo`.
+
+## [`dwell/`](dwell/) — the *when* you commit is the *what* you choose
+
+A cart circles a loop of `n` ticks. Holding is free — an extra full lap changes nothing — and
+it leaves only when you **reverse**; which of `k` exits it takes is a pure function of the
+phase at the instant of reversal. A tiny, exact model of reversal-indexed routing. Python
+stdlib only. `python3 dwell.py route 0 6 12 4`.
+
+## [`conflict/`](conflict/) — refuse to commit a file that no longer parses
+
+A bad merge leaves `<<<<<<<`, `=======`, `>>>>>>>` markers wedged into a file — broken source
+that landed, and it hides, because the failure only surfaces when something reads the file.
+This scans the working tree and refuses the ones carrying unresolved markers. Python stdlib
+only. `python3 conflict.py`.
+
+## [`hunkhole/`](hunkhole/) — find the change git's own tools hide
+
+Git tells you which **files** changed; it does not tell you when a stale tree or a clumsy
+restore quietly **reverted** part of a file while leaving the file in place. A presence check
+reads that as clean recovery; `hunkhole` reads the hole. Python stdlib only.
+`python3 hunkhole.py <BEFORE>`.
+
+## [`markdown/`](markdown/) — one Markdown source, two honest shadows
+
+A tiny, dependency-free Markdown compiler with a single root and pure emitters
+(`source → parse() → AST → { toHTML, toPlainText }`), so the HTML and the plain-text
+rendering are two honest views of the same parse — never two drifting hand-writes.
+Dependency-free JavaScript. `echo "# Hello" | node markdown.js`.
+
+## [`callsigns/`](callsigns/) — memorable IDs that are safe by construction
+
+A random identifier you can read aloud, remember for the length of a standup, and paste
+anywhere without escaping — `word-word-hash` (e.g. `sunny-champion-8h3kq7`), confusable-free
+by construction, with a hash tail that keeps it near-unique at scale. Python stdlib only.
+`python3 callsigns.py`.
+
+## [`tracebus/`](tracebus/) — a message bus that leaves a receipt
+
+A tiny, dependency-free publish/subscribe bus with two rules most buses skip: **every legal
+path is declared up front, and every emission is written to a log you can replay.** A bus you
+can audit after the fact instead of guessing what fired. Dependency-free JavaScript.
+`node tracebus.js --demo`.
+
 ---
 
 ## License
 
-All thirteen are **MIT** (see each folder's `LICENSE`, and `../LICENSE-gifts`). That's the
+All twenty are **MIT** (see each folder's `LICENSE`, and `../LICENSE-gifts`). That's the
 whole point — they're yours.
 
 *Loop MMT™ · © 2026 Shea Gunther · New Gloucester, Maine*
