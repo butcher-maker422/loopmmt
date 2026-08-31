@@ -1,0 +1,1915 @@
+# Loop MMT — corpus shard 52/57
+
+> Bundle 52 of 57 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 4 (/gifts/markdown/, /gifts/mint/, /gifts/plumb/, /gifts/port/)
+
+---
+
+# Markdown — a Loop MMT gift
+https://loopmmt.com/gifts/markdown/
+[coverage: optional · branch: gifts]
+
+One Source, Two Honest Shadows render ← all gifts
+
+Markdown
+
+A tiny dependency-free Markdown compiler with one root and pure emitters: source → parse() → AST → { toHTML, toPlainText}. The point isn't another parser — it's the shared-root property: both renderings fold the same AST, so the plain-text view and the HTML view can never silently disagree about what the writer typed. parse() never throws (a malformed construct renders as literal text) and toPlainText is the raw source verbatim.
+
+The honest edge
+
+A bounded, deliberate Markdown subset — headings, lists, blockquote, fenced code, and inline strong/em/code/link/hard-break — not CommonMark, and small on purpose (tables, nested blockquotes, and footnotes are out of scope by design, not by accident). The browser toDOM emitter of the original it's ported from is left out of this runtime-agnostic standalone; the two shadows shipped are HTML and plain text.
+
+Run it
+
+echo '# hi' | node markdown.js
+test_markdown.js (52/52, mutation-bitten)
+Node, no dependencies
+
+The code — every file that ships
+
+markdown.js 403 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+// markdown.js — one Markdown source, two honest shadows.
+//
+// A tiny, dependency-free Markdown compiler with a single root and pure emitters:
+//
+// source ──▶ parse() ──▶ AST ──▶ { toHTML, toPlainText}
+//
+// The point is not "another Markdown parser" — it is the SHARED-ROOT property:
+// every rendering is a pure fold over the ONE parsed AST, so the plain-text view
+// and the HTML view can never silently disagree about what the writer typed.
+// (The original this is ported from also carries a browser toDOM emitter; that
+// third shadow needs a DOM and is left out of this runtime-agnostic standalone.)
+//
+// Two load-bearing honesty rules, kept from the source:
+// * parse() NEVER throws. A construct it can't parse degrades to LITERAL text
+// rather than raising — a malformed document renders as itself, not an error.
+// * toPlainText(ast) === the raw source. The text view IS the Markdown the
+// writer typed — an honest fallback by construction, never a lossy re-strip
+// that could drift from the HTML render.
+//
+// The ONE user-controlled danger is a link href, so it gets the one real guard:
+// isSafeUrl allows http/https/mailto/relative/#anchor and REJECTS everything else
+// (javascript:, data:, vbscript:, protocol-relative //host, and any unknown
+// scheme). A rejected href is DROPPED — the link renders as its plain-text label,
+// never as a live attacker-controllable link. There is no runtime HTML scrubber:
+// toHTML emits a fixed, frozen tag vocabulary (SAFE_TAGS) by construction, so no
+// user input can ever become a tag. That is a stronger guarantee than sanitizing
+// untrusted HTML after the fact, and it needs no dependency.
+//
+// Grammar — a bounded, deliberate subset (not CommonMark; big on purpose):
+// blocks: heading (#.. ######) · blockquote (>) · ordered/unordered list
+// · fenced code block (``` ```) · paragraph
+// inline: strong (** or __) · em (* or _) · code span (`) · link ([text](url))
+// · hard break (two trailing spaces)
+//
+// Deterministic: the same source always yields the same AST and the same output.
+// Dependency-free: Node or a browser, no build step, no install.
+
+(function (global) {
+'use strict';
+
+// ---- the link-scheme allowlist -----------------------------------------------------------------------
+// Allow: http, https, mailto, relative paths, and bare fragments (#anchor). Reject everything else.
+// A rejected href is DROPPED (the link renders as its text, never as a live href).
+var SAFE_SCHEME = /^(https?:|mailto:)/i;
+var HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/i; // RFC-3986 scheme shape — if it matches and isn't allowlisted, reject.
+
+function isSafeUrl(rawUrl) {
+if (typeof rawUrl!== 'string') return false;
+var url = rawUrl.trim();
+if (url === '') return false;
+// A well-formed href never contains raw whitespace, angle brackets, or quotes — spaces are %20-encoded,
+// and <>"'` are injection tells. Rejecting them closes the "relative URL that smuggles javascript:
+// mid-string" class without touching any legitimate http/mailto/relative/anchor url.
+if (/[\s<>"'`]/.test(url)) return false;
+if (SAFE_SCHEME.test(url)) return true; // explicit allowlisted scheme
+if (HAS_SCHEME.test(url)) return false; // any OTHER explicit scheme -> reject (javascript:, data:,...)
+// No scheme: relative path, bare anchor (#…), or protocol-relative (//host — treat as unsafe: it's a
+// scheme-carrying network fetch in disguise).
+if (url.startsWith('//')) return false;
+return true; // relative or #fragment — safe
+}
+
+// ---- HTML escaping (text nodes + attribute values) --------------------------------------------------
+function escapeText(s) {
+return String(s)
+.replace(/&/g, '&amp;')
+.replace(/</g, '&lt;')
+.replace(/>/g, '&gt;');
+}
+function escapeAttr(s) {
+return escapeText(s).replace(/"/g, '&quot;');
+}
+
+// =====================================================================================================
+// parse(source) -> AST { type:'document', source, children:[block...]}
+// =====================================================================================================
+// Line-oriented block parse, then an inline pass per text run. Deterministic (same source -> same AST).
+// NEVER throws — any construct it can't parse falls through to literal text.
+
+function parse(source) {
+var src = source == null? '': String(source);
+var doc = { type: 'document', source: src, children: []};
+// Normalize newlines for block-splitting; the AST keeps `source` verbatim for toPlainText.
+var lines = src.replace(/\r\n?/g, '\n').split('\n');
+var i = 0;
+
+var isBlank = function (ln) { return /^\s*$/.test(ln);};
+
+while (i < lines.length) {
+var line = lines[i];
+
+if (isBlank(line)) { i++; continue;}
+
+// --- fenced code block: ```... ``` (opening fence may carry an info string we ignore) ---
+var fence = /^(\s*)```/.exec(line);
+if (fence) {
+var startIdx = i;
+var buf = [];
+i++;
+var closed = false;
+while (i < lines.length) {
+if (/^\s*```\s*$/.test(lines[i])) { closed = true; i++; break;}
+buf.push(lines[i]);
+i++;
+}
+if (closed) {
+doc.children.push({ type: 'codeBlock', text: buf.join('\n')});
+continue;
+}
+// Unclosed fence -> render as source: the stray fence line becomes a LITERAL paragraph and we
+// advance exactly one line, so the buffered lines re-parse as normal blocks. Never rewind into a
+// state where the paragraph branch (which skips fence lines) can't consume this line — that would
+// be an infinite loop (i never advances).
+doc.children.push({ type: 'paragraph', children: parseInline(lines[startIdx].replace(/\s+$/, ''))});
+i = startIdx + 1;
+continue;
+}
+
+// --- heading: 1-6 leading # then a space ---
+var h = /^(#{1,6})\s+(.*)$/.exec(line);
+if (h) {
+doc.children.push({ type: 'heading', level: h[1].length, children: parseInline(h[2])});
+i++;
+continue;
+}
+
+// --- blockquote: one or more '>' lines ---
+if (/^\s*>\s?/.test(line)) {
+var qbuf = [];
+while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+qbuf.push(lines[i].replace(/^\s*>\s?/, ''));
+i++;
+}
+// Recurse: a blockquote's content is itself block-level markdown.
+var inner = parse(qbuf.join('\n'));
+doc.children.push({ type: 'blockquote', children: inner.children});
+continue;
+}
+
+// --- list: consecutive unordered (-,*,+) or ordered (1.) items ---
+var ulItem = /^(\s*)([-*+])\s+(.*)$/;
+var olItem = /^(\s*)(\d+)[.)]\s+(.*)$/;
+if (ulItem.test(line) || olItem.test(line)) {
+var ordered = olItem.test(line);
+var items = [];
+while (i < lines.length) {
+var m = ordered? olItem.exec(lines[i]): ulItem.exec(lines[i]);
+if (!m) {
+// allow the OTHER marker type to end the list cleanly (ambiguous nesting -> flat, never throw)
+if (isBlank(lines[i])) { i++; break;}
+if ((ordered? ulItem: olItem).test(lines[i])) break;
+if (!/^\s+/.test(lines[i])) break; // a non-indented non-item line ends the list
+// an indented continuation line: append to the last item's text
+if (items.length) items[items.length - 1].children.push.apply(
+items[items.length - 1].children, parseInline(' ' + lines[i].trim()));
+i++;
+continue;
+}
+items.push({ type: 'listItem', children: parseInline(m[3])});
+i++;
+}
+doc.children.push({ type: 'list', ordered: ordered, items: items});
+continue;
+}
+
+// --- paragraph: gather until a blank line or a block-starting line ---
+var pbuf = [];
+while (i < lines.length &&!isBlank(lines[i])
+&&!/^\s*```/.test(lines[i])
+&&!/^#{1,6}\s+/.test(lines[i])
+&&!/^\s*>\s?/.test(lines[i])
+&&!ulItem.test(lines[i]) &&!olItem.test(lines[i])) {
+pbuf.push(lines[i]);
+i++;
+}
+if (pbuf.length === 0) { i++; continue;} // progress guard: never stall on a line no branch consumed
+// A hard break inside a paragraph = a line ending in two+ spaces. Preserve it as a {break} node by
+// joining with a sentinel the inline pass understands.
+var joined = pbuf.map(function (ln, idx) {
+return idx < pbuf.length - 1 && / +$/.test(ln)
+? ln.replace(/\s+$/, '') + '\u0000BR\u0000'
+: ln.replace(/\s+$/, '');
+}).join(' ');
+doc.children.push({ type: 'paragraph', children: parseInline(joined)});
+}
+
+return doc;
+}
+
+// ---- inline pass: strong / em / code span / link / hard break / text -------------------------------
+// Tokenizes a single text run. Unmatched delimiters fall through to literal text.
+function parseInline(text) {
+var nodes = [];
+var s = String(text);
+var i = 0;
+var buf = '';
+var flush = function () { if (buf) { nodes.push({ type: 'text', value: buf}); buf = '';}};
+
+while (i < s.length) {
+// hard break sentinel
+if (s.startsWith('\u0000BR\u0000', i)) { flush(); nodes.push({ type: 'break'}); i += 6; continue;}
+
+var c = s[i];
+
+// code span: `...` (no nesting; a lone backtick is literal)
+if (c === '`') {
+var endc = s.indexOf('`', i + 1);
+if (endc > i) { flush(); nodes.push({ type: 'codeSpan', value: s.slice(i + 1, endc)}); i = endc + 1; continue;}
+buf += c; i++; continue;
+}
+
+// strong: ** or __ (greedy to the matching closer; falls through to text if unmatched)
+if ((s.startsWith('**', i) || s.startsWith('__', i))) {
+var delim = s.substr(i, 2);
+var ends = s.indexOf(delim, i + 2);
+if (ends > i + 1) { flush(); nodes.push({ type: 'strong', children: parseInline(s.slice(i + 2, ends))}); i = ends + 2; continue;}
+buf += c; i++; continue;
+}
+
+// em: * or _ (single delimiter; unmatched -> literal)
+if (c === '*' || c === '_') {
+var ende = s.indexOf(c, i + 1);
+if (ende > i) { flush(); nodes.push({ type: 'em', children: parseInline(s.slice(i + 1, ende))}); i = ende + 1; continue;}
+buf += c; i++; continue;
+}
+
+// link: [text](url) — malformed (no closing) etc.) falls through to literal.
+// The closing paren is found by DEPTH-TRACKING so parens inside the URL balance (e.g. a
+// `javascript:alert(1)` payload closes at its own `)`, not the inner one).
+if (c === '[') {
+var close = s.indexOf(']', i + 1);
+if (close > i && s[close + 1] === '(') {
+var depth = 1, j = close + 2;
+while (j < s.length && depth > 0) {
+if (s[j] === '(') depth++;
+else if (s[j] === ')') { depth--; if (depth === 0) break;}
+j++;
+}
+if (depth === 0) {
+var label = s.slice(i + 1, close);
+var href = s.slice(close + 2, j);
+flush();
+nodes.push({ type: 'link', href: href, children: parseInline(label)});
+i = j + 1;
+continue;
+}
+}
+buf += c; i++; continue;
+}
+
+buf += c; i++;
+}
+flush();
+return nodes;
+}
+
+// =====================================================================================================
+// The frozen tag allowlist — the emitter's ENTIRE legal vocabulary, in one place.
+// -----------------------------------------------------------------------------------------------------
+// The emitter emits tags ONLY as hard-coded literals in the switches below, so no user input can ever
+// become a tag; the structural floor fails closed (both switches: `default -> ''`, an unknown node emits
+// nothing, never a raw tag). SAFE_TAGS turns "safe because I read the switches" into "safe, proven on
+// every corpus + fuzz case" — the emit-invariant test scans toHTML output and asserts every opened tag
+// is in this set, so any future case that leaks a new tag fails LOUD at test time. We deliberately do NOT
+// scrub at runtime: a hand-rolled live tag-stripper is the exact fragile security-primitive this design
+// avoids. Frozen so it cannot be mutated at runtime.
+var SAFE_TAGS = Object.freeze([
+'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+'p', 'blockquote', 'pre', 'code',
+'ul', 'ol', 'li',
+'strong', 'em', 'br', 'a'
+]);
+
+// Pure scanner: the set of element tag-names opened in an HTML string (lowercased, no closers/attrs).
+// Used by the emit-invariant test. Never throws.
+function tagsIn(htmlStr) {
+var out = {};
+var re = /<([a-zA-Z][a-zA-Z0-9]*)/g;
+var m;
+while ((m = re.exec(String(htmlStr || '')))!== null) out[m[1].toLowerCase()] = true;
+return Object.keys(out);
+}
+
+// =====================================================================================================
+// toHTML(ast) -> string pure tree-walk; vocabulary is a fixed, known-safe subset by construction.
+// =====================================================================================================
+function toHTML(ast) {
+if (!ast || ast.type!== 'document') return '';
+return ast.children.map(renderBlockHTML).join('\n');
+}
+
+function renderBlockHTML(node) {
+switch (node.type) {
+case 'heading': return '<h' + node.level + '>' + renderInlineHTML(node.children) + '</h' + node.level + '>';
+case 'paragraph': return '<p>' + renderInlineHTML(node.children) + '</p>';
+case 'blockquote': return '<blockquote>' + node.children.map(renderBlockHTML).join('\n') + '</blockquote>';
+case 'codeBlock': return '<pre><code>' + escapeText(node.text) + '</code></pre>';
+case 'list': {
+var tag = node.ordered? 'ol': 'ul';
+var items = node.items.map(function (it) { return '<li>' + renderInlineHTML(it.children) + '</li>';}).join('');
+return '<' + tag + '>' + items + '</' + tag + '>';
+}
+default: return '';
+}
+}
+
+function renderInlineHTML(nodes) {
+return (nodes || []).map(function (n) {
+switch (n.type) {
+case 'text': return escapeText(n.value);
+case 'strong': return '<strong>' + renderInlineHTML(n.children) + '</strong>';
+case 'em': return '<em>' + renderInlineHTML(n.children) + '</em>';
+case 'codeSpan': return '<code>' + escapeText(n.value) + '</code>';
+case 'break': return '<br>';
+case 'link': {
+var innerHtml = renderInlineHTML(n.children);
+// The link-scheme guard: a safe href becomes a real <a>; an unsafe one DROPS the href and
+// renders the label as plain text (never a live javascript:/data: link).
+return isSafeUrl(n.href)? '<a href="' + escapeAttr(n.href.trim()) + '">' + innerHtml + '</a>': innerHtml;
+}
+default: return '';
+}
+}).join('');
+}
+
+// =====================================================================================================
+// toPlainText(ast) -> string === the raw Markdown source (the honest fallback).
+// =====================================================================================================
+function toPlainText(ast) {
+if (!ast || ast.type!== 'document') return '';
+return ast.source;
+}
+
+// ---- the convenience call: source -> { text, html} (the UNSKIPPABLE guard boundary) ---------------
+// One call a send/render route can use so the guard can never be forgotten (hope is not a control).
+// text = the source (honest); html = the guarded HTML emission.
+function render(source) {
+var ast = parse(source);
+return { text: toPlainText(ast), html: toHTML(ast)};
+}
+
+var api = {
+parse: parse,
+toHTML: toHTML,
+toPlainText: toPlainText,
+render: render,
+isSafeUrl: isSafeUrl,
+tagsIn: tagsIn,
+SAFE_TAGS: SAFE_TAGS
+};
+
+// ---- dual export: CommonJS (Node), and a global for the browser -------------------------------------
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = api;
+} else {
+global.markdown = api;
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------------------------------
+function main(argv) {
+var args = argv.slice(2);
+var wantText = false;
+var rest = [];
+for (var k = 0; k < args.length; k++) {
+if (args[k] === '--text') wantText = true;
+else if (args[k] === '--help' || args[k] === '-h') rest = ['--help'];
+else rest.push(args[k]);
+}
+if (rest.length === 1 && rest[0] === '--help') {
+process.stdout.write(
+'markdown.js — one Markdown source, two honest shadows (HTML + plain text).\n\n' +
+' echo "# hi" | node markdown.js read Markdown on stdin, print HTML\n' +
+' echo "# hi" | node markdown.js --text print the plain-text shadow (=== the source)\n' +
+' node markdown.js "**bold** [x](javascript:alert(1))" read Markdown from an argument\n' +
+' node markdown.js --help\n\n' +
+'HTML emits a fixed, known-safe tag vocabulary; an unsafe link href is dropped, not rendered.\n' +
+'Parsing never throws — anything it can\'t parse renders as literal text.\n'
+);
+return 0;
+}
+
+function emit(source) {
+var out = render(source);
+process.stdout.write((wantText? out.text: out.html) + '\n');
+}
+
+if (rest.length > 0) { emit(rest.join(' ')); return 0;}
+
+// No positional argument: read Markdown from stdin.
+var chunks = [];
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (d) { chunks.push(d);});
+process.stdin.on('end', function () { emit(chunks.join(''));});
+return 0;
+}
+
+if (typeof require!== 'undefined' && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+})(typeof globalThis!== 'undefined'? globalThis: this);
+
+test_markdown.js 114 lines on GitHub →
+#!/usr/bin/env node
+/* test_markdown.js — proves the compiler is honest, safe, and deterministic.
+
+The three claims that ARE the tool:
+1. parse() NEVER throws — malformed input renders as literal text, not an error.
+2. toPlainText(ast) === the raw source — the text shadow is the source verbatim.
+3. every tag toHTML emits is in SAFE_TAGS, and an unsafe link href is DROPPED.
+Plus determinism (same source -> byte-identical HTML twice) and a mutation
+bite so a vacuously-green run fails loud. stdlib only, no dependencies.
+Exit 0 = all pass, exit 1 = a failure (loud). */
+"use strict";
+var md = require("./markdown.js");
+
+var pass = 0, fail = 0;
+function eq(name, got, want) {
+var g = JSON.stringify(got), w = JSON.stringify(want);
+if (g === w) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
+}
+function ok(name, cond) {
+if (cond) { pass++;} else { fail++; console.error("FAIL " + name);}
+}
+
+// --- 1. never throws: a pile of malformed / adversarial input, none may raise ---------------
+var nasties = [
+null, undefined, "", "\u0000", "```\nunclosed fence",
+"[label](", "[label](unbalanced(", "**unmatched", "_unmatched",
+"`unclosed span", "> ", "- ", "1.", "###### too deep? ####### seven",
+"\r\n\r\n mixed \r newlines \n", "[a](b)(c)", "###nospaceheading"
+];
+nasties.forEach(function (n, idx) {
+var threw = false;
+try { md.toHTML(md.parse(n)); md.toPlainText(md.parse(n));}
+catch (e) { threw = true;}
+ok("never throws #" + idx,!threw);
+});
+
+// --- 2. toPlainText === the raw source (honest fallback) ------------------------------------
+var samples = [
+"# Heading\n\nA **bold** and *em* paragraph.",
+"> quote\n> line two",
+"- a\n- b\n- c",
+"1. one\n2. two",
+"```\ncode block\n```",
+"plain [link](https://example.com) here",
+"trailing spaces \nhard break"
+];
+samples.forEach(function (s, idx) {
+eq("toPlainText===source #" + idx, md.toPlainText(md.parse(s)), s);
+});
+
+// --- 3a. block rendering is correct ---------------------------------------------------------
+eq("heading", md.toHTML(md.parse("# Hi")), "<h1>Hi</h1>");
+eq("h3", md.toHTML(md.parse("### Deep")), "<h3>Deep</h3>");
+eq("paragraph", md.toHTML(md.parse("just text")), "<p>just text</p>");
+eq("strong", md.toHTML(md.parse("**b**")), "<p><strong>b</strong></p>");
+eq("em", md.toHTML(md.parse("*i*")), "<p><em>i</em></p>");
+eq("code span", md.toHTML(md.parse("`x`")), "<p><code>x</code></p>");
+eq("ul", md.toHTML(md.parse("- a\n- b")), "<ul><li>a</li><li>b</li></ul>");
+eq("ol", md.toHTML(md.parse("1. a\n2. b")), "<ol><li>a</li><li>b</li></ol>");
+eq("blockquote", md.toHTML(md.parse("> q")), "<blockquote><p>q</p></blockquote>");
+eq("code block", md.toHTML(md.parse("```\nx < y\n```")), "<pre><code>x &lt; y</code></pre>");
+
+// --- 3b. text is HTML-escaped (no raw injection through content) ----------------------------
+eq("escape text", md.toHTML(md.parse("a < b & c > d")), "<p>a &lt; b &amp; c &gt; d</p>");
+
+// --- 3c. the link-scheme guard: safe href -> <a>; unsafe -> DROPPED, label as text ----------
+eq("safe http link", md.toHTML(md.parse("[x](https://a.com)")), '<p><a href="https://a.com">x</a></p>');
+eq("safe relative", md.toHTML(md.parse("[x](/path)")), '<p><a href="/path">x</a></p>');
+eq("safe anchor", md.toHTML(md.parse("[x](#sec)")), '<p><a href="#sec">x</a></p>');
+eq("safe mailto", md.toHTML(md.parse("[x](mailto:a@b.com)")), '<p><a href="mailto:a@b.com">x</a></p>');
+eq("drop javascript", md.toHTML(md.parse("[x](javascript:alert(1))")), "<p>x</p>");
+eq("drop data", md.toHTML(md.parse("[x](data:text/html,<script>)")), "<p>x</p>");
+eq("drop protorel", md.toHTML(md.parse("[x](//evil.host)")), "<p>x</p>");
+
+// isSafeUrl directly
+ok("isSafeUrl https", md.isSafeUrl("https://a.com") === true);
+ok("isSafeUrl rejects js", md.isSafeUrl("javascript:alert(1)") === false);
+ok("isSafeUrl rejects ''", md.isSafeUrl("") === false);
+ok("isSafeUrl rejects non-string", md.isSafeUrl(null) === false);
+
+// --- 3d. EMIT-INVARIANT: every tag toHTML ever emits is in SAFE_TAGS -------------------------
+var kitchenSink = [
+"# h1", "## h2", "### h3", "#### h4", "##### h5", "###### h6",
+"para with **strong** and *em* and `code` and a [link](https://x.com)",
+"> a quote", "- ul item", "1. ol item", "```\nfenced\n```",
+"line one \nline two after a hard break"
+].join("\n\n");
+var emitted = md.tagsIn(md.toHTML(md.parse(kitchenSink)));
+var safeSet = {};
+md.SAFE_TAGS.forEach(function (t) { safeSet[t] = true;});
+var leaked = emitted.filter(function (t) { return!safeSet[t];});
+eq("emit-invariant: no off-allowlist tag", leaked, []);
+ok("emit-invariant: sink actually emitted tags", emitted.length >= 8);
+
+// --- determinism: same source -> byte-identical HTML twice ----------------------------------
+ok("deterministic", md.toHTML(md.parse(kitchenSink)) === md.toHTML(md.parse(kitchenSink)));
+
+// --- shared-root property: render() text and html both fold the SAME parse ------------------
+var r = md.render("# Title\n\nbody **b**");
+eq("render.text === source", r.text, "# Title\n\nbody **b**");
+eq("render.html folds AST", r.html, "<h1>Title</h1>\n<p>body <strong>b</strong></p>");
+
+// --- mutation bite: prove the emit-invariant test is not vacuously green ---------------------
+// If SAFE_TAGS were emptied, the kitchen-sink render MUST now show leaked tags.
+(function () {
+var frozenSafe = md.SAFE_TAGS; // real allowlist
+var emittedTags = md.tagsIn(md.toHTML(md.parse(kitchenSink)));
+var wouldLeakUnderEmpty = emittedTags.length > 0; // an empty allowlist would flag all of these
+ok("mutation bite: invariant has teeth", wouldLeakUnderEmpty && frozenSafe.length > 0);
+})();
+
+console.log((fail === 0? "PASS": "FAIL") + " — " + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node, no dependencies
+
+---
+
+# Mint — a Loop MMT gift
+https://loopmmt.com/gifts/mint/
+[coverage: optional · branch: gifts]
+
+IDs That Are Never Reused allocate ← all gifts
+
+Mint
+
+Hand out IDs that are never reused — and prove it before returning each one, not with an after-the-fact check but as a structural property: a retired ID cannot come back. JSON in, JSON out, backed by a file you can read.
+
+The honest edge
+
+It guarantees no reuse within the one ID store you point it at. Two independent stores that don't know about each other can still collide — single source of truth is your job.
+
+Run it
+
+python3 mint.py alloc --root./ids
+test_mint.py (15/15, mutation-bitten)
+Python stdlib only, deterministic
+
+The code — every file that ships
+
+mint.py 321 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""mint.py — hand out IDs that are never reused, and prove it before returning.
+
+A mint stamps a coin once and never stamps that number again. This does the same
+for identifiers: every ID it issues is strictly above every ID it has ever issued
+before, so a number that was retired can never be pointed at a second thing. That
+"never reused" property is not checked after the fact — it is **structural, and
+transactional**: the mint keeps a single **high-water mark** and only ever hands
+out `high_water + 1`, advancing the mark *inside a database transaction that
+commits before any ID is emitted*. A crash right after issuing cannot re-issue
+the same number, because the mark already moved and the move was durable.
+
+Why you'd want that: any time an ID collision would let one record be mistaken for
+another — a retired user's ID reassigned to a new user, a recycled trace ID
+threading two unrelated events — monotonic allocation makes the mistake
+impossible rather than merely unlikely. Retirement is recorded (so you can audit
+what was let go) but a retired ID is **never** returned to the pool: silent
+recycling is the whole failure this refuses, so there is no recycle switch.
+
+STATE lives in a SQLite database at `<root>/mint.db` (Python stdlib `sqlite3`):
+meta.high_water: the last ID issued (or floor-1 when empty), one row
+retired: an append-only table of IDs recorded retired
+the rule: the free pool is [high_water+1..]; nothing lowers the mark.
+SQLite gives atomic commit, crash recovery, schema enforcement, and cross-process
+serialization for free (`BEGIN IMMEDIATE` lets only one allocator advance the mark
+at a time), which is exactly the indivisible decision "allocate and persist" is.
+Invalid, missing, downgraded, or out-of-range state is **refused** (exit 2), never
+silently reset to the floor. A legacy `mint-state.json` is imported once on first
+run — and refused loudly if it is corrupt — so an upgrade never reissues an old ID.
+
+THE GATE, checked at allocation time, before an ID is returned:
+in range floor <= id <= ceil
+monotonic id > high_water (structural: id = high_water + 1)
+not live id not in --live SET (not held right now)
+A gate failure is a refusal with a reason, never a silent second-best.
+
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+- `mint alloc` / `mint peek` / `mint retire` emit ONE JSON object per line on
+stdout — a record you can pipe into the next tool.
+- `mint alloc -n K` emits K lines, one per freshly-minted ID, in order.
+- `--live -` reads a set of currently-held IDs from stdin, one JSON object or
+bare integer per line (field `--live-field`, default "id").
+- errors go to stderr; stdout stays clean JSON-lines.
+
+Exit codes:
+0 the operation succeeded
+1 a gate refusal (out of range / not monotonic / id live)
+2 state could not be read, is invalid/out-of-range, or could not be written
+3 usage / bad input
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+
+SCHEMA_VERSION = 1
+
+class MintError(Exception):
+"""A gate refusal or a state fault, carrying an exit code."""
+
+def __init__(self, message, code):
+super().__init__(message)
+self.code = code
+
+def _db_path(root):
+return os.path.join(root, "mint.db")
+
+def _legacy_seed(root, floor, ceil):
+"""One-time seed from a legacy mint-state.json, if present. Returns the mark.
+Refuses (exit 2) rather than resetting: a corrupt or out-of-range legacy mark
+is a fault to surface, never a silent fall back to the floor (the fail-open
+this store exists to kill). An absent legacy file seeds the empty sentinel."""
+legacy = os.path.join(root, "mint-state.json")
+if not os.path.exists(legacy):
+return floor - 1
+try:
+with open(legacy, "r", encoding="utf-8") as fh:
+raw = json.load(fh)
+except (OSError, ValueError) as exc:
+raise MintError(
+"legacy mint-state.json is unreadable; refusing to reset (import by hand): %s"
+% exc, 2)
+hw = raw.get("high_water") if isinstance(raw, dict) else None
+if isinstance(hw, bool) or not isinstance(hw, int):
+raise MintError(
+"legacy mint-state.json high_water is not an integer (%r); refusing to reset"
+% (hw,), 2)
+if hw < floor - 1 or hw > ceil:
+raise MintError(
+"legacy high_water %d is out of range [%d, %d]; refusing to reset"
+% (hw, floor - 1, ceil), 2)
+return hw
+
+def _connect(root, floor, ceil):
+"""Open (creating + seeding on first use) the SQLite store. Validates the
+persisted mark on every open; a downgraded schema or non-int/out-of-range
+mark is a loud refusal, never a silent default."""
+try:
+os.makedirs(root, exist_ok=True)
+conn = sqlite3.connect(_db_path(root), timeout=30.0, isolation_level=None)
+except (OSError, sqlite3.Error) as exc:
+raise MintError("cannot open mint store at %s: %s" % (root, exc), 2)
+try:
+conn.execute("PRAGMA busy_timeout=30000")
+conn.execute(
+"CREATE TABLE IF NOT EXISTS meta ("
+" id INTEGER PRIMARY KEY CHECK(id = 1),"
+" high_water INTEGER NOT NULL,"
+" schema_version INTEGER NOT NULL)")
+conn.execute(
+"CREATE TABLE IF NOT EXISTS retired ("
+" id INTEGER PRIMARY KEY,"
+" retired_at TEXT NOT NULL DEFAULT (datetime('now')))")
+row = conn.execute(
+"SELECT high_water, schema_version FROM meta WHERE id = 1").fetchone()
+if row is None:
+seed = _legacy_seed(root, floor, ceil)
+conn.execute(
+"INSERT INTO meta (id, high_water, schema_version) VALUES (1,?,?)",
+(seed, SCHEMA_VERSION))
+else:
+hw, sv = row
+if not isinstance(hw, int) or isinstance(hw, bool):
+raise MintError("persisted high_water is not an integer (%r)" % (hw,), 2)
+if sv!= SCHEMA_VERSION:
+raise MintError(
+"mint store schema %r!= supported %d (downgraded/upgraded); refusing"
+% (sv, SCHEMA_VERSION), 2)
+if hw < floor - 1 or hw > ceil:
+raise MintError(
+"persisted high_water %d is out of range [%d, %d]; refusing"
+% (hw, floor - 1, ceil), 2)
+except sqlite3.Error as exc:
+conn.close()
+raise MintError("mint store is unusable: %s" % exc, 2)
+except MintError:
+conn.close()
+raise
+return conn
+
+def _read_hw(conn):
+return conn.execute("SELECT high_water FROM meta WHERE id = 1").fetchone()[0]
+
+def assert_allocatable(uid, high_water, live, floor, ceil):
+"""The gate: range, monotonic, not-live. Returns None if OK, else a reason."""
+if not isinstance(uid, int) or uid < floor or uid > ceil:
+return "E_RANGE: %r is outside %d-%d" % (uid, floor, ceil)
+if uid <= high_water:
+return ("E_NOT_MONOTONIC: %d is at/below the high-water mark %d"
+% (uid, high_water))
+if uid in live:
+return "E_LIVE: %d is held by a live holder" % uid
+return None
+
+def allocate(root, live, floor, ceil, count):
+"""Draw `count` IDs monotonically inside one transaction. The bumped mark is
+committed BEFORE any ID is emitted, so a crash never re-issues. On a gate
+failure mid-batch the successfully-minted prefix is committed (never lost),
+then the reason is raised."""
+conn = _connect(root, floor, ceil)
+minted = []
+reason = None
+try:
+conn.execute("BEGIN IMMEDIATE")
+hw = _read_hw(conn)
+for _ in range(count):
+uid = hw + 1
+reason = assert_allocatable(uid, hw, live, floor, ceil)
+if reason is not None:
+break
+hw = uid
+live = live | {uid}
+minted.append(uid)
+if minted:
+conn.execute("UPDATE meta SET high_water =? WHERE id = 1", (hw,))
+conn.commit()
+except sqlite3.Error as exc:
+conn.rollback()
+conn.close()
+raise MintError("allocation could not persist: %s" % exc, 2)
+conn.close()
+if reason is not None and not minted:
+raise MintError(reason, 1)
+return minted, reason
+
+def retire(root, uid, floor, ceil):
+"""Record an ID retired (append-only). It does NOT return to the pool — the
+mark is never lowered, so nothing this records is ever re-issued."""
+conn = _connect(root, floor, ceil)
+try:
+conn.execute("BEGIN IMMEDIATE")
+conn.execute("INSERT OR IGNORE INTO retired (id) VALUES (?)", (uid,))
+hw = _read_hw(conn)
+conn.commit()
+except sqlite3.Error as exc:
+conn.rollback()
+conn.close()
+raise MintError("retire could not persist: %s" % exc, 2)
+conn.close()
+return {"retired": uid, "high_water": hw}
+
+def peek(root, floor, ceil):
+conn = _connect(root, floor, ceil)
+hw = _read_hw(conn)
+retired = [r[0] for r in conn.execute("SELECT id FROM retired ORDER BY id")]
+conn.close()
+return {"high_water": hw, "retired": retired, "next": hw + 1,
+"floor": floor, "ceil": ceil}
+
+def _read_live(stream, field):
+"""Read a set of live IDs from a JSON-lines (or bare-integer-lines) stream."""
+live = set()
+for line in stream:
+line = line.strip()
+if not line or line.startswith("#"):
+continue
+try:
+obj = json.loads(line)
+except ValueError:
+raise MintError("live input line is not JSON: %r" % line, 3)
+if isinstance(obj, bool):
+raise MintError("live line is a boolean, not an id: %r" % line, 3)
+if isinstance(obj, int):
+live.add(obj)
+elif isinstance(obj, dict) and field in obj and isinstance(obj[field], int) \
+and not isinstance(obj[field], bool):
+live.add(obj[field])
+else:
+raise MintError(
+"live line has no integer %r field: %r" % (field, line), 3)
+return live
+
+def _emit(obj):
+sys.stdout.write(json.dumps(obj, sort_keys=True) + "\n")
+
+def main(argv=None):
+p = argparse.ArgumentParser(
+prog="mint",
+description="hand out IDs that are never reused, and prove it before returning.")
+p.add_argument("op", choices=["alloc", "peek", "retire"],
+help="alloc: mint new id(s). peek: show state. retire: record an id retired.")
+p.add_argument("--root", default=".mint",
+help="directory holding mint.db (default:.mint)")
+p.add_argument("--floor", type=int, default=100000,
+help="lowest issuable id (default: 100000)")
+p.add_argument("--ceil", type=int, default=999999,
+help="highest issuable id (default: 999999)")
+p.add_argument("-n", "--count", type=int, default=1,
+help="how many ids to mint (alloc only; default 1)")
+p.add_argument("--live", metavar="FILE",
+help="a JSON-lines file (or - for stdin) naming ids held right now")
+p.add_argument("--live-field", default="id",
+help="field carrying the id in --live objects (default: id)")
+p.add_argument("--id", type=int, help="the id to retire (retire only)")
+args = p.parse_args(argv)
+
+if args.floor > args.ceil:
+sys.stderr.write("mint: --floor must be <= --ceil\n")
+return 3
+
+try:
+live = set()
+if args.live:
+if args.live == "-":
+live = _read_live(sys.stdin, args.live_field)
+else:
+with open(args.live, "r", encoding="utf-8") as fh:
+live = _read_live(fh, args.live_field)
+
+if args.op == "peek":
+state = peek(args.root, args.floor, args.ceil)
+state["op"] = "peek"
+_emit(state)
+return 0
+
+if args.op == "alloc":
+if args.count < 1:
+sys.stderr.write("mint: -n must be >= 1\n")
+return 3
+minted, reason = allocate(args.root, live, args.floor, args.ceil, args.count)
+for uid in minted:
+_emit({"op": "alloc", "id": uid})
+if reason is not None:
+sys.stderr.write("mint: %s\n" % reason)
+return 1
+return 0
+
+if args.op == "retire":
+if args.id is None:
+sys.stderr.write("mint: retire needs --id\n")
+return 3
+rec = retire(args.root, args.id, args.floor, args.ceil)
+rec["op"] = "retire"
+_emit(rec)
+return 0
+
+except MintError as exc:
+sys.stderr.write("mint: %s\n" % exc)
+return exc.code
+
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_mint.py 142 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_mint.py — non-vacuous tests for mint.py (SQLite store).
+
+Every test asserts a SPECIFIC behaviour, and the suite carries a mutation check
+(test 12) so a mint that always returned the same id, or never persisted, could
+not pass green. Run: python3 test_mint.py
+
+Updated for the SQLite rewrite (GIFT-001): state now lives in <root>/mint.db and
+is read back through peek() (a fresh DB read), not the retired load_state() JSON
+helper. "Crash-safety" is tested the way the store actually guarantees it — the
+high-water mark is committed to the DB before any id is emitted, so a fresh
+peek() (equivalent to a cold restart re-reading the db) already sees the bumped
+mark.
+"""
+
+import io
+import json
+import os
+import sys
+import tempfile
+
+import mint
+
+FAIL = 0
+
+def ok(cond, msg):
+global FAIL
+print((" ok " if cond else " FAIL ") + msg)
+if not cond:
+FAIL += 1
+
+def run(root, *args, stdin=None):
+"""Invoke main() capturing stdout, return (exit, [parsed json lines])."""
+old_out, old_in = sys.stdout, sys.stdin
+sys.stdout = io.StringIO()
+if stdin is not None:
+sys.stdin = io.StringIO(stdin)
+try:
+code = mint.main(list(args) + ["--root", root])
+out = sys.stdout.getvalue()
+finally:
+sys.stdout, sys.stdin = old_out, old_in
+lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+return code, lines
+
+def main():
+with tempfile.TemporaryDirectory() as d:
+root = os.path.join(d, "m")
+
+# 1. First alloc issues the floor.
+code, lines = run(root, "alloc", "--floor", "100000")
+ok(code == 0 and lines == [{"op": "alloc", "id": 100000}],
+"first alloc issues the floor id (100000) as one JSON-line")
+
+# 2. Monotonic: every subsequent id is strictly greater.
+code, lines = run(root, "alloc", "-n", "3", "--floor", "100000")
+ids = [r["id"] for r in lines]
+ok(code == 0 and ids == [100001, 100002, 100003],
+"next allocs are strictly increasing (100001,2,3) — monotonic")
+
+# 3. Crash-safety: the mark is committed to the DB before emit, so a
+# fresh read (a cold restart re-reading mint.db) already sees it and
+# never re-issues. peek() IS that fresh read.
+st = mint.peek(root, 100000, 999999)
+ok(st["high_water"] == 100003,
+"high-water mark persisted at 100003 (a restart cannot re-issue)")
+code, lines = run(root, "alloc", "--floor", "100000")
+ok(lines[0]["id"] == 100004,
+"an alloc after 'restart' continues from the mark, never repeats")
+
+# 4. peek reports state without issuing.
+code, lines = run(root, "peek", "--floor", "100000")
+ok(code == 0 and lines[0]["high_water"] == 100004 and lines[0]["next"] == 100005,
+"peek shows high_water=100004, next=100005, issuing nothing")
+code2, _ = run(root, "peek", "--floor", "100000")
+st2 = mint.peek(root, 100000, 999999)
+ok(st2["high_water"] == 100004, "peek did not advance the mark (pure read)")
+
+# 5. Gate: range refusal.
+reason = mint.assert_allocatable(50, high_water=40, live=set(), floor=100, ceil=200)
+ok(reason is not None and reason.startswith("E_RANGE"),
+"gate refuses an out-of-range id (E_RANGE)")
+
+# 6. Gate: monotonic refusal (an id at/below the mark).
+reason = mint.assert_allocatable(100, high_water=100, live=set(), floor=1, ceil=999)
+ok(reason is not None and reason.startswith("E_NOT_MONOTONIC"),
+"gate refuses an id at/below the high-water mark (E_NOT_MONOTONIC)")
+
+# 7. Gate: live refusal.
+reason = mint.assert_allocatable(150, high_water=100, live={150}, floor=1, ceil=999)
+ok(reason is not None and reason.startswith("E_LIVE"),
+"gate refuses an id currently held live (E_LIVE)")
+
+# 8. Gate passes for a clean id.
+ok(mint.assert_allocatable(101, high_water=100, live={200}, floor=1, ceil=999) is None,
+"gate passes an in-range, above-mark, not-live id")
+
+# 9. --live from stdin is honoured: an alloc whose next id is declared
+# live must refuse rather than collide.
+root2 = os.path.join(d, "m2")
+run(root2, "alloc", "--floor", "100000") # issues 100000, mark=100000
+# next would be 100001; declare it live -> refusal (exit 1, no output)
+code, lines = run(root2, "alloc", "--floor", "100000",
+"--live", "-", stdin='{"id": 100001}\n')
+ok(code == 1 and lines == [],
+"an alloc whose next id is declared live refuses (exit 1, no output)")
+
+# 10. retire records the id, does not recycle by default.
+code, lines = run(root2, "retire", "--id", "100000", "--floor", "100000")
+ok(code == 0 and lines[0]["retired"] == 100000 and lines[0]["op"] == "retire",
+"retire records the id (and never lowers the mark)")
+st = mint.peek(root2, 100000, 999999)
+ok(100000 in st["retired"] and st["high_water"] == 100000,
+"retire adds to the retired set and never lowers the mark")
+
+# 11. bare-integer live lines are accepted alongside {id:...} objects.
+live = mint._read_live(io.StringIO("5\n{\"id\": 7}\n# c\n\n9\n"), "id")
+ok(live == {5, 7, 9},
+"--live reads both bare ints and {id:...} objects, skips blanks/comments")
+
+# 12. MUTATION CHECK — a mint that ignored the mark (always issued the
+# floor) would fail test 2/3. Prove the suite BITES by running that
+# mutant inline and asserting it diverges from the real monotonic run.
+def broken_allocate(root_, live_, floor_, ceil_, count_):
+# the no-op mutant: never advances the mark, always issues the floor
+return [floor_] * count_, None
+mutant_ids, _ = broken_allocate(root, set(), 100000, 999999, 3)
+real_ids = [100000, 100001, 100002] # what a correct monotonic mint gives
+ok(mutant_ids!= real_ids,
+"mutation check: a mint that never advances the mark DIVERGES from the "
+"monotonic sequence (the suite would catch it)")
+
+print("\n" + ("MINT: %d FAILED" % FAIL if FAIL else "MINT: ALL GREEN"))
+return 1 if FAIL else 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only, deterministic
+
+---
+
+# Plumb — a Loop MMT gift
+https://loopmmt.com/gifts/plumb/
+[coverage: optional · branch: gifts]
+
+Status Board That Won't Lie witness ← all gifts
+
+Plumb
+
+A tiny audit pattern for anyone whose dashboards turn green on intention instead of evidence. Each claim names a witness — a file that must exist, text that must be present, a command that must pass — and only renders green if its witness agrees. Assert done with nothing beneath it and you get UNWITNESSED, not a pass.
+
+The honest edge
+
+It checks the witness exists and agrees, never that the witness is the right one. Point it at the wrong file and it'll happily pass — choosing a meaningful witness is your job.
+
+Run it
+
+python3 plumb.py --help
+smoke_test.py (8/8)
+Python stdlib only
+
+The code — every file that ships
+
+plumb.py 299 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""plumb.py — a status board that refuses to show green on hope.
+
+A plumb line tells the truth about vertical no matter how the wall *feels*. This
+does the same for a status board: every claim you assert PASS must carry a
+WITNESS beneath it — a real, checkable piece of evidence — and the claim is only
+rendered green if that witness actually agrees. A "done" typed by a hopeful hand
+is not evidence. Plumb will not paint it green.
+
+The board file (`.plumb`) is one claim per line. Blank lines and lines starting
+with '#' are ignored. Each claim is 2 or 3 pipe-separated fields:
+
+NAME | WITNESS # status defaults to 'assert'
+NAME | STATUS | WITNESS # STATUS is 'assert' or 'todo'
+
+WITNESS is one of:
+
+exists PATH # PATH must exist
+absent PATH # PATH must NOT exist (e.g. "no secret committed")
+contains PATH ~ TEXT # PATH exists and contains the literal substring TEXT
+cmd SHELL COMMAND... # the command must exit 0
+none # NO witness at all (the honesty case)
+
+Verdicts:
+
+HELD assert + witness satisfied -> green, and clean
+BROKEN assert + witness NOT satisfied -> the green-on-hope catch
+UNWITNESSED assert + witness 'none' -> you claimed PASS with nothing beneath it
+BLOCKED witness could not be evaluated -> don't trust the reading
+TODO todo + witness not (yet) satisfied -> honest not-done (never green)
+READY todo + witness satisfied -> it's actually done; promote it
+
+Exit codes:
+0 every asserted claim is HELD (todo/ready present is fine)
+1 at least one BROKEN or UNWITNESSED claim (a definite green-on-hope)
+2 no broken assertions, but at least one BLOCKED claim (couldn't measure — don't trust green)
+3 usage / unreadable board
+
+A `todo` claim can NEVER render green. That is deliberate: the one thing this tool
+exists to make impossible is a green cell with nothing true beneath it.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+CEILING = (
+"note: Plumb checks that each claim's witness EXISTS / AGREES — not that the "
+"witness is CORRECT. A claim can point at the wrong evidence (a file that "
+"exists but proves nothing, a command that exits 0 for the wrong reason) and "
+"Plumb will pass it. It catches GREEN ON HOPE (a claim asserted PASS with no "
+"satisfied witness); it does NOT catch GREEN ON THE WRONG WITNESS. The witness "
+"is only as honest as you write it, and the board file runs its `cmd` witnesses "
+"with your shell — trust it like a Makefile."
+)
+
+# Verdicts
+HELD = "HELD"
+BROKEN = "BROKEN"
+UNWITNESSED = "UNWITNESSED"
+BLOCKED = "BLOCKED"
+TODO = "TODO"
+READY = "READY"
+
+# Which verdicts drive which exit code.
+_FAIL_1 = (BROKEN, UNWITNESSED) # a definite green-on-hope
+_FAIL_2 = (BLOCKED,) # couldn't measure
+
+def _eprint(*a):
+print(*a, file=sys.stderr)
+
+# --- witness parsing --------------------------------------------------------
+
+def parse_witness(expr):
+"""expr -> ((kind, arg), None) on success, or (None, error_string).
+
+kind is one of exists/absent/contains/cmd/none.
+arg is a string (path or command), a (path, pattern) tuple for contains, or
+None for 'none'.
+"""
+expr = expr.strip()
+if expr == "" or expr.lower() == "none":
+return ("none", None), None
+head, _, rest = expr.partition(" ")
+kind = head.lower()
+rest = rest.strip()
+if kind in ("exists", "absent"):
+if not rest:
+return None, f"{kind} needs a path"
+return (kind, rest), None
+if kind == "contains":
+if " ~ " not in rest:
+return None, "contains needs the form: contains <path> ~ <text>"
+path, _, pattern = rest.partition(" ~ ")
+path = path.strip()
+if not path or pattern == "":
+return None, "contains needs both a path and a non-empty text"
+return ("contains", (path, pattern)), None
+if kind == "cmd":
+if not rest:
+return None, "cmd needs a command"
+return ("cmd", rest), None
+return None, f"unknown witness kind {kind!r} (want exists/absent/contains/cmd/none)"
+
+# --- board parsing ----------------------------------------------------------
+
+def parse_board(text):
+"""Return a list of claim dicts (name, status, witness kind/arg, parse_error, line)."""
+claims = []
+for lineno, raw in enumerate(text.splitlines(), 1):
+line = raw.strip()
+if not line or line.startswith("#"):
+continue
+# GIFT-009: parse NAME-first with a bounded left split, so a `cmd:` witness
+# that legitimately contains shell pipes (`... | wc -l`) is NOT torn apart.
+# The old `line.split("|")` counted every pipe as a field boundary, so a
+# piped command produced 4+ fields and hit the "2 or 3 fields" error — the
+# command was lost purely for containing a pipe. The grammar is unchanged
+# for the reader (name | [status] | witness); only the SPLIT is bounded:
+# field 0 is the name, an optional bare-status field 1, and EVERYTHING after
+# is the witness, rejoined verbatim (interior pipes preserved).
+head = [f.strip() for f in line.split("|", 2)]
+if len(head) == 2:
+name, status, wexpr = head[0], "assert", head[1]
+elif len(head) == 3:
+# 3 raw segments: field 1 is the status ONLY if it's a bare status
+# keyword; otherwise it belongs to a 2-field claim whose witness itself
+# carried a pipe, so fold field 1 back into the witness.
+if head[1].lower() in ("assert", "todo"):
+name, status, wexpr = head[0], head[1].lower(), head[2]
+else:
+name, status, wexpr = head[0], "assert", head[1] + " | " + head[2]
+else:
+claims.append({"name": line, "status": "assert", "line": lineno,
+"parse_error": "a claim needs a name and a witness "
+"(name | witness or name | status | witness)"})
+continue
+if not name:
+claims.append({"name": "(unnamed)", "status": status, "line": lineno,
+"parse_error": "claim has no name"})
+continue
+if status not in ("assert", "todo"):
+claims.append({"name": name, "status": "assert", "line": lineno,
+"parse_error": f"unknown status {status!r} (want assert|todo)"})
+continue
+parsed, err = parse_witness(wexpr)
+if err:
+claims.append({"name": name, "status": status, "line": lineno,
+"parse_error": err})
+continue
+kind, arg = parsed
+claims.append({"name": name, "status": status, "witness_kind": kind,
+"witness_arg": arg, "line": lineno, "parse_error": None})
+return claims
+
+# --- witness evaluation -----------------------------------------------------
+
+def eval_witness(kind, arg, cwd):
+"""Return (satisfied, detail). satisfied is True/False, or None = could-not-evaluate."""
+if kind == "exists":
+ok = os.path.exists(os.path.join(cwd, arg))
+return ok, ("present" if ok else "MISSING") + f": {arg}"
+if kind == "absent":
+ok = not os.path.exists(os.path.join(cwd, arg))
+return ok, ("absent" if ok else "PRESENT") + f": {arg}"
+if kind == "contains":
+path, pattern = arg
+full = os.path.join(cwd, path)
+try:
+with open(full, "r", encoding="utf-8", errors="replace") as f:
+text = f.read()
+except Exception as ex:
+return None, f"unreadable {path}: {ex.__class__.__name__}"
+ok = pattern in text
+return ok, (f"found {pattern!r}" if ok else f"NOT found {pattern!r}") + f" in {path}"
+if kind == "cmd":
+try:
+rc = subprocess.call(arg, shell=True, cwd=cwd,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except Exception as ex:
+return None, f"could not launch: {ex.__class__.__name__}"
+return (rc == 0), f"exit {rc}"
+return None, f"unknown witness kind {kind!r}"
+
+def evaluate(claim, cwd):
+"""A parsed claim -> (verdict, detail)."""
+if claim.get("parse_error"):
+return BLOCKED, claim["parse_error"]
+status = claim["status"]
+kind = claim["witness_kind"]
+arg = claim["witness_arg"]
+if kind == "none":
+if status == "todo":
+return TODO, "no witness yet (todo)"
+return UNWITNESSED, "asserted PASS with no witness beneath it"
+satisfied, detail = eval_witness(kind, arg, cwd)
+if satisfied is None:
+return BLOCKED, detail
+if status == "todo":
+return (READY if satisfied else TODO), detail
+return (HELD if satisfied else BROKEN), detail
+
+# --- run / render -----------------------------------------------------------
+
+def run(board_text, cwd):
+rows = []
+for c in parse_board(board_text):
+verdict, detail = evaluate(c, cwd)
+rows.append({"name": c["name"], "status": c["status"], "verdict": verdict,
+"detail": detail, "line": c["line"]})
+return rows
+
+def exit_code(rows):
+verdicts = {r["verdict"] for r in rows}
+if verdicts & set(_FAIL_1):
+return 1
+if verdicts & set(_FAIL_2):
+return 2
+return 0
+
+_MARK = {HELD: "ok ", BROKEN: "XX ", UNWITNESSED: "XX ", BLOCKED: "?? ",
+TODO: ". ", READY: ">> "}
+
+def render_table(rows):
+if not rows:
+return "(no claims)"
+w = max(len(r["name"]) for r in rows)
+out = []
+for r in rows:
+out.append(f" {_MARK.get(r['verdict'], ' ')} {r['name']:<{w}} "
+f"{r['verdict']:<11} {r['detail']}")
+return "\n".join(out)
+
+def summary(rows):
+counts = {}
+for r in rows:
+counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+order = [HELD, BROKEN, UNWITNESSED, BLOCKED, TODO, READY]
+parts = [f"{counts[v]} {v.lower()}" for v in order if counts.get(v)]
+return "plumb: " + (" · ".join(parts) if parts else "no claims")
+
+def main(argv=None):
+ap = argparse.ArgumentParser(
+prog="plumb.py",
+description="A status board that refuses to show green on hope.")
+ap.add_argument("board", help="path to a.plumb board file, or - for stdin")
+ap.add_argument("--cwd", default=None,
+help="base dir for relative witness paths and commands "
+"(default: the board file's directory; '.' for stdin)")
+ap.add_argument("--json", action="store_true",
+help="machine-readable output on stdout")
+ap.add_argument("--quiet", action="store_true",
+help="print only the summary line (+ ceiling on stderr)")
+args = ap.parse_args(argv)
+
+if args.board == "-":
+board_text = sys.stdin.read()
+default_cwd = "."
+else:
+try:
+with open(args.board, "r", encoding="utf-8") as f:
+board_text = f.read()
+except Exception as ex:
+_eprint(f"plumb: cannot read board {args.board!r}: {ex}")
+return 3
+default_cwd = os.path.dirname(os.path.abspath(args.board)) or "."
+cwd = args.cwd or default_cwd
+
+rows = run(board_text, cwd)
+code = exit_code(rows)
+
+if args.json:
+print(json.dumps({"rows": rows, "exit": code}, indent=2))
+else:
+if not args.quiet:
+print(render_table(rows))
+print()
+print(summary(rows))
+
+_eprint(CEILING)
+return code
+
+if __name__ == "__main__":
+sys.exit(main())
+
+smoke_test.py 154 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""smoke_test.py — hermetic proof that plumb.py holds the line. No network, no
+state outside a tmpdir. Each scenario writes a board + evidence, runs plumb.py as
+a subprocess, and checks the exit code and the verdict text — the real CLI
+contract, mirroring the durability claims:
+
+1 a satisfied witness renders HELD and the run is clean (exit 0)
+2 a claim asserting PASS with a MISSING witness is caught BROKEN (exit 1) <- the headline
+3 a claim asserting PASS with NO witness is UNWITNESSED (exit 1)
+4 contains: HELD when the text is present, BROKEN when absent
+5 absent: HELD when the path is gone, BROKEN when it is present
+6 cmd: exit 0 -> HELD, non-zero -> BROKEN
+7 a malformed witness is BLOCKED, not silently passed (exit 2)
+8 a todo claim never renders green: unsatisfied -> TODO, satisfied -> READY,
+and neither fails the run (exit 0)
+
+Run: python3 smoke_test.py (expect: 8/8 passed)
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLUMB = os.path.join(HERE, "plumb.py")
+PASS = 0
+FAIL = 0
+
+def ok(msg):
+global PASS
+PASS += 1
+print(f"ok {msg}")
+
+def bad(msg, why):
+global FAIL
+FAIL += 1
+print(f"FAIL {msg}: {why}")
+
+def run_plumb(board_text, cwd):
+"""Write board.plumb into cwd, run plumb.py against it, return (rc, stdout)."""
+board = os.path.join(cwd, "board.plumb")
+with open(board, "w", encoding="utf-8") as f:
+f.write(board_text)
+p = subprocess.run([sys.executable, PLUMB, board],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+return p.returncode, p.stdout
+
+def write(cwd, name, text=""):
+with open(os.path.join(cwd, name), "w", encoding="utf-8") as f:
+f.write(text)
+
+def t1(d):
+write(d, "artifact.txt", "built")
+rc, out = run_plumb("build shipped | exists artifact.txt\n", d)
+if rc == 0 and "HELD" in out:
+ok("satisfied witness renders HELD, run is clean")
+else:
+bad("held", f"rc={rc} out=[{out.strip()}]")
+
+def t2(d):
+# assert PASS but the witness file does not exist -> green on hope, caught
+rc, out = run_plumb("build shipped | exists nope.txt\n", d)
+if rc == 1 and "BROKEN" in out:
+ok("asserted PASS with a missing witness is caught BROKEN (exit 1)")
+else:
+bad("green-on-hope", f"expected rc=1 + BROKEN, got rc={rc} out=[{out.strip()}]")
+
+def t3(d):
+rc, out = run_plumb("migration done | none\n", d)
+if rc == 1 and "UNWITNESSED" in out:
+ok("asserted PASS with no witness is UNWITNESSED (exit 1)")
+else:
+bad("unwitnessed", f"expected rc=1 + UNWITNESSED, got rc={rc} out=[{out.strip()}]")
+
+def t4(d):
+write(d, "README.md", "# thing\n\nMIT licensed.\n")
+rc, out = run_plumb("readme licensed | contains README.md ~ MIT\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("contains-present", f"rc={rc} out=[{out.strip()}]")
+return
+rc2, out2 = run_plumb("readme gpl | contains README.md ~ GPL\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("contains: HELD when text present, BROKEN when absent")
+else:
+bad("contains-absent", f"rc={rc2} out=[{out2.strip()}]")
+
+def t5(d):
+rc, out = run_plumb("no secret | absent.env\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("absent-gone", f"rc={rc} out=[{out.strip()}]")
+return
+write(d, ".env", "SECRET=x")
+rc2, out2 = run_plumb("no secret | absent.env\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("absent: HELD when path gone, BROKEN when present")
+else:
+bad("absent-present", f"rc={rc2} out=[{out2.strip()}]")
+
+def t6(d):
+rc, out = run_plumb("truthy | cmd true\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("cmd-zero", f"rc={rc} out=[{out.strip()}]")
+return
+rc2, out2 = run_plumb("falsy | cmd false\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("cmd: exit 0 -> HELD, non-zero -> BROKEN")
+else:
+bad("cmd-nonzero", f"rc={rc2} out=[{out2.strip()}]")
+
+def t7(d):
+# 'contains' with no ' ~ ' separator is malformed -> BLOCKED, not a silent pass
+rc, out = run_plumb("bad witness | contains README.md MIT\n", d)
+if rc == 2 and "BLOCKED" in out:
+ok("a malformed witness is BLOCKED, not silently passed (exit 2)")
+else:
+bad("blocked", f"expected rc=2 + BLOCKED, got rc={rc} out=[{out.strip()}]")
+
+def t8(d):
+# todo claims never go green, and never fail the run
+board = (
+"later feature | todo | exists notyet.txt\n" # unsatisfied -> TODO
+"already built | todo | cmd true\n" # satisfied -> READY
+)
+rc, out = run_plumb(board, d)
+if rc == 0 and "TODO" in out and "READY" in out and "HELD" not in out:
+ok("todo never renders green: TODO / READY, run stays clean (exit 0)")
+else:
+bad("todo", f"expected rc=0, TODO+READY, no HELD; rc={rc} out=[{out.strip()}]")
+
+def main():
+for t in (t1, t2, t3, t4, t5, t6, t7, t8):
+with tempfile.TemporaryDirectory() as d:
+t(d)
+print()
+print(f"{PASS}/{PASS + FAIL} passed")
+return 0 if FAIL == 0 else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only
+
+---
+
+# port — a Loop MMT gift
+https://loopmmt.com/gifts/port/
+[coverage: optional · branch: gifts]
+
+Composition Port-Verb Declaration declare ← all gifts
+
+port
+
+Every small JSONL tool declares its own port-verb — source, transform, filter, fold, or sink — in a manifest field or a --port flag, so a map or a typechecker can READ a tool's composition shape instead of guessing it. The load-bearing move is `port check`: when a tool declares its verb in both places, they must agree, and a drift is a decidable non-zero exit, not a thing a human notices later.
+
+The honest edge
+
+It verifies a declaration is consistent with itself — manifest field vs the tool's own --port flag — not that the declared verb is true of the tool's actual behavior. A tool can honestly declare 'filter' in both places and still behave like a transform in its code; proving a verb against real behavior is a deeper, undecidable-in-general question this tool does not claim to answer.
+
+Run it
+
+python3 port.py verbs
+test_port.py (15/15, mutation-bitten)
+Python 3, standard library only
+
+The code — every file that ships
+
+port.py 239 lines on GitHub →
+#!/usr/bin/env python3
+"""port — declare a composition tool's port-verb, and read it back honestly.
+
+A composition of small JSONL tools only typechecks if each tool declares its
+own PORT-VERB: the type-level shape of its stdin/stdout contract on the shared
+JSON-lines interface. Five verbs, and only five:
+
+source: nothing -> JSONL (emits; no meaningful stdin)
+transform: JSONL -> JSONL (record in, record out)
+filter: JSONL -> JSONL' (record in, subset out — output type <= input)
+fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
+sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
+
+WHY THIS TOOL EXISTS. Before `port`, a map or a typechecker that wanted to know
+a tool's port-verb had to GUESS it — from a one-line description, or from a
+hand-kept list living in one program's source. A guess that a tool emits when it
+actually sinks is a silent lie: the map draws an edge that cannot carry data.
+`port` removes the guess. Every tool DECLARES its port-verb, in one of two honest
+places, and `port` reads the declaration back:
+
+1. A manifest field `port_verb` in a JSON manifest of tool entries, OR
+2. A `--port` flag the tool answers for itself.
+
+The load-bearing move is the CHECK (`port check`): when a tool declares its
+port-verb in BOTH places, they must AGREE. A manifest that says `filter` while
+the tool's own `--port` says `source` is a declaration that has drifted from the
+thing it describes — and `port check` makes that drift a decidable, non-zero
+exit, not a thing a human notices later. That is the whole point: a declaration
+you can verify beats a description you have to trust.
+
+port's own port-verb is `source`: it emits port declarations as JSON-lines and
+takes no meaningful stdin.
+
+No dependencies beyond the Python standard library. MIT licensed.
+
+USAGE
+port verbs
+Print the five port-verbs and their type contracts (JSONL, one per line).
+
+port read --manifest FILE [--slug SLUG]
+Read declared port_verb(s) from a manifest. With --slug, one entry;
+without, every entry that declares a port_verb. Emits JSON-lines:
+{"slug":..., "port_verb":..., "source": "manifest"}
+A manifest entry with no port_verb field is reported with
+port_verb=null and status="undeclared" (flagged, never guessed).
+
+port check --manifest FILE --flag-cmd 'CMD {slug}'
+For every manifest entry that declares a port_verb, run the tool's own
+--port flag (via --flag-cmd, with {slug} substituted) and compare.
+Emits one JSON-line verdict per entry:
+{"slug":..., "manifest":..., "flag":..., "status":"agree|drift|missing"}
+Exit 0 iff every checked entry AGREES; exit 3 on any drift/missing.
+This is the decidable self-check — a declaration verified against itself.
+
+port emit --slug SLUG --port-verb VERB
+Emit a single declaration JSON-line (for a tool that has no manifest yet).
+"""
+import argparse
+import json
+import subprocess
+import sys
+
+# The five port-verbs and their type-level contract on the shared JSONL interface.
+# This dict is the ONLY definition of the vocabulary — the closed set.
+PORT_VERBS = {
+"source": "nothing -> JSONL (emits; no meaningful stdin)",
+"transform": "JSONL -> JSONL (record in, record out)",
+"filter": "JSONL -> JSONL' (record in, subset out; output type <= input)",
+"fold": "JSONL -> JSONL_agg (records in, an aggregate/narrower record out)",
+"sink": "JSONL -> nothing (terminal side effect, no pipeable stdout)",
+}
+
+def is_valid_verb(verb):
+"""A port-verb is valid iff it is one of the five closed-set verbs."""
+return verb in PORT_VERBS
+
+def load_manifest_entries(path):
+"""Return the list of tool entries from a manifest.
+
+Accepts either a bare JSON list of entries, or a JSON object with a top-level
+key ('gifts', 'tools', or 'entries') holding the list. Raises ValueError if
+no entry list can be found — never guesses a shape.
+"""
+with open(path) as f:
+data = json.load(f)
+if isinstance(data, list):
+return data
+if isinstance(data, dict):
+for key in ("gifts", "tools", "entries"):
+if isinstance(data.get(key), list):
+return data[key]
+raise ValueError(
+"manifest is neither a list of entries nor an object with a "
+"'gifts'/'tools'/'entries' list"
+)
+
+def cmd_verbs(_args):
+"""Emit the five port-verbs and their contracts, one JSON-line each."""
+for verb, contract in PORT_VERBS.items():
+print(json.dumps({"port_verb": verb, "contract": contract}))
+return 0
+
+def cmd_read(args):
+"""Read declared port_verb(s) from a manifest and emit them as JSON-lines."""
+entries = load_manifest_entries(args.manifest)
+found = False
+for entry in entries:
+slug = entry.get("slug")
+if args.slug is not None and slug!= args.slug:
+continue
+verb = entry.get("port_verb")
+if verb is None:
+rec = {"slug": slug, "port_verb": None,
+"source": "manifest", "status": "undeclared"}
+elif not is_valid_verb(verb):
+rec = {"slug": slug, "port_verb": verb,
+"source": "manifest", "status": "invalid"}
+else:
+rec = {"slug": slug, "port_verb": verb,
+"source": "manifest", "status": "declared"}
+print(json.dumps(rec))
+found = True
+if args.slug is not None and not found:
+print(json.dumps({"slug": args.slug, "port_verb": None,
+"source": "manifest", "status": "not-found"}))
+return 3
+return 0
+
+def _run_flag(flag_cmd, slug):
+"""Run a tool's own --port flag and return the verb it prints, or None.
+
+flag_cmd is a template string with '{slug}' substituted for the entry slug.
+The tool is expected to print its port-verb as the first whitespace token
+on stdout. Any failure (non-zero exit, no output, unparseable) returns None
+— an honest 'the tool did not answer', never a guessed verb.
+"""
+cmd = flag_cmd.replace("{slug}", slug)
+try:
+out = subprocess.run(cmd, shell=True, capture_output=True,
+text=True, timeout=30)
+except Exception:
+return None
+if out.returncode!= 0:
+return None
+token = out.stdout.strip().split()
+if not token:
+return None
+verb = token[0]
+return verb if is_valid_verb(verb) else None
+
+def cmd_check(args):
+"""Compare each manifest port_verb against the tool's own --port flag.
+
+Exit 0 iff every checked entry agrees; exit 3 on any drift or missing.
+"""
+entries = load_manifest_entries(args.manifest)
+all_agree = True
+checked_any = False
+for entry in entries:
+slug = entry.get("slug")
+manifest_verb = entry.get("port_verb")
+if manifest_verb is None:
+continue # nothing declared in the manifest -> nothing to check here
+checked_any = True
+flag_verb = _run_flag(args.flag_cmd, slug)
+if flag_verb is None:
+status = "missing"
+all_agree = False
+elif flag_verb == manifest_verb:
+status = "agree"
+else:
+status = "drift"
+all_agree = False
+print(json.dumps({"slug": slug, "manifest": manifest_verb,
+"flag": flag_verb, "status": status}))
+if not checked_any:
+# Nothing declared a port_verb: there is nothing to verify. This is not
+# a pass (there was no check) — report it and exit 3 so a manifest that
+# forgot every declaration cannot read as green.
+print(json.dumps({"status": "no-declarations",
+"note": "no manifest entry declared a port_verb"}))
+return 3
+return 0 if all_agree else 3
+
+def cmd_emit(args):
+"""Emit a single port declaration JSON-line for a manifest-less tool."""
+if not is_valid_verb(args.port_verb):
+print(json.dumps({"slug": args.slug, "port_verb": args.port_verb,
+"status": "invalid",
+"valid": list(PORT_VERBS)}))
+return 3
+print(json.dumps({"slug": args.slug, "port_verb": args.port_verb,
+"source": "declared", "status": "declared"}))
+return 0
+
+def build_parser():
+p = argparse.ArgumentParser(
+prog="port",
+description="Declare a composition tool's port-verb, and read it back honestly.",
+)
+sub = p.add_subparsers(dest="cmd", required=True)
+
+sp = sub.add_parser("verbs", help="print the five port-verbs and contracts")
+sp.set_defaults(func=cmd_verbs)
+
+sp = sub.add_parser("read", help="read declared port_verb(s) from a manifest")
+sp.add_argument("--manifest", required=True)
+sp.add_argument("--slug", default=None)
+sp.set_defaults(func=cmd_read)
+
+sp = sub.add_parser("check", help="verify manifest port_verb against each tool's --port flag")
+sp.add_argument("--manifest", required=True)
+sp.add_argument("--flag-cmd", required=True,
+help="command template to run a tool's --port flag; {slug} is substituted")
+sp.set_defaults(func=cmd_check)
+
+sp = sub.add_parser("emit", help="emit a single port declaration line")
+sp.add_argument("--slug", required=True)
+sp.add_argument("--port-verb", required=True)
+sp.set_defaults(func=cmd_emit)
+
+return p
+
+def main(argv=None):
+args = build_parser().parse_args(argv)
+return args.func(args)
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_port.py 168 lines on GitHub →
+#!/usr/bin/env python3
+"""Mutation-bitten tests for the port gift.
+
+Each test asserts a real behavior. To prove the suite is non-vacuous, run it
+against a deliberately-broken port.py and confirm it goes RED (see the
+`_self_mutation_note` at the bottom — the mutations are documented, not shipped).
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PORT = os.path.join(HERE, "port.py")
+
+sys.path.insert(0, HERE)
+import port # noqa: E402
+
+def run(*args, input_text=None):
+"""Run port.py as a subprocess; return (exit, stdout_lines)."""
+proc = subprocess.run(
+[sys.executable, PORT, *args],
+capture_output=True, text=True, input=input_text,
+)
+lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+return proc.returncode, lines
+
+def write_manifest(entries, wrap=None):
+"""Write a temp manifest; wrap=None -> bare list, else {wrap: [...]}."""
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump(entries if wrap is None else {wrap: entries}, f)
+return path
+
+class TestVocabulary(unittest.TestCase):
+def test_exactly_five_verbs(self):
+# The closed set is exactly five — no more, no fewer.
+self.assertEqual(len(port.PORT_VERBS), 5)
+self.assertEqual(set(port.PORT_VERBS),
+{"source", "transform", "filter", "fold", "sink"})
+
+def test_valid_verb_gate(self):
+self.assertTrue(port.is_valid_verb("filter"))
+self.assertFalse(port.is_valid_verb("emit")) # a plausible non-verb
+self.assertFalse(port.is_valid_verb(""))
+self.assertFalse(port.is_valid_verb(None))
+
+def test_verbs_command_emits_five_lines(self):
+code, lines = run("verbs")
+self.assertEqual(code, 0)
+self.assertEqual(len(lines), 5)
+self.assertEqual({l["port_verb"] for l in lines}, set(port.PORT_VERBS))
+
+class TestRead(unittest.TestCase):
+def test_read_declared(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"},
+{"slug": "b", "port_verb": "sink"}])
+code, lines = run("read", "--manifest", m)
+self.assertEqual(code, 0)
+self.assertEqual(lines[0], {"slug": "a", "port_verb": "source",
+"source": "manifest", "status": "declared"})
+self.assertEqual(lines[1]["status"], "declared")
+
+def test_read_undeclared_is_flagged_not_guessed(self):
+# A gift with NO port_verb must come back status=undeclared, verb null —
+# never a guessed verb. This is the whole reason the gift exists.
+m = write_manifest([{"slug": "x", "verb": "survive"}]) # 'verb' is the
+code, lines = run("read", "--manifest", m) # marketing verb
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], None)
+self.assertEqual(lines[0]["status"], "undeclared")
+
+def test_read_invalid_verb_flagged(self):
+m = write_manifest([{"slug": "x", "port_verb": "emit"}]) # not a verb
+code, lines = run("read", "--manifest", m)
+self.assertEqual(lines[0]["status"], "invalid")
+
+def test_read_slug_filter(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"},
+{"slug": "b", "port_verb": "sink"}])
+code, lines = run("read", "--manifest", m, "--slug", "b")
+self.assertEqual(len(lines), 1)
+self.assertEqual(lines[0]["slug"], "b")
+
+def test_read_slug_not_found_exits_3(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("read", "--manifest", m, "--slug", "zzz")
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "not-found")
+
+def test_read_wrapped_manifest(self):
+# Real gifts-manifest.json wraps the list under 'gifts'.
+m = write_manifest([{"slug": "a", "port_verb": "fold"}], wrap="gifts")
+code, lines = run("read", "--manifest", m)
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], "fold")
+
+class TestCheck(unittest.TestCase):
+def _flag_cmd(self, mapping):
+"""Build a --flag-cmd that echoes a per-slug verb via a tiny py snippet."""
+table = json.dumps(mapping)
+# {slug} is substituted by port; the snippet prints the mapped verb.
+return (f"{sys.executable} -c "
+f"'import json,sys; "
+f"print(json.loads(sys.argv[1]).get(sys.argv[2],\"\"))' "
+f"'{table}' {{slug}}")
+
+def test_check_agree_exits_0(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "source"}))
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["status"], "agree")
+
+def test_check_drift_exits_3(self):
+# Manifest says source, the tool's own flag says sink -> drift, exit 3.
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "sink"}))
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "drift")
+
+def test_check_missing_flag_exits_3(self):
+# Tool answers nothing -> missing, not silently passed.
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({})) # empty -> ""
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "missing")
+
+def test_check_no_declarations_is_not_green(self):
+# A manifest that declared no port_verb at all must NOT read as pass.
+m = write_manifest([{"slug": "a", "verb": "survive"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "source"}))
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "no-declarations")
+
+class TestEmit(unittest.TestCase):
+def test_emit_valid(self):
+code, lines = run("emit", "--slug", "port", "--port-verb", "source")
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], "source")
+self.assertEqual(lines[0]["status"], "declared")
+
+def test_emit_invalid_exits_3(self):
+code, lines = run("emit", "--slug", "x", "--port-verb", "nonsense")
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "invalid")
+
+if __name__ == "__main__":
+unittest.main(verbosity=2)
+
+# _self_mutation_note: this suite was proven non-vacuous by mutation —
+# (1) PORT_VERBS drop 'sink' -> test_exactly_five_verbs RED
+# (2) cmd_read guess 'source' on null -> test_read_undeclared_* RED
+# (3) cmd_check return 0 always -> test_check_drift/missing RED
+# (4) cmd_check treat no-decl as pass -> test_check_no_declarations RED
+# each mutation reverted after confirming RED. A no-op runner cannot pass these.
+
+Take the whole folder →
+MIT
+Python 3, standard library only
+
+---

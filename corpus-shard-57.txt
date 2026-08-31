@@ -1,0 +1,431 @@
+# Loop MMT — corpus shard 57/57
+
+> Bundle 57 of 57 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 1 (/gifts/ward/)
+
+---
+
+# Ward — a Loop MMT gift
+https://loopmmt.com/gifts/ward/
+[coverage: optional · branch: gifts]
+
+Self-Verifying Integrity Badge refuse ← all gifts
+
+Ward
+
+A status badge that will not go solid on hope. Every filled cell carries a witness beneath it — a file that must exist, a file that must contain a string, or a command that must exit 0 — and renders solid only when that witness agrees right now. Any claim whose witness is missing or disagrees renders a hollow ring, never a silent solid.
+
+The prompt that made this → — Ward was grown from “One Shape, Wide Latitude,” a planning-only fable-seed experiment. You can also see it live as the Ward receipt →, the nine-cell close badge a real session produces.
+
+The honest edge
+
+You cannot make a cell lie by asserting harder — but Ward checks the witness agrees, not that you chose the right witness. A meaningful witness is still your call.
+
+Run it
+
+python3 ward.py badge.json --root.
+smoke_test.py
+Python stdlib only, ~200 lines
+
+The code — every file that ships
+
+ward.py 324 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+ward — a self-verifying integrity badge that will not go solid on hope.
+
+THE IDEA.
+A status badge is a grid of cells, one per claim you want to show as "done".
+The temptation with any badge is to colour a cell in because you BELIEVE the
+thing is finished. `ward` refuses to. A cell renders SOLID only when its claim
+is backed by a witness that actually agrees right now; any claim whose witness
+is missing, disagrees, or is malformed renders as a HOLLOW RING — never a
+silent solid. The badge's own honesty is the feature: you cannot make a cell
+lie by asserting harder.
+
+It is the badge-shaped sibling of a "status board that won't go green on hope":
+same principle (a claim needs a witness), rendered as a compact grid you can
+drop into a README, a terminal, or an HTML page.
+
+WITNESS KINDS (per cell).
+file:PATH solid iff PATH exists
+contains:PATH::TEXT solid iff PATH exists AND contains TEXT
+cmd:SHELL solid iff `SHELL` exits 0
+(no witness) a cell with no witness is DECLARED-only -> renders as a
+ring, because a claim with nothing beneath it is exactly
+what this tool exists to expose.
+
+THE COERCE WELD (the load-bearing honesty rule).
+Every cell state is routed through one gate: an unknown, missing, or errored
+witness result can only ever become a RING. There is no code path from a bad
+witness to a solid cell. That is what makes the badge trustworthy — not that
+it is always green, but that green always means something.
+
+OUTPUT.
+--format text a 3x3 (or NxM) grid of glyphs + a legend + a presence caveat
+--format html an HTML fragment (cells carry data-state so you can style them)
+--format json the resolved cells, for piping
+
+EXIT CODES.
+0 every declared claim resolved SOLID (a fully-earned badge)
+1 at least one claim rendered as a RING (unearned) -- LOUD, by design
+2 usage / IO error
+
+HONEST EDGE.
+`ward` checks that a witness EXISTS AND AGREES, never that it is the RIGHT
+witness. Point a cell at the wrong file and it will happily go solid — choosing
+a meaningful witness is your job. Presence is not proof of substance. Python
+stdlib only, offline, deterministic.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import html
+
+# GIFT-010: a command witness that never finishes must not hang the badge. A
+# witness that does not complete within this bound is uncertainty -> RING (never
+# a solid), and its whole process group is killed so grandchildren don't survive.
+WITNESS_TIMEOUT_S = 30
+
+def _run_shell_bounded(shell_cmd, cwd, timeout):
+"""Run a shell command in its own process group; kill the group on timeout.
+Returns (returncode, timed_out): returncode is None when timed_out is True."""
+proc = subprocess.Popen(
+shell_cmd, shell=True, cwd=cwd,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+start_new_session=True,
+)
+try:
+proc.wait(timeout=timeout)
+return proc.returncode, False
+except subprocess.TimeoutExpired:
+try:
+os.killpg(proc.pid, signal.SIGKILL)
+except (ProcessLookupError, PermissionError):
+pass
+proc.wait()
+return None, True
+
+RING = "ring" # hollow — unearned; the only state a bad witness can reach
+SOLID = "solid" # filled — witness exists and agrees
+
+_GLYPH = {SOLID: "\u25c9", RING: "\u25cb"} # ◉ solid ring-dot / ○ hollow ring
+
+# GIFT-010 follow-on: the diagnostic REASON a cell resolved as it did. The
+# correctness core is unchanged — the coerce weld still lets ONLY `ok` reach
+# SOLID; every other reason is a RING. The reason is purely additive telemetry:
+# a caller who ignored it before behaves identically. `ok` earns SOLID; each
+# other token names WHY a cell rings, so a wall of rings is diagnosable instead
+# of uniformly opaque. (The audit's ask: surface the timeout — and, generalized,
+# every ring cause — for diagnostics.)
+REASON_OK = "ok" # witness exists and cleanly agrees -> SOLID
+REASON_NO_WITNESS = "no-witness" # declared-only cell (empty spec)
+REASON_MISSING_FILE = "missing-file" # file:/contains: target absent
+REASON_CONTAINS_MISS = "contains-miss" # file present, text not found
+REASON_MALFORMED = "malformed" # contains: with no '::' separator
+REASON_CMD_FAIL = "cmd-fail" # cmd: witness exited non-zero
+REASON_TIMEOUT = "timeout" # cmd: witness exceeded the bound (a hang)
+REASON_UNKNOWN_KIND = "unknown-kind" # witness prefix not recognized
+REASON_ERROR = "error" # an exception while resolving (the weld's net)
+
+# A ring reason is anything that is not OK. The one solid-earning reason is OK,
+# and this is the single place the earned<->reason correspondence is stated, so
+# the coerce weld ("only a clean witness reaches SOLID") stays decidable.
+_SOLID_REASON = REASON_OK
+
+def _resolve_witness(spec, root, timeout=WITNESS_TIMEOUT_S):
+"""Return (earned, reason). `earned` is True (earn SOLID) only on a clean,
+agreeing witness, in which case `reason` is REASON_OK. Any error, miss,
+malformed spec, or `cmd:` witness that exceeds `timeout` seconds returns
+(False, <a specific ring reason>) -> the coerce weld renders a RING. There is
+deliberately no path here that returns True on uncertainty (a hang is
+uncertainty); the reason token names WHICH uncertainty it was."""
+if not spec:
+return False, REASON_NO_WITNESS
+try:
+if spec.startswith("file:"):
+path = spec[len("file:"):]
+if os.path.exists(os.path.join(root, path)):
+return True, REASON_OK
+return False, REASON_MISSING_FILE
+if spec.startswith("contains:"):
+body = spec[len("contains:"):]
+if "::" not in body:
+return False, REASON_MALFORMED
+path, text = body.split("::", 1)
+full = os.path.join(root, path)
+if not os.path.exists(full):
+return False, REASON_MISSING_FILE
+with open(full, encoding="utf-8", errors="replace") as fh:
+if text in fh.read():
+return True, REASON_OK
+return False, REASON_CONTAINS_MISS
+if spec.startswith("cmd:"):
+shell = spec[len("cmd:"):]
+rc, timed_out = _run_shell_bounded(shell, root, timeout)
+if timed_out:
+return False, REASON_TIMEOUT # uncertainty -> RING; never solid on a hang
+if rc == 0:
+return True, REASON_OK
+return False, REASON_CMD_FAIL
+except Exception:
+return False, REASON_ERROR # the weld: any error is a RING, never a solid
+return False, REASON_UNKNOWN_KIND # unknown witness kind -> RING
+
+def resolve(cells, root, timeout=WITNESS_TIMEOUT_S):
+"""cells: list of {label, witness}. Returns list of
+{label, state, witness, reason}. The coerce weld lives here: state is SOLID
+iff the witness cleanly agreed (reason == REASON_OK). `reason` is additive —
+it names WHY a ring rang (missing-file, contains-miss, cmd-fail, timeout,
+malformed, unknown-kind, no-witness, error) — and never changes state."""
+out = []
+for c in cells:
+earned, reason = _resolve_witness(c.get("witness", ""), root, timeout)
+# The weld, restated as an invariant: earned iff reason is the solid one.
+state = SOLID if earned else RING
+out.append({
+"label": c.get("label", ""),
+"witness": c.get("witness", ""),
+"state": state,
+"reason": reason,
+})
+return out
+
+def _grid(resolved, cols):
+rows = []
+for i in range(0, len(resolved), cols):
+rows.append(resolved[i:i + cols])
+return rows
+
+def render_text(resolved, cols):
+lines = []
+for row in _grid(resolved, cols):
+lines.append(" " + " ".join(_GLYPH[c["state"]] for c in row))
+legend = f"\n {_GLYPH[SOLID]} earned (witness agrees) {_GLYPH[RING]} unearned (ring \u2014 no green on hope)"
+caveat = "\n note: a solid cell means its witness EXISTS AND AGREES, not that the witness is the RIGHT one."
+labels = "\n".join(
+f" {_GLYPH[c['state']]} {c['label']}" + _reason_gloss(c)
+for c in resolved
+)
+return "\n".join(lines) + "\n" + labels + legend + caveat
+
+def _reason_gloss(cell):
+"""A short human tail naming WHY a ring rang (or nothing for a solid). Uses
+the machine reason token so the text render is diagnosable, not just red."""
+if cell["state"] == SOLID:
+return ""
+return f" [ring: {cell.get('reason', REASON_UNKNOWN_KIND)}]"
+
+def render_html(resolved, cols):
+out = ['<div class="ward" role="img" aria-label="integrity badge">']
+for row in _grid(resolved, cols):
+out.append(' <div class="ward__row">')
+for c in row:
+# data-reason carries the diagnostic token (styleable + inspectable);
+# the title names the ring cause for a hover, additively.
+reason = c.get("reason", REASON_UNKNOWN_KIND)
+title = str(c["label"])
+if c["state"] == RING:
+title = f"{title} \u2014 ring: {reason}"
+out.append(
+f' <span class="ward__cell" data-state="{c["state"]}" '
+f'data-reason="{html.escape(reason, quote=True)}" '
+f'title="{html.escape(title, quote=True)}">{_GLYPH[c["state"]]}</span>'
+)
+out.append(' </div>')
+out.append(' <p class="ward__caveat">A solid cell means its witness exists and agrees, '
+'never that the witness is the right one.</p>')
+out.append('</div>')
+return "\n".join(out)
+
+def load_cells(path):
+with open(path, encoding="utf-8") as fh:
+data = json.load(fh)
+if isinstance(data, dict):
+data = data.get("cells", [])
+if not isinstance(data, list):
+raise ValueError("badge spec must be a list of cells, or {\"cells\": [...]}")
+return data
+
+def main(argv=None):
+argv = argv if argv is not None else sys.argv[1:]
+ap = argparse.ArgumentParser(
+prog="ward",
+description="A self-verifying integrity badge that will not go solid on hope.")
+ap.add_argument("spec", nargs="?", help="path to a JSON badge spec (list of {label, witness})")
+ap.add_argument("--root", default=".", help="root the witnesses resolve against (default:.)")
+ap.add_argument("--cols", type=int, default=3, help="grid columns (default: 3 -> a 3x3 ward)")
+ap.add_argument("--format", choices=("text", "html", "json"), default="text")
+ap.add_argument("--selftest", action="store_true", help="prove the coerce weld (no bad witness -> solid)")
+args = ap.parse_args(argv)
+
+if args.selftest:
+return _selftest()
+if not args.spec:
+ap.print_help()
+return 2
+try:
+cells = load_cells(args.spec)
+except Exception as e:
+print(f"ward: cannot read spec: {e}", file=sys.stderr)
+return 2
+
+resolved = resolve(cells, args.root)
+if args.format == "json":
+print(json.dumps(resolved, indent=2))
+elif args.format == "html":
+print(render_html(resolved, args.cols))
+else:
+print(render_text(resolved, args.cols))
+
+unearned = [c for c in resolved if c["state"] == RING]
+return 1 if unearned else 0
+
+def _selftest():
+"""Non-vacuity: the weld must hold AND every ring must name its reason. A
+missing file, a failing command, a malformed witness, an absent witness, an
+unknown kind, and a timeout must ALL render RING; only a real, agreeing
+witness earns SOLID. GIFT-010 follow-on: each case also asserts the exact
+diagnostic REASON token, so the reason field is proven discriminating (a
+ring that always said 'unknown' would pass state but fail reason here)."""
+import tempfile
+ok = True
+with tempfile.TemporaryDirectory() as d:
+with open(os.path.join(d, "present.txt"), "w") as f:
+f.write("the witness text is here")
+# (label, witness, want_state, want_reason)
+cases = [
+("real file", "file:present.txt", SOLID, REASON_OK),
+("missing file", "file:nope.txt", RING, REASON_MISSING_FILE),
+("contains hit", "contains:present.txt::witness", SOLID, REASON_OK),
+("contains miss", "contains:present.txt::absent", RING, REASON_CONTAINS_MISS),
+("contains missing file","contains:nope.txt::x", RING, REASON_MISSING_FILE),
+("cmd pass", "cmd:true", SOLID, REASON_OK),
+("cmd fail", "cmd:false", RING, REASON_CMD_FAIL),
+("malformed contains", "contains:present.txt", RING, REASON_MALFORMED),
+("unknown kind", "wat:present.txt", RING, REASON_UNKNOWN_KIND),
+("no witness", "", RING, REASON_NO_WITNESS),
+]
+cells = [{"label": lbl, "witness": w} for lbl, w, _, _ in cases]
+resolved = resolve(cells, d)
+for (lbl, _w, want_state, want_reason), got in zip(cases, resolved):
+good = got["state"] == want_state and got["reason"] == want_reason
+ok = ok and good
+print(f" [selftest] {lbl:22s} -> {got['state']:5s}/{got['reason']:13s} "
+f"(want {want_state}/{want_reason}) -> {'PASS' if good else 'FAIL'}")
+
+# The timeout reason is proven separately: a witness that outlives its
+# bound must ring with REASON_TIMEOUT, never a solid on a hang.
+t_cells = [{"label": "hang", "witness": "cmd:sleep 5"}]
+t_resolved = resolve(t_cells, d, timeout=1)
+t_got = t_resolved[0]
+t_good = t_got["state"] == RING and t_got["reason"] == REASON_TIMEOUT
+ok = ok and t_good
+print(f" [selftest] {'timeout (hang)':22s} -> {t_got['state']:5s}/{t_got['reason']:13s} "
+f"(want {RING}/{REASON_TIMEOUT}) -> {'PASS' if t_good else 'FAIL'}")
+
+# The weld invariant, stated decidably: earned iff reason is the solid one.
+weld_holds = all(
+(c["state"] == SOLID) == (c["reason"] == _SOLID_REASON)
+for c in resolved + t_resolved
+)
+ok = ok and weld_holds
+print(f" [selftest] {'weld: SOLID iff reason==ok':22s} -> {'PASS' if weld_holds else 'FAIL'}")
+print(f"\nward selftest: {'ALL PASS' if ok else 'FAILURE'} "
+f"(the coerce weld holds; every ring names its reason)" if ok
+else "\nward selftest: FAILURE")
+return 0 if ok else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+smoke_test.py 81 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""smoke_test for ward — proves the coerce weld and the three witness kinds.
+
+Run: python3 smoke_test.py (exit 0 = all pass)
+
+The point of these tests is the WELD: there must be no path from a missing,
+failing, malformed, or absent witness to a SOLID cell. If any such path existed,
+the badge could lie, and the whole tool would be pointless.
+"""
+import os
+import tempfile
+import sys
+
+import ward
+
+_PASS = 0
+_FAIL = 0
+
+def check(name, got, want):
+global _PASS, _FAIL
+if got == want:
+_PASS += 1
+print(f"ok {name}")
+else:
+_FAIL += 1
+print(f"XX {name}: got {got!r}, want {want!r}")
+
+def main():
+with tempfile.TemporaryDirectory() as d:
+with open(os.path.join(d, "here.txt"), "w") as f:
+f.write("alpha beta gamma")
+
+# file: witness
+r = ward.resolve([{"label": "f", "witness": "file:here.txt"}], d)
+check("file present -> solid", r[0]["state"], ward.SOLID)
+r = ward.resolve([{"label": "f", "witness": "file:gone.txt"}], d)
+check("file missing -> ring", r[0]["state"], ward.RING)
+
+# contains: witness
+r = ward.resolve([{"label": "c", "witness": "contains:here.txt::beta"}], d)
+check("contains hit -> solid", r[0]["state"], ward.SOLID)
+r = ward.resolve([{"label": "c", "witness": "contains:here.txt::omega"}], d)
+check("contains miss -> ring", r[0]["state"], ward.RING)
+r = ward.resolve([{"label": "c", "witness": "contains:here.txt"}], d)
+check("contains malformed -> ring", r[0]["state"], ward.RING)
+
+# cmd: witness
+r = ward.resolve([{"label": "x", "witness": "cmd:true"}], d)
+check("cmd pass -> solid", r[0]["state"], ward.SOLID)
+r = ward.resolve([{"label": "x", "witness": "cmd:false"}], d)
+check("cmd fail -> ring", r[0]["state"], ward.RING)
+
+# the weld: unknown + absent witness -> ring, never solid
+r = ward.resolve([{"label": "u", "witness": "mystery:here.txt"}], d)
+check("unknown kind -> ring", r[0]["state"], ward.RING)
+r = ward.resolve([{"label": "n", "witness": ""}], d)
+check("no witness -> ring", r[0]["state"], ward.RING)
+
+# exit-code contract: any ring -> main returns 1
+import json
+spec = os.path.join(d, "spec.json")
+with open(spec, "w") as f:
+json.dump([{"label": "ok", "witness": "file:here.txt"},
+{"label": "bad", "witness": "file:gone.txt"}], f)
+rc = ward.main([spec, "--root", d, "--format", "json"])
+check("one ring -> exit 1", rc, 1)
+
+with open(spec, "w") as f:
+json.dump([{"label": "ok", "witness": "file:here.txt"}], f)
+rc = ward.main([spec, "--root", d, "--format", "json"])
+check("all solid -> exit 0", rc, 0)
+
+print(f"\n{_PASS}/{_PASS + _FAIL} green")
+return 0 if _FAIL == 0 else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only, ~200 lines
+
+---

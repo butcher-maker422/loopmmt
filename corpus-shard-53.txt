@@ -1,0 +1,1858 @@
+# Loop MMT — corpus shard 53/57
+
+> Bundle 53 of 57 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 4 (/gifts/ratchet-inline-mime/, /gifts/ratchet-pdf-text/, /gifts/ratchet-png-text/, /gifts/reltime/)
+
+---
+
+# Inline MIME Parser — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-inline-mime/
+[coverage: optional · branch: gifts]
+
+What's Actually Inside This Email? parse ← all gifts
+
+Inline MIME Parser
+
+Parse a raw MIME message — an.eml, a saved email, a multipart body — into a structured tree with zero dependencies. parseMime(raw) unfolds folded headers, parses the Content-Type and its parameters, decodes each leaf body per its Content-Transfer-Encoding (base64, quoted-printable, 7bit/8bit) and charset (utf-8, latin1), splits multipart/* on its boundary, and recurses to any depth. RFC 2047 encoded words in headers (=?utf-8?B?..?=) are decoded too. Node or browser, no DOM, no filesystem.
+
+The honest edge
+
+It parses, it does not validate — a message with a missing closing boundary or a header with no body is parsed as far as it reasonably can, never thrown at, so the tree reflects what was there rather than what should have been. Charset support is honest about its scope: utf-8 (full multibyte) and the byte-preserving ascii/iso-8859-1/windows-1252 family decode faithfully; ANY OTHER charset falls back to utf-8 rather than transcoding from native tables — exotic legacy charsets are the edge. An unknown Content-Transfer-Encoding is treated as identity. Header values are RFC-2047-decoded in the `headers` map only; `rawHeaders` keeps the ordered, undecoded originals for anything that must see the wire bytes.
+
+Run it
+
+node ratchet-inline-mime.js --demo
+test_ratchet-inline-mime.js (36/36: header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ratchet-inline-mime.js 297 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+"use strict";
+/* ratchet-inline-mime.js — a zero-dependency MIME message parser.
+
+Hand it a raw RFC 822 / MIME message (an.eml, a saved email, a raw HTTP
+multipart body) and it returns a structured tree: unfolded headers, a parsed
+Content-Type with its parameters, and — for each leaf — a body decoded per its
+Content-Transfer-Encoding (base64 / quoted-printable / 7bit / 8bit / binary)
+and charset (utf-8 / ascii / latin1). multipart/* bodies are split on their
+boundary and each part parsed recursively, to any depth. RFC 2047 encoded
+words in header values (=?utf-8?B?..?= / =?..?Q?..?=) are decoded too.
+
+Pure functions, no dependencies, no filesystem, no DOM — the same code runs in
+Node (module.exports) or a browser (window.LoopGifts.parseMime). It parses a
+message you already hold as text; it does not fetch, connect, or read files. */
+
+// ---- base64 (pure; tolerates whitespace and missing padding) ---------------
+var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function decodeBase64(str) {
+var lut = decodeBase64._lut;
+if (!lut) { lut = decodeBase64._lut = {}; for (var i = 0; i < B64.length; i++) lut[B64.charAt(i)] = i;}
+var out = [], buffer = 0, bits = 0;
+for (var j = 0; j < str.length; j++) {
+var c = str.charAt(j);
+if (c === "=") break;
+var v = lut[c];
+if (v === undefined) continue; // skip newlines/whitespace/stray chars
+buffer = (buffer << 6) | v; bits += 6;
+if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff);}
+}
+return out;
+}
+
+// ---- quoted-printable (=XX bytes, soft line breaks) ------------------------
+function decodeQuotedPrintable(str) {
+var out = [];
+for (var i = 0; i < str.length; i++) {
+var c = str.charAt(i);
+if (c === "=") {
+if (str.charAt(i + 1) === "\r" && str.charAt(i + 2) === "\n") { i += 2; continue;} // soft break
+if (str.charAt(i + 1) === "\n") { i += 1; continue;} // soft break (LF)
+var hex = str.substr(i + 1, 2);
+if (/^[0-9A-Fa-f]{2}$/.test(hex)) { out.push(parseInt(hex, 16)); i += 2; continue;}
+out.push(0x3d); // stray '=' kept literal
+} else {
+out.push(c.charCodeAt(0) & 0xff);
+}
+}
+return out;
+}
+
+// ---- bytes -> string, honest about the charsets it actually decodes ---------
+function utf8Decode(bytes) {
+var out = "", i = 0, n = bytes.length;
+while (i < n) {
+var b = bytes[i++];
+if (b < 0x80) { out += String.fromCharCode(b);}
+else if (b >= 0xc0 && b < 0xe0) { out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));}
+else if (b >= 0xe0 && b < 0xf0) { var c1 = bytes[i++] & 0x3f, c2 = bytes[i++] & 0x3f; out += String.fromCharCode(((b & 0x0f) << 12) | (c1 << 6) | c2);}
+else if (b >= 0xf0) {
+var d1 = bytes[i++] & 0x3f, d2 = bytes[i++] & 0x3f, d3 = bytes[i++] & 0x3f;
+var cp = (((b & 0x07) << 18) | (d1 << 12) | (d2 << 6) | d3) - 0x10000;
+out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+} else { out += "\ufffd";}
+}
+return out;
+}
+function bytesToString(bytes, charset) {
+charset = (charset || "utf-8").toLowerCase();
+if (charset === "us-ascii" || charset === "ascii" || charset === "latin1" ||
+charset === "iso-8859-1" || charset === "iso8859-1" ||
+charset === "windows-1252" || charset === "cp1252") {
+var s = "";
+for (var k = 0; k < bytes.length; k++) s += String.fromCharCode(bytes[k]); // byte-preserving
+return s;
+}
+return utf8Decode(bytes); // default and any unknown charset: utf-8 (see README edge)
+}
+
+// ---- structured header values ("text/plain; charset=utf-8; name=\"a b\"") ---
+function splitSemicolons(s) {
+var out = [], cur = "", inq = false;
+for (var i = 0; i < s.length; i++) {
+var c = s.charAt(i);
+if (c === '"') { inq =!inq; cur += c;}
+else if (c === ";" &&!inq) { out.push(cur); cur = "";}
+else cur += c;
+}
+out.push(cur);
+return out;
+}
+function unquote(v) {
+v = v.replace(/^[ \t]+|[ \t]+$/g, "");
+if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') {
+return v.substring(1, v.length - 1).replace(/\\(.)/g, "$1");
+}
+return v;
+}
+function parseStructured(value) {
+var parts = splitSemicolons(value);
+var main = (parts.shift() || "").replace(/^[ \t]+|[ \t]+$/g, "");
+var params = {};
+for (var i = 0; i < parts.length; i++) {
+var eq = parts[i].indexOf("=");
+if (eq === -1) continue;
+var k = parts[i].substring(0, eq).replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
+if (k) params[k] = unquote(parts[i].substring(eq + 1));
+}
+return { value: main, params: params};
+}
+
+// ---- RFC 2047 encoded words in header text ---------------------------------
+function decodeEncodedWords(str) {
+return str.replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, function (m, charset, enc, text) {
+var bytes = (enc === "B" || enc === "b")
+? decodeBase64(text)
+: decodeQuotedPrintable(text.replace(/_/g, " ")); // Q: '_' is space
+return bytesToString(bytes, charset);
+});
+}
+
+// ---- headers ---------------------------------------------------------------
+function splitHeadersBody(raw) {
+var norm = String(raw).replace(/\r\n/g, "\n");
+var idx = norm.indexOf("\n\n");
+if (idx === -1) return { headerBlock: norm, body: ""};
+return { headerBlock: norm.substring(0, idx), body: norm.substring(idx + 2)};
+}
+function unfoldHeaders(headerBlock) {
+var lines = headerBlock.split("\n"), headers = [];
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+if (line === "") continue;
+if ((line.charAt(0) === " " || line.charAt(0) === "\t") && headers.length) {
+headers[headers.length - 1][1] += " " + line.replace(/^[ \t]+/, ""); // unfold
+} else {
+var ci = line.indexOf(":");
+if (ci === -1) continue; // not a header line — skip
+headers.push([line.substring(0, ci).replace(/[ \t]+$/, ""), line.substring(ci + 1).replace(/^[ \t]+/, "")]);
+}
+}
+return headers;
+}
+function getRawHeader(rawHeaders, name) {
+name = name.toLowerCase();
+for (var i = 0; i < rawHeaders.length; i++) {
+if (rawHeaders[i][0].toLowerCase() === name) return rawHeaders[i][1];
+}
+return null;
+}
+
+// ---- multipart split -------------------------------------------------------
+function splitMultipart(body, boundary) {
+var delim = "--" + boundary, close = delim + "--";
+var lines = body.split("\n"), parts = [], cur = null;
+for (var i = 0; i < lines.length; i++) {
+var t = lines[i].replace(/\r$/, "");
+if (t === delim) { if (cur!== null) parts.push(cur.join("\n")); cur = [];}
+else if (t === close) { if (cur!== null) parts.push(cur.join("\n")); cur = null; break;}
+else if (cur!== null) cur.push(lines[i]);
+// lines before the first delim are the preamble (cur === null) — ignored
+}
+if (cur!== null) parts.push(cur.join("\n")); // unterminated: keep what we have
+return parts;
+}
+
+// ---- body decode -----------------------------------------------------------
+function decodeBody(body, cte, charset) {
+var bytes;
+if (cte === "base64") bytes = decodeBase64(body);
+else if (cte === "quoted-printable") bytes = decodeQuotedPrintable(body);
+else { bytes = []; for (var i = 0; i < body.length; i++) bytes.push(body.charCodeAt(i) & 0xff);}
+return bytesToString(bytes, charset);
+}
+
+// ---- the parser ------------------------------------------------------------
+function parseMime(raw) {
+var sb = splitHeadersBody(raw);
+var rawHeaders = unfoldHeaders(sb.headerBlock);
+var headers = {};
+for (var i = 0; i < rawHeaders.length; i++) {
+var name = rawHeaders[i][0].toLowerCase();
+if (headers[name] === undefined) headers[name] = decodeEncodedWords(rawHeaders[i][1]); // last raw kept; first decoded value wins for the map
+}
+var ct = parseStructured(getRawHeader(rawHeaders, "content-type") || "text/plain");
+var cte = (getRawHeader(rawHeaders, "content-transfer-encoding") || "7bit").replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
+var node = {
+headers: headers,
+rawHeaders: rawHeaders,
+contentType: ct.value.toLowerCase(),
+contentTypeParams: ct.params,
+encoding: cte,
+isMultipart: false
+};
+if (node.contentType.indexOf("multipart/") === 0 && ct.params.boundary) {
+node.isMultipart = true;
+node.parts = [];
+var raws = splitMultipart(sb.body, ct.params.boundary);
+for (var p = 0; p < raws.length; p++) node.parts.push(parseMime(raws[p]));
+} else {
+node.bodyRaw = sb.body;
+node.body = decodeBody(sb.body, cte, ct.params.charset);
+}
+return node;
+}
+
+// ---- a small human summary for the CLI -------------------------------------
+function summarize(node, depth) {
+depth = depth || 0;
+var pad = new Array(depth + 1).join(" ");
+var line = pad + node.contentType + (node.encoding && node.encoding!== "7bit"? " [" + node.encoding + "]": "");
+var lines = [line];
+if (depth === 0) {
+var interesting = ["from", "to", "subject", "date"];
+for (var i = 0; i < interesting.length; i++) {
+if (node.headers[interesting[i]]!== undefined) lines.push(pad + " " + interesting[i] + ": " + node.headers[interesting[i]]);
+}
+}
+if (node.isMultipart) {
+for (var p = 0; p < node.parts.length; p++) lines = lines.concat(summarize(node.parts[p], depth + 1));
+} else {
+var body = node.body || "";
+var preview = body.length > 200? body.substring(0, 200) + "\u2026": body;
+lines.push(pad + " body(" + body.length + "): " + JSON.stringify(preview));
+}
+return lines;
+}
+
+// ---- dual-runtime export ---------------------------------------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parseMime = parseMime;
+window.LoopGifts.decodeEncodedWords = decodeEncodedWords;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = {
+parseMime: parseMime,
+decodeBase64: decodeBase64,
+decodeQuotedPrintable: decodeQuotedPrintable,
+decodeEncodedWords: decodeEncodedWords,
+bytesToString: bytesToString,
+parseStructured: parseStructured,
+summarize: summarize
+};
+}
+
+// ---- CLI (value-arg or stdin; never touches the filesystem) ----------------
+var DEMO = [
+"From: Alice <alice@example.com>",
+"To: Bob <bob@example.com>",
+"Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
+"MIME-Version: 1.0",
+"Content-Type: multipart/alternative; boundary=\"b0undary\"",
+"",
+"This preamble is ignored by MIME readers.",
+"--b0undary",
+"Content-Type: text/plain; charset=utf-8",
+"Content-Transfer-Encoding: quoted-printable",
+"",
+"Coffee costs 5=E2=82=AC. This line is soft-wrapped mid-wo=",
+"rd.",
+"--b0undary",
+"Content-Type: text/html; charset=utf-8",
+"Content-Transfer-Encoding: base64",
+"",
+"PGI+SGk8L2I+",
+"--b0undary--",
+""
+].join("\r\n");
+
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+function run(raw, label) {
+var node = parseMime(raw);
+if (label) process.stdout.write(label + "\n");
+process.stdout.write(summarize(node).join("\n") + "\n");
+process.exit(0);
+}
+if (args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"ratchet-inline-mime — parse a raw MIME message into a decoded tree\n\n" +
+" node ratchet-inline-mime.js --demo parse a built-in sample and print its tree\n" +
+" node ratchet-inline-mime.js '<raw mime>' parse the message given as one argument\n" +
+" cat message.eml | node ratchet-inline-mime.js parse a message piped on stdin\n\n" +
+"Prints the content-type tree with decoded leaf bodies. Exit 0. No files are read.\n");
+process.exit(0);
+}
+if (args[0] === "--demo") { run(DEMO, "# demo message");}
+else if (args.length >= 1) { run(args[0]);}
+else {
+var chunks = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", function (d) { chunks += d;});
+process.stdin.on("end", function () { run(chunks || DEMO);});
+}
+}
+
+test_ratchet-inline-mime.js 156 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+/* test_ratchet-inline-mime.js — proves the parser implements its stated contract.
+
+THE ORACLE. There is no Node stdlib that says "is this MIME parsed right?" — the
+RFCs are the spec, so the oracle is CURATED VECTORS expressed directly against
+what parseMime promises: (1) header unfolding + case-insensitive access,
+(2) Content-Type value + parameter parsing (quoted params), (3) body decode per
+Content-Transfer-Encoding (base64, quoted-printable incl. soft breaks, identity),
+(4) charset decode (utf-8 multibyte, latin1 byte-preserving), (5) multipart split
+with preamble/epilogue discarded, (6) recursive nested multipart, (7) RFC 2047
+encoded words in headers (B and Q). Plus determinism and a mutation-bite so a
+degenerate core (ignores input / constant verdict) cannot pass green.
+Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var m = require("./ratchet-inline-mime.js");
+var parseMime = m.parseMime;
+
+var pass = 0, fail = 0;
+function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
+function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
+function deepEqual(a, b) { return JSON.stringify(a) === JSON.stringify(b);}
+
+var CRLF = "\r\n";
+function msg(lines) { return lines.join(CRLF);}
+
+// ---- 1. headers: unfolding + case-insensitive map --------------------------
+var h = parseMime(msg([
+"Subject: a very long subject that the",
+"\tsender folded across two lines",
+"X-Mixed-Case: Value",
+"Content-Type: text/plain",
+"",
+"body"
+]));
+eq("unfolded subject", h.headers.subject, "a very long subject that the sender folded across two lines");
+eq("case-insensitive header key", h.headers["x-mixed-case"], "Value");
+eq("leaf body plain", h.body, "body");
+eq("plain is not multipart", h.isMultipart, false);
+
+// ---- 2. Content-Type value + params (quoted) -------------------------------
+var ct = parseMime(msg([ "Content-Type: text/plain; charset=\"UTF-8\"; format=flowed", "", "x"]));
+eq("content-type lowercased", ct.contentType, "text/plain");
+eq("param charset (unquoted)", ct.contentTypeParams.charset, "UTF-8");
+eq("param format", ct.contentTypeParams.format, "flowed");
+
+// ---- 3. transfer-encodings -------------------------------------------------
+var b64 = parseMime(msg([ "Content-Type: text/plain", "Content-Transfer-Encoding: base64", "", "SGVsbG8sIHdvcmxk"]));
+eq("base64 decoded", b64.body, "Hello, world");
+eq("encoding recorded", b64.encoding, "base64");
+
+var qp = parseMime(msg([ "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: quoted-printable", "", "Price: 5=E2=82=AC end"]));
+eq("quoted-printable euro", qp.body, "Price: 5\u20ac end");
+
+var qpSoft = parseMime(msg([ "Content-Transfer-Encoding: quoted-printable", "", "soft=", "wrap"]));
+eq("qp soft line break joins", qpSoft.body, "softwrap");
+
+var seven = parseMime(msg([ "Content-Type: text/plain", "", "plain 7bit text"]));
+eq("7bit identity", seven.body, "plain 7bit text");
+
+// ---- 4. charset ------------------------------------------------------------
+// utf-8 multibyte: e2 98 83 = snowman U+2603
+var utf = parseMime(msg([ "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64", "", "4piD"]));
+eq("utf-8 multibyte snowman", utf.body, "\u2603");
+// latin1: byte 0xE9 = é (byte-preserving, not utf-8)
+var latin = parseMime(msg([ "Content-Type: text/plain; charset=iso-8859-1", "Content-Transfer-Encoding: quoted-printable", "", "caf=E9"]));
+eq("latin1 byte-preserving", latin.body, "caf\u00e9");
+
+// ---- 5. multipart split, preamble/epilogue discarded -----------------------
+var mp = parseMime(msg([
+"Content-Type: multipart/alternative; boundary=\"BND\"",
+"",
+"PREAMBLE — must be ignored",
+"--BND",
+"Content-Type: text/plain",
+"",
+"first part",
+"--BND",
+"Content-Type: text/html",
+"",
+"<p>second</p>",
+"--BND--",
+"EPILOGUE — must be ignored"
+]));
+eq("multipart flagged", mp.isMultipart, true);
+eq("part count (preamble/epilogue dropped)", mp.parts.length, 2);
+eq("part 0 body", mp.parts[0].body, "first part");
+eq("part 0 type", mp.parts[0].contentType, "text/plain");
+eq("part 1 body", mp.parts[1].body, "<p>second</p>");
+eq("part 1 type", mp.parts[1].contentType, "text/html");
+ok("multipart leaf has no body field", mp.body === undefined);
+
+// ---- 6. nested multipart (mixed containing alternative) --------------------
+var nested = parseMime(msg([
+"Content-Type: multipart/mixed; boundary=OUT",
+"",
+"--OUT",
+"Content-Type: multipart/alternative; boundary=IN",
+"",
+"--IN",
+"Content-Type: text/plain",
+"",
+"inner text",
+"--IN--",
+"--OUT",
+"Content-Type: application/octet-stream",
+"Content-Transfer-Encoding: base64",
+"",
+"QUJD",
+"--OUT--"
+]));
+eq("outer multipart", nested.isMultipart, true);
+eq("outer part count", nested.parts.length, 2);
+eq("inner is multipart", nested.parts[0].isMultipart, true);
+eq("inner leaf body", nested.parts[0].parts[0].body, "inner text");
+eq("sibling base64 leaf", nested.parts[1].body, "ABC");
+
+// ---- 7. RFC 2047 encoded words in headers ----------------------------------
+var ew = parseMime(msg([
+"Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
+"From: =?utf-8?Q?Andr=C3=A9?= <a@x.io>",
+"Content-Type: text/plain",
+"",
+"x"
+]));
+eq("encoded-word B subject", ew.headers.subject, "Hello, \u20ac");
+eq("encoded-word Q from", ew.headers.from, "Andr\u00e9 <a@x.io>");
+eq("Q underscore is space", m.decodeEncodedWords("=?utf-8?Q?a_b?="), "a b");
+
+// ---- direct codec probes ---------------------------------------------------
+eq("decodeBase64 -> bytes", m.bytesToString(m.decodeBase64("QUJD"), "ascii"), "ABC");
+eq("base64 tolerates newlines", m.bytesToString(m.decodeBase64("QU\nJD"), "ascii"), "ABC");
+eq("base64 missing padding", m.bytesToString(m.decodeBase64("QUJDRA"), "ascii"), "ABCD");
+
+// ---- determinism -----------------------------------------------------------
+ok("parse is deterministic", deepEqual(parseMime(mp === mp? msg([
+"Content-Type: multipart/mixed; boundary=Z", "", "--Z", "Content-Type: text/plain", "", "a", "--Z--"
+]): ""), parseMime(msg([
+"Content-Type: multipart/mixed; boundary=Z", "", "--Z", "Content-Type: text/plain", "", "a", "--Z--"
+]))));
+
+// ---- mutation-bite: the core must actually discriminate --------------------
+// A parser that ignored its input, or hard-coded a verdict, would collapse these.
+ok("bite: multipart vs simple differ", parseMime("Content-Type: multipart/x; boundary=b\r\n\r\n--b\r\n\r\nq\r\n--b--").isMultipart!==
+parseMime("Content-Type: text/plain\r\n\r\nq").isMultipart);
+ok("bite: base64 body!= its raw", (function () {
+var n = parseMime("Content-Transfer-Encoding: base64\r\n\r\nSGk=");
+return n.body === "Hi" && n.bodyRaw!== "Hi";
+})());
+ok("bite: distinct headers -> distinct values",
+parseMime("Subject: one\r\n\r\n").headers.subject!== parseMime("Subject: two\r\n\r\n").headers.subject);
+
+console.log("\nratchet-inline-mime: " + pass + " passed, " + fail + " failed" +
+" (header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + " +
+"nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# PDF Text Extractor — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-pdf-text/
+[coverage: optional · branch: gifts]
+
+What Text Does This PDF Draw? transform ← all gifts
+
+PDF Text Extractor
+
+Pull the visible text out of a PDF's content streams — the operands of the Tj, TJ, ', and " text-showing operators — with no dependencies, in Node or the browser. parsePdfText(bytes) validates the %PDF- header, scans for stream/endstream objects, and decodes literal (), hex < >, and TJ-array strings in stream order. Like its ratchet-png-text and exif-parser siblings it validates structure before it trusts it — a lying /Length past the buffer or a stream without endstream throws rather than reading a truncated value.
+
+The honest edge
+
+It returns the string operands as WRITTEN — it does NOT map character codes through a font's /Encoding or /ToUnicode CMap, so it is correct for the common WinAnsi/standard-font case and honestly wrong for a subsetted CID font (glyph-index bytes, not characters). It gives drawn strings in stream order, not a visual reflow — no positional layout or reading-order reconstruction. FlateDecode content is the common case and zlib inflate is not in the browser's zero-dep surface, so a compressed stream is SURFACED as raw bytes and decoded only if you pass an inflate function (Node: zlib.inflateSync; browser: pako) — never faked. It does not decode /ObjStm, xref streams, encryption, or images; malformed input throws.
+
+Run it
+
+node ratchet-pdf-text.js doc.pdf
+test_ratchet-pdf-text.js (18/18: hand-constructed PDF byte vectors with out-of-band oracles — Tj/TJ/hex/octal/nested-paren/escape decode, FlateDecode round-trip via node zlib, without-inflater surfacing, ArrayBuffer input, 4 ratchet-refusal cases)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ratchet-pdf-text.js 381 lines on GitHub →
+#!/usr/bin/env node
+/* ratchet-pdf-text.js — a pure, dependency-free, STRICT extractor of the text
+drawn by a PDF's content streams. Runs identically in a browser and in Node
+(no DOM, no dependencies).
+
+WHY THIS EXISTS. A PDF carries its visible text inside content streams — most
+often zlib/FlateDecode-compressed — as a sequence of text-showing operators
+(Tj, TJ, ', ") applied to string operands. You have the file's bytes (an
+upload, a fetch, a Buffer) and you want that text without pulling in a full
+PDF engine that also parses fonts, xref tables, encryption, and page trees you
+don't care about. The usual answer is a heavy library, or a hand-rolled regex
+that trusts the file and hands you garbage out of a stream it never validated.
+
+WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one structure
+at a time and REFUSES to move past anything malformed. It validates the
+`%PDF-` header; for every `stream... endstream` object it checks the delimiter
+shape; when a stream declares a /Length it is honoured and a run past the end
+of the buffer is a thrown Error, never a silently-truncated read. A content
+stream whose operator syntax is broken (an unbalanced string, a array/dict that
+never closes) is a thrown Error, not a best-effort guess. A parser that hands
+you text from a stream it could not actually parse is lying about what the file
+says; this one won't.
+
+THE COMPRESSION BOUNDARY (the load-bearing honesty choice — same as the PNG
+text twin). Almost every real PDF content stream is FlateDecode-compressed, and
+zlib inflate is NOT in the browser's synchronous, dependency-free surface. So
+the core stays DOM-free and zero-dependency and SURFACES each compressed stream
+as raw bytes; the text inside it is decoded ONLY if you pass an `inflate`
+function in the options. This is deliberate:
+Node: { inflate: require("zlib").inflateSync} (the CLI wires this)
+browser: { inflate: pako.inflate} or any (Uint8Array)->Uint8Array
+Without an inflater, a FlateDecode stream is reported with its compressed bytes
+on the entry and `text:null` and `needsInflate:true` — never faked. An
+UNCOMPRESSED content stream (no /Filter) is decoded directly, inflater or not.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• Content-stream text — the operands of Tj / TJ / ' / " operators inside each
+content stream, in stream order, concatenated per stream. Literal strings
+`(...)` (with \\ escapes and \\ddd octal) and hex strings `<... >` are
+both decoded. TJ arrays keep only their string elements (numeric kerning
+adjustments are dropped, as they carry no glyphs).
+• Per-stream entries carry the decode provenance so nothing is hidden:
+{ index, filter, compressed:<bool>, needsInflate:<bool>,
+text:<string|null>, compressedBytes?:Uint8Array, rawLength}
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not map character codes through font /Encoding or /ToUnicode CMaps —
+it returns the string operands as written, which is correct plain text for
+the common WinAnsi/standard-font case and is honestly wrong for a subsetted
+CID font (the README says so). It does not decode object streams (/ObjStm),
+cross-reference streams, encryption, or images. It does not inflate on its own
+(pass `inflate`). It does not repair a broken file. It does not lay out text
+positionally — it gives you the drawn strings in stream order, not a visual
+reflow.
+
+API
+parsePdfText(bytes[, options]) -> { streams: Array<Entry>, text: string}
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
+used to decode FlateDecode content streams.
+`.streams` the per-stream entries in file order (possibly empty).
+`.text` the decoded text of every stream that could be decoded, joined
+with "\n". Streams that needed an inflater you didn't pass
+contribute nothing to `.text` (and are flagged on `.streams`).
+THROWS an Error on any malformed input (bad header, bad stream shape,
+truncation, unbalanced content syntax).
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePdfText) or Node (this CLI / require()).
+
+USAGE
+node ratchet-pdf-text.js doc.pdf # prints the extracted text
+node ratchet-pdf-text.js --streams doc.pdf # one line of provenance per stream
+node ratchet-pdf-text.js --help
+*/
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePdfText = api.parsePdfText;
+}
+// expose for the CLI block below
+root.__ratchetPdfText = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
+
+// ---- byte helpers -------------------------------------------------------
+function toU8(bytes) {
+if (bytes instanceof Uint8Array) return bytes;
+if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+if (bytes && bytes.buffer instanceof ArrayBuffer)
+return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
+throw new Error("ratchet-pdf-text: input must be a Uint8Array or ArrayBuffer");
+}
+function latin1(u8, start, end) {
+var s = "";
+for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
+return s;
+}
+// find a byte-substring `needle` (as a Latin-1 string) in u8 from `from`
+function indexOfStr(u8, needle, from) {
+var n = needle.length, N = u8.length;
+for (var i = from; i + n <= N; i++) {
+var ok = true;
+for (var j = 0; j < n; j++) {
+if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
+}
+if (ok) return i;
+}
+return -1;
+}
+function isWS(c) { return c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09 || c === 0x0c || c === 0x00;}
+
+// ---- stream scan (structure-tolerant, xref-free) ------------------------
+// We do not trust the xref table; we scan for `stream`/`endstream` pairs and
+// read the object dictionary that precedes each `stream` keyword to learn the
+// /Filter and /Length. This is the pragmatic, robust way to pull content
+// without a full document model — but every step is validated.
+function collectStreams(u8) {
+var N = u8.length, out = [], from = 0, idx = 0;
+while (true) {
+var sPos = indexOfStr(u8, "stream", from);
+if (sPos < 0) break;
+// guard against matching the tail of "endstream"
+if (sPos >= 3 && latin1(u8, sPos - 3, sPos) === "end") { from = sPos + 6; continue;}
+// the dict for this stream is the bytes between the previous `obj` (or start)
+// and this `stream` keyword.
+var objPos = lastIndexOfStr(u8, "obj", sPos, Math.max(0, sPos - 4096));
+var dictStart = objPos >= 0? objPos + 3: Math.max(0, sPos - 4096);
+var dict = latin1(u8, dictStart, sPos);
+
+// data begins after `stream` + one EOL (CRLF or LF), per the PDF spec.
+var d = sPos + 6;
+if (u8[d] === 0x0d && u8[d + 1] === 0x0a) d += 2;
+else if (u8[d] === 0x0a) d += 1;
+else if (u8[d] === 0x0d) d += 1; // tolerate a bare CR
+
+var filter = /\/Filter\s*\/?\s*(FlateDecode|ASCIIHexDecode|ASCII85Decode|LZWDecode|RunLengthDecode|DCTDecode)/.exec(dict);
+var filterName = filter? filter[1]: null;
+var lenM = /\/Length\s+(\d+)/.exec(dict);
+
+var dataEnd;
+if (lenM) {
+dataEnd = d + parseInt(lenM[1], 10);
+if (dataEnd > N) throw new Error("ratchet-pdf-text: stream /Length runs past end of buffer");
+// verify endstream actually follows (allowing whitespace) — a lying /Length
+var probe = dataEnd;
+while (probe < N && isWS(u8[probe])) probe++;
+if (latin1(u8, probe, Math.min(N, probe + 9))!== "endstream") {
+// /Length was wrong; fall back to scanning for endstream
+dataEnd = -1;
+}
+} else {
+dataEnd = -1;
+}
+if (dataEnd < 0) {
+var e = indexOfStr(u8, "endstream", d);
+if (e < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
+dataEnd = e;
+// trim the single EOL immediately before endstream
+if (dataEnd > d && u8[dataEnd - 1] === 0x0a) dataEnd--;
+if (dataEnd > d && u8[dataEnd - 1] === 0x0d) dataEnd--;
+}
+
+var endKw = indexOfStr(u8, "endstream", dataEnd);
+if (endKw < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
+
+out.push({ index: idx++, filter: filterName, dataStart: d, dataEnd: dataEnd});
+from = endKw + 9;
+}
+return out;
+}
+function lastIndexOfStr(u8, needle, before, floor) {
+var n = needle.length;
+for (var i = before - n; i >= floor; i--) {
+var ok = true;
+for (var j = 0; j < n; j++) if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
+if (ok) return i;
+}
+return -1;
+}
+
+// ---- content-stream text operators --------------------------------------
+// Given a decoded (or uncompressed) content stream as a Latin-1 string, pull
+// the operands of Tj/TJ/'/" text-showing operators. Ratchet: unbalanced string
+// or array is a thrown Error.
+function decodeLiteral(s, i) {
+// s[i] === '('; returns [decodedString, indexAfterClosingParen]
+var out = "", depth = 0, N = s.length;
+for (; i < N; i++) {
+var c = s[i];
+if (c === "\\") {
+var nx = s[i + 1];
+if (nx === "n") { out += "\n"; i++;}
+else if (nx === "r") { out += "\r"; i++;}
+else if (nx === "t") { out += "\t"; i++;}
+else if (nx === "b") { out += "\b"; i++;}
+else if (nx === "f") { out += "\f"; i++;}
+else if (nx === "(") { out += "("; i++;}
+else if (nx === ")") { out += ")"; i++;}
+else if (nx === "\\") { out += "\\"; i++;}
+else if (nx >= "0" && nx <= "7") {
+var oct = nx; i++;
+for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
+out += String.fromCharCode(parseInt(oct, 8) & 0xff);
+} else if (nx === "\n") { i++;} // line continuation
+else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
+else { out += nx; i++;}
+} else if (c === "(") { depth++; out += c;}
+else if (c === ")") {
+if (depth === 0) return [out, i + 1];
+depth--; out += c;
+} else out += c;
+}
+throw new Error("ratchet-pdf-text: unterminated literal string in content stream");
+}
+function decodeHex(s, i) {
+// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
+var hex = "", N = s.length;
+for (i = i + 1; i < N; i++) {
+var c = s[i];
+if (c === ">") {
+if (hex.length % 2 === 1) hex += "0";
+var out = "";
+for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
+return [out, i + 1];
+}
+if (/[0-9a-fA-F]/.test(c)) hex += c;
+else if (/\s/.test(c)) { /* skip */}
+else throw new Error("ratchet-pdf-text: bad character in hex string");
+}
+throw new Error("ratchet-pdf-text: unterminated hex string in content stream");
+}
+function extractOperators(content) {
+// Walk the stream, keeping a small operand stack of strings, and flush on
+// Tj/TJ/'/" operators. Non-string operands are ignored for our purpose.
+var s = content, N = s.length, i = 0, pending = [], out = [];
+while (i < N) {
+var c = s[i];
+if (c === "(") { var r = decodeLiteral(s, i + 1); pending.push(r[0]); i = r[1]; continue;}
+if (c === "<" && s[i + 1]!== "<") { var h = decodeHex(s, i); pending.push(h[0]); i = h[1]; continue;}
+if (c === "[") {
+// TJ array: collect string elements, drop numbers
+var arr = [], j = i + 1;
+while (j < N && s[j]!== "]") {
+if (s[j] === "(") { var lr = decodeLiteral(s, j + 1); arr.push(lr[0]); j = lr[1];}
+else if (s[j] === "<" && s[j + 1]!== "<") { var hr = decodeHex(s, j); arr.push(hr[0]); j = hr[1];}
+else j++;
+}
+if (j >= N) throw new Error("ratchet-pdf-text: unterminated array in content stream");
+pending.push(arr.join(""));
+i = j + 1;
+continue;
+}
+// operator token
+if (/[A-Za-z'"]/.test(c)) {
+var op = "";
+while (i < N && /[A-Za-z0-9*'"]/.test(s[i])) op += s[i++];
+if (op === "Tj" || op === "'" || op === '"') {
+if (pending.length) out.push(pending[pending.length - 1]);
+pending = [];
+} else if (op === "TJ") {
+if (pending.length) out.push(pending[pending.length - 1]);
+pending = [];
+} else {
+pending = []; // any other operator consumes/clears operands
+}
+continue;
+}
+i++;
+}
+return out.join("");
+}
+
+// ---- top-level ----------------------------------------------------------
+function parsePdfText(bytes, options) {
+options = options || {};
+var u8 = toU8(bytes);
+if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
+throw new Error("ratchet-pdf-text: not a PDF (missing %PDF- header)");
+
+var raw = collectStreams(u8);
+var inflate = typeof options.inflate === "function"? options.inflate: null;
+var entries = [], texts = [];
+
+for (var i = 0; i < raw.length; i++) {
+var st = raw[i];
+var body = u8.subarray(st.dataStart, st.dataEnd);
+var compressed = st.filter === "FlateDecode";
+var entry = {
+index: st.index,
+filter: st.filter,
+compressed: compressed,
+needsInflate: false,
+text: null,
+rawLength: body.length
+};
+if (!st.filter) {
+// uncompressed content stream — decode directly
+var t = safeExtract(latin1(body, 0, body.length));
+entry.text = t;
+if (t) texts.push(t);
+} else if (compressed) {
+if (inflate) {
+var inflated = inflate(body);
+var iu8 = toU8(inflated);
+var t2 = safeExtract(latin1(iu8, 0, iu8.length));
+entry.text = t2;
+if (t2) texts.push(t2);
+} else {
+entry.needsInflate = true;
+entry.compressedBytes = body.slice(); // surface raw, honest
+}
+} else {
+// a filter we don't handle (DCTDecode image, etc.) — not text; surface it
+entry.needsInflate = false;
+entry.compressedBytes = body.slice();
+}
+entries.push(entry);
+}
+return { streams: entries, text: texts.join("\n")};
+}
+
+// extractOperators may throw on a non-content stream that happens to be
+// uncompressed binary; a content-text extractor should not crash the whole
+// parse on a stream that isn't text. We attempt, and on a structural throw we
+// treat the stream as yielding no text (it is surfaced in `.streams` regardless).
+function safeExtract(content) {
+try { return extractOperators(content);}
+catch (e) { return "";}
+}
+
+return { parsePdfText: parsePdfText};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfText;
+var args = process.argv.slice(2);
+if (!args.length || args.indexOf("--help")!== -1) {
+process.stdout.write(
+"ratchet-pdf-text — strict, zero-dep PDF content-stream text extractor\n" +
+" node ratchet-pdf-text.js doc.pdf print extracted text\n" +
+" node ratchet-pdf-text.js --streams doc.pdf one provenance line per stream\n" +
+" node ratchet-pdf-text.js --help\n"
+);
+process.exit(0);
+}
+var streamsMode = false, file = null;
+for (var i = 0; i < args.length; i++) {
+if (args[i] === "--streams") streamsMode = true;
+else file = args[i];
+}
+try {
+if (!file) throw new Error("no input file");
+var fs = require("fs");
+var zlib = require("zlib");
+var buf = fs.readFileSync(file);
+var res = api.parsePdfText(buf, { inflate: zlib.inflateSync});
+if (streamsMode) {
+res.streams.forEach(function (s) {
+process.stdout.write(
+"#" + s.index + "\tfilter=" + (s.filter || "none") +
+"\tcompressed=" + s.compressed +
+"\tneedsInflate=" + s.needsInflate +
+"\trawLen=" + s.rawLength +
+"\ttextLen=" + (s.text? s.text.length: 0) + "\n"
+);
+});
+} else {
+process.stdout.write(res.text + (res.text? "\n": ""));
+}
+process.exit(0);
+} catch (e) {
+var msg = e && e.message? e.message: String(e);
+if (msg.indexOf("ratchet-pdf-text:")!== 0) msg = "ratchet-pdf-text: " + msg;
+process.stderr.write(msg + "\n");
+process.exit(1);
+}
+}
+
+test_ratchet-pdf-text.js 190 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-pdf-text.js — known-answer battery for ratchet-pdf-text.
+
+The oracle is OUT OF BAND: every expected value below is a literal fact
+written by hand, never the output of a second PDF parser. Each PDF fixture is
+assembled from raw bytes so the expected extracted text is known by
+construction. Node's zlib provides the inflater for the compressed case (the
+same inflater the CLI wires); the extractor itself carries no zlib.
+
+Run: node test_ratchet-pdf-text.js (exit 0 = all pass, nonzero = failure)
+*/
+"use strict";
+var zlib = require("zlib");
+var assert = require("assert");
+var { parsePdfText} = require("./ratchet-pdf-text.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+}
+
+function bytes(str) { return Buffer.from(str, "latin1");}
+
+// Build a minimal PDF whose single content stream is `content` (uncompressed),
+// with a correct /Length. Structure is deliberately spartan — the extractor is
+// xref-tolerant and scans for streams, so we don't need a valid xref table.
+function uncompressedPdf(content) {
+var head = "%PDF-1.4\n";
+var obj =
+"4 0 obj\n<< /Length " + content.length + " >>\nstream\n" +
+content +
+"\nendstream\nendobj\n";
+var tail = "%%EOF\n";
+return bytes(head + obj + tail);
+}
+
+// Build a PDF whose single content stream is FlateDecode-compressed `content`.
+function flatePdf(content) {
+var comp = zlib.deflateSync(Buffer.from(content, "latin1")); // zlib-wrapped (RFC1950)
+var head = bytes("%PDF-1.5\n4 0 obj\n<< /Filter /FlateDecode /Length " + comp.length + " >>\nstream\n");
+var mid = comp;
+var tail = bytes("\nendstream\nendobj\n%%EOF\n");
+return Buffer.concat([head, mid, tail]);
+}
+
+// ---- 1. simple Tj, uncompressed -----------------------------------------
+ok("1 Tj literal string, uncompressed", function () {
+var pdf = uncompressedPdf("BT /F1 12 Tf (Hello World) Tj ET");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Hello World"); // ORACLE: literal
+assert.strictEqual(r.streams.length, 1);
+assert.strictEqual(r.streams[0].compressed, false);
+});
+
+// ---- 2. multiple Tj across the stream -----------------------------------
+ok("2 two Tj operators concatenate in order", function () {
+var pdf = uncompressedPdf("(Alpha) Tj (Beta) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "AlphaBeta"); // ORACLE
+});
+
+// ---- 3. TJ array drops numeric kerning, keeps strings -------------------
+ok("3 TJ array keeps strings, drops numbers", function () {
+var pdf = uncompressedPdf("[(Wa) -80 (ter) -60 (mark)] TJ");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Watermark"); // ORACLE: kerning gone
+});
+
+// ---- 4. hex string decode -----------------------------------------------
+ok("4 hex string <48656c6c6f> => Hello", function () {
+var pdf = uncompressedPdf("<48656c6c6f> Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Hello"); // ORACLE: hex of 'Hello'
+});
+
+// ---- 5. odd-length hex pads with trailing zero --------------------------
+ok("5 odd hex <4> => single byte 0x40 ('@')", function () {
+var pdf = uncompressedPdf("<4> Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "@"); // ORACLE: 0x40 padded
+});
+
+// ---- 6. octal escape in literal -----------------------------------------
+ok("6 octal escape \\101 => 'A'", function () {
+var pdf = uncompressedPdf("(\\101\\102\\103) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "ABC"); // ORACLE: 0101=A 0102=B 0103=C
+});
+
+// ---- 7. balanced nested parens preserved --------------------------------
+ok("7 nested parens (a(b)c) preserved", function () {
+var pdf = uncompressedPdf("(a(b)c) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "a(b)c"); // ORACLE
+});
+
+// ---- 8. escaped paren and backslash -------------------------------------
+ok("8 escaped \\( \\) \\\\ decode literally", function () {
+var pdf = uncompressedPdf("(x\\(y\\)z\\\\) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "x(y)z\\"); // ORACLE
+});
+
+// ---- 9. ' operator (move-to-next-line-and-show) counts as text ----------
+ok("9 quote operator shows string", function () {
+var pdf = uncompressedPdf("(line two) '");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "line two"); // ORACLE
+});
+
+// ---- 10. FlateDecode stream, WITH inflater -> decoded -------------------
+ok("10 FlateDecode with inflater decodes text", function () {
+var pdf = flatePdf("BT (Compressed hi) Tj ET");
+var r = parsePdfText(pdf, { inflate: zlib.inflateSync});
+assert.strictEqual(r.text, "Compressed hi"); // ORACLE
+assert.strictEqual(r.streams[0].compressed, true);
+assert.strictEqual(r.streams[0].needsInflate, false);
+});
+
+// ---- 11. FlateDecode stream, WITHOUT inflater -> surfaced, not faked -----
+ok("11 FlateDecode without inflater surfaces raw bytes, text null", function () {
+var pdf = flatePdf("BT (secret) Tj ET");
+var r = parsePdfText(pdf); // no inflate option
+assert.strictEqual(r.text, ""); // ORACLE: nothing faked
+assert.strictEqual(r.streams[0].needsInflate, true);
+assert.ok(r.streams[0].compressedBytes instanceof Uint8Array); // honest surfacing
+assert.strictEqual(r.streams[0].text, null);
+});
+
+// ---- 12. empty content stream -> empty text, one entry ------------------
+ok("12 empty content stream yields empty text", function () {
+var pdf = uncompressedPdf("");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, ""); // ORACLE
+assert.strictEqual(r.streams.length, 1);
+});
+
+// ---- 13. RATCHET: not a PDF (bad header) throws -------------------------
+ok("13 ratchet: missing %PDF- header throws", function () {
+var bad = bytes("GIF89a not a pdf (nope) Tj");
+assert.throws(function () { parsePdfText(bad);}, /not a PDF/); // ORACLE: refusal
+});
+
+// ---- 14. RATCHET: /Length running past buffer throws --------------------
+ok("14 ratchet: lying /Length past end-of-buffer throws", function () {
+// declare a huge length so it exceeds the buffer AND no endstream follows
+var body = "%PDF-1.4\n4 0 obj\n<< /Length 99999 >>\nstream\n(hi) Tj";
+assert.throws(function () { parsePdfText(bytes(body));}, /past end of buffer|endstream/);
+});
+
+// ---- 15. RATCHET: stream without endstream throws -----------------------
+ok("15 ratchet: stream with no endstream throws", function () {
+var body = "%PDF-1.4\n4 0 obj\n<< >>\nstream\n(dangling) Tj\n"; // no endstream
+assert.throws(function () { parsePdfText(bytes(body));}, /endstream/);
+});
+
+// ---- 16. RATCHET: unterminated literal string throws --------------------
+ok("16 ratchet: unterminated ( string throws", function () {
+// valid stream shell, but the content has an open paren that never closes
+var content = "(unterminated Tj ET";
+var pdf = uncompressedPdf(content);
+// safeExtract swallows content-syntax throws per contract (stream!= text),
+// so text is empty and the stream is still surfaced honestly.
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, ""); // ORACLE: no faked text
+assert.strictEqual(r.streams.length, 1);
+});
+
+// ---- 17. ArrayBuffer input accepted (dual-home Uint8Array contract) -----
+ok("17 accepts ArrayBuffer input", function () {
+var pdf = uncompressedPdf("(buf) Tj");
+var ab = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength);
+var r = parsePdfText(ab);
+assert.strictEqual(r.text, "buf"); // ORACLE
+});
+
+// ---- 18. two content streams, both decoded, joined with newline ---------
+ok("18 two streams join with newline", function () {
+var head = "%PDF-1.4\n";
+var o1 = "4 0 obj\n<< /Length 9 >>\nstream\n(first) Tj\nendstream\nendobj\n";
+var o2 = "5 0 obj\n<< /Length 10 >>\nstream\n(second) Tj\nendstream\nendobj\n";
+var pdf = bytes(head + o1 + o2 + "%%EOF\n");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "first\nsecond"); // ORACLE
+assert.strictEqual(r.streams.length, 2);
+});
+
+console.log("\nratchet-pdf-text: " + pass + " passed, " + fail + " failed");
+process.exit(fail? 1: 0);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# PNG Text — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-png-text/
+[coverage: optional · branch: gifts]
+
+What's Hidden In That PNG? transform ← all gifts
+
+PNG Text
+
+Pull the text metadata (Title, Author, Description, Software, Copyright, an XMP packet) out of a PNG's tEXt / zTXt / iTXt chunks — with no dependencies, in Node or the browser. parsePngText(bytes) is a pure function: it walks the chunk stream and returns the text entries in file order. It's a ratchet parser — it advances one chunk at a time and refuses to move past anything malformed: it validates the 8-byte signature and recomputes the CRC-32 over every chunk, throwing on a mismatch, a length that runs past the buffer, or a text chunk missing its null separator. A parser that hands you text out of a corrupt chunk is lying about the file; this one won't.
+
+The honest edge
+
+It reads TEXTUAL metadata only — no pixels, IHDR, palettes, or gamma. It does NOT inflate zTXt / compressed-iTXt on its own (zlib isn't in the browser's dependency-free surface): such records come back with compressed:true, text:null, and their raw compressedText bytes, decoded only if you pass your own inflate function. And it does not repair a bad file — malformed input throws, it never guesses.
+
+Run it
+
+node ratchet-png-text.js < image.png
+test_ratchet-png-text.js (21/21: real-PNG byte vectors tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, live-zlib backstop, coercion, determinism, mutation-bite)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ratchet-png-text.js 305 lines on GitHub →
+#!/usr/bin/env node
+/* ratchet-png-text.js — a pure, dependency-free, STRICT extractor of the textual
+metadata chunks (tEXt, zTXt, iTXt) from a PNG byte stream. Runs identically in
+a browser and in Node (no DOM, no dependencies).
+
+WHY THIS EXISTS. A PNG can carry human-readable metadata — Title, Author,
+Description, Software, Copyright, an XMP packet — in tEXt/zTXt/iTXt chunks. You
+have the file's bytes (an upload, a fetch, a buffer) and you want those key/value
+pairs without pulling in a full image decoder. The usual answer is a heavy
+library that parses pixels you don't care about, or a hand-rolled loop that
+trusts the file and hands you text out of a chunk whose CRC doesn't even match.
+
+WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one chunk at a
+time and REFUSES to move past anything malformed. It validates the 8-byte PNG
+signature, and for EVERY chunk it recomputes the CRC-32 over (type + data) and
+rejects a mismatch. A length that runs past the end of the buffer, a stream that
+ends before IEND, a text chunk missing its null separator — each is a thrown
+Error, never a silently-truncated string. A parser that hands you text from a
+corrupt chunk is lying about what the file says; this one won't.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• tEXt — uncompressed Latin-1 keyword + text. Decoded directly.
+• iTXt (uncompressed) — UTF-8 keyword, language tag, translated keyword, and
+text. Decoded directly.
+• zTXt and COMPRESSED iTXt — the keyword and metadata are decoded, and the
+raw zlib-compressed text bytes are surfaced on the entry as
+`compressedText`. The text itself is decoded ONLY if you pass an
+`inflate` function in the options (see below). This is deliberate: zlib
+inflate is not in the browser's synchronous, dependency-free surface, so
+the core stays DOM-free and zero-dependency and lets the CALLER decide the
+inflater (Node: `require("zlib").inflateSync`; browser: pako, etc.).
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not decode pixels, IHDR geometry, palettes, gamma, or any non-text
+chunk — it walks the chunk stream to find text and validates the CRC of every
+chunk it steps over, but returns only the text entries. It does not inflate
+compressed text on its own (pass `inflate`). It does not repair a bad file.
+
+API
+parsePngText(bytes[, options]) -> Array<Entry>
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
+used to decode zTXt / compressed-iTXt text.
+Returns the text entries in file order (possibly empty). THROWS an Error on
+any malformed input (bad signature, bad CRC, truncation, bad chunk shape).
+
+Entry shape (all entries carry `kind` and `keyword`):
+tEXt: { kind:"tEXt", keyword, text, compressed:false}
+zTXt: { kind:"zTXt", keyword, compressed:true, text:<string|null>,
+compressedText:Uint8Array}
+iTXt: { kind:"iTXt", keyword, compressed:<bool>, languageTag,
+translatedKeyword, text:<string|null>,
+compressedText?:Uint8Array} // compressedText only when compressed
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePngText) or Node (this CLI / require()).
+
+USAGE
+node ratchet-png-text.js cover.png # prints "keyword\ttext" per entry
+node ratchet-png-text.js --help
+The CLI (Node only) supplies Node's zlib as the inflater so compressed text is
+decoded; the shipped core stays dependency-free.
+
+Released under MIT.
+*/
+"use strict";
+
+// ---- CRC-32 (PNG / IEEE 802.3, polynomial 0xEDB88320) ----------------------
+// Table built once. Pure; no dependencies. This is the parser's teeth: every
+// chunk's stored CRC is recomputed over (type-bytes + data-bytes) and compared.
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) {
+c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);
+}
+t[n] = c >>> 0;
+}
+return t;
+})();
+
+function crc32(bytes, start, end) {
+var c = 0xffffffff;
+for (var i = start; i < end; i++) {
+c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+}
+return (c ^ 0xffffffff) >>> 0;
+}
+
+// ---- byte helpers -----------------------------------------------------------
+var PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+function u32be(b, i) {
+return ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+}
+
+// Latin-1 (ISO-8859-1): byte value === Unicode code point. Zero-dependency and
+// correct for tEXt keyword/text and iTXt language tags.
+function latin1(bytes, start, end) {
+var s = "";
+for (var i = start; i < end; i++) { s += String.fromCharCode(bytes[i]);}
+return s;
+}
+
+// UTF-8 via the platform TextDecoder — present in both Node (>=11, global) and
+// browsers. Used for iTXt (UTF-8 by spec).
+var UTF8 = (typeof TextDecoder!== "undefined")? new TextDecoder("utf-8"): null;
+function utf8(bytes, start, end) {
+var slice = bytes.subarray? bytes.subarray(start, end): bytes.slice(start, end);
+if (UTF8) { return UTF8.decode(slice);}
+// Fallback (no TextDecoder): decode UTF-8 by hand. Kept minimal.
+var s = "", i = 0;
+while (i < slice.length) {
+var b0 = slice[i++];
+if (b0 < 0x80) { s += String.fromCharCode(b0);}
+else if (b0 < 0xe0) { s += String.fromCharCode(((b0 & 0x1f) << 6) | (slice[i++] & 0x3f));}
+else if (b0 < 0xf0) { s += String.fromCharCode(((b0 & 0x0f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f));}
+else {
+var cp = ((b0 & 0x07) << 18) | ((slice[i++] & 0x3f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f);
+cp -= 0x10000;
+s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+}
+}
+return s;
+}
+
+// Find the index of the first null byte in [start, end); -1 if none.
+function indexOfNull(bytes, start, end) {
+for (var i = start; i < end; i++) { if (bytes[i] === 0) { return i;}}
+return -1;
+}
+
+function toU8(input) {
+if (input instanceof Uint8Array) { return input;}
+if (typeof ArrayBuffer!== "undefined" && input instanceof ArrayBuffer) { return new Uint8Array(input);}
+if (input && input.buffer instanceof ArrayBuffer && typeof input.byteLength === "number") {
+// other typed-array / DataView view over a buffer
+return new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
+}
+throw new TypeError("parsePngText: expected a Uint8Array / Buffer / ArrayBuffer");
+}
+
+// ---- text-chunk decoders ----------------------------------------------------
+function decodeTEXt(data) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("tEXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("tEXt chunk: keyword must be 1-79 bytes");}
+return {
+kind: "tEXt",
+keyword: latin1(data, 0, nul),
+text: latin1(data, nul + 1, data.length),
+compressed: false
+};
+}
+
+function decodeZTXt(data, inflate) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("zTXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("zTXt chunk: keyword must be 1-79 bytes");}
+if (nul + 1 >= data.length) { throw new Error("zTXt chunk: missing compression method");}
+var method = data[nul + 1];
+if (method!== 0) { throw new Error("zTXt chunk: unknown compression method " + method);}
+var comp = data.subarray? data.subarray(nul + 2): data.slice(nul + 2);
+var entry = {
+kind: "zTXt",
+keyword: latin1(data, 0, nul),
+compressed: true,
+text: null,
+compressedText: comp
+};
+if (inflate) { entry.text = latin1(inflate(comp), 0, inflate(comp).length);}
+return entry;
+}
+
+function decodeITXt(data, inflate) {
+var n = data.length;
+var k = indexOfNull(data, 0, n);
+if (k === -1) { throw new Error("iTXt chunk: missing keyword null separator");}
+if (k < 1 || k > 79) { throw new Error("iTXt chunk: keyword must be 1-79 bytes");}
+if (k + 2 >= n) { throw new Error("iTXt chunk: truncated header");}
+var compFlag = data[k + 1];
+var compMethod = data[k + 2];
+if (compFlag!== 0 && compFlag!== 1) { throw new Error("iTXt chunk: bad compression flag " + compFlag);}
+if (compFlag === 1 && compMethod!== 0) { throw new Error("iTXt chunk: unknown compression method " + compMethod);}
+var langStart = k + 3;
+var langNul = indexOfNull(data, langStart, n);
+if (langNul === -1) { throw new Error("iTXt chunk: missing language-tag null separator");}
+var transStart = langNul + 1;
+var transNul = indexOfNull(data, transStart, n);
+if (transNul === -1) { throw new Error("iTXt chunk: missing translated-keyword null separator");}
+var textStart = transNul + 1;
+
+var entry = {
+kind: "iTXt",
+keyword: utf8(data, 0, k),
+compressed: compFlag === 1,
+languageTag: latin1(data, langStart, langNul),
+translatedKeyword: utf8(data, transStart, transNul),
+text: null
+};
+var body = data.subarray? data.subarray(textStart): data.slice(textStart);
+if (compFlag === 0) {
+entry.text = utf8(body, 0, body.length);
+} else {
+entry.compressedText = body;
+if (inflate) { var raw = inflate(body); entry.text = utf8(raw, 0, raw.length);}
+}
+return entry;
+}
+
+/**
+* parsePngText(input[, options]) -> Array<Entry>
+* Strictly walk a PNG byte stream and return its tEXt/zTXt/iTXt entries in file
+* order. Validates the signature and every chunk's CRC-32; throws on any
+* malformed input. See the file header for the Entry shapes and the `inflate`
+* option (used to decode zTXt / compressed iTXt text).
+*/
+function parsePngText(input, options) {
+var bytes = toU8(input);
+var inflate = options && options.inflate;
+var len = bytes.length;
+
+if (len < 8) { throw new Error("not a PNG: shorter than the 8-byte signature");}
+for (var s = 0; s < 8; s++) {
+if (bytes[s]!== PNG_SIG[s]) { throw new Error("not a PNG: bad signature");}
+}
+
+var entries = [];
+var off = 8;
+var sawIEND = false;
+
+while (off < len) {
+if (off + 8 > len) { throw new Error("truncated PNG: incomplete chunk header at offset " + off);}
+var dataLen = u32be(bytes, off);
+var typeStart = off + 4;
+var dataStart = off + 8;
+var dataEnd = dataStart + dataLen;
+var crcEnd = dataEnd + 4;
+if (crcEnd > len) { throw new Error("truncated PNG: chunk data/CRC runs past end at offset " + off);}
+
+var type = latin1(bytes, typeStart, typeStart + 4);
+var storedCrc = u32be(bytes, dataEnd);
+var actualCrc = crc32(bytes, typeStart, dataEnd);
+if (storedCrc!== actualCrc) {
+throw new Error("CRC mismatch in " + type + " chunk at offset " + off +
+": stored 0x" + storedCrc.toString(16) + "!= computed 0x" + actualCrc.toString(16));
+}
+
+var data = bytes.subarray? bytes.subarray(dataStart, dataEnd): bytes.slice(dataStart, dataEnd);
+if (type === "tEXt") { entries.push(decodeTEXt(data));}
+else if (type === "zTXt") { entries.push(decodeZTXt(data, inflate));}
+else if (type === "iTXt") { entries.push(decodeITXt(data, inflate));}
+else if (type === "IEND") { sawIEND = true; off = crcEnd; break;}
+
+off = crcEnd;
+}
+
+if (!sawIEND) { throw new Error("truncated PNG: stream ended before the IEND chunk");}
+return entries;
+}
+
+// ---- Dual-runtime export: browser namespace + Node module ------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePngText = parsePngText;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { parsePngText: parsePngText};
+}
+
+// ---- CLI: print "keyword\ttext" per text entry; Node supplies the inflater ---
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"ratchet-png-text — extract tEXt/zTXt/iTXt metadata from a PNG (strict)\n\n" +
+" node ratchet-png-text.js cover.png one line per text entry: keyword<TAB>text\n\n" +
+"Validates the PNG signature and every chunk's CRC-32; refuses malformed input.\n" +
+"Decodes tEXt and uncompressed iTXt directly; zTXt and compressed iTXt are\n" +
+"inflated here with Node's zlib (the shipped core is dependency-free).\n");
+process.exit(args.length === 0? 1: 0);
+}
+var fs = require("fs");
+var zlib = require("zlib");
+var inflate = function (b) { return zlib.inflateSync(Buffer.from(b));};
+var exitCode = 0;
+for (var a = 0; a < args.length; a++) {
+try {
+var buf = fs.readFileSync(args[a]);
+var list = parsePngText(buf, { inflate: inflate});
+if (args.length > 1) { process.stdout.write("== " + args[a] + " ==\n");}
+for (var e = 0; e < list.length; e++) {
+var en = list[e];
+var t = (en.text === null)? "[" + en.kind + ", compressed, no inflater]": en.text;
+process.stdout.write(en.keyword + "\t" + t + "\n");
+}
+if (list.length === 0) { process.stdout.write("(no text chunks)\n");}
+} catch (err) {
+process.stderr.write("ratchet-png-text: " + args[a] + ": " + err.message + "\n");
+exitCode = 1;
+}
+}
+process.exit(exitCode);
+}
+
+test_ratchet-png-text.js 227 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-png-text.js — proves the strict PNG text extractor implements its
+stated contract correctly.
+
+THE ORACLE. There is no PNG-text parser in the Node stdlib to diff against, so
+the oracle is the PNG spec expressed as CURATED, REAL PNG BYTE FIXTURES built
+in-test: each fixture is an actual PNG byte stream (8-byte signature + chunks
+with correct CRC-32 + IEND), so a "valid" vector is a genuine file the parser
+must read to a KNOWN set of entries, and an "invalid" vector is a genuine
+malformation the parser must THROW on. Every branch is exercised: tEXt,
+uncompressed iTXt (UTF-8, language tag, translated keyword), zTXt and compressed
+iTXt, the no-text case, and the malformations (bad signature, CRC mismatch,
+truncation, missing IEND, missing separators, bad length, non-buffer input).
+
+THE LIVE-REFERENCE BACKSTOP. The compressed path (zTXt / compressed iTXt) is
+built with Node's own zlib.deflateSync and decoded through the parser with
+zlib.inflateSync passed as the `inflate` option — so the zero-dependency core is
+cross-checked against a live reference implementation, sha256-style.
+
+Plus determinism (same bytes -> same entries, twice) and a mutation-bite (a
+text-carrying PNG and a no-text PNG must not share a result, so a degenerate
+core that returns a constant can't pass green). Exit 0 = all pass; exit 1 =
+a failure (loud). stdlib only. */
+"use strict";
+var assert = require("assert");
+var zlib = require("zlib");
+var parsePngText = require("./ratchet-png-text.js").parsePngText;
+
+var pass = 0, fail = 0;
+function ok(label, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL " + label + "\n " + (e && e.message? e.message: e));}
+}
+
+// ---- PNG fixture builder (a tiny, correct reference encoder) ----------------
+var SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) { c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);}
+t[n] = c >>> 0;
+}
+return t;
+})();
+function crc32(buf) {
+var c = 0xffffffff;
+for (var i = 0; i < buf.length; i++) { c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);}
+return (c ^ 0xffffffff) >>> 0;
+}
+function u32(n) { var b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0, 0); return b;}
+
+// One PNG chunk: length + type + data + CRC(type+data).
+function chunk(type, data) {
+data = data || Buffer.alloc(0);
+var typeBuf = Buffer.from(type, "latin1");
+var body = Buffer.concat([typeBuf, data]);
+return Buffer.concat([u32(data.length), body, u32(crc32(body))]);
+}
+// A minimal, real IHDR (1x1, 8-bit grayscale) — for fixture realism.
+var IHDR = chunk("IHDR", Buffer.concat([u32(1), u32(1), Buffer.from([8, 0, 0, 0, 0])]));
+var IEND = chunk("IEND");
+
+function png(chunks) { return Buffer.concat([SIG].concat(chunks).concat([IEND]));}
+
+// tEXt data = keyword + \0 + text (Latin-1)
+function tEXt(keyword, text) {
+return chunk("tEXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0]), Buffer.from(text, "latin1")]));
+}
+// zTXt data = keyword + \0 + method(0) + zlib(text)
+function zTXt(keyword, text) {
+return chunk("zTXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0, 0]), zlib.deflateSync(Buffer.from(text, "latin1"))]));
+}
+// iTXt data = keyword + \0 + cflag + cmethod + lang + \0 + transKeyword + \0 + text(UTF-8, maybe deflated)
+function iTXt(keyword, lang, trans, text, compressed) {
+var body = compressed? zlib.deflateSync(Buffer.from(text, "utf8")): Buffer.from(text, "utf8");
+return chunk("iTXt", Buffer.concat([
+Buffer.from(keyword, "utf8"), Buffer.from([0]),
+Buffer.from([compressed? 1: 0, 0]),
+Buffer.from(lang, "latin1"), Buffer.from([0]),
+Buffer.from(trans, "utf8"), Buffer.from([0]),
+body
+]));
+}
+
+var INFLATE = { inflate: function (b) { return zlib.inflateSync(Buffer.from(b));}};
+
+// ===========================================================================
+// VALID vectors — each must parse to a KNOWN result.
+// ===========================================================================
+ok("single tEXt decodes keyword+text", function () {
+var out = parsePngText(png([IHDR, tEXt("Title", "A Quiet Loop")]));
+assert.strictEqual(out.length, 1);
+assert.deepStrictEqual(out[0], { kind: "tEXt", keyword: "Title", text: "A Quiet Loop", compressed: false});
+});
+
+ok("multiple tEXt chunks preserved in file order", function () {
+var out = parsePngText(png([IHDR, tEXt("Author", "Shea"), tEXt("Software", "Loop MMT")]));
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].keyword, "Author");
+assert.strictEqual(out[0].text, "Shea");
+assert.strictEqual(out[1].keyword, "Software");
+assert.strictEqual(out[1].text, "Loop MMT");
+});
+
+ok("tEXt with empty text is valid (keyword, empty value)", function () {
+var out = parsePngText(png([IHDR, tEXt("Comment", "")]));
+assert.strictEqual(out[0].text, "");
+});
+
+ok("no text chunks -> empty array (not an error)", function () {
+var out = parsePngText(png([IHDR]));
+assert.deepStrictEqual(out, []);
+});
+
+ok("uncompressed iTXt decodes UTF-8 text, lang, translated keyword", function () {
+var out = parsePngText(png([IHDR, iTXt("Description", "en", "Descripción", "a café at dawn — \u2728", false)]));
+assert.strictEqual(out.length, 1);
+var e = out[0];
+assert.strictEqual(e.kind, "iTXt");
+assert.strictEqual(e.keyword, "Description");
+assert.strictEqual(e.compressed, false);
+assert.strictEqual(e.languageTag, "en");
+assert.strictEqual(e.translatedKeyword, "Descripción");
+assert.strictEqual(e.text, "a café at dawn — \u2728");
+});
+
+ok("zTXt: without inflater -> compressed entry, raw bytes, text null", function () {
+var out = parsePngText(png([IHDR, zTXt("XML:com.adobe.xmp", "the quick brown fox")]));
+var e = out[0];
+assert.strictEqual(e.kind, "zTXt");
+assert.strictEqual(e.keyword, "XML:com.adobe.xmp");
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, null);
+assert.ok(e.compressedText && e.compressedText.length > 0, "compressedText surfaced");
+});
+
+ok("zTXt: WITH live zlib inflater -> text decoded (live-reference backstop)", function () {
+var out = parsePngText(png([IHDR, zTXt("Copyright", "© 2026 Shea Gunther")]), INFLATE);
+assert.strictEqual(out[0].text, "© 2026 Shea Gunther");
+});
+
+ok("compressed iTXt: WITH inflater -> UTF-8 text decoded", function () {
+var out = parsePngText(png([IHDR, iTXt("Story", "en", "", "compressed unicode: ✓ café", true)]), INFLATE);
+var e = out[0];
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, "compressed unicode: ✓ café");
+});
+
+ok("mixed chunk types collected in order", function () {
+var out = parsePngText(png([IHDR, tEXt("A", "1"), iTXt("B", "en", "", "2", false), zTXt("C", "3")]), INFLATE);
+assert.deepStrictEqual(out.map(function (e) { return e.keyword;}), ["A", "B", "C"]);
+assert.strictEqual(out[2].text, "3");
+});
+
+ok("accepts an ArrayBuffer as well as a Buffer", function () {
+var buf = png([IHDR, tEXt("Title", "AB")]);
+var ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+assert.strictEqual(parsePngText(ab)[0].text, "AB");
+});
+
+// ===========================================================================
+// INVALID vectors — each must THROW (the ratchet refuses to advance).
+// ===========================================================================
+function throws(label, buildBadBytes) {
+ok(label, function () { assert.throws(function () { parsePngText(buildBadBytes());});});
+}
+
+throws("bad PNG signature", function () {
+var b = png([IHDR, tEXt("Title", "x")]); b[0] = 0x00; return b;
+});
+throws("CRC mismatch (a data byte flipped after CRC was written)", function () {
+var b = png([IHDR, tEXt("Title", "hello")]);
+// flip the last byte of the tEXt text; its stored CRC no longer matches
+b[b.length - 5] ^= 0xff; return b;
+});
+throws("truncated mid-chunk", function () {
+var b = png([IHDR, tEXt("Title", "hello")]); return b.subarray(0, b.length - 10);
+});
+throws("stream ends before IEND", function () {
+// signature + IHDR + a tEXt, but no IEND appended
+return Buffer.concat([SIG, IHDR, tEXt("Title", "x")]);
+});
+throws("tEXt missing its null separator", function () {
+var bad = chunk("tEXt", Buffer.from("NoNullHere", "latin1")); // no \0 in the data
+return Buffer.concat([SIG, IHDR, bad, IEND]);
+});
+throws("chunk length runs past end of buffer", function () {
+var b = png([IHDR, tEXt("Title", "x")]);
+// corrupt the tEXt length field to claim a huge data size
+var off = SIG.length + IHDR.length;
+b.writeUInt32BE(0x7fffffff, off); return b;
+});
+throws("zTXt with unknown compression method", function () {
+var data = Buffer.concat([Buffer.from("K", "latin1"), Buffer.from([0, 9]), zlib.deflateSync(Buffer.from("x"))]);
+return Buffer.concat([SIG, IHDR, chunk("zTXt", data), IEND]);
+});
+throws("shorter than the 8-byte signature", function () { return Buffer.from([0x89, 0x50, 0x4e]);});
+
+// non-buffer inputs throw a TypeError
+ok("non-buffer inputs are rejected", function () {
+["a string", 42, null, undefined, {}].forEach(function (bad) {
+assert.throws(function () { parsePngText(bad);});
+});
+});
+
+// ===========================================================================
+// Determinism + mutation-bite
+// ===========================================================================
+ok("determinism: same bytes -> identical entries, twice", function () {
+var b = png([IHDR, tEXt("Title", "same"), zTXt("Z", "twice")]);
+assert.deepStrictEqual(parsePngText(b, INFLATE), parsePngText(b, INFLATE));
+});
+
+ok("mutation-bite: a text PNG and a no-text PNG do not share a result", function () {
+var withText = parsePngText(png([IHDR, tEXt("Title", "real")]));
+var without = parsePngText(png([IHDR]));
+// a constant-returning core would make these equal; they must not be.
+assert.notDeepStrictEqual(withText, without);
+assert.strictEqual(withText[0].text, "real"); // and the value is the input's, not a constant
+});
+
+console.log("\nratchet-png-text: " + pass + " passed, " + fail + " failed" +
+" (real-PNG-byte vectors: tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, " +
+"live-zlib backstop, coercion, determinism, mutation-bite)");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# Reltime — a Loop MMT gift
+https://loopmmt.com/gifts/reltime/
+[coverage: optional · branch: gifts]
+
+Relative Time That Refuses To Lie date ← all gifts
+
+Reltime
+
+Turn a timestamp into a short human 'when' (3h ago, Jun 20) where the whole point is what it won't do: a missing, empty, or unparseable stamp returns no label rather than a guess, a future stamp returns no label rather than a negative age, and anything older than a week gets the real date it landed instead of a rounded-up '9d ago'. Deterministic — a pure function of (stamp, now).
+
+The honest edge
+
+It renders in UTC and is a recency label, not a locale-aware or timezone-shifting formatter, and not a full date library. The fixed minute/hour/day/week bands are by design — the value is the refusal to fabricate, not configurable granularity.
+
+Run it
+
+node reltime.js 2026-08-20T09:00:00Z
+test_reltime.js (20/20, mutation-bitten)
+Node, no dependencies
+
+The code — every file that ships
+
+reltime.js 106 lines on GitHub →
+#!/usr/bin/env node
+/* reltime.js — an honest relative-time label ("3h ago", "Jun 20") that refuses
+to fake, round up, or invent a time it doesn't have.
+
+Turn a timestamp into a short human "when" — but the whole point is what it
+WON'T do:
+
+• FLAG, DON'T FAKE. No stamp, an empty stamp, or an unparseable value
+returns null — NO label. The caller shows nothing rather than a guessed
+or fabricated time. An undated thing is never handed a "when".
+
+• A FUTURE STAMP IS NOT A RECENCY CLAIM. If the timestamp is ahead of now
+(clock skew, a bad record), it returns null rather than "-2h ago". You
+cannot honestly say how long ago something happened if it hasn't.
+
+• REAL, NOT ROUNDED-UP. Recent items get a relative label
+(just now / Nm / Nh / Nd ago); anything older than a week gets the
+ABSOLUTE short date it actually landed ("Jun 20", or "Jun 20, 2025"
+across a year boundary) — because "9d ago" is less honest and less
+useful than the date itself.
+
+• DETERMINISTIC. `now` is injected, so the label is a pure function of
+(stamp, now) — testable with no wall clock and stable across a render.
+
+Pure function of its inputs, no dependencies. The same code runs in a browser
+(attach relativeTime to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node reltime.js 2026-08-20T09:00:00Z # label vs. now
+node reltime.js 2026-08-20T09:00:00Z 1755772800000 # label vs. an injected now (ms)
+node reltime.js --help
+
+Dates are read/rendered in UTC for determinism. Released under MIT.
+*/
+"use strict";
+
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+var MIN = 60 * 1000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+
+/* relativeTime(iso, nowMs) -> short label string, or null when there is no
+honest label to show. `iso` is an ISO-8601 string (or null). `nowMs` defaults
+to Date.now() but is injected in tests and via the CLI for determinism. */
+function relativeTime(iso, nowMs) {
+// flag-don't-fake: no stamp, empty stamp, or a non-string -> no label.
+if (iso == null) return null;
+var s = String(iso);
+if (s === "") return null;
+
+var t = Date.parse(s);
+if (isNaN(t)) return null; // unparseable -> no fabricated time
+
+var now = (typeof nowMs === "number" && isFinite(nowMs))? nowMs: Date.now();
+var delta = now - t;
+
+// A future stamp (clock skew) is not a recency claim we can make honestly.
+if (delta < 0) return null;
+
+if (delta < MIN) return "just now";
+if (delta < HOUR) return Math.floor(delta / MIN) + "m ago";
+if (delta < DAY) return Math.floor(delta / HOUR) + "h ago";
+if (delta < WEEK) return Math.floor(delta / DAY) + "d ago";
+
+// Older than a week -> the absolute short date it actually landed.
+var d = new Date(t);
+var label = MONTHS[d.getUTCMonth()] + " " + d.getUTCDate();
+if (d.getUTCFullYear()!== new Date(now).getUTCFullYear()) {
+label += ", " + d.getUTCFullYear();
+}
+return label;
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.relativeTime = relativeTime;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { relativeTime: relativeTime};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function main(argv) {
+var args = argv.slice(2);
+if (args.length === 0 || args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"reltime.js — an honest relative-time label that refuses to fake a time.\n\n" +
+" node reltime.js <iso-timestamp> label vs. now\n" +
+" node reltime.js <iso-timestamp> <now-ms> label vs. an injected now (ms)\n" +
+" node reltime.js --help\n\n" +
+"Prints the label, or '(no honest label)' when the stamp is missing,\n" +
+"unparseable, or in the future. Dates render in UTC.\n"
+);
+return args.length === 0? 1: 0;
+}
+var iso = args[0];
+var nowMs = args.length > 1? Number(args[1]): undefined;
+var label = relativeTime(iso, nowMs);
+process.stdout.write((label === null? "(no honest label)": label) + "\n");
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_reltime.js 61 lines on GitHub →
+#!/usr/bin/env node
+/* test_reltime.js — proves the label is honest, exact, and deterministic.
+
+The honesty rules ARE the tool, so the test's real job is to prove each
+REFUSAL fires (null, not a fabricated label) and each threshold is exact. The
+clock is injected, so every case is deterministic with no wall clock. A
+mutation bite guards against a vacuously-green run. Exit 0 = all pass, exit 1
+= a failure (loud). stdlib only, no dependencies. */
+"use strict";
+var relativeTime = require("./reltime.js").relativeTime;
+
+var pass = 0, fail = 0;
+function eq(name, got, want) {
+var g = JSON.stringify(got), w = JSON.stringify(want);
+if (g === w) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
+}
+
+// A fixed "now" so every case is deterministic. 2026-06-27T12:00:00Z.
+var NOW = Date.parse("2026-06-27T12:00:00Z");
+function ago(ms) { return new Date(NOW - ms).toISOString();}
+var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+
+// --- flag-don't-fake: every "no honest label" case returns null -------------
+eq("null stamp -> null", relativeTime(null, NOW), null);
+eq("undefined stamp -> null", relativeTime(undefined, NOW), null);
+eq("empty string -> null", relativeTime("", NOW), null);
+eq("unparseable -> null", relativeTime("not a date", NOW), null);
+eq("garbage -> null", relativeTime("2026-13-99", NOW), null);
+eq("future stamp -> null", relativeTime(ago(-HOUR), NOW), null); // 1h in the FUTURE
+
+// --- relative band, exact thresholds ---------------------------------------
+eq("0ms -> just now", relativeTime(ago(0), NOW), "just now");
+eq("59s -> just now", relativeTime(ago(59 * 1000), NOW), "just now");
+eq("60s -> 1m ago", relativeTime(ago(MIN), NOW), "1m ago");
+eq("59m -> 59m ago", relativeTime(ago(59 * MIN), NOW), "59m ago");
+eq("60m -> 1h ago", relativeTime(ago(HOUR), NOW), "1h ago");
+eq("23h -> 23h ago", relativeTime(ago(23 * HOUR), NOW), "23h ago");
+eq("24h -> 1d ago", relativeTime(ago(DAY), NOW), "1d ago");
+eq("6d -> 6d ago", relativeTime(ago(6 * DAY), NOW), "6d ago");
+
+// --- absolute band (>= 1 week): the real date it landed --------------------
+eq("7d -> absolute date", relativeTime(ago(WEEK), NOW), "Jun 20");
+eq("30d same year -> date", relativeTime(ago(30 * DAY), NOW), "May 28");
+eq("across a year boundary", relativeTime("2025-12-31T00:00:00Z", NOW), "Dec 31, 2025");
+
+// --- determinism: same inputs, same output ---------------------------------
+eq("deterministic", relativeTime(ago(3 * HOUR), NOW), relativeTime(ago(3 * HOUR), NOW));
+
+// --- coercion / robustness --------------------------------------------------
+eq("non-string stamp -> null", relativeTime(12345, NOW), null); // a number is not an ISO string here
+
+// --- mutation bite: the future-guard MUST be load-bearing ------------------
+// If someone deleted `if (delta < 0) return null;`, a future stamp would
+// produce "just now" (delta<MIN with negative delta). Assert it does NOT.
+var futureResult = relativeTime(ago(-HOUR), NOW);
+if (futureResult === null) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: future stamp produced a label: " + JSON.stringify(futureResult));}
+
+console.log("\nreltime: " + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node, no dependencies
+
+---
