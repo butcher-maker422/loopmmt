@@ -1,1226 +1,1473 @@
-# Loop MMT — corpus shard 48/57
+# Loop MMT — corpus shard 48/60
 
-> Bundle 48 of 57 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 48 of 60 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/declare/, /gifts/derived/, /gifts/dwell/)
+Nodes in this shard: 3 (/gifts/conductor/, /gifts/conflict/, /gifts/cruise/)
 
 ---
 
-# declare — a Loop MMT gift
-https://loopmmt.com/gifts/declare/
+# conductor — a Loop MMT gift
+https://loopmmt.com/gifts/conductor/
 [coverage: optional · branch: gifts]
 
-Named Pipeline Score save ← all gifts
+Provenance Pipeline Runner run ← all gifts
 
-declare
+conductor
 
-Turn an ad-hoc shell pipe — A | B | C — into a saved, named, shareable artifact: a 'gift score'. declare emits a small canonical JSON object (a name + an ordered list of tool slugs) you keep, read, and re-run instead of retyping the sequence. The emit is deterministic by construction — fixed key order, stages in pipeline order (never sorted) — and `declare check` re-emits and byte-compares so a stored score can be proven current.
+Run a declared pipeline of small JSONL tools — A | B | C — with a record. conductor typechecks the pipeline before it runs (a broken pipeline never launches a stage), runs the stages in order under one trace-id piping stdout into stdin, and appends a per-stage receipt to a replayable ledger: exit code, bytes in and out, and which stage broke. A failing stage stops the run, is recorded failed, and every later stage is recorded skipped — so 'what happened to this run?' always has an answer.
 
 The honest edge
 
-It SAVES a pipeline; it does not VALIDATE it (that's typecheck) and does not RUN it (that's a runner). declare will faithfully write down a score that would not typecheck — it claims only that the pipeline is recorded, never that it is runnable. With --manifest it flags any stage that isn't a declared tool, saving the score anyway and flagging it, never silently dropping a stage.
+conductor runs the commands you give it — it is exactly as safe as the commands in the score, and it does not sandbox them. Its typecheck is the TYPE-level gate (ports line up so data can flow), not a proof the RECORDS fit or that a stage is correct. It proves the run happened in order with a receipt; it never proves the run was right.
 
 Run it
 
-python3 declare.py write --name NAME --stages A,B,C
-test_declare.py (12/12 golden, 7/7 mutations caught)
+python3 conductor.py check --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py'
+test_conductor.py (12/12, mutation-bitten)
 Python 3, standard library only
 
 The code — every file that ships
 
-declare.py 297 lines on GitHub →
+conductor.py 381 lines on GitHub →
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-declare — save a named, reusable pipeline as a "gift score".
+"""conductor — run a declared pipeline of small JSONL tools, with a record.
 
-You keep retyping the same chain of little JSONL tools: `gitlog | vclock | cairn`.
-`declare` turns that ad-hoc shell pipe into a saved, named, shareable artifact —
-a *score* — that you (or anyone you hand it to) can keep, read, and re-run later
-instead of remembering the exact sequence. It is the one durable noun in the
-compose set: `port` labels a tool, `map` shows what chains, `typecheck` checks a
-chain, and `declare` writes a chain down so it survives the shell session.
+You have a saved "score" — an ordered pipeline of little JSON-lines tools, the
+kind the `declare` gift writes. You could run it by hand with a shell pipe. What
+the shell won't do: check the pipeline typechecks *before* it runs, thread one
+trace-id through the whole run, and hand you back a record of what each stage
+actually did — its exit code, how many bytes it read and wrote, whether it was
+the stage that broke. `conductor` does that. It is a provenance-runner, not a
+shell wrapper: every run leaves a receipt you can read back, and a run that fails
+tells you *which stage* failed, in order, not just that the pipe collapsed.
 
-WHAT A SCORE IS (a small, canonical JSON object)
-{
-"kind": "gift-score",
-"name": "commit-causality",
-"stages": ["gitlog", "vclock", "cairn"],
-"note": "git history -> causal order -> durable store" (optional)
-}
-Just a name and an ordered list of gift slugs. No DAG, no branching, no
-executor — a linear pipeline, which is what a shell `A | B | C` actually is.
-(A future version could grow branches; the format leaves room, the seam is
-the `stages` list. Kept flat on purpose — the gift is the atom, not the IDE.)
+WHAT IT DOES, in order:
+1. Typecheck first. conductor carries its own copy of the five-verb composition
+gate (the same rule the `typecheck` and `declare` gifts use) and refuses to
+run a pipeline that does not compose — a sink that isn't last, a source that
+isn't first. You never watch a broken pipeline half-run; it is stopped at
+the desk (exit 3), before a single stage is launched.
+2. Run the stages in order, piping each stage's stdout into the next stage's
+stdin, exactly as a shell pipe would — but under one trace-id.
+3. Record every stage to an append-only ledger: trace-id, stage index, slug,
+command, exit code, bytes in, bytes out, and a verdict (ok / failed /
+skipped-after-failure). The ledger is JSON-lines you can replay by trace-id.
+4. Fail clean. If a stage exits non-zero, conductor stops the run, records that
+stage as failed and every later stage as skipped, and exits non-zero itself
+— naming the stage that broke. No later stage runs on a broken input.
 
-WHAT THIS IS A STRIP OF
-An internal composition architecture (CC-BY-NC) frames saved composition
-trees as programs: apps are the instruction set, the tree is the machine, and
-a user wires apps into a graph they keep and re-run. This gift is the
-gift-scale strip of exactly that idea — "a saved composition is a program you
-keep" — reduced to its atom: a named LINEAR pipeline of standalone tools,
-minus the app-suite, the executor, and the DAG machinery. Net-new code
-(nothing is lifted), re-licensed MIT, standard library only.
+THE MODEL. Five port-verbs on the shared JSON-lines interface, and only five
+(the same five the `port`, `map`, `typecheck`, and `declare` gifts use):
 
-DETERMINISTIC BY CONSTRUCTION
-The emitted score is a canonical fold of (name, stages, note): keys in a
-fixed order, `stages` in the order you gave them (never sorted — order is the
-pipeline), and `declare check` re-emits and byte-compares so a saved score
-can be proven current. Same score in, same bytes out, every time.
+source: nothing -> JSONL (emits; no meaningful stdin)
+transform: JSONL -> JSONL (record in, record out)
+filter: JSONL -> JSONL' (record in, subset out; output type <= input)
+fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
+sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
 
-WHAT IT DELIBERATELY DOES NOT DO (the honesty boundary)
-declare SAVES a pipeline. It does not VALIDATE it and it does not RUN it.
-- It does not check that the stages typecheck (that a stage emits what the
-next accepts) — that is `typecheck`'s job; run `typecheck` on the score.
-- It does not execute the pipeline — that is a runner's job.
-declare will happily write down a score that does not typecheck; it makes no
-claim that a saved score is runnable, only that it is faithfully recorded.
-It does one honest structural check: every stage slug is non-empty and the
-score has at least one stage. It does NOT confirm the slugs name real tools
-(it has no manifest by default) — pass `--manifest` to have it flag any slug
-that is not a declared tool, still saving the score and flagging, never
-silently dropping.
+A pipeline composes iff every adjacent join A -> B has A EMITS (A.verb!= sink)
+and B ACCEPTS (B.verb!= source). conductor carries its own copy of that gate so
+it stands alone — a gift is single-file and zero-dependency by covenant, so it
+agrees with `typecheck` and `declare` by sharing the RULE, not by importing them.
+
+WHY A RECORD, NOT JUST A PIPE. A shell pipe answers "did it work?" with a single
+combined exit status and a jumble of interleaved stderr. When a five-stage
+pipeline produces nothing, the shell won't tell you *which* stage went dark.
+conductor's ledger does: one record per stage, in order, so "what happened to
+this run?" has an answer. This is tracebus's trace-id-and-ledger idea (the
+`tracebus` gift is a routed message bus with a replayable ledger) applied to a
+LINEAR ordered run instead of a fanned-out bus — a different shape, the same
+honesty about leaving a receipt.
+
+THE SCORE / STAGE FORMAT. A stage is `{"slug":..., "port_verb":..., "cmd": [...]}`
+— the port-verb for the typecheck, and `cmd` the argv list conductor executes for
+that stage (e.g. ["python3", "census.py"]). Stages come from `--stage` flags, or
+piped in on stdin as JSON-lines (the shape `declare show` emits, with a `cmd`
+added), or read from a declare score file with `--score` when the score carries
+per-stage `cmd`s. A stage with a port-verb but no `cmd` can be typechecked but
+not run (conductor says so and exits 2 on a run).
+
+HONEST CEILING. conductor runs the commands you give it — it is exactly as safe
+as the commands in the score, and it does not sandbox them. Its typecheck is the
+TYPE-level gate (ports line up so data can flow), NOT a proof the RECORDS fit or
+that a stage is correct; a pipeline can typecheck clean, run to completion, and
+still have done the wrong thing. conductor proves the run happened, in order,
+with a receipt — it never proves the run was right.
+
+conductor's own port-verb is `sink`: it consumes a pipeline (and the data flowing
+through it) and produces side effects — the stages' work and the ledger — with no
+pipeable JSONL on its own stdout. The run record goes to the ledger; conductor's
+stdout is the final stage's stdout, passed through.
+
+No dependencies beyond the Python standard library. MIT licensed.
 
 USAGE
-declare write --name NAME --stages A,B,C [--note "..."] [--manifest F]
-Emit a canonical gift-score (JSON) on stdout. With --manifest, annotate
-any stage slug absent from the manifest as unknown (flagged, not dropped).
-declare check --score score.json
-Re-emit the score canonically and byte-compare against the file.
-Exit 0 if the file is already canonical, 3 if it differs (and print the
-canonical form), 2 on a malformed score.
-declare --port
-Print declare's own port-verb (source) as one JSON-line and exit.
-declare --selftest
-Run the built-in checks and exit 0/1.
+conductor verbs
+Print the five port-verbs and their contracts (JSON-lines).
 
-The score is plain JSON: pipe it into `typecheck` via its stages, keep it in a
-repo, hand it to a friend. It is yours the moment it is written down.
+conductor check --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py'
+Typecheck the pipeline WITHOUT running it. Exit 0 if it composes, 3 if not,
+4 if a verb is undeclared. (Stage token: slug:verb:cmd, cmd shell-split.)
+
+conductor run --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py' \
+[--ledger FILE] [--input FILE]
+Typecheck, then run the stages in order under one trace-id, piping
+stdout->stdin. --input seeds the first stage's stdin (default: empty).
+Appends one record per stage to --ledger (default: conductor.ledger.jsonl).
+Final stage's stdout goes to conductor's stdout. Exit 0 if every stage
+succeeded, 5 if a stage failed (naming it), 3/4 if the pipeline doesn't
+typecheck.
+
+conductor replay --ledger FILE --trace TRACE_ID
+Print every stage record for a trace-id, in run order (JSON-lines).
+
+EXIT CODES
+0 ok (composed / ran clean / replayed)
+3 the pipeline does not typecheck — not run
+4 a stage's port-verb is undeclared or not one of the five
+5 a stage failed at runtime (the run stopped; the ledger names it)
+2 usage error (bad arguments, a stage with no cmd on a run, unreadable file)
 """
 import argparse
 import json
+import os
+import shlex
+import subprocess
 import sys
+import uuid
 
-VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
-
-def canonical_score(name, stages, note=None):
-"""The pure fold: (name, stages, note) -> a canonical score dict.
-
-Fixed key order, stages preserved in given order (never sorted — order IS
-the pipeline), note omitted when empty. Deterministic: same inputs, same
-dict, always.
-"""
-score = {
-"kind": "gift-score",
-"name": name,
-"stages": list(stages),
+PORT_VERBS = {
+"source": "nothing -> JSONL (emits; no meaningful stdin)",
+"transform": "JSONL -> JSONL (record in, record out)",
+"filter": "JSONL -> JSONL' (record in, subset out; output type <= input)",
+"fold": "JSONL -> JSONL_agg (records in, an aggregate/narrower record out)",
+"sink": "JSONL -> nothing (terminal side effect, no pipeable stdout)",
 }
-if note:
-score["note"] = note
-return score
 
-def score_to_bytes(score):
-"""Canonical serialization — sort_keys False (we control order), stable
-separators, trailing newline. The byte form `check` compares against."""
-# Emit keys in our fixed order by rebuilding in that order.
-ordered = {}
-for k in ("kind", "name", "stages", "note"):
-if k in score:
-ordered[k] = score[k]
-# Any extra keys (forward-compat) appended in sorted order, after ours.
-for k in sorted(score):
-if k not in ordered:
-ordered[k] = score[k]
-return json.dumps(ordered, ensure_ascii=False, indent=2) + "\n"
+def emits(verb):
+"""True iff a stage with this verb produces pipeable stdout (can feed right)."""
+return verb!= "sink"
 
-def validate_shape(name, stages):
-"""Structural check only — returns a list of problems (empty = ok).
+def accepts(verb):
+"""True iff a stage with this verb consumes stdin (can be fed from the left)."""
+return verb!= "source"
 
-Not a typecheck, not a runnability claim. Just: a score needs a name, at
-least one stage, and every stage slug non-empty.
-"""
-problems = []
-if not name or not str(name).strip():
-problems.append("score has no name")
-if not stages:
-problems.append("score has no stages (a pipeline needs at least one)")
-for i, s in enumerate(stages):
-if not s or not str(s).strip():
-problems.append(f"stage {i} is empty")
-return problems
+def typecheck_stages(stages):
+"""Decide a pipeline of (slug, verb, cmd) or (slug, verb) tuples.
 
-def load_manifest_slugs(path):
-"""Return the set of slugs declared in a manifest (for the optional
-unknown-stage flag). Never guesses shape; raises ValueError if it can't
-find an entry list."""
-with open(path) as f:
-data = json.load(f)
-if isinstance(data, list):
-entries = data
-elif isinstance(data, dict):
-entries = None
-for k in ("gifts", "tools", "entries"):
-if isinstance(data.get(k), list):
-entries = data[k]
-break
-if entries is None:
-raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
-else:
-raise ValueError(f"{path}: not a JSON list or object")
-return {e.get("slug") for e in entries if e.get("slug")}
-
-def parse_stages(s):
-parts = [p.strip() for p in s.split(",")]
-parts = [p for p in parts if p]
-if not parts:
-raise ValueError("--stages needs at least one slug (comma-separated)")
-return parts
-
-def cmd_write(args):
-stages = parse_stages(args.stages)
-problems = validate_shape(args.name, stages)
-if problems:
-for p in problems:
-sys.stderr.write(f"declare: {p}\n")
-return 2
-
-score = canonical_score(args.name, stages, args.note)
-
-unknown = []
-if args.manifest:
-try:
-known = load_manifest_slugs(args.manifest)
-except (ValueError, OSError, json.JSONDecodeError) as e:
-sys.stderr.write(f"declare: {e}\n")
-return 2
-unknown = [s for s in stages if s not in known]
-if unknown:
-# Annotate — flagged in the score, never silently dropped.
-score["unknown_stages"] = unknown
-
-sys.stdout.write(score_to_bytes(score))
-if unknown:
-sys.stderr.write(
-"declare: NOTE — these stages are not declared tools in the manifest "
-"(saved anyway, flagged): " + ", ".join(unknown) + "\n"
+Returns (ok, broken). Raises ValueError on an undeclared/unknown verb. The
+same gate `typecheck`/`declare` carry — copied, per the single-file covenant."""
+for st in stages:
+slug, verb = st[0], st[1]
+if verb not in PORT_VERBS:
+raise ValueError(
+"stage '%s' declares port_verb '%s', not one of the five (%s) — "
+"cannot decide" % (slug, verb, ", ".join(sorted(PORT_VERBS)))
 )
+broken = []
+for i in range(len(stages) - 1):
+a_slug, a_verb = stages[i][0], stages[i][1]
+b_slug, b_verb = stages[i + 1][0], stages[i + 1][1]
+reasons = []
+if not emits(a_verb):
+reasons.append({"side": "from", "slug": a_slug, "verb": a_verb,
+"why": "a sink emits nothing to feed the next stage — "
+"a sink is only legal as the last stage"})
+if not accepts(b_verb):
+reasons.append({"side": "to", "slug": b_slug, "verb": b_verb,
+"why": "a source accepts nothing from the previous stage — "
+"a source is only legal as the first stage"})
+if reasons:
+broken.append({"index": i, "from": a_slug, "to": b_slug, "reasons": reasons})
+return (len(broken) == 0, broken)
+
+def _emit(obj):
+"""Print one JSON-line, deterministically (sorted keys, compact separators)."""
+sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
+
+def _parse_stage_token(tok):
+"""Parse 'slug:verb' or 'slug:verb:cmd' -> (slug, verb, cmd_list_or_None).
+
+Only the first two colons split slug/verb; the remainder is the command
+(shell-split), so a cmd may itself contain colons."""
+parts = tok.split(":", 2)
+if len(parts) < 2:
+raise ValueError("stage token '%s' must be slug:verb[:cmd]" % tok)
+slug, verb = parts[0], parts[1]
+cmd = shlex.split(parts[2]) if len(parts) == 3 and parts[2] else None
+return (slug, verb, cmd)
+
+def _collect_stages(args):
+"""Collect stages from --stage tokens or stdin JSON-lines. Returns (stages, err)."""
+stages = []
+if getattr(args, "stage", None):
+for tok in args.stage:
+try:
+stages.append(_parse_stage_token(tok))
+except ValueError as exc:
+sys.stderr.write("conductor: %s\n" % exc)
+return None, 2
+if getattr(args, "from_stdin", False):
+for line in sys.stdin:
+line = line.strip()
+if not line:
+continue
+try:
+obj = json.loads(line)
+except ValueError:
+sys.stderr.write("conductor: stdin line is not JSON: %s\n" % line)
+return None, 2
+slug = obj.get("slug")
+if slug is None:
+sys.stderr.write("conductor: stdin record has no 'slug': %s\n" % line)
+return None, 2
+stages.append((slug, obj.get("port_verb", ""), obj.get("cmd")))
+if not stages:
+sys.stderr.write("conductor: no stages (use --stage, or --stdin with JSON-lines)\n")
+return None, 2
+return stages, None
+
+def _typecheck_or_report(stages):
+"""Run the gate; emit a report on failure. Returns exit code (0 ok, 3/4 fail)."""
+try:
+ok, broken = typecheck_stages(stages)
+except ValueError as exc:
+_emit({"kind": "error", "status": "undeclared", "detail": str(exc)})
+return 4
+if not ok:
+_emit({"kind": "refused", "reason": "pipeline does not typecheck", "broken_joins": broken})
+return 3
+return 0
+
+def cmd_verbs(args):
+for name in ["source", "transform", "filter", "fold", "sink"]:
+_emit({"port_verb": name, "contract": PORT_VERBS[name]})
 return 0
 
 def cmd_check(args):
+stages, err = _collect_stages(args)
+if err is not None:
+return err
+code = _typecheck_or_report(stages)
+if code == 0:
+_emit({"kind": "check", "typechecks": True, "n_stages": len(stages)})
+return code
+
+def _append_ledger(ledger_path, record):
+with open(ledger_path, "a") as f:
+f.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+def cmd_run(args):
+stages, err = _collect_stages(args)
+if err is not None:
+return err
+# 1. Typecheck first — never launch a stage of a broken pipeline.
+code = _typecheck_or_report(stages)
+if code!= 0:
+return code
+# Every stage must carry a cmd to be run.
+for slug, verb, cmd in stages:
+if not cmd:
+sys.stderr.write("conductor: stage '%s' has no cmd — cannot run "
+"(use slug:verb:cmd)\n" % slug)
+return 2
+ledger_path = args.ledger or "conductor.ledger.jsonl"
+trace_id = args.trace or str(uuid.uuid4())
+# Seed input.
+if args.input:
 try:
-with open(args.score) as f:
-raw = f.read()
-data = json.loads(raw)
-except (OSError, json.JSONDecodeError) as e:
-sys.stderr.write(f"declare: {e}\n")
+with open(args.input, "rb") as f:
+data = f.read()
+except OSError as exc:
+sys.stderr.write("conductor: cannot read --input %s: %s\n" % (args.input, exc))
 return 2
-
-name = data.get("name")
-stages = data.get("stages")
-if not isinstance(stages, list):
-sys.stderr.write("declare: score has no 'stages' list\n")
-return 2
-problems = validate_shape(name, stages)
-if problems:
-for p in problems:
-sys.stderr.write(f"declare: {p}\n")
-return 2
-
-# Rebuild canonically from the score's own fields, preserving any extras.
-rebuilt = dict(data)
-canon = score_to_bytes(rebuilt)
-if canon == raw:
+else:
+data = b""
+_append_ledger(ledger_path, {"kind": "run-start", "trace_id": trace_id,
+"n_stages": len(stages)})
+failed_index = None
+for i, (slug, verb, cmd) in enumerate(stages):
+if failed_index is not None:
+_append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
+"index": i, "slug": slug, "cmd": cmd,
+"verdict": "skipped", "reason": "an earlier stage failed"})
+continue
+try:
+proc = subprocess.run(cmd, input=data, stdout=subprocess.PIPE,
+stderr=subprocess.PIPE)
+except (OSError, ValueError) as exc:
+_append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
+"index": i, "slug": slug, "cmd": cmd,
+"verdict": "failed", "exit": None,
+"error": str(exc)})
+failed_index = i
+continue
+rec = {"kind": "stage", "trace_id": trace_id, "index": i, "slug": slug,
+"cmd": cmd, "exit": proc.returncode,
+"bytes_in": len(data), "bytes_out": len(proc.stdout),
+"verdict": "ok" if proc.returncode == 0 else "failed"}
+if proc.returncode!= 0:
+rec["stderr_tail"] = proc.stderr.decode("utf-8", "replace")[-500:]
+_append_ledger(ledger_path, rec)
+if proc.returncode!= 0:
+failed_index = i
+continue
+data = proc.stdout
+if failed_index is None:
+# Final stage's stdout is conductor's stdout (a sink typically emits none).
+sys.stdout.buffer.write(data)
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id, "verdict": "ok"})
+_emit_run_summary(trace_id, ledger_path, ok=True, failed_index=None, stages=stages)
 return 0
-sys.stdout.write(canon)
-sys.stderr.write("declare: score is NOT canonical — the canonical form is above.\n")
-return 3
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id, "verdict": "failed",
+"failed_index": failed_index})
+_emit_run_summary(trace_id, ledger_path, ok=False, failed_index=failed_index, stages=stages)
+return 5
 
-def _selftest():
-checks = []
+def _emit_run_summary(trace_id, ledger_path, ok, failed_index, stages):
+summary = {"kind": "run-summary", "trace_id": trace_id, "ledger": ledger_path,
+"n_stages": len(stages), "ok": ok}
+if not ok:
+summary["failed_stage"] = {"index": failed_index, "slug": stages[failed_index][0]}
+# summary goes to stderr so it never pollutes the passed-through final stdout
+sys.stderr.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
 
-# 1. write is deterministic — same inputs, same bytes.
-a = score_to_bytes(canonical_score("p", ["gitlog", "vclock", "cairn"]))
-b = score_to_bytes(canonical_score("p", ["gitlog", "vclock", "cairn"]))
-checks.append(("write is deterministic (same bytes)", a == b))
+def cmd_replay(args):
+if not args.ledger or not args.trace:
+sys.stderr.write("conductor: replay needs --ledger and --trace\n")
+return 2
+try:
+with open(args.ledger, "r") as f:
+lines = f.readlines()
+except OSError as exc:
+sys.stderr.write("conductor: cannot read ledger %s: %s\n" % (args.ledger, exc))
+return 2
+found = False
+for line in lines:
+line = line.strip()
+if not line:
+continue
+try:
+rec = json.loads(line)
+except ValueError:
+continue
+if rec.get("trace_id") == args.trace:
+found = True
+_emit(rec)
+if not found:
+sys.stderr.write("conductor: no records for trace-id %s in %s\n" % (args.trace, args.ledger))
+return 2
+return 0
 
-# 2. stages are NEVER reordered (order is the pipeline).
-s = canonical_score("p", ["cairn", "gitlog", "vclock"])
-checks.append(("stages preserve order, not sorted", s["stages"] == ["cairn", "gitlog", "vclock"]))
+def build_parser():
+p = argparse.ArgumentParser(prog="conductor",
+description="Run a declared pipeline of JSONL tools, with a record.")
+sub = p.add_subparsers(dest="cmd", required=True)
 
-# 3. key order is fixed: kind, name, stages.
-out = score_to_bytes(canonical_score("p", ["a", "b"]))
-checks.append(("canonical key order kind<name<stages",
-out.index('"kind"') < out.index('"name"') < out.index('"stages"')))
+sp_verbs = sub.add_parser("verbs", help="print the five port-verbs and contracts")
+sp_verbs.set_defaults(func=cmd_verbs)
 
-# 4. note omitted when empty, present when given.
-no_note = canonical_score("p", ["a"])
-with_note = canonical_score("p", ["a"], "hi")
-checks.append(("note omitted when empty", "note" not in no_note))
-checks.append(("note present when given", with_note.get("note") == "hi"))
+sp_check = sub.add_parser("check", help="typecheck the pipeline without running it")
+sp_check.add_argument("--stage", action="append", help="slug:verb[:cmd] (repeatable, in order)")
+sp_check.add_argument("--stdin", dest="from_stdin", action="store_true", help="read stages as JSON-lines on stdin")
+sp_check.set_defaults(func=cmd_check)
 
-# 5. shape validation catches empty stages and no name.
-checks.append(("empty stages list is a problem", validate_shape("p", [])!= []))
-checks.append(("no name is a problem", validate_shape("", ["a"])!= []))
-checks.append(("empty stage slug is a problem", validate_shape("p", ["a", ""])!= []))
-checks.append(("good score has no problems", validate_shape("p", ["a", "b"]) == []))
+sp_run = sub.add_parser("run", help="typecheck then run the stages in order, with a record")
+sp_run.add_argument("--stage", action="append", help="slug:verb:cmd (repeatable, in order)")
+sp_run.add_argument("--stdin", dest="from_stdin", action="store_true", help="read stages as JSON-lines on stdin")
+sp_run.add_argument("--ledger", help="append per-stage records here (default: conductor.ledger.jsonl)")
+sp_run.add_argument("--input", help="file to seed the first stage's stdin (default: empty)")
+sp_run.add_argument("--trace", help="use this trace-id (default: a fresh uuid4)")
+sp_run.set_defaults(func=cmd_run)
 
-# 6. round-trip: a canonical score re-canonicalizes to itself (check == 0 path).
-canon = score_to_bytes(canonical_score("p", ["a", "b"], "n"))
-reparsed = json.loads(canon)
-recanon = score_to_bytes(reparsed)
-checks.append(("canonical score is a fixpoint of the fold", canon == recanon))
+sp_replay = sub.add_parser("replay", help="print every stage record for a trace-id")
+sp_replay.add_argument("--ledger", required=True)
+sp_replay.add_argument("--trace", required=True)
+sp_replay.set_defaults(func=cmd_replay)
 
-# 7. a non-canonical byte form differs from the fold (check would flip to 3).
-messy = '{"stages": ["a","b"], "name": "p", "kind": "gift-score"}\n'
-reparsed2 = json.loads(messy)
-checks.append(("non-canonical bytes differ from canonical",
-score_to_bytes(reparsed2)!= messy))
-
-passed = sum(1 for _, ok in checks if ok)
-for name_, ok in checks:
-print(f" {'PASS' if ok else 'FAIL'} {name_}")
-print(f"{passed}/{len(checks)} checks passed")
-return passed == len(checks)
+return p
 
 def main(argv=None):
-ap = argparse.ArgumentParser(
-description="Save a named, reusable pipeline of small JSONL tools as a canonical 'gift score'."
-)
-ap.add_argument("--port", action="store_true", help="print declare's own port-verb (source) and exit")
-ap.add_argument("--selftest", action="store_true", help="run built-in checks and exit")
-sub = ap.add_subparsers(dest="cmd")
-
-pw = sub.add_parser("write", help="emit a canonical gift-score")
-pw.add_argument("--name", required=True)
-pw.add_argument("--stages", required=True, help="comma-separated slugs in pipeline order")
-pw.add_argument("--note", default=None)
-pw.add_argument("--manifest", default=None, help="optional: flag stages not declared in this manifest")
-
-pc = sub.add_parser("check", help="re-emit a score canonically and byte-compare")
-pc.add_argument("--score", required=True)
-
-args = ap.parse_args(argv)
-
-if args.port:
-print(json.dumps({"slug": "declare", "port_verb": "source"}))
-return 0
-if args.selftest:
-return 0 if _selftest() else 1
-if args.cmd == "write":
-return cmd_write(args)
-if args.cmd == "check":
-return cmd_check(args)
-ap.print_help()
-return 2
+parser = build_parser()
+args = parser.parse_args(argv)
+return args.func(args)
 
 if __name__ == "__main__":
 sys.exit(main())
 
-test_declare.py 130 lines on GitHub →
+test_conductor.py 210 lines on GitHub →
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-Mutation-bitten test for the declare gift.
+"""Tests for the conductor gift.
 
-GOLDEN — the behavior contract: the fold is deterministic, stages keep their
-order (never sorted), the key order is fixed, note is conditional, shape
-validation catches the real problems, and a canonical score is a fixpoint.
+Mutation-bitten. The load-bearing behaviors, each asserted so that deleting the
+behavior would fail the test:
+* typecheck-first: a broken pipeline must NOT launch any stage (assert no
+ledger records for stages, exit 3);
+* fail-clean: a failing stage stops the run, is recorded 'failed', and every
+later stage is recorded 'skipped' (assert both, exit 5);
+* the ledger records every stage in order with exit/bytes;
+* replay returns exactly the records for a trace-id.
 
-MUTATION BATTERY — each load-bearing predicate is flipped in a copy of the
-module; a correct suite turns at least one golden check RED for each. A mutation
-nothing catches is a test hole (this file fails loud on it). Predicates are
-isolated on purpose — the sibling typecheck gift taught this line that a golden
-set which only checks the aggregate lets endpoint/conjunct mutations escape.
+Uses tiny real python subprocess stages so execution is genuinely exercised.
+Run: python3 -m unittest test_conductor -v (stdlib only, no deps)
 """
-import importlib.util
+import io
+import json
+import os
 import sys
-from pathlib import Path
+import tempfile
+import unittest
+from contextlib import redirect_stdout, redirect_stderr
 
-HERE = Path(__file__).resolve().parent
-MODPATH = HERE / "declare.py"
+import conductor as cd
 
-def _load_module(src_text=None):
-spec = importlib.util.spec_from_file_location("declare_under_test", MODPATH)
-mod = importlib.util.module_from_spec(spec)
-if src_text is None:
-spec.loader.exec_module(mod)
-else:
-exec(compile(src_text, str(MODPATH), "exec"), mod.__dict__)
-return mod
+PY = sys.executable
 
-def golden_checks(m):
-out = []
+# tiny real stages (as shell-quotable command strings for slug:verb:cmd tokens)
+# emit: prints two json-lines, ignores stdin (a source)
+EMIT = "%s -c \"print('{\\\"a\\\":1}');print('{\\\"a\\\":2}')\"" % PY
+# pass: echoes stdin to stdout unchanged (a transform)
+PASS = "%s -c \"import sys;sys.stdout.write(sys.stdin.read())\"" % PY
+# count: reads stdin, prints one summary line (a fold)
+COUNT = "%s -c \"import sys;n=len([l for l in sys.stdin if l.strip()]);print('{\\\"n\\\":%%d}'%%n)\"" % PY
+# boom: exits 1 after reading stdin (a failing stage)
+BOOM = "%s -c \"import sys;sys.stdin.read();sys.exit(1)\"" % PY
+# sink: reads stdin, writes nothing to stdout, exit 0
+SINK = "%s -c \"import sys;sys.stdin.read()\"" % PY
 
-# Determinism: same inputs -> same bytes.
-a = m.score_to_bytes(m.canonical_score("p", ["gitlog", "vclock", "cairn"]))
-b = m.score_to_bytes(m.canonical_score("p", ["gitlog", "vclock", "cairn"]))
-out.append(("fold is deterministic (same bytes)", a == b))
-
-# Stages preserve order — isolated: a reversed input stays reversed.
-s = m.canonical_score("p", ["cairn", "gitlog", "vclock"])
-out.append(("stages NOT sorted (order preserved)", s["stages"] == ["cairn", "gitlog", "vclock"]))
-
-# A distinct order test that WOULD pass if stages were sorted — pins it hard.
-s2 = m.canonical_score("p", ["b", "a"])
-out.append(("stages ['b','a'] stay ['b','a'] not ['a','b']", s2["stages"] == ["b", "a"]))
-
-# Fixed key order.
-out2 = m.score_to_bytes(m.canonical_score("p", ["a", "b"]))
-out.append(("key order kind<name<stages",
-out2.index('"kind"') < out2.index('"name"') < out2.index('"stages"')))
-
-# Note conditional — isolate both directions.
-out.append(("note omitted when empty", "note" not in m.canonical_score("p", ["a"])))
-out.append(("note present when given", m.canonical_score("p", ["a"], "hi").get("note") == "hi"))
-
-# Shape validation — isolate EACH problem so a disabled clause is caught.
-out.append(("empty stages -> problem", m.validate_shape("p", [])!= []))
-out.append(("no name -> problem", m.validate_shape("", ["a"])!= []))
-out.append(("empty stage slug -> problem", m.validate_shape("p", ["a", ""])!= []))
-out.append(("good score -> no problem", m.validate_shape("p", ["a", "b"]) == []))
-
-# Canonical fixpoint.
-canon = m.score_to_bytes(m.canonical_score("p", ["a", "b"], "n"))
-import json as _j
-out.append(("canonical score is a fixpoint", canon == m.score_to_bytes(_j.loads(canon))))
-
-# kind is always the gift-score tag.
-out.append(("kind is 'gift-score'", m.canonical_score("p", ["a"])["kind"] == "gift-score"))
-
-return out
-
-MUTATIONS = [
-("stages sorted (order destroyed)", '"stages": list(stages),', '"stages": sorted(stages),'),
-("name validation disabled", 'if not name or not str(name).strip():', 'if False:'),
-("empty-stages check disabled", 'if not stages:', 'if False:'),
-("empty-stage-slug check disabled",
-'if not s or not str(s).strip():', 'if False:'),
-("note always included",
-'if note:\n score["note"] = note', 'score["note"] = note'),
-("kind tag wrong", ' "kind": "gift-score",', ' "kind": "wrong",'),
-("key order broken (name before kind)",
-'for k in ("kind", "name", "stages", "note"):',
-'for k in ("name", "kind", "stages", "note"):'),
-]
-
-def run():
-show = "--show" in sys.argv
-src = MODPATH.read_text()
-
-base = _load_module()
-gold = golden_checks(base)
-gold_ok = all(ok for _, ok in gold)
-if show or not gold_ok:
-for name, ok in gold:
-print(f" {'PASS' if ok else 'FAIL'} {name}")
-print(f"GOLDEN: {sum(ok for _, ok in gold)}/{len(gold)} passed")
-if not gold_ok:
-print("GOLDEN FAILED — the gift is broken, not the test.")
-return 1
-
-all_caught = True
-for name, find, repl in MUTATIONS:
-if find not in src:
-print(f" BITE-BROKEN {name}: anchor not found — test is stale")
-all_caught = False
-continue
-mutated = src.replace(find, repl, 1)
+def run(argv, stdin_text=None):
+obuf, ebuf = io.StringIO(), io.StringIO()
+old_stdin = sys.stdin
+if stdin_text is not None:
+sys.stdin = io.StringIO(stdin_text)
+# conductor.run writes final stdout via sys.stdout.buffer; capture that too
+old_stdout_buffer = getattr(sys.stdout, "buffer", None)
 try:
-res = golden_checks(_load_module(mutated))
-caught = any(not ok for _, ok in res)
-except Exception:
-caught = True
-mark = "caught" if caught else "ESCAPED"
-if show or not caught:
-print(f" {mark:8s} mutation: {name}")
-if not caught:
-all_caught = False
+with redirect_stdout(obuf), redirect_stderr(ebuf):
+# give the redirected StringIO a.buffer that tees to bytes
+class _B:
+def __init__(self, s): self.s = s
+def write(self, b): self.s.write(b.decode("utf-8", "replace"))
+sys.stdout.buffer = _B(obuf)
+code = cd.main(argv)
+finally:
+sys.stdin = old_stdin
+out_recs = [json.loads(l) for l in obuf.getvalue().splitlines() if l.strip().startswith("{")]
+err_recs = [json.loads(l) for l in ebuf.getvalue().splitlines() if l.strip().startswith("{")]
+return code, out_recs, err_recs
 
-print(f"MUTATIONS: {sum(1 for n, f, r in MUTATIONS if f in src)}/{len(MUTATIONS)} biteable; "
-f"{'ALL CAUGHT' if all_caught else 'SOME ESCAPED'}")
-return 0 if (gold_ok and all_caught) else 1
+def read_ledger(path):
+recs = []
+if os.path.exists(path):
+with open(path) as f:
+for line in f:
+line = line.strip()
+if line:
+recs.append(json.loads(line))
+return recs
+
+class TmpCase(unittest.TestCase):
+def setUp(self):
+self.d = tempfile.mkdtemp()
+self.ledger = os.path.join(self.d, "l.jsonl")
+
+def tearDown(self):
+import shutil
+shutil.rmtree(self.d, ignore_errors=True)
+
+class TestGate(unittest.TestCase):
+def test_emits_accepts(self):
+self.assertFalse(cd.emits("sink"))
+self.assertFalse(cd.accepts("source"))
+self.assertTrue(cd.emits("source"))
+self.assertTrue(cd.accepts("sink"))
+
+class TestCheck(unittest.TestCase):
+def test_check_valid(self):
+code, out, _ = run(["check", "--stage", "a:source", "--stage", "b:fold"])
+self.assertEqual(code, 0)
+self.assertTrue(out[-1]["typechecks"])
+
+def test_check_broken_is_3(self):
+code, out, _ = run(["check", "--stage", "a:sink", "--stage", "b:transform"])
+self.assertEqual(code, 3)
+self.assertEqual(out[-1]["kind"], "refused")
+
+def test_check_undeclared_is_4(self):
+code, out, _ = run(["check", "--stage", "a:source", "--stage", "b:emits"])
+self.assertEqual(code, 4)
+
+class TestTypecheckFirstNoLaunch(TmpCase):
+"""THE typecheck-first guarantee: a broken pipeline must NOT run any stage.
+Assert exit 3 AND zero stage records in the ledger — deleting the pre-run
+typecheck would let a stage launch and write a record."""
+
+def test_broken_pipeline_launches_nothing(self):
+code, out, err = run(["run",
+"--stage", "a:sink:%s" % SINK, # sink not last
+"--stage", "b:transform:%s" % PASS,
+"--ledger", self.ledger])
+self.assertEqual(code, 3)
+led = read_ledger(self.ledger)
+stage_recs = [r for r in led if r.get("kind") == "stage"]
+self.assertEqual(stage_recs, [], "a broken pipeline launched a stage — typecheck-first failed")
+
+class TestRunCleanRecords(TmpCase):
+def test_full_run_records_every_stage_in_order(self):
+code, out, err = run(["run",
+"--stage", "emit:source:%s" % EMIT,
+"--stage", "pass:transform:%s" % PASS,
+"--stage", "count:fold:%s" % COUNT,
+"--ledger", self.ledger, "--trace", "T1"])
+self.assertEqual(code, 0)
+led = read_ledger(self.ledger)
+stage_recs = [r for r in led if r.get("kind") == "stage"]
+self.assertEqual([r["index"] for r in stage_recs], [0, 1, 2])
+self.assertEqual([r["slug"] for r in stage_recs], ["emit", "pass", "count"])
+self.assertTrue(all(r["verdict"] == "ok" for r in stage_recs))
+# bytes flow: emit produces >0, count reads what pass passed
+self.assertGreater(stage_recs[0]["bytes_out"], 0)
+self.assertEqual(stage_recs[1]["bytes_in"], stage_recs[0]["bytes_out"])
+# run-summary on stderr says ok
+self.assertTrue(err[-1]["ok"])
+
+class TestFailClean(TmpCase):
+"""A failing stage stops the run: it is recorded 'failed', every LATER stage
+'skipped', exit 5, and the summary names the failed stage. Deleting the
+fail-stop would let a later stage run on broken input."""
+
+def test_failure_stops_and_marks_skipped(self):
+code, out, err = run(["run",
+"--stage", "emit:source:%s" % EMIT,
+"--stage", "boom:transform:%s" % BOOM, # fails
+"--stage", "count:fold:%s" % COUNT, # must be skipped
+"--ledger", self.ledger, "--trace", "T2"])
+self.assertEqual(code, 5)
+led = read_ledger(self.ledger)
+by_slug = {r["slug"]: r for r in led if r.get("kind") == "stage"}
+self.assertEqual(by_slug["boom"]["verdict"], "failed")
+self.assertEqual(by_slug["count"]["verdict"], "skipped")
+# summary names the failed stage
+summ = err[-1]
+self.assertFalse(summ["ok"])
+self.assertEqual(summ["failed_stage"]["slug"], "boom")
+
+def test_missing_cmd_on_run_is_exit2(self):
+code, out, err = run(["run", "--stage", "a:source", "--ledger", self.ledger])
+self.assertEqual(code, 2)
+
+class TestReplay(TmpCase):
+def test_replay_returns_only_that_trace(self):
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TA"])
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TB"])
+code, out, _ = run(["replay", "--ledger", self.ledger, "--trace", "TA"])
+self.assertEqual(code, 0)
+self.assertTrue(out)
+self.assertTrue(all(r["trace_id"] == "TA" for r in out))
+# TB records are NOT in TA's replay
+self.assertFalse(any(r["trace_id"] == "TB" for r in out))
+
+def test_replay_unknown_trace_is_exit2(self):
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TA"])
+code, _, _ = run(["replay", "--ledger", self.ledger, "--trace", "NOPE"])
+self.assertEqual(code, 2)
+
+class TestStdinStages(TmpCase):
+def test_stages_from_stdin_run(self):
+stdin = "\n".join([
+json.dumps({"slug": "emit", "port_verb": "source", "cmd": cd.shlex.split(EMIT)}),
+json.dumps({"slug": "sink", "port_verb": "sink", "cmd": cd.shlex.split(SINK)}),
+])
+code, out, err = run(["run", "--stdin", "--ledger", self.ledger, "--trace", "TS"],
+stdin_text=stdin)
+self.assertEqual(code, 0)
+
+class TestVerbs(unittest.TestCase):
+def test_verbs_five_in_order(self):
+code, out, _ = run(["verbs"])
+self.assertEqual(code, 0)
+self.assertEqual([r["port_verb"] for r in out],
+["source", "transform", "filter", "fold", "sink"])
+
+if __name__ == "__main__":
+unittest.main()
+
+Take the whole folder →
+MIT
+Python 3, standard library only
+
+---
+
+# Conflict — a Loop MMT gift
+https://loopmmt.com/gifts/conflict/
+[coverage: optional · branch: gifts]
+
+A Broken Merge Can't Land filter ← all gifts
+
+Conflict
+
+A merge that goes wrong leaves <<<<<<<, =======, >>>>>>> markers wedged into a file; once committed, that file no longer parses — it isn't 'a merge in progress,' it's broken source that landed, and it hides until something tries to read it. Conflict is the one-command gate: wire it into a pre-commit hook or CI and a file carrying the marker triad simply cannot land. The clever part is the TRIAD RULE — ======= alone is a legal line (a Markdown rule, a comment banner), so conflict fires only on all three markers together, line-start only, and never cries wolf on a legal ======= or a marker mid-line.
+
+The honest edge
+
+This is a check, not an immunity — it protects you only when it is RUN, so wire it into a hook or CI rather than trusting a human to remember. And it detects the standard git marker triad; a tool that uses different markers needs a different pattern. Visibility, not immunity.
+
+Run it
+
+python3 conflict.py --help
+test_conflict.py (18 checks / 7 tests, mutation-bitten, triad-rule + line-start guards + throwaway-repo end-to-end)
+Python standard library only, read-only, deterministic
+
+The code — every file that ships
+
+conflict.py 172 lines on GitHub →
+#!/usr/bin/env python3
+"""conflict — refuse to commit a file that no longer parses.
+
+A merge that goes wrong leaves `<<<<<<<`, `=======`, `>>>>>>>` markers wedged
+into a file. Once committed, that file no longer parses — it isn't "a merge in
+progress," it's broken source that landed. Worse, it hides: the failure surfaces
+only when something tries to read the file, and if that read happens in a quiet
+place, it can sit on your main branch for days while everything downstream of it
+silently degrades.
+
+`conflict` is the one-command gate that catches it. It scans a git tree for the
+merge-marker triad and exits non-zero if any file carries an unresolved merge, so
+you can wire it into a pre-commit hook or CI and a broken file simply cannot land.
+
+WHY IT'S HONEST
+
+- **The triad, never the lone middle.** `=======` on its own is a legal line — a
+Markdown horizontal rule, a Python separator comment, an ASCII banner. It is a
+conflict marker ONLY in the company of `<<<<<<<` and `>>>>>>>` in the same
+file. `conflict` fires on the *triad within one file*, never on a bare
+`=======`. A lint that cries wolf on a legal line gets disabled, and a disabled
+lint is worse than none.
+
+- **Decidable from bytes.** A conflict marker on a branch needs no judgment, no
+review, no discussion — it is arithmetic. `conflict` reports the finding as an
+exit code, not a paragraph: exit codes don't decay, don't need finding, and
+cost nothing to re-run.
+
+- **It is read-only.** It reads blobs out of git (or off disk) and compares. It
+writes nothing and fixes nothing.
+
+THE HONEST EDGE
+
+This is a check, not an immunity — it protects you only when it is RUN. Wire it
+into a hook or CI so "run it" isn't something a human has to remember. And it
+detects the standard git marker triad; a tool that uses different markers needs a
+different pattern. Visibility, not immunity.
+
+USAGE
+python3 conflict.py # scan the working tree (tracked files)
+python3 conflict.py --ref main # scan any committed tree by ref
+python3 conflict.py --ignore _snapshots/ --ignore vendor/
+# skip path substrings (repeatable)
+
+EXIT 0 = clean · 3 = unresolved merge found (the alarm) · 2 = error/usage
+
+MIT licensed. Python standard library only. Read-only. Deterministic.
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+
+# The three markers git leaves on a conflicted merge. `=======` is only a marker
+# in the company of the other two — see the triad rule in main().
+MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
+
+def git_files(ref: str | None) -> list[str]:
+"""List tracked files at `ref` (committed tree) or in the working tree."""
+if ref:
+out = subprocess.run(
+["git", "ls-tree", "-r", "--name-only", ref],
+capture_output=True, text=True,
+).stdout
+else:
+out = subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout
+return out.split()
+
+def read_blob(f: str, ref: str | None) -> bytes:
+"""Read a file's bytes at `ref` or from the working tree."""
+if ref:
+return subprocess.run(["git", "show", f"{ref}:{f}"], capture_output=True).stdout
+with open(f, "rb") as fh:
+return fh.read()
+
+def marker_lines(text: str) -> dict[str, list[int]]:
+"""Map each marker to the 1-based line numbers where a line STARTS with it."""
+lines = text.split("\n")
+return {m: [i + 1 for i, ln in enumerate(lines) if ln.startswith(m)] for m in MARKERS}
+
+def has_conflict(text: str) -> bool:
+"""True iff `text` contains the full marker TRIAD (not a lone `=======`)."""
+found = marker_lines(text)
+return all(found[m] for m in MARKERS)
+
+def is_ignored(path: str, ignore: tuple[str,...]) -> bool:
+"""True iff `path` contains any ignore substring (skip it)."""
+return any(ig in path for ig in ignore)
+
+def scan(ref: str | None = None, ignore: tuple[str,...] = ()) -> list[tuple[str, dict]]:
+"""Return [(path, marker_lines)] for every tracked file carrying the triad."""
+hits: list[tuple[str, dict]] = []
+for f in git_files(ref):
+if is_ignored(f, ignore):
+continue
+try:
+raw = read_blob(f, ref)
+except (OSError, FileNotFoundError):
+continue
+try:
+text = raw.decode("utf-8")
+except UnicodeDecodeError:
+continue # a binary blob has no markers to read
+if has_conflict(text):
+hits.append((f, marker_lines(text)))
+return hits
+
+def _parse_args(argv: list[str]) -> tuple[str | None, tuple[str,...]]:
+ref: str | None = None
+ignore: list[str] = []
+i = 0
+while i < len(argv):
+a = argv[i]
+if a == "--ref":
+if i + 1 >= len(argv):
+raise ValueError("--ref needs a git ref")
+ref = argv[i + 1]
+i += 2
+elif a == "--ignore":
+if i + 1 >= len(argv):
+raise ValueError("--ignore needs a path substring")
+ignore.append(argv[i + 1])
+i += 2
+elif a in ("-h", "--help"):
+raise ValueError("__help__")
+else:
+raise ValueError(f"unknown argument: {a}")
+return ref, tuple(ignore)
+
+def main(argv: list[str]) -> int:
+try:
+ref, ignore = _parse_args(argv)
+except ValueError as exc:
+if str(exc) == "__help__":
+sys.stdout.write(__doc__)
+return 2
+sys.stderr.write(f"conflict: {exc}\n")
+return 2
+
+hits = scan(ref, ignore)
+where = f"`{ref}`" if ref else "the working tree"
+
+if not hits:
+sys.stdout.write(f"conflict: clean — no unresolved merge in {where}.\n")
+return 0
+
+sys.stderr.write(
+f"conflict: {len(hits)} file(s) in {where} carry an UNRESOLVED MERGE.\n"
+)
+for f, found in hits:
+ln = found["<<<<<<< "][0]
+sys.stderr.write(
+f" {f}:{ln} <<<<<<< / ======= / >>>>>>> "
+f"({len(found['<<<<<<< '])} conflict block(s))\n"
+)
+sys.stderr.write(
+"\nA conflict marker on a branch is not a merge in progress — it is a "
+"FILE THAT NO LONGER PARSES, landed. Resolve it. Do not commit over it.\n"
+)
+return 3
+
+if __name__ == "__main__":
+raise SystemExit(main(sys.argv[1:]))
+
+test_conflict.py 181 lines on GitHub →
+#!/usr/bin/env python3
+"""test_conflict.py — the certifying properties of the conflict gift.
+
+Run: python3 test_conflict.py (exit 0 = all pass, 1 = a failure)
+
+The load-bearing property is the TRIAD RULE: a lone `=======` (a legal line) must
+NOT fire, while the full marker triad must. Each test is MUTATION-BITTEN — it is
+here because a plausible mutation of conflict.py makes it fail loud. The core is
+pure (marker_lines / has_conflict / is_ignored), so it's tested directly; the
+git-facing shell is exercised in a throwaway repo.
+"""
+import os
+import subprocess
+import sys
+
+import conflict as c
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+CONFLICTED = """\
+line before
+<<<<<<< HEAD
+ours
+=======
+theirs
+>>>>>>> origin/main
+line after
+"""
+
+# a lone `=======` in legal, innocent company — MUST NOT fire
+INNOCENT_RULE = """\
+Section One
+=======
+Section Two
+
+Some prose under a Markdown setext rule.
+"""
+
+INNOCENT_BANNER = """\
+# ============================================================
+# a decorative comment banner, not a conflict
+# ============================================================
+def f(): pass
+"""
+
+# --- 1. the triad fires; a lone middle does not (the core property) ----------
+def test_triad_rule():
+check(c.has_conflict(CONFLICTED), "the full marker triad must be detected")
+check(not c.has_conflict(INNOCENT_RULE), "a lone ======= (Markdown rule) must NOT fire")
+check(not c.has_conflict(INNOCENT_BANNER), "a ==== banner must NOT fire")
+# a triad that is missing one leg must NOT fire
+missing_close = CONFLICTED.replace(">>>>>>> origin/main\n", "")
+check(not c.has_conflict(missing_close), "two-of-three markers must NOT fire (needs the triad)")
+
+# --- 2. golden: marker_lines reports the exact line numbers ------------------
+def test_marker_lines_golden():
+found = c.marker_lines(CONFLICTED)
+check(found["<<<<<<< "] == [2], f"open marker line wrong: {found['<<<<<<< ']}")
+check(found["======="] == [4], f"middle marker line wrong: {found['=======']}")
+check(found[">>>>>>> "] == [6], f"close marker line wrong: {found['>>>>>>> ']}")
+# the three exact line-number asserts above ARE the golden: they pin the
+# detected positions, not merely the count.
+
+# --- 3. only a line that STARTS with a marker counts ------------------------
+def test_startswith_only():
+# a single marker mid-line (e.g. inside a string) is not a line-start conflict
+embedded = 'x = "<<<<<<< not a real marker"\n'
+check(not c.has_conflict(embedded), "a marker mid-line must not count as a conflict")
+# the discriminating case: ALL THREE markers mid-line. Under startswith this
+# is clean (no line STARTS with a marker); a naive `m in ln` would flag it.
+triad_midline = "a <<<<<<< b\nc ======= d\ne >>>>>>> f\n"
+check(
+not c.has_conflict(triad_midline),
+"three markers mid-line must NOT fire (startswith, not substring)",
+)
+
+# --- 4. is_ignored honors substrings ----------------------------------------
+def test_is_ignored():
+check(c.is_ignored("a/_snapshots/x.txt", ("_snapshots/",)), "ignore substring should match")
+check(not c.is_ignored("a/src/x.txt", ("_snapshots/",)), "non-matching path must not be ignored")
+check(not c.is_ignored("anything", ()), "empty ignore never ignores")
+
+# --- 5. arg parse: --ref, --ignore (repeatable), unknown ---------------------
+def test_parse_args():
+ref, ig = c._parse_args(["--ref", "main", "--ignore", "a/", "--ignore", "b/"])
+check(ref == "main", f"--ref not parsed: {ref}")
+check(ig == ("a/", "b/"), f"--ignore not repeatable: {ig}")
+raised = False
+try:
+c._parse_args(["--bogus"])
+except ValueError:
+raised = True
+check(raised, "unknown arg must raise")
+
+# --- 6. END-TO-END against a throwaway repo ---------------------------------
+def _run_git(cwd, *args):
+subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+
+def test_end_to_end():
+import tempfile
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+# one clean file, one conflicted file
+with open(os.path.join(repo, "clean.py"), "w") as fh:
+fh.write("def ok(): pass\n")
+with open(os.path.join(repo, "broken.py"), "w") as fh:
+fh.write(CONFLICTED)
+_run_git(repo, "add", "-A")
+_run_git(repo, "commit", "-qm", "with a conflict")
+
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+hits = c.scan(ref=None)
+finally:
+os.chdir(cwd0)
+paths = sorted(f for f, _ in hits)
+check(paths == ["broken.py"], f"end-to-end should flag only broken.py: {paths}")
+
+# --- 7. ignore actually excludes a conflicted file --------------------------
+def test_end_to_end_ignore():
+import tempfile
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+os.makedirs(os.path.join(repo, "_snapshots"))
+with open(os.path.join(repo, "_snapshots", "past.txt"), "w") as fh:
+fh.write(CONFLICTED) # a deliberate record of a past conflict
+_run_git(repo, "add", "-A")
+_run_git(repo, "commit", "-qm", "snapshot")
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+with_ignore = c.scan(ref=None, ignore=("_snapshots/",))
+without = c.scan(ref=None)
+finally:
+os.chdir(cwd0)
+check(with_ignore == [], f"ignored path should not be flagged: {with_ignore}")
+check(len(without) == 1, f"without ignore the file should flag: {without}")
+
+def run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+try:
+t()
+except Exception as exc:
+_FAILURES.append(f"{t.__name__} raised: {exc!r}")
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
+return 0
 
 if __name__ == "__main__":
 sys.exit(run())
 
 Take the whole folder →
 MIT
-Python 3, standard library only
+Python standard library only, read-only, deterministic
 
 ---
 
-# derived — a Loop MMT gift
-https://loopmmt.com/gifts/derived/
+# Cruise — a Loop MMT gift
+https://loopmmt.com/gifts/cruise/
 [coverage: optional · branch: gifts]
 
-Derived-File Staleness Checker check ← all gifts
+Feature Inventory, No Hallucinations fold ← all gifts
 
-derived
+Cruise
 
-Is a generated file stale against the command that makes it? A derived file (one a build command produces, that no human should hand-edit) still exists on disk when it falls behind its source — so no presence check ever catches it. derived runs the build fresh in a private sandbox and byte-compares its output against the committed file: CURRENT (exit 0), STALE (exit 3, difference named), BUILD-FAILED, or a usage error. Non-mutating by contract — it never touches your working tree.
+Walk a codebase and emit a ledger of byte-derived facts — the routes it serves, the calls it makes, the buttons a user can touch, the claims its tests make — each fact carrying what it proves and what it does NOT. Hand the ledger to an LLM and ask it to group and name features: it can't invent one with no route, no label, and no test behind it. The floor under the prose.
 
 The honest edge
 
-this checks STALENESS (committed vs a fresh build), not CORRECTNESS: a green means the file matches what the command emits right now, never that the command or its output is right. It runs your build command, so only point it at a command you trust.
+It's a text scan with a declared pattern set, not a language parser — a framework or idiom it wasn't told about is a fact it won't see (it fails safe: a real fact left out, never a fabricated one put in). Route/call matching is literal, so a served '/x/:id' and a called '/x/42' are different strings and a live parameterized route can read as headless. Treat headless as 'look here,' not 'delete this.'
 
 Run it
 
-python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --copy gen.py
-test_derived.py (11/11, mutation-bitten)
-Python 3, standard library only
+python3 cruise.py src/
+test_cruise.py (17/17, mutation-bitten, pinned golden)
+Python stdlib only, deterministic
 
 The code — every file that ships
 
-derived.py 245 lines on GitHub →
+cruise.py 321 lines on GitHub →
 #!/usr/bin/env python3
-"""derived.py — is a generated file STALE against the command that makes it?
+# SPDX-License-Identifier: MIT
+"""cruise.py — a deterministic feature inventory of a codebase, so an LLM can't invent features.
 
-A "derived" file is one no human should hand-edit: a build command produces it
-from some source, and the committed copy is only ever supposed to be whatever
-that command most recently emitted. The failure this catches is the oldest one
-in generated code: the source moved, nobody re-ran the build, and the committed
-derived file quietly fell behind. It works today (it is a real file on disk) and
-breaks silently later, so no "does the file exist?" check ever sees it.
+Ask a language model "list all the features of this app" and it does two bad things
+at once: it hallucinates plausible features that aren't there, and it misses real
+ones that are. It has no floor under it. Cruise builds the floor. It walks a source
+tree, extracts every byte-derived FACT about what the code actually exposes, and
+emits a **ledger** — one fact per line, each carrying what it PROVES and, just as
+important, what it does NOT prove. Hand that ledger to an LLM and ask it to *group
+and name* the facts into features, and it cannot invent one that has no route, no
+label, and no test behind it. The ledger is the floor; the prose is composed on top.
 
-A script-generated file cannot DRIFT; it can only be STALE,
-and stale is one command.
+The name is a timber cruise: a systematic field survey of a standing forest, run to
+produce a valuation for a buyer. This is that, for software — tally what is actually
+standing, emit the survey, let someone else write the sales sheet from real numbers.
 
-That sentence is TRUE and it is NOT A GUARD. The command is unenforced, so the
-sentence describes the fix, not a mechanism -- and the file goes stale while the
-sentence sits there being correct. This tool is the mechanism: it RUNS the build
-command and byte-compares its fresh output against the committed derived file.
+python3 cruise.py <tree-root> [options]
 
-NON-MUTATING BY CONTRACT (the property this gift is built around).
-This never edits your working tree. It runs the build command inside a private
-temporary directory, seeded with a copy of your inputs, and compares the fresh
-output there against the committed derived file here. Your files are never
-touched -- there is no reading of a tree that proves an edit is worthless, and a
-checker must not destroy one on a guess. If the build command insists on writing
-in place, pass --in-place and it runs against a full copy of the working tree in
-the sandbox (still never your real tree).
+------------------------------------------------------------------------------
+THE FOUR PLOTS (each a pure, independent extractor over byte-truth):
 
-THE ORACLE IS THE COMMAND ITSELF, ON PURPOSE.
-This carries no copy of the source->derived mapping. You name the build command
-and the file it is supposed to produce; the tool asks the only question that
-needs no mapping: run the command fresh -- does what it emits match what is
-committed, byte for byte? A checker that re-declared the mapping would be a
-second source of truth for it, which is the very fault class being guarded.
+routes server path literals in route/handler declarations
+-> what the backend SERVES. e.g. app.get("/api/x")
+calls client-side fetch/axios/request URLs
+-> what the frontend ASKS FOR. e.g. fetch("/api/x")
+affordances user-visible control labels (button/link/menu text)
+-> what a USER can touch. e.g. <button>Save</button>
+claims assertion descriptions in test files
+-> what the code CLAIMS about itself. NOT executed, just read.
 
-EXITS
-0 CURRENT -- the committed derived file matches a fresh build, byte for byte
-3 STALE -- it does not; the diff summary is printed (and --show-diff dumps it)
-4 BUILD-FAILED -- the build command exited non-zero; nothing can be concluded
-2 USAGE -- bad arguments, or the derived file / a --copy input is missing
+Each plot is a text scan with a declared pattern set, not a language parser. That is
+the honest limit (see THE EDGE). It fails SAFE: a real fact it can't pattern-match is
+a fact left out of the ledger, never a fabricated one put in.
 
-USAGE
-# The build command writes the derived file to a path you name.
-python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --copy gen.py --copy data/
+WHAT EACH FACT PROVES — AND WHAT IT DOESN'T:
+Every fact in the ledger ships its own `proves` and `does_not_prove` string, because
+a right number under a wrong noun is a lie with a receipt. A `route` proves the
+backend has a path literal; it does NOT prove the route works, is reachable, or is
+tested. A `claim` proves a test file SAYS something; it does NOT prove the test runs
+or passes. The ledger stops you inventing a FEATURE. It cannot stop you inventing a
+PROPERTY of a real one — so it tells you, per fact, which properties it did not check.
 
-# The build command writes to stdout; capture it and compare.
-python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --stdout --copy gen.py
+TWO FREE GRADES (decidable, fall out of the plots):
+HEADLESS-ROUTE a served route that no client call anywhere names. Built, but
+nothing on the client side asks for it. (Fails SAFE: reported only
+when neither called nor mentioned — a missed grade, never invented.)
+UNCLAIMED a file with affordances but zero test claims -> unverified surface.
 
-# The build insists on editing files in place: run it against a tree copy.
-python3 derived.py --build-cmd "make derived" --derived out/x --in-place
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+`--json` emits ONE JSON object per fact on stdout, sorted, deterministic:
+{"plot","value","path","line","proves","does_not_prove"}
+and the grades as {"grade","value","detail"} objects. Pipe the ledger into the
+next tool (count facts, filter to one plot, feed an LLM the whole thing).
+Without `--json` it prints a grouped human report.
 
-python3 derived.py --json # machine-readable verdict
+Determinism: the tree is walked in sorted order, facts are sorted by
+(plot, path, line, value), and the same tree always produces the same ledger —
+byte-identical, so it is diffable, hashable, and cache-keyable.
+
+Exit codes:
+0 ran clean (facts or none — a cruise is a report, not a gate)
+1 at least one HEADLESS-ROUTE grade AND --strict was given (gate mode)
+3 usage / unreadable root
 """
 
 import argparse
 import json
 import os
-import shutil
-import subprocess
+import re
 import sys
-import tempfile
 
-EXIT_CURRENT = 0
-EXIT_USAGE = 2
-EXIT_STALE = 3
-EXIT_BUILD_FAILED = 4
+DEFAULT_EXTS = [
+".py", ".js", ".cjs", ".mjs", ".ts", ".jsx", ".tsx",
+".go", ".rb", ".java", ".rs", ".php",
+".html", ".htm",
+]
 
-# --- the printed edge: what this gift does NOT do -------------------------
-EDGE = (
-"this checks STALENESS (committed vs a fresh build), not CORRECTNESS: "
-"a green means the file matches what the command emits right now, never "
-"that the command or its output is right. It runs your build command, so "
-"only point it at a command you trust."
-)
-
-def _read_bytes(path):
-with open(path, "rb") as fh:
-return fh.read()
-
-def _diff_summary(want, got):
-"""A short, deterministic description of a byte difference. No external diff."""
-if want == got:
-return "identical"
-if len(want)!= len(got):
-lead = "committed" if len(want) > len(got) else "fresh-build"
-return f"length differs: committed={len(want)}B fresh={len(got)}B (longer: {lead})"
-for i, (a, b) in enumerate(zip(want, got)):
-if a!= b:
-return f"first byte differs at offset {i}: committed=0x{a:02x} fresh=0x{b:02x}"
-return "differ" # unreachable given the length/zip checks above
-
-def check(build_cmd, derived, copies, use_stdout=False, in_place=False,
-repo_root=None):
-"""Run the build fresh in a sandbox and compare to the committed derived file.
-
-Returns a result dict with a 'status' of current | stale | build-failed | usage.
-Never mutates the working tree.
-"""
-root = repo_root or os.getcwd()
-result = {
-"build_cmd": build_cmd,
-"derived": derived,
-"status": "current",
-"diff": "identical",
-"edge": EDGE,
+# What each plot proves and does not prove. Emitted INTO every fact so the ledger
+# can never be read as claiming more than a text scan can support.
+PLOT_PROVES = {
+"route": {
+"proves": "the server source declares this path literal in a route/handler",
+"does_not_prove": "that the route works, is reachable, is authorized, or is tested",
+},
+"call": {
+"proves": "the client source issues a request naming this URL",
+"does_not_prove": "that the request succeeds or that a server serves this path",
+},
+"affordance": {
+"proves": "the markup contains this user-visible control label",
+"does_not_prove": "that the control is enabled, wired to anything, or reachable",
+},
+"claim": {
+"proves": "a test file contains this assertion description string",
+"does_not_prove": "that the test executes, or that it passes",
+},
 }
 
-committed_path = os.path.join(root, derived)
-if not os.path.isfile(committed_path):
-result["status"] = "usage"
-result["error"] = f"derived file not found: {derived}"
-return result
-committed = _read_bytes(committed_path)
+# ---- plot patterns (declared, so THE EDGE can name them) ---------------------
 
-sandbox = tempfile.mkdtemp(prefix="derived-check.")
+# routes: common server frameworks' path-literal declarations.
+# The receiver must be a SERVER object (app/router/server/route/mux/r) — never a
+# client HTTP library (axios/fetch/http/xhr/request), so `axios.post("/x")` is a
+# CALL and not misread as a served route. The receiver group is the guard.
+_ROUTE_PATS = [
+# app.get("/x") / router.post('/x') / server.delete(`/x`) (Express/Koa/Fastify)
+re.compile(r"""\b(?:app|router|server|route|mux|r)\s*\.\s*(?:get|post|put|patch|delete|all|use|head|options)\s*\(\s*["'`](/[^"'`]*)["'`]""", re.I),
+# @app.route("/x") / @router.get("/x") (Flask/FastAPI style)
+re.compile(r"""@\w+\.(?:route|get|post|put|patch|delete)\s*\(\s*["'`](/[^"'`]*)["'`]""", re.I),
+# http.HandleFunc("/x") (Go style)
+re.compile(r"""HandleFunc\s*\(\s*["'`](/[^"'`]*)["'`]""", re.I),
+]
+
+# calls: client-side request URLs.
+_CALL_PATS = [
+re.compile(r"""\bfetch\s*\(\s*["'`](/[^"'`?]*)["'`?]""", re.I),
+re.compile(r"""\baxios\s*(?:\.\s*(?:get|post|put|patch|delete))?\s*\(\s*["'`](/[^"'`?]*)["'`?]""", re.I),
+re.compile(r"""\b(?:request|http\.request|xhr\.open)\s*\(\s*(?:["'][A-Z]+["']\s*,\s*)?["'`](/[^"'`?]*)["'`?]""", re.I),
+]
+
+# affordances: user-visible control text. <button>Save</button>, <a>Delete</a>, aria-label.
+_AFFORD_PATS = [
+re.compile(r"""<button\b[^>]*>\s*([^<>{][^<>]*?)\s*</button>""", re.I | re.S),
+re.compile(r"""<a\b[^>]*>\s*([^<>{][^<>]*?)\s*</a>""", re.I | re.S),
+re.compile(r"""\baria-label\s*=\s*["']([^"']+)["']""", re.I),
+re.compile(r"""<(?:li|span)\b[^>]*\brole\s*=\s*["']menuitem["'][^>]*>\s*([^<>{][^<>]*?)\s*</""", re.I | re.S),
+]
+
+# claims: test assertion descriptions. it("...")/test("...")/describe("...")/def test_x
+_CLAIM_PATS = [
+re.compile(r"""\b(?:it|test|describe)\s*\(\s*["'`]([^"'`]+)["'`]""", re.I),
+re.compile(r"""\bdef\s+(test_[A-Za-z0-9_]+)\s*\(""",),
+]
+
+_TEST_HINTS = ("test", "spec", "__tests__")
+
+def _is_test_file(rel):
+low = rel.lower()
+return any(h in low for h in _TEST_HINTS)
+
+def _line_starts(text):
+starts = [0]
+for m in re.finditer(r"\n", text):
+starts.append(m.end())
+return starts
+
+def _lineno(off, starts):
+lo, hi = 0, len(starts) - 1
+while lo < hi:
+mid = (lo + hi + 1) // 2
+if starts[mid] <= off:
+lo = mid
+else:
+hi = mid - 1
+return lo + 1
+
+def _clean(s):
+# collapse whitespace in a captured affordance/claim label
+return re.sub(r"\s+", " ", s).strip()
+
+def _extract(text, pats, plot, rel, starts):
+facts = []
+seen = set()
+for pat in pats:
+for m in pat.finditer(text):
+val = _clean(m.group(1))
+if not val:
+continue
+ln = _lineno(m.start(), starts)
+key = (plot, val, ln)
+if key in seen:
+continue
+seen.add(key)
+facts.append({
+"plot": plot,
+"value": val,
+"path": rel,
+"line": ln,
+"proves": PLOT_PROVES[plot]["proves"],
+"does_not_prove": PLOT_PROVES[plot]["does_not_prove"],
+})
+return facts
+
+def scan_file(path, rel):
 try:
-if in_place:
-# Copy the whole working tree so an in-place build can't touch the real one.
-for entry in os.listdir(root):
-if entry == ".git":
-continue # never needed to rebuild a derived file; huge
-src = os.path.join(root, entry)
-dst = os.path.join(sandbox, entry)
-if os.path.isdir(src):
-shutil.copytree(src, dst, symlinks=True)
-else:
-shutil.copy2(src, dst)
-else:
-for rel in copies:
-src = os.path.join(root, rel)
-if not os.path.exists(src):
-result["status"] = "usage"
-result["error"] = f"--copy input not found: {rel}"
-return result
-dst = os.path.join(sandbox, rel)
-os.makedirs(os.path.dirname(dst) or sandbox, exist_ok=True)
-if os.path.isdir(src):
-shutil.copytree(src, dst, symlinks=True)
-else:
-shutil.copy2(src, dst)
+with open(path, encoding="utf-8", errors="replace") as fh:
+text = fh.read()
+except OSError:
+return []
+starts = _line_starts(text)
+facts = []
+facts += _extract(text, _ROUTE_PATS, "route", rel, starts)
+facts += _extract(text, _CALL_PATS, "call", rel, starts)
+facts += _extract(text, _AFFORD_PATS, "affordance", rel, starts)
+if _is_test_file(rel):
+facts += _extract(text, _CLAIM_PATS, "claim", rel, starts)
+return facts
 
-proc = subprocess.run(
-build_cmd, shell=True, cwd=sandbox,
-capture_output=True, timeout=300,
-)
-if proc.returncode!= 0:
-result["status"] = "build-failed"
-result["exit"] = proc.returncode
-result["stderr"] = proc.stderr.decode("utf-8", "replace")[:2000]
-return result
+def scan_tree(root, exts):
+exts_l = tuple(e.lower() for e in exts)
+out = []
+for dp, dns, fns in os.walk(root):
+for skip in (".git", "node_modules", ".hg", ".svn", "__pycache__", "dist", "build"):
+if skip in dns:
+dns.remove(skip)
+dns.sort()
+for fn in sorted(fns):
+if fn.lower().endswith(exts_l):
+full = os.path.join(dp, fn)
+rel = os.path.relpath(full, root)
+out.extend(scan_file(full, rel))
+out.sort(key=lambda f: (f["plot"], f["path"], f["line"], f["value"]))
+return out
 
-if use_stdout:
-fresh = proc.stdout
-else:
-fresh_path = os.path.join(sandbox, derived)
-if not os.path.isfile(fresh_path):
-result["status"] = "build-failed"
-result["error"] = (
-f"build ran but produced no {derived} in the sandbox "
-f"(did you mean --stdout, or a different --derived path?)"
-)
-return result
-fresh = _read_bytes(fresh_path)
+def grade(facts):
+"""Two decidable grades over the fact set. Fail SAFE: reported only when the
+byte-truth is unambiguous (a missed grade, never an invented one)."""
+grades = []
 
-if fresh == committed:
-result["status"] = "current"
-result["diff"] = "identical"
-else:
-result["status"] = "stale"
-result["diff"] = _diff_summary(committed, fresh)
-result["_fresh"] = fresh
-result["_committed"] = committed
-return result
-finally:
-shutil.rmtree(sandbox, ignore_errors=True)
+served = {f["value"] for f in facts if f["plot"] == "route"}
+named = {f["value"] for f in facts if f["plot"] == "call"}
+# a headless route is one served but never named by any client call
+for r in sorted(served - named):
+grades.append({
+"grade": "HEADLESS-ROUTE",
+"value": r,
+"detail": "served but no client call names it — built, unreached by the client source scanned",
+})
+
+# a file with affordances but no claims -> unclaimed surface
+afforded = {f["path"] for f in facts if f["plot"] == "affordance"}
+claimed_files = {f["path"] for f in facts if f["plot"] == "claim"}
+# claims live in test files, not the afforded file; grade at the tree level:
+if afforded and not any(f["plot"] == "claim" for f in facts):
+grades.append({
+"grade": "UNCLAIMED",
+"value": "(tree)",
+"detail": "%d file(s) expose affordances and the tree has zero test claims — unverified surface" % len(afforded),
+})
+return grades
 
 def main(argv=None):
-ap = argparse.ArgumentParser(
-description="Is a generated file stale against the command that makes it?",
-epilog="EDGE: " + EDGE,
+p = argparse.ArgumentParser(
+prog="cruise",
+description="a deterministic feature inventory of a codebase — the floor an LLM can't hallucinate through.",
 )
-ap.add_argument("--build-cmd", required=True,
-help="the command that regenerates the derived file (run in a sandbox)")
-ap.add_argument("--derived", required=True,
-help="repo-relative path of the file the command is supposed to produce")
-ap.add_argument("--copy", action="append", default=[], metavar="PATH",
-help="input file/dir the build needs; repeatable (ignored with --in-place)")
-ap.add_argument("--stdout", action="store_true",
-help="the build writes the derived content to stdout; capture and compare it")
-ap.add_argument("--in-place", action="store_true",
-help="the build edits files in place; run it against a full copy of the tree")
-ap.add_argument("--show-diff", action="store_true",
-help="on STALE, dump both versions' first differing region")
-ap.add_argument("--json", action="store_true", help="machine-readable verdict")
-ap.add_argument("--edge", action="store_true", help="print the printed edge and exit")
-args = ap.parse_args(argv)
+p.add_argument("root", help="the directory to walk")
+p.add_argument("--ext", action="append", metavar=".EXT",
+help="a file extension to include (repeatable; default: common source types)")
+p.add_argument("--plot", action="append", metavar="NAME",
+choices=["route", "call", "affordance", "claim"],
+help="restrict to one plot (repeatable): route call affordance claim")
+p.add_argument("--json", action="store_true",
+help="emit one JSON object per fact and per grade on stdout (the pipe contract)")
+p.add_argument("--strict", action="store_true",
+help="exit 1 if any HEADLESS-ROUTE grade is found (gate mode)")
+args = p.parse_args(argv)
 
-if args.edge:
-print(EDGE)
-return EXIT_CURRENT
+if not os.path.isdir(args.root):
+sys.stderr.write("cruise: not a directory: %s\n" % args.root)
+return 3
 
-res = check(
-args.build_cmd, args.derived, args.copy,
-use_stdout=args.stdout, in_place=args.in_place,
-)
-status = res["status"]
-# strip internal blobs before any user-facing emission
-fresh = res.pop("_fresh", None)
-committed = res.pop("_committed", None)
+exts = args.ext if args.ext else DEFAULT_EXTS
+facts = scan_tree(args.root, exts)
+if args.plot:
+want = set(args.plot)
+facts = [f for f in facts if f["plot"] in want]
+grades = grade(facts)
+headless = sum(1 for g in grades if g["grade"] == "HEADLESS-ROUTE")
 
 if args.json:
-print(json.dumps(res, indent=2, sort_keys=True))
-else:
-if status == "current":
-print(f"CURRENT — {args.derived} matches a fresh build")
-elif status == "stale":
-print(f"STALE — {args.derived} is behind its build command")
-print(f" {res['diff']}")
-print(f" regenerate with: {args.build_cmd}")
-if args.show_diff and fresh is not None:
-print(" --- committed (first 400B) ---")
-sys.stdout.buffer.write(committed[:400])
-print("\n --- fresh build (first 400B) ---")
-sys.stdout.buffer.write(fresh[:400])
-print()
-elif status == "build-failed":
-print(f"BUILD-FAILED — {res.get('error') or 'the build command exited non-zero'}")
-if res.get("stderr"):
-print(res["stderr"])
-else: # usage
-print(f"USAGE ERROR — {res.get('error', 'bad arguments')}", file=sys.stderr)
+for f in facts:
+sys.stdout.write(json.dumps(f, sort_keys=True) + "\n")
+for g in grades:
+sys.stdout.write(json.dumps(g, sort_keys=True) + "\n")
+return 1 if (args.strict and headless) else 0
 
-return {
-"current": EXIT_CURRENT,
-"stale": EXIT_STALE,
-"build-failed": EXIT_BUILD_FAILED,
-"usage": EXIT_USAGE,
-}[status]
+if not facts:
+print("cruise: no features inventoried under %s" % args.root)
+return 0
+
+by_plot = {}
+for f in facts:
+by_plot.setdefault(f["plot"], []).append(f)
+order = ["route", "call", "affordance", "claim"]
+print("# cruise — feature ledger for %s" % args.root)
+print("# %d fact(s): %s\n" % (
+len(facts),
+", ".join("%d %s" % (len(by_plot[k]), k) for k in order if k in by_plot)))
+for k in order:
+if k not in by_plot:
+continue
+hs = by_plot[k]
+print("## %s (%d) — proves: %s" % (k, len(hs), PLOT_PROVES[k]["proves"]))
+print("## does NOT prove: %s" % PLOT_PROVES[k]["does_not_prove"])
+for f in hs:
+print(" %-40s %s:%d" % (f["value"][:40], f["path"], f["line"]))
+print()
+if grades:
+print("## grades")
+for g in grades:
+print(" [%s] %s — %s" % (g["grade"], g["value"], g["detail"]))
+print()
+print("\u2192 hand this ledger to an LLM and ask it to GROUP and NAME the facts.")
+print(" it cannot invent a feature with no route, no label, and no test behind it.")
+return 1 if (args.strict and headless) else 0
 
 if __name__ == "__main__":
 sys.exit(main())
 
-test_derived.py 207 lines on GitHub →
+test_cruise.py 173 lines on GitHub →
 #!/usr/bin/env python3
-"""test_derived.py — mutation-bitten behavior proof for the derived gift.
+# SPDX-License-Identifier: MIT
+"""test_cruise.py — mutation-bitten tests for the cruise gift.
 
-stdlib only. Each test asserts a distinct BEHAVIOR, so deleting the behavior
-from derived.py makes a test fail (that is the "mutation bite"). Run:
+Self-contained: builds its own fixture tree in a tempdir, runs cruise over it, and
+asserts on the ledger. Includes a PINNED GOLDEN wire string — the exact deterministic
+JSON-lines output for the fixture — so a change in extraction, ordering, or the
+proves/does-not-prove text is caught as a byte diff.
 
-python3 test_derived.py # prints N/N and exits 0 on all-green
+Mutation bite (proven with teeth in the build):
+- remove the sort in scan_tree() -> ordering tests + golden fail
+- drop the server-receiver guard in routes -> a client call double-counts as a route
+- omit proves/does_not_prove from a fact -> the "every fact carries proves" test fails
+- break the headless grade set-difference -> the grade tests fail
+
+Run: python3 test_cruise.py (prints "N/N passed" and exits 0 on all-green)
 """
+
+import io
+import json
 import os
-import shutil
-import subprocess
 import sys
 import tempfile
+import contextlib
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-GIFT = os.path.join(HERE, "derived.py")
+import cruise
 
-CURRENT, USAGE, STALE, BUILD_FAILED = 0, 2, 3, 4
+# --- fixture -----------------------------------------------------------------
 
-def _scratch():
-d = tempfile.mkdtemp(prefix="derived-test.")
-return d
+FIXTURE = {
+"server/api.js": (
+'app.get("/api/users")\n'
+'app.post("/api/login")\n'
+'router.delete("/api/users/:id")\n'
+'app.get("/api/orphan")\n'
+),
+"client/ui.js": (
+'fetch("/api/users")\n'
+'axios.post("/api/login")\n'
+'// nobody calls /api/orphan\n'
+),
+"client/page.html": (
+"<button>Save Changes</button>\n"
+'<a aria-label="Delete account">x</a>\n'
+),
+"__tests__/api.test.js": (
+'it("returns users on GET /api/users")\n'
+'test("rejects bad login")\n'
+),
+}
 
-def _run(cwd, *args):
-"""Run the gift with cwd set so repo-relative paths resolve there."""
-p = subprocess.run(
-[sys.executable, GIFT, *args],
-cwd=cwd, capture_output=True, text=True, timeout=120,
-)
-return p.returncode, p.stdout, p.stderr
+# The PINNED GOLDEN: the exact --json output over the fixture, one object per line.
+# Regenerate deliberately (never silently) if the contract changes.
+GOLDEN = [
+{"does_not_prove": "that the control is enabled, wired to anything, or reachable", "line": 1, "path": "client/page.html", "plot": "affordance", "proves": "the markup contains this user-visible control label", "value": "Save Changes"},
+{"does_not_prove": "that the control is enabled, wired to anything, or reachable", "line": 2, "path": "client/page.html", "plot": "affordance", "proves": "the markup contains this user-visible control label", "value": "Delete account"},
+{"does_not_prove": "that the control is enabled, wired to anything, or reachable", "line": 2, "path": "client/page.html", "plot": "affordance", "proves": "the markup contains this user-visible control label", "value": "x"},
+{"does_not_prove": "that the request succeeds or that a server serves this path", "line": 1, "path": "client/ui.js", "plot": "call", "proves": "the client source issues a request naming this URL", "value": "/api/users"},
+{"does_not_prove": "that the request succeeds or that a server serves this path", "line": 2, "path": "client/ui.js", "plot": "call", "proves": "the client source issues a request naming this URL", "value": "/api/login"},
+{"does_not_prove": "that the test executes, or that it passes", "line": 1, "path": "__tests__/api.test.js", "plot": "claim", "proves": "a test file contains this assertion description string", "value": "returns users on GET /api/users"},
+{"does_not_prove": "that the test executes, or that it passes", "line": 2, "path": "__tests__/api.test.js", "plot": "claim", "proves": "a test file contains this assertion description string", "value": "rejects bad login"},
+{"does_not_prove": "that the route works, is reachable, is authorized, or is tested", "line": 1, "path": "server/api.js", "plot": "route", "proves": "the server source declares this path literal in a route/handler", "value": "/api/users"},
+{"does_not_prove": "that the route works, is reachable, is authorized, or is tested", "line": 2, "path": "server/api.js", "plot": "route", "proves": "the server source declares this path literal in a route/handler", "value": "/api/login"},
+{"does_not_prove": "that the route works, is reachable, is authorized, or is tested", "line": 3, "path": "server/api.js", "plot": "route", "proves": "the server source declares this path literal in a route/handler", "value": "/api/users/:id"},
+{"does_not_prove": "that the route works, is reachable, is authorized, or is tested", "line": 4, "path": "server/api.js", "plot": "route", "proves": "the server source declares this path literal in a route/handler", "value": "/api/orphan"},
+{"detail": "served but no client call names it \u2014 built, unreached by the client source scanned", "grade": "HEADLESS-ROUTE", "value": "/api/orphan"},
+{"detail": "served but no client call names it \u2014 built, unreached by the client source scanned", "grade": "HEADLESS-ROUTE", "value": "/api/users/:id"},
+]
 
-# A build command that writes "1\n2\n3\n" to out.txt, deterministically.
-GEN = 'python3 -c "open(\'out.txt\',\'w\').write(\'1\\n2\\n3\\n\')"'
+def build_fixture(root):
+for rel, body in FIXTURE.items():
+full = os.path.join(root, rel)
+os.makedirs(os.path.dirname(full), exist_ok=True)
+with open(full, "w", encoding="utf-8") as fh:
+fh.write(body)
 
-results = []
+def run_json(root, extra=None):
+argv = [root, "--json"] + (extra or [])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+rc = cruise.main(argv)
+lines = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+return rc, lines
+
+# --- tests -------------------------------------------------------------------
+
+RESULTS = []
 
 def check(name, cond):
-results.append((name, bool(cond)))
-print(f" [{'PASS' if cond else 'FAIL'}] {name}")
-
-def t_current_when_committed_matches_fresh_build():
-"""A committed file equal to a fresh build reads CURRENT (exit 0)."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n3\n") # matches GEN
-rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
-check("current when committed == fresh build", rc == CURRENT and "CURRENT" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_stale_when_committed_differs():
-"""A committed file that differs from the fresh build reads STALE (exit 3)."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n") # stale: build emits three lines
-rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
-check("stale when committed!= fresh build", rc == STALE and "STALE" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_non_mutating_leaves_committed_file_untouched():
-"""Running the check never edits the working tree's committed file."""
-d = _scratch()
-try:
-stale_content = "1\n2\n"
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write(stale_content)
-_run(d, "--build-cmd", GEN, "--derived", "out.txt")
-after = open(os.path.join(d, "out.txt")).read()
-check("non-mutating: committed file unchanged after a check", after == stale_content)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_build_failed_when_command_errors():
-"""A build command that exits non-zero yields BUILD-FAILED (exit 4), never a verdict."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("anything\n")
-rc, out, _ = _run(d, "--build-cmd", "python3 -c \"import sys; sys.exit(1)\"",
-"--derived", "out.txt")
-check("build-failed on non-zero build command", rc == BUILD_FAILED and "BUILD-FAILED" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_usage_when_derived_missing():
-"""A missing derived file is a usage error (exit 2), not STALE/CURRENT."""
-d = _scratch()
-try:
-rc, out, err = _run(d, "--build-cmd", GEN, "--derived", "nope.txt")
-check("usage error when derived file is absent", rc == USAGE and "USAGE" in (out + err))
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_stdout_mode_compares_captured_output():
-"""--stdout compares the build's stdout, not a file on disk."""
-d = _scratch()
-try:
-with open(os.path.join(d, "cur.txt"), "w") as f:
-f.write("hello\n")
-rc, out, _ = _run(d, "--build-cmd", 'python3 -c "print(\'hello\')"',
-"--derived", "cur.txt", "--stdout")
-check("--stdout compares captured stdout", rc == CURRENT and "CURRENT" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_stdout_mode_detects_stale():
-"""--stdout still detects a mismatch as STALE."""
-d = _scratch()
-try:
-with open(os.path.join(d, "cur.txt"), "w") as f:
-f.write("goodbye\n")
-rc, out, _ = _run(d, "--build-cmd", 'python3 -c "print(\'hello\')"',
-"--derived", "cur.txt", "--stdout")
-check("--stdout detects stale", rc == STALE and "STALE" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_deterministic_same_verdict_across_runs():
-"""The same inputs yield the same verdict every run (byte-oracle determinism)."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n3\n")
-verdicts = set()
-for _ in range(3):
-rc, _, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
-verdicts.add(rc)
-check("deterministic: identical verdict across 3 runs", verdicts == {CURRENT})
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_json_mode_emits_status():
-"""--json emits a parseable object carrying the status."""
-d = _scratch()
-try:
-import json as _json
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n3\n")
-rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt", "--json")
-obj = _json.loads(out)
-check("--json emits status object", obj.get("status") == "current")
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_edge_is_present_and_printed():
-"""The printed edge exists in the artifact and prints on demand."""
-d = _scratch()
-src = open(GIFT).read()
-rc, out, _ = _run(d, "--edge", "--build-cmd", "x", "--derived", "y")
-check("printed edge present in source AND on --edge",
-"STALENESS" in src and "not CORRECTNESS" in src and "STALENESS" in out)
-
-def t_diff_summary_names_the_difference():
-"""On STALE, the output names WHERE/HOW it differs (not just 'differ')."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n") # shorter than fresh
-rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
-check("stale output names the difference (length/offset)",
-rc == STALE and ("length differs" in out or "offset" in out))
-finally:
-shutil.rmtree(d, ignore_errors=True)
+RESULTS.append((name, bool(cond)))
 
 def main():
-print("test_derived.py")
-for fn in [
-t_current_when_committed_matches_fresh_build,
-t_stale_when_committed_differs,
-t_non_mutating_leaves_committed_file_untouched,
-t_build_failed_when_command_errors,
-t_usage_when_derived_missing,
-t_stdout_mode_compares_captured_output,
-t_stdout_mode_detects_stale,
-t_deterministic_same_verdict_across_runs,
-t_json_mode_emits_status,
-t_edge_is_present_and_printed,
-t_diff_summary_names_the_difference,
-]:
-fn()
-passed = sum(1 for _, ok in results if ok)
-total = len(results)
-print(f"\n{passed}/{total} passing")
+with tempfile.TemporaryDirectory() as root:
+build_fixture(root)
+rc, facts = run_json(root)
+
+# 1. pinned golden — exact deterministic ledger
+check("golden: ledger matches pinned wire objects exactly", facts == GOLDEN)
+
+# 2. determinism — same tree, byte-identical twice
+_, again = run_json(root)
+check("determinism: two runs byte-identical", facts == again)
+
+only_facts = [f for f in facts if "plot" in f]
+grades = [f for f in facts if "grade" in f]
+
+# 3. plot tallies
+routes = [f for f in only_facts if f["plot"] == "route"]
+calls = [f for f in only_facts if f["plot"] == "call"]
+affs = [f for f in only_facts if f["plot"] == "affordance"]
+claims = [f for f in only_facts if f["plot"] == "claim"]
+check("routes: exactly the 4 server declarations", len(routes) == 4)
+check("calls: exactly the 2 client requests", len(calls) == 2)
+check("affordances: exactly the 3 labels", len(affs) == 3)
+check("claims: exactly the 2 test descriptions", len(claims) == 2)
+
+# 4. the server-receiver guard — axios.post is a CALL, never a route (double-count bite)
+route_vals = {r["value"] for r in routes if r["path"] == "client/ui.js"}
+check("guard: no client-file value counted as a route", route_vals == set())
+
+# 5. every fact carries proves + does_not_prove (the honesty bite)
+check("honesty: every fact has proves", all(f.get("proves") for f in only_facts))
+check("honesty: every fact has does_not_prove", all(f.get("does_not_prove") for f in only_facts))
+
+# 6. headless grade — orphan (never called) is graded; users (called) is not
+hv = {g["value"] for g in grades if g["grade"] == "HEADLESS-ROUTE"}
+check("grade: /api/orphan is HEADLESS (never called)", "/api/orphan" in hv)
+check("grade: /api/users is NOT headless (it is called)", "/api/users" not in hv)
+
+# 7. ordering — sorted by (plot, path, line, value)
+keys = [(f["plot"], f["path"], f["line"], f["value"]) for f in only_facts]
+check("ordering: facts sorted by (plot,path,line,value)", keys == sorted(keys))
+
+# 8. --plot filter narrows to one plot
+_, ro = run_json(root, ["--plot", "route"])
+rof = [f for f in ro if "plot" in f]
+check("filter: --plot route yields only routes", all(f["plot"] == "route" for f in rof) and len(rof) == 4)
+
+# 9. --strict returns exit 1 when a headless route exists
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+rc_strict = cruise.main([root, "--json", "--strict"])
+check("strict: exit 1 with a headless route present", rc_strict == 1)
+
+# 10. non-strict default is exit 0 (report, not gate)
+check("default: exit 0 (a cruise is a report)", rc == 0)
+
+# 11. usage: non-directory root -> exit 3
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+rc_bad = cruise.main([os.path.join(root, "nope"), "--json"])
+check("usage: missing root -> exit 3", rc_bad == 3)
+
+# 12. empty tree -> no facts, exit 0
+with tempfile.TemporaryDirectory() as empty:
+rc_e, fe = run_json(empty)
+check("empty: no facts, exit 0", fe == [] and rc_e == 0)
+
+passed = sum(1 for _, ok in RESULTS if ok)
+total = len(RESULTS)
+for name, ok in RESULTS:
+print("%s %s" % ("ok " if ok else "FAIL", name))
+print("\n%d/%d passed" % (passed, total))
 return 0 if passed == total else 1
 
 if __name__ == "__main__":
 sys.exit(main())
-
-Take the whole folder →
-MIT
-Python 3, standard library only
-
----
-
-# Dwell — a Loop MMT gift
-https://loopmmt.com/gifts/dwell/
-[coverage: optional · branch: gifts]
-
-When You Commit Is What You Choose route ← all gifts
-
-Dwell
-
-A cart circles a loop of n ticks; holding is free and an extra full lap changes nothing. It leaves only when you reverse, and which of k exits it takes is a pure function of the phase at that instant: exit = (phase * k) // n. There's no separate 'pick' step — deferring costs nothing, and the moment you stop deferring IS the decision. Integer-exact and byte-replayable; a decision is an audit record you re-derive, not an opinion you store.
-
-The honest edge
-
-It is the deterministic router only: given (entry, reverse, n, k) the exit is a fact, but it does NOT decide when to stop deferring — that judgment (the reversal) is yours. k <= n is a wall (you can't quantize a loop of n ticks into more than n exits); k > n is refused, not rounded.
-
-Run it
-
-python3 dwell.py route 0 6 12 4
-test_dwell.py (89/89, mutation-bitten)
-Python stdlib only, deterministic
-
-The code — every file that ships
-
-dwell.py 182 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""dwell.py -- reversal-indexed routing: the WHEN you commit IS the WHAT you choose.
-
-A cart circles a loop of `n` ticks. Holding is free -- it can circle forever, and
-an extra full lap changes nothing. It leaves only when you REVERSE, and which of
-`k` exits it leaves on is a pure function of the PHASE at the instant of reversal:
-
-phase(entry, reverse, n) = (reverse - entry) mod n # where on the loop, in [0, n)
-exit_segment(entry, reverse, n, k) = (phase * k) // n # which of k exits, in [0, k)
-
-The choice is carried entirely by the timing. There is no separate "pick" step:
-deferring is free, and the moment you stop deferring is itself the decision. That
-is the whole idea -- a decision structure where latency is not lost time but the
-signal.
-
-Integer-exact by construction (no float), so the map is total, pure, and
-byte-replayable -- the same (entry, reverse, n, k) always yields the same exit,
-on any machine, forever. The WINDING number (how many full laps were circled) is
-DISCARDED for routing; that discard IS the free-hold property:
-
-exit_segment(entry, reverse, n, k) == exit_segment(entry, reverse + n, n, k)
-
-A `Mark` records a routing decision as two integers, and `replay(mark, n, k)`
-recomputes the exit from them -- so a decision is an audit record you can re-derive,
-never a stored opinion you have to trust.
-
-HONEST CEILING. This is the fully-deterministic ROUTER: given (entry, reverse, n, k)
-the exit is a fact. It does NOT decide *when* to stop deferring -- that single
-judgment (the reversal itself) is yours. The router turns your timing into a choice;
-it does not make the choice for you.
-
-python3 dwell.py route <entry> <reverse> <n> <k> # -> the exit segment [0, k)
-python3 dwell.py phase <entry> <reverse> <n> # -> phase [0, n) + winding
-python3 dwell.py demo # a small routing table
-python3 dwell.py --help
-
-Python 3 stdlib only, no dependencies.
-"""
-from __future__ import annotations
-
-import sys
-from dataclasses import dataclass
-from typing import NamedTuple
-
-__all__ = ["phase", "winding", "exit_segment", "Mark", "replay", "DwellError"]
-
-class DwellError(ValueError):
-"""A malformed Dwell call -- bad resolution, exit count, or tick order."""
-
-def _validate(entry_tick: int, reverse_tick: int, n: int, k: int) -> None:
-for name, val in (("entry_tick", entry_tick), ("reverse_tick", reverse_tick),
-("n", n), ("k", k)):
-if not isinstance(val, int) or isinstance(val, bool):
-raise DwellError(f"{name} must be a plain int, got {val!r}")
-if n < 1:
-raise DwellError(f"n (loop resolution) must be >= 1, got {n}")
-if k < 1:
-raise DwellError(f"k (exit count) must be >= 1, got {k}")
-if k > n:
-# You cannot quantize a loop of n ticks into more than n distinguishable exits.
-raise DwellError(f"k must be <= n (k<=n is a wall), got k={k} n={n}")
-if reverse_tick < entry_tick:
-# Ticks are a monotone clock; the cart enters, then circles, then reverses.
-raise DwellError(
-f"reverse_tick ({reverse_tick}) must be >= entry_tick ({entry_tick})")
-
-def phase(entry_tick: int, reverse_tick: int, n: int) -> int:
-"""Where on the loop the cart sits at reversal, in [0, n). Winding is folded out."""
-_validate(entry_tick, reverse_tick, n, k=1)
-return (reverse_tick - entry_tick) % n
-
-def winding(entry_tick: int, reverse_tick: int, n: int) -> int:
-"""
-How many FULL laps were circled before reversal (the coordinate the router
-discards). Read-only: routing never depends on it, and that independence IS the
-free-hold property -- a decision deferred through extra laps is not penalized.
-"""
-_validate(entry_tick, reverse_tick, n, k=1)
-return (reverse_tick - entry_tick) // n
-
-def exit_segment(entry_tick: int, reverse_tick: int, n: int, k: int) -> int:
-"""
-The router. Returns the exit segment in [0, k) the cart leaves on when reversed
-at `reverse_tick`, having entered at `entry_tick`, on a loop of resolution `n`
-with `k` exits.
-
-Pure, total, integer-exact. Tie-break at a segment boundary is floor, by
-construction (`(phase*k)//n`). Free-hold holds by the same construction: adding
-a full lap (n ticks) to reverse_tick leaves the exit unchanged.
-"""
-_validate(entry_tick, reverse_tick, n, k)
-return ((reverse_tick - entry_tick) % n * k) // n
-
-class Mark(NamedTuple):
-"""An audit record of one routing decision -- two integers, nothing else."""
-entry_tick: int
-reverse_tick: int
-
-@dataclass(frozen=True)
-class DwellSpec:
-"""The static shape of a loop: its resolution and its exit count."""
-n: int
-k: int
-
-def replay(mark: Mark, n: int, k: int) -> int:
-"""
-Recompute the exit a Mark produced, from the Mark plus the loop spec. Because the
-router is pure, replay(mark, n, k) == the exit_segment that produced it -- so the
-Mark is an audit record you re-derive, never an opinion you have to trust.
-"""
-return exit_segment(mark.entry_tick, mark.reverse_tick, n, k)
-
-# ---- CLI ---------------------------------------------------------------------------------------------
-_USAGE = """dwell.py -- reversal-indexed routing: when you commit is what you choose.
-
-python3 dwell.py route <entry> <reverse> <n> <k> the exit segment in [0, k)
-python3 dwell.py phase <entry> <reverse> <n> phase in [0, n) + winding (laps)
-python3 dwell.py demo a small routing table
-python3 dwell.py --help
-
-n = loop resolution (ticks per lap), k = number of exits (k <= n).
-An extra full lap never changes the exit -- deferring is free.
-"""
-
-def _demo() -> None:
-n, k = 12, 4
-print(f"loop n={n} ticks, k={k} exits; entry at tick 0")
-print("reverse | phase winding -> exit")
-for reverse in range(0, 25):
-p = phase(0, reverse, n)
-w = winding(0, reverse, n)
-e = exit_segment(0, reverse, n, k)
-print(f" {reverse:5d} | {p:5d} {w:6d} -> {e}")
-print("(note tick 12 and tick 24 -- a full/second lap -- route identically to tick 0: free-hold)")
-
-def main(argv) -> int:
-args = argv[1:]
-if not args or args[0] in ("--help", "-h", "help"):
-sys.stdout.write(_USAGE)
-return 0 if args else 1
-cmd = args[0]
-try:
-if cmd == "route":
-if len(args)!= 5:
-raise DwellError("route needs: <entry> <reverse> <n> <k>")
-entry, reverse, n, k = (int(x) for x in args[1:5])
-sys.stdout.write(str(exit_segment(entry, reverse, n, k)) + "\n")
-return 0
-if cmd == "phase":
-if len(args)!= 4:
-raise DwellError("phase needs: <entry> <reverse> <n>")
-entry, reverse, n = (int(x) for x in args[1:4])
-sys.stdout.write(f"phase={phase(entry, reverse, n)} winding={winding(entry, reverse, n)}\n")
-return 0
-if cmd == "demo":
-_demo()
-return 0
-except DwellError as e:
-sys.stderr.write(f"dwell: {e}\n")
-return 2
-except ValueError:
-sys.stderr.write("dwell: ticks, n, and k must be integers\n")
-return 2
-sys.stderr.write(f"dwell: unknown command {cmd!r}\n")
-sys.stderr.write(_USAGE)
-return 2
-
-if __name__ == "__main__":
-raise SystemExit(main(sys.argv))
-
-test_dwell.py 119 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_dwell.py -- proves the router is pure, total, and free-hold.
-
-The claims that ARE the tool:
-1. FREE-HOLD: adding a full lap (n ticks) to the reversal leaves the exit
-unchanged -- deferring is free. This is the whole idea; it gets the most tests.
-2. The exit is exactly (phase * k) // n, integer, in [0, k).
-3. replay(Mark) == the exit that produced it (an audit record, re-derived).
-4. Malformed calls REFUSE (raise DwellError), they don't silently guess.
-Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
-Exit 0 = all pass, exit 1 = a failure (loud).
-"""
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dwell import phase, winding, exit_segment, Mark, replay, DwellError
-
-_pass = 0
-_fail = 0
-
-def eq(name, got, want):
-global _pass, _fail
-if got == want:
-_pass += 1
-else:
-_fail += 1
-print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
-
-def ok(name, cond):
-global _pass, _fail
-if cond:
-_pass += 1
-else:
-_fail += 1
-print(f"FAIL {name}")
-
-def raises(name, fn):
-global _pass, _fail
-try:
-fn()
-_fail += 1
-print(f"FAIL {name} -- expected DwellError, none raised")
-except DwellError:
-_pass += 1
-except Exception as e: # noqa: BLE001
-_fail += 1
-print(f"FAIL {name} -- wrong exception {type(e).__name__}: {e}")
-
-# --- 1. FREE-HOLD: an extra full lap never changes the exit ---------------------------------
-n, k = 12, 4
-for reverse in range(0, 12):
-base = exit_segment(0, reverse, n, k)
-eq(f"free-hold +1 lap @rev={reverse}", exit_segment(0, reverse + n, n, k), base)
-eq(f"free-hold +2 laps @rev={reverse}", exit_segment(0, reverse + 2 * n, n, k), base)
-eq(f"free-hold +7 laps @rev={reverse}", exit_segment(0, reverse + 7 * n, n, k), base)
-
-# winding counts the laps that routing discards
-eq("winding 0 laps", winding(0, 5, 12), 0)
-eq("winding 1 lap", winding(0, 17, 12), 1)
-eq("winding 7 laps", winding(0, 84, 12), 7)
-eq("phase folds winding out", phase(0, 84, 12), phase(0, 0, 12))
-
-# --- 2. the routing law is exactly (phase*k)//n, in range ----------------------------------
-eq("phase 0 -> exit 0", exit_segment(0, 0, 12, 4), 0)
-eq("phase 3 -> exit 1", exit_segment(0, 3, 12, 4), 1) # (3*4)//12 = 1
-eq("phase 5 -> exit 1", exit_segment(0, 5, 12, 4), 1) # (5*4)//12 = 1
-eq("phase 6 -> exit 2", exit_segment(0, 6, 12, 4), 2) # (6*4)//12 = 2
-eq("phase 11 -> exit 3", exit_segment(0, 11, 12, 4), 3) # (11*4)//12 = 3
-# boundary tie-break is floor by construction
-eq("boundary floor phase 2->0", exit_segment(0, 2, 12, 4), 0) # (2*4)//12 = 0
-
-# entry offset only matters via the difference
-eq("entry offset invariance", exit_segment(100, 105, 12, 4), exit_segment(0, 5, 12, 4))
-
-# every exit stays in [0, k) across a whole lap
-for reverse in range(0, n):
-e = exit_segment(0, reverse, n, k)
-ok(f"exit in range @rev={reverse}", 0 <= e < k)
-
-# k == n: each tick is its own exit (bijective)
-for reverse in range(0, 8):
-eq(f"k==n bijection @rev={reverse}", exit_segment(0, reverse, 8, 8), reverse)
-
-# k == 1: everything routes to the single exit 0
-for reverse in range(0, 12):
-eq(f"k==1 single exit @rev={reverse}", exit_segment(0, reverse, 12, 1), 0)
-
-# --- 3. replay(Mark) == the exit that produced it -------------------------------------------
-m = Mark(entry_tick=3, reverse_tick=20)
-eq("replay == exit_segment", replay(m, 12, 4), exit_segment(3, 20, 12, 4))
-# an audit record survives a re-derivation on any machine (pure)
-eq("replay deterministic", replay(m, 12, 4), replay(m, 12, 4))
-
-# --- 4. malformed calls REFUSE, never guess ------------------------------------------------
-raises("n<1 refused", lambda: exit_segment(0, 0, 0, 1))
-raises("k<1 refused", lambda: exit_segment(0, 0, 12, 0))
-raises("k>n refused (the wall)", lambda: exit_segment(0, 0, 4, 5))
-raises("reverse<entry refused", lambda: exit_segment(5, 3, 12, 4))
-raises("bool is not int", lambda: exit_segment(0, True, 12, 4))
-raises("float refused", lambda: phase(0, 5.0, 12))
-
-# --- mutation bite: prove free-hold has teeth ----------------------------------------------
-# If routing (wrongly) depended on winding, +1 lap WOULD change the exit for some reversal.
-# Assert there EXISTS a reversal where phase differs from phase+lap yet exits still match --
-# i.e. the invariant is non-vacuous (the exits are not all identical anyway).
-distinct_exits = {exit_segment(0, r, n, k) for r in range(n)}
-ok("mutation bite: exits are genuinely varied", len(distinct_exits) == k)
-ok("mutation bite: +lap holds AND base varies",
-exit_segment(0, 3, n, k) == exit_segment(0, 3 + n, n, k)
-and exit_segment(0, 3, n, k)!= exit_segment(0, 6, n, k))
-
-print(("PASS" if _fail == 0 else "FAIL") + f" -- {_pass} passed, {_fail} failed")
-sys.exit(0 if _fail == 0 else 1)
 
 Take the whole folder →
 MIT

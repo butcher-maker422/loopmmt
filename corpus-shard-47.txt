@@ -1,8 +1,572 @@
-# Loop MMT — corpus shard 47/57
+# Loop MMT — corpus shard 47/60
 
-> Bundle 47 of 57 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 47 of 60 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/callsigns/, /gifts/census/, /gifts/conductor/, /gifts/conflict/)
+Nodes in this shard: 3 (/gifts/cairn/, /gifts/callsigns/, /gifts/census/)
+
+---
+
+# Cairn — a Loop MMT gift
+https://loopmmt.com/gifts/cairn/
+[coverage: optional · branch: gifts]
+
+Multi-Store Git Redundancy survive ← all gifts
+
+Cairn
+
+Priority-ordered failover clone, a host-aware credential helper, and redundant push across distinct-class git stores — so your canonical history survives any one store going away. The load-bearing idea is the independence class: two mirrors on one provider aren't redundancy.
+
+The honest edge
+
+It survives store loss, not corruption you push yourself. Push a bad commit and every mirror faithfully keeps your mistake.
+
+Run it
+
+./cairn.sh
+smoke_test.sh (5/5)
+Bash + git
+
+The code — every file that ships
+
+cairn.sh 275 lines on GitHub →
+#!/usr/bin/env bash
+# cairn.sh — a self-healing, multi-store git fabric in one script.
+#
+# Keep the same repo on several INDEPENDENT git stores so the loss of any one
+# store (a host outage, a deleted account, a revoked token, a dead disk) never
+# costs you the repo. Three moves:
+#
+# clone Priority-ordered FAILOVER clone: try store 1, then 2, then 3;
+# the first reachable+authed store wins. LOUD STOP only when ALL
+# are dead. (This is the cold-boot path — how a fresh machine gets
+# the repo when you don't know which store is up.)
+#
+# push Redundant fan-out push to every enabled store, in parallel, with
+# a bounded per-store timeout. The write succeeds iff at least
+# THRESHOLD distinct INDEPENDENCE CLASSES confirm it — never a raw
+# store count. Two stores that share a class (two repos on the same
+# provider) count ONCE, because losing that provider loses both.
+# A store that fails is a "laggard": noted, never fatal, as long as
+# the class threshold is met. A laggard is behind, not wrong.
+#
+# frontier Probe every store's main head and REPORT the MAX head among ones
+# that are comparable (one is an ancestor of the other — a laggard
+# just catches up). READ-ONLY: it records discovered heads under
+# refs/cairn/heads/ and reports the frontier SHA — it moves nothing
+# (no main, no HEAD, no laggard heal). To adopt, run yourself:
+# git fetch && git merge --ff-only <frontier>. If two heads are
+# INCOMPARABLE — a real fork,
+# neither an ancestor of the other — that is a DIVERGENCE: it is
+# recorded under refs/cairn/divergence/<utc>/ and surfaced LOUD, and
+# is NEVER auto-merged. Divergence is a human decision.
+#
+# The whole point is expressed in the config, not the code: see `stores`
+# (`stores.example` to start). Each store is tagged with a failure CLASS; the
+# durability threshold is a number of DISTINCT CLASSES. Edit the config, never
+# this script.
+#
+# Credentials never live here. Private stores authenticate through git's askpass
+# (see `askpass.example.sh`): a helper that reads a token from a GITIGNORED file
+# at call time and writes it ONLY to git's stdin — never to disk, a log, an
+# argument, or a stored remote URL. This script contains no secret and needs to
+# know none.
+#
+# git-only + POSIX-ish bash. No dependencies. MIT licensed.
+#
+# Usage:
+# cairn.sh clone <dest> # failover clone into <dest>
+# cairn.sh push [ref] # fan-out push (ref default: HEAD)
+# cairn.sh frontier # REPORT max comparable head (read-only); loud on divergence
+# cairn.sh doctor # validate the stores config
+#
+# Config resolution: $CAIRN_STORES (default:./stores)
+# Knobs (env): CAIRN_TIMEOUT (per-store seconds, default 10)
+#
+# Exit codes: 0 ok · 1 loud failure (below threshold / all stores dead) ·
+# 2 frontier divergence · 3 config problem
+set -euo pipefail
+
+CAIRN_STORES="${CAIRN_STORES:-stores}"
+CAIRN_TIMEOUT="${CAIRN_TIMEOUT:-10}"
+
+CEILING="note: the Cairn survives the LOSS of a store (host, account, token, disk) \
+— it does NOT survive corruption YOU push yourself; a bad commit fans out to every \
+mirror. It heals AVAILABILITY, not correctness. Incomparable heads are surfaced as a \
+divergence, never auto-merged."
+
+die() { echo "cairn: $*" >&2; exit 3;}
+
+# --- config parsing (git-only; no jq) ---------------------------------------
+# A store line is 5 pipe-separated fields: name | class | priority | url | enabled
+# The threshold is one line: threshold = <N> (default 2 if absent)
+# Blank lines and lines beginning with '#' are ignored.
+
+_threshold() {
+awk -F= '
+/^[[:space:]]*#/ {next}
+tolower($1) ~ /threshold/ { v=$2; gsub(/[^0-9]/,"",v); if (v!="") { print v; exit}}
+' "$1"
+}
+
+# Emit enabled stores as "name|class|priority|url", priority-ascending.
+_enabled_stores() {
+awk -F'|' '
+/^[[:space:]]*#/ {next}
+NF < 5 {next}
+{
+for (i=1;i<=5;i++){ gsub(/^[ \t]+|[ \t]+$/,"",$i)}
+if ($5=="true") print $3"|"$1"|"$2"|"$4
+}
+' "$1" | sort -t'|' -k1,1n | awk -F'|' '{print $2"|"$3"|"$1"|"$4}'
+}
+
+_require_config() { [ -f "$CAIRN_STORES"] || die "no stores config at '$CAIRN_STORES' (set CAIRN_STORES, or copy stores.example -> stores)";}
+
+# --- doctor: validate the config --------------------------------------------
+cmd_doctor() {
+_require_config
+local stores thr classes ncanon problems=0
+stores="$(_enabled_stores "$CAIRN_STORES")"
+[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
+thr="$(_threshold "$CAIRN_STORES")"; thr="${thr:-2}"
+# distinct enabled classes
+classes="$(printf '%s\n' "$stores" | awk -F'|' '{print $2}' | sort -u | wc -l)"
+echo "cairn doctor: $(printf '%s\n' "$stores" | grep -c.) enabled store(s), $classes distinct class(es), threshold=$thr"
+if [ "$classes" -lt "$thr"]; then
+echo " WARN: only $classes distinct class(es) enabled but threshold is $thr — a push cannot meet durability until you enable more independent classes." >&2
+problems=1
+fi
+# duplicate priorities
+if printf '%s\n' "$stores" | awk -F'|' '{print $3}' | sort | uniq -d | grep -q.; then
+echo " WARN: duplicate priorities — failover order is ambiguous." >&2
+problems=1
+fi
+[ "$problems" -eq 0] && echo " ok."
+echo "$CEILING"
+# GIFT-005: doctor is a validation gate, not a pretty-printer. A below-threshold
+# or duplicate-priority config makes the durability contract impossible/ambiguous
+# -> loud failure (exit 1, per the documented convention above), never exit 0.
+[ "$problems" -eq 0] && return 0
+return 1
+}
+
+# --- clone: priority-ordered failover ---------------------------------------
+cmd_clone() {
+local dest="${1:-}"
+[ -n "$dest"] || die "usage: cairn.sh clone <dest>"
+_require_config
+local n=0 name class prio url
+while IFS='|' read -r name class prio url; do
+[ -n "$name"] || continue
+n=$((n+1))
+echo "cairn: trying $name ($class)..." >&2
+if timeout "$CAIRN_TIMEOUT" git clone --quiet "$url" "$dest" 2>/dev/null; then
+echo "cairn: cloned from $name ($class)." >&2
+echo "$CEILING" >&2
+return 0
+fi
+echo "cairn: $name unreachable/auth-fail — failing over." >&2
+done <<EOF
+$(_enabled_stores "$CAIRN_STORES")
+EOF
+[ "$n" -gt 0] || die "no enabled stores in '$CAIRN_STORES'"
+echo "cairn: LOUD STOP — every store is unreachable. Nothing to clone from." >&2
+exit 1
+}
+
+# --- push: distinct-class fan-out -------------------------------------------
+cmd_push() {
+local ref="${1:-HEAD}"
+_require_config
+local thr work stores name class prio url
+thr="$(_threshold "$CAIRN_STORES")"; thr="${thr:-2}"
+stores="$(_enabled_stores "$CAIRN_STORES")"
+[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
+work="$(mktemp -d)"
+
+# fan out, parallel, each store writes its own result file
+while IFS='|' read -r name class prio url; do
+[ -n "$name"] || continue
+(
+if timeout "$CAIRN_TIMEOUT" git push --quiet "$url" "${ref}:refs/heads/main" >/dev/null 2>&1; then
+echo "OK|$class"
+else
+echo "FAIL|$class"
+fi
+) >"$work/$name" &
+done <<EOF
+$stores
+EOF
+wait
+
+# aggregate by DISTINCT class
+local confirmed="" ok="" fail="" line st nc
+while IFS='|' read -r name class prio url; do
+[ -n "$name"] || continue
+line="$(cat "$work/$name")"; st="${line%%|*}"
+if [ "$st" = "OK"]; then
+ok="$ok $name($class)"
+case " $confirmed " in *" $class "*):;; *) confirmed="$confirmed $class";; esac
+else
+fail="$fail $name($class)"
+fi
+done <<EOF
+$stores
+EOF
+nc="$(echo $confirmed | wc -w)"
+
+echo "cairn push: confirmed classes=$nc (need >=$thr) |$ok | laggards:${fail:- none}"
+echo "$CEILING"
+rm -rf "$work"
+if [ "$nc" -ge "$thr"]; then
+return 0
+fi
+echo "cairn push LOUD-FAIL: only $nc distinct class(es) [$confirmed] confirmed, threshold is $thr — durability NOT met for this push." >&2
+return 1
+}
+
+# --- frontier: REPORT max comparable head (read-only), loud on divergence ----
+cmd_frontier() {
+_require_config
+git rev-parse --git-dir >/dev/null 2>&1 || die "frontier must run inside a git repo (it fetches store heads into refs/cairn/heads/)"
+local stores name class prio url sha names="" a b
+declare -A HEAD
+stores="$(_enabled_stores "$CAIRN_STORES")"
+[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
+
+while IFS='|' read -r name class prio url; do
+[ -n "$name"] || continue
+sha="$(timeout "$CAIRN_TIMEOUT" git ls-remote "$url" refs/heads/main 2>/dev/null | awk '{print $1}' | head -1)"
+if [ -z "$sha"]; then
+echo "cairn: $name ($class) — no main head or unreachable (skip)." >&2
+continue
+fi
+# fetch the objects so ancestry is decidable locally; a store that advertises
+# a head it cannot actually serve is corrupt-at-that-head — fail past it.
+if timeout "$CAIRN_TIMEOUT" git fetch --quiet "$url" refs/heads/main 2>/dev/null \
+&& git cat-file -e "$sha" 2>/dev/null; then
+git update-ref "refs/cairn/heads/$name" "$sha"
+HEAD[$name]="$sha"
+names="$names $name"
+else
+echo "cairn: $name ($class) advertises $sha but cannot serve it — failing past (fixity)." >&2
+fi
+done <<EOF
+$stores
+EOF
+
+[ -n "$names"] || die "frontier: no servable store heads found."
+
+# find a store whose head is a descendant-or-equal of every other head
+local best="" dominates
+for a in $names; do
+dominates=1
+for b in $names; do
+[ "$a" = "$b"] && continue
+if! git merge-base --is-ancestor "${HEAD[$b]}" "${HEAD[$a]}" 2>/dev/null; then
+dominates=0; break
+fi
+done
+if [ "$dominates" -eq 1]; then best="$a"; break; fi
+done
+
+if [ -n "$best"]; then
+echo "cairn frontier: frontier=${HEAD[$best]} (from $best). READ-ONLY report — nothing was moved. To adopt: git fetch && git merge --ff-only ${HEAD[$best]}"
+echo "$CEILING"
+return 0
+fi
+
+# no dominator => incomparable heads => divergence. Record, never merge.
+local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+for a in $names; do
+git update-ref "refs/cairn/divergence/$ts/$a" "${HEAD[$a]}"
+done
+echo "cairn frontier LOUD: incomparable store heads — this is a FORK, not a lag." >&2
+echo "cairn frontier: divergence recorded at refs/cairn/divergence/$ts/* — NOT auto-merged; resolve by hand." >&2
+echo "$CEILING" >&2
+return 2
+}
+
+# --- dispatch ---------------------------------------------------------------
+main() {
+local cmd="${1:-}"; shift || true
+case "$cmd" in
+clone) cmd_clone "$@";;
+push) cmd_push "$@";;
+frontier) cmd_frontier "$@";;
+reconverge) die "reconverge was renamed to 'frontier': it reports the max comparable head but never moved main or touched other stores (the old name overpromised). Use 'cairn frontier'.";;
+doctor) cmd_doctor "$@";;
+""|-h|--help|help)
+sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+;;
+*) die "unknown command '$cmd' (try: clone | push | frontier | doctor)";;
+esac
+}
+
+main "$@"
+
+askpass.example.sh 62 lines on GitHub →
+#!/bin/sh
+# askpass.example.sh — a host-aware git credential helper. COPY to askpass.sh
+# and edit the host arms + field names for your stores.
+#
+# WHY THIS EXISTS
+# Private stores need a token. The unsafe habits are (a) baking the token into
+# the remote URL (it lands in.git/config and every `git remote -v`), and
+# (b) exporting it as an environment variable (it leaks into child processes
+# and is gone across separate shells, so the NEXT push silently fails auth).
+# This helper avoids both: git calls it at push/fetch time, it reads the token
+# from a GITIGNORED file at CALL TIME, and writes it ONLY to git's stdin.
+#
+# SAFE TO COMMIT — once you've replaced the placeholders with your HOSTS and
+# FIELD NAMES (which are not secret). The SECRET never appears here: it lives in
+# a separate file you never commit. This example is verifiably credential-free.
+#
+# WIRE IT (before any push/fetch):
+# cp askpass.example.sh askpass.sh # then edit the host arms below
+# git config core.askpass "$PWD/askpass.sh"
+# git config credential.username x-access-token # if your host wants a user
+#
+# THE CRED FILE
+# Put your tokens in a file your.gitignore excludes, e.g. `cairn.cred`
+# (add `cairn.cred` and `*.cred` to.gitignore). One token per line, keyed:
+# HOST_A_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
+# HOST_B_TOKEN=yyyyyyyyyyyyyyyyyyyyyyyy
+# Point the helper at it: export CAIRN_CRED=/abs/path/to/cairn.cred
+#
+# Git passes the prompt string as $1, e.g. "Password for 'https://host-b.example':"
+# and, for username prompts, a string beginning "Username". Route by host so ONE
+# helper can serve MANY stores, each with its OWN scoped token (one leak reaches
+# one store — the independence the class model buys). Each token is written only
+# to git's stdin, never to disk, a log, or a URL.
+
+CRED="${CAIRN_CRED:-./cairn.cred}"
+
+# read a keyed value from the cred file, keeping only the value (no spaces/CR)
+_field() {
+grep -m1 -E "^[[:space:]]*$1[[:space:]]*=" "$CRED" 2>/dev/null \
+| sed -E 's/^[^=]*=[[:space:]]*//' | tr -d '[:space:]'
+}
+
+case "$1" in
+*host-b.example*)
+# Example: a public host that wants username=account, password=token.
+case "$1" in
+Username*) printf '%s\n' "your-host-b-account";; # public, not a secret
+*) printf '%s\n' "$(_field HOST_B_TOKEN)";;
+esac
+;;
+*box.example*)
+# Example: a self-hosted git server (git-over-HTTPS).
+case "$1" in
+Username*) printf '%s\n' "your-selfhost-account";; # public, not a secret
+*) printf '%s\n' "$(_field SELFHOST_TOKEN)";;
+esac
+;;
+*)
+# Default / your primary host. Adjust the field name to your store.
+printf '%s\n' "$(_field HOST_A_TOKEN)"
+;;
+esac
+
+stores.example 34 lines on GitHub →
+# cairn stores — copy this to `stores` and edit. This file ships as an EXAMPLE;
+# it contains NO real hosts, accounts, or credentials.
+#
+# One store per line, 5 pipe-separated fields:
+#
+# name | class | priority | url | enabled
+#
+# name a short handle for the store (used in output + ref namespacing)
+# class the INDEPENDENCE CLASS. This is the load-bearing field. Two stores
+# in the SAME class are NOT independent — if the thing that class
+# names goes down (a provider, a machine, an account), both go with
+# it. Give each genuinely-separate failure domain its own class.
+# Examples of distinct classes: a big public host (cloud-A), a
+# different public host (cloud-B), a box you run yourself
+# (self-host), an offline bundle (offline).
+# priority failover order for `clone` (lower first). Keep them unique.
+# url a git remote URL (https://…/repo.git, ssh://…, or a local path).
+# enabled true | false. Disabled stores are ignored entirely.
+#
+# The durability threshold is a number of DISTINCT CLASSES (not stores):
+threshold = 2
+# A push succeeds iff at least this many distinct classes confirm it. Set it to
+# the number of independent failures you want to survive, plus one.
+
+# name | class | priority | url | enabled
+primary | cloud-A | 1 | https://host-a.example/you/repo.git | true
+mirror-public | cloud-B | 2 | https://host-b.example/you/repo.git | true
+mirror-selfhost | self-host | 3 | https://box.example/you/repo.git | true
+
+# An offline class is real durability against a total network outage, but a live
+# `file://` store inside an ephemeral machine is a phantom — it vanishes with the
+# machine. Realize the offline class as an operator-held `git clone --all` bundle
+# regenerated on a cadence, and keep this entry disabled:
+# local-bundle | offline | 4 | file:///path/to/repo.bundle.git | false
+
+smoke_test.sh 157 lines on GitHub →
+#!/usr/bin/env bash
+# smoke_test.sh — hermetic proof that cairn.sh works. No network: every "store"
+# is a local bare git repo standing in for a remote. Five scenarios, mirroring
+# the durability claims:
+#
+# 1 failover clone skips a dead store and clones from the next live one
+# 2 a distinct-class fan-out push succeeds when >= threshold classes confirm
+# 3 two SAME-class stores count ONCE — below threshold => loud fail (exit 1)
+# 4 frontier REPORTS the MAX head (read-only) when heads are comparable
+# 5 frontier records INCOMPARABLE heads as divergence (exit 2), moves nothing
+#
+# Run: bash smoke_test.sh (expect: 5/5 passed)
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CAIRN="$HERE/cairn.sh"
+PASS=0; FAIL=0
+ROOT="$(mktemp -d)"; trap 'rm -rf "$ROOT"' EXIT
+
+ok() { echo "ok $1"; PASS=$((PASS+1));}
+bad() { echo "FAIL $1: $2"; FAIL=$((FAIL+1));}
+
+git_q() { git -c init.defaultBranch=main -c user.name=t -c user.email=t@t "$@";}
+
+mk_source() { # $1 dest; makes a repo on main with one commit
+git_q init -q "$1"
+( cd "$1"; echo "base" > file.txt; git_q add file.txt; git_q commit -q -m base)
+}
+mk_bare() { git_q init -q --bare "$1";}
+seed() { git_q -C "$1" push -q "$2" main:refs/heads/main;} # $1 src $2 bare
+head_of() { git_q -C "$1" rev-parse HEAD;}
+bare_main(){ git_q --git-dir="$1" rev-parse refs/heads/main 2>/dev/null;}
+
+# --- 1: failover clone ------------------------------------------------------
+t1() {
+local d="$ROOT/t1"; mkdir -p "$d"
+mk_source "$d/src"
+mk_bare "$d/live.git"; seed "$d/src" "$d/live.git"
+cat > "$d/stores" <<EOF
+threshold = 2
+dead | cloud-A | 1 | $d/does-not-exist.git | true
+live | cloud-B | 2 | $d/live.git | true
+EOF
+if CAIRN_STORES="$d/stores" bash "$CAIRN" clone "$d/clone" >/dev/null 2>&1 \
+&& [ -f "$d/clone/file.txt"] \
+&& [ "$(cat "$d/clone/file.txt")" = "base"]; then
+ok "failover clone skips dead store, clones from next"
+else
+bad "failover clone" "did not clone from the live store after the dead one"
+fi
+}
+
+# --- 2: distinct-class push succeeds ----------------------------------------
+t2() {
+local d="$ROOT/t2"; mkdir -p "$d"
+mk_source "$d/src"
+mk_bare "$d/a.git"; mk_bare "$d/b.git"; mk_bare "$d/c.git"
+cat > "$d/stores" <<EOF
+threshold = 2
+a | cloud-A | 1 | $d/a.git | true
+b | cloud-B | 2 | $d/b.git | true
+c | self-host | 3 | $d/c.git | true
+EOF
+local want; want="$(head_of "$d/src")"
+if ( cd "$d/src"; CAIRN_STORES="$d/stores" bash "$CAIRN" push HEAD) >/dev/null 2>&1 \
+&& [ "$(bare_main "$d/a.git")" = "$want"] \
+&& [ "$(bare_main "$d/b.git")" = "$want"] \
+&& [ "$(bare_main "$d/c.git")" = "$want"]; then
+ok "distinct-class push confirmed 3 classes >= threshold 2"
+else
+bad "distinct-class push" "not all stores received main, or exit nonzero"
+fi
+}
+
+# --- 3: two same-class stores count once => below threshold => loud fail -----
+t3() {
+local d="$ROOT/t3"; mkdir -p "$d"
+mk_source "$d/src"
+mk_bare "$d/a1.git"; mk_bare "$d/a2.git"
+cat > "$d/stores" <<EOF
+threshold = 2
+a1 | cloud-A | 1 | $d/a1.git | true
+a2 | cloud-A | 2 | $d/a2.git | true
+EOF
+# both pushes SUCCEED, but they share a class => 1 distinct class < 2 => exit 1
+( cd "$d/src"; CAIRN_STORES="$d/stores" bash "$CAIRN" push HEAD) >/dev/null 2>&1
+if [ "$?" -eq 1]; then
+ok "two same-class stores count once; below threshold is a loud fail"
+else
+bad "same-class threshold" "expected exit 1 (durability not met), got $?"
+fi
+}
+
+# --- 4: frontier REPORTS the max comparable head (read-only) ----------------
+t4() {
+local d="$ROOT/t4"; mkdir -p "$d"
+mk_source "$d/src"
+mk_bare "$d/a.git"; mk_bare "$d/b.git"
+seed "$d/src" "$d/a.git"; seed "$d/src" "$d/b.git" # both at base
+# A moves ahead by one commit; B stays behind (a laggard)
+( cd "$d/src"; echo more >> file.txt; git_q add file.txt; git_q commit -q -m ahead)
+seed "$d/src" "$d/a.git"
+local ahead; ahead="$(head_of "$d/src")"
+git_q clone -q "$d/b.git" "$d/recon" # recon starts behind
+cat > "$d/stores" <<EOF
+threshold = 2
+a | cloud-A | 1 | $d/a.git | true
+b | cloud-B | 2 | $d/b.git | true
+EOF
+# frontier is DISCOVERY-ONLY: it must REPORT the ahead head, RECORD it under
+# refs/cairn/heads/, and MOVE NOTHING. Assert by inspecting refs, never by
+# accepting printed prose as proof of adoption (the false-green this fixes).
+local before; before="$( cd "$d/recon"; git rev-parse HEAD)"
+local out rc
+out="$( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" frontier 2>&1)"; rc=$?
+local reported; reported="$( printf '%s' "$out" | sed -n 's/.*frontier=\([0-9a-f]\{7,\}\).*/\1/p' | head -1)"
+local after; after="$( cd "$d/recon"; git rev-parse HEAD)"
+local recorded; recorded="$( cd "$d/recon"; git rev-parse refs/cairn/heads/a 2>/dev/null)"
+if [ "$rc" -eq 0] && [ "$reported" = "$ahead"] && [ "$after" = "$before"] && [ "$recorded" = "$ahead"]; then
+ok "frontier reports the max comparable head, records it under refs/cairn/heads/, and does NOT move local HEAD (read-only)"
+else
+bad "frontier discovery" "rc=$rc reported=$reported ahead=$ahead before=$before after=$after recorded=$recorded"
+fi
+}
+
+# --- 5: frontier records incomparable heads as divergence (moves nothing) ---
+t5() {
+local d="$ROOT/t5"; mkdir -p "$d"
+mk_source "$d/base"
+mk_bare "$d/a.git"; mk_bare "$d/b.git"
+# two SIBLING commits on top of the same base => incomparable heads
+git_q clone -q "$d/base" "$d/x"
+( cd "$d/x"; echo x >> file.txt; git_q add file.txt; git_q commit -q -m fork-x)
+seed "$d/x" "$d/a.git"
+git_q clone -q "$d/base" "$d/y"
+( cd "$d/y"; echo y >> file.txt; git_q add file.txt; git_q commit -q -m fork-y)
+seed "$d/y" "$d/b.git"
+git_q clone -q "$d/a.git" "$d/recon" # recon has X
+cat > "$d/stores" <<EOF
+threshold = 2
+a | cloud-A | 1 | $d/a.git | true
+b | cloud-B | 2 | $d/b.git | true
+EOF
+( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" frontier) >/dev/null 2>&1
+local rc=$?
+local divs
+divs="$(git_q -C "$d/recon" for-each-ref --format='%(refname)' 'refs/cairn/divergence/' | wc -l)"
+if [ "$rc" -eq 2] && [ "$divs" -ge 2]; then
+ok "frontier records incomparable heads as a divergence, never merges (exit 2)"
+else
+bad "frontier divergence" "expected exit 2 with recorded divergence refs; rc=$rc divs=$divs"
+fi
+}
+
+t1; t2; t3; t4; t5
+echo
+echo "$((PASS))/$((PASS+FAIL)) passed"
+[ "$FAIL" -eq 0]
+
+Take the whole folder →
+MIT
+Bash + git
 
 ---
 
@@ -815,964 +1379,5 @@ sys.exit(main())
 Take the whole folder →
 MIT
 Python stdlib only, deterministic
-
----
-
-# conductor — a Loop MMT gift
-https://loopmmt.com/gifts/conductor/
-[coverage: optional · branch: gifts]
-
-Provenance Pipeline Runner run ← all gifts
-
-conductor
-
-Run a declared pipeline of small JSONL tools — A | B | C — with a record. conductor typechecks the pipeline before it runs (a broken pipeline never launches a stage), runs the stages in order under one trace-id piping stdout into stdin, and appends a per-stage receipt to a replayable ledger: exit code, bytes in and out, and which stage broke. A failing stage stops the run, is recorded failed, and every later stage is recorded skipped — so 'what happened to this run?' always has an answer.
-
-The honest edge
-
-conductor runs the commands you give it — it is exactly as safe as the commands in the score, and it does not sandbox them. Its typecheck is the TYPE-level gate (ports line up so data can flow), not a proof the RECORDS fit or that a stage is correct. It proves the run happened in order with a receipt; it never proves the run was right.
-
-Run it
-
-python3 conductor.py check --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py'
-test_conductor.py (12/12, mutation-bitten)
-Python 3, standard library only
-
-The code — every file that ships
-
-conductor.py 381 lines on GitHub →
-#!/usr/bin/env python3
-"""conductor — run a declared pipeline of small JSONL tools, with a record.
-
-You have a saved "score" — an ordered pipeline of little JSON-lines tools, the
-kind the `declare` gift writes. You could run it by hand with a shell pipe. What
-the shell won't do: check the pipeline typechecks *before* it runs, thread one
-trace-id through the whole run, and hand you back a record of what each stage
-actually did — its exit code, how many bytes it read and wrote, whether it was
-the stage that broke. `conductor` does that. It is a provenance-runner, not a
-shell wrapper: every run leaves a receipt you can read back, and a run that fails
-tells you *which stage* failed, in order, not just that the pipe collapsed.
-
-WHAT IT DOES, in order:
-1. Typecheck first. conductor carries its own copy of the five-verb composition
-gate (the same rule the `typecheck` and `declare` gifts use) and refuses to
-run a pipeline that does not compose — a sink that isn't last, a source that
-isn't first. You never watch a broken pipeline half-run; it is stopped at
-the desk (exit 3), before a single stage is launched.
-2. Run the stages in order, piping each stage's stdout into the next stage's
-stdin, exactly as a shell pipe would — but under one trace-id.
-3. Record every stage to an append-only ledger: trace-id, stage index, slug,
-command, exit code, bytes in, bytes out, and a verdict (ok / failed /
-skipped-after-failure). The ledger is JSON-lines you can replay by trace-id.
-4. Fail clean. If a stage exits non-zero, conductor stops the run, records that
-stage as failed and every later stage as skipped, and exits non-zero itself
-— naming the stage that broke. No later stage runs on a broken input.
-
-THE MODEL. Five port-verbs on the shared JSON-lines interface, and only five
-(the same five the `port`, `map`, `typecheck`, and `declare` gifts use):
-
-source: nothing -> JSONL (emits; no meaningful stdin)
-transform: JSONL -> JSONL (record in, record out)
-filter: JSONL -> JSONL' (record in, subset out; output type <= input)
-fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
-sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
-
-A pipeline composes iff every adjacent join A -> B has A EMITS (A.verb!= sink)
-and B ACCEPTS (B.verb!= source). conductor carries its own copy of that gate so
-it stands alone — a gift is single-file and zero-dependency by covenant, so it
-agrees with `typecheck` and `declare` by sharing the RULE, not by importing them.
-
-WHY A RECORD, NOT JUST A PIPE. A shell pipe answers "did it work?" with a single
-combined exit status and a jumble of interleaved stderr. When a five-stage
-pipeline produces nothing, the shell won't tell you *which* stage went dark.
-conductor's ledger does: one record per stage, in order, so "what happened to
-this run?" has an answer. This is tracebus's trace-id-and-ledger idea (the
-`tracebus` gift is a routed message bus with a replayable ledger) applied to a
-LINEAR ordered run instead of a fanned-out bus — a different shape, the same
-honesty about leaving a receipt.
-
-THE SCORE / STAGE FORMAT. A stage is `{"slug":..., "port_verb":..., "cmd": [...]}`
-— the port-verb for the typecheck, and `cmd` the argv list conductor executes for
-that stage (e.g. ["python3", "census.py"]). Stages come from `--stage` flags, or
-piped in on stdin as JSON-lines (the shape `declare show` emits, with a `cmd`
-added), or read from a declare score file with `--score` when the score carries
-per-stage `cmd`s. A stage with a port-verb but no `cmd` can be typechecked but
-not run (conductor says so and exits 2 on a run).
-
-HONEST CEILING. conductor runs the commands you give it — it is exactly as safe
-as the commands in the score, and it does not sandbox them. Its typecheck is the
-TYPE-level gate (ports line up so data can flow), NOT a proof the RECORDS fit or
-that a stage is correct; a pipeline can typecheck clean, run to completion, and
-still have done the wrong thing. conductor proves the run happened, in order,
-with a receipt — it never proves the run was right.
-
-conductor's own port-verb is `sink`: it consumes a pipeline (and the data flowing
-through it) and produces side effects — the stages' work and the ledger — with no
-pipeable JSONL on its own stdout. The run record goes to the ledger; conductor's
-stdout is the final stage's stdout, passed through.
-
-No dependencies beyond the Python standard library. MIT licensed.
-
-USAGE
-conductor verbs
-Print the five port-verbs and their contracts (JSON-lines).
-
-conductor check --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py'
-Typecheck the pipeline WITHOUT running it. Exit 0 if it composes, 3 if not,
-4 if a verb is undeclared. (Stage token: slug:verb:cmd, cmd shell-split.)
-
-conductor run --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py' \
-[--ledger FILE] [--input FILE]
-Typecheck, then run the stages in order under one trace-id, piping
-stdout->stdin. --input seeds the first stage's stdin (default: empty).
-Appends one record per stage to --ledger (default: conductor.ledger.jsonl).
-Final stage's stdout goes to conductor's stdout. Exit 0 if every stage
-succeeded, 5 if a stage failed (naming it), 3/4 if the pipeline doesn't
-typecheck.
-
-conductor replay --ledger FILE --trace TRACE_ID
-Print every stage record for a trace-id, in run order (JSON-lines).
-
-EXIT CODES
-0 ok (composed / ran clean / replayed)
-3 the pipeline does not typecheck — not run
-4 a stage's port-verb is undeclared or not one of the five
-5 a stage failed at runtime (the run stopped; the ledger names it)
-2 usage error (bad arguments, a stage with no cmd on a run, unreadable file)
-"""
-import argparse
-import json
-import os
-import shlex
-import subprocess
-import sys
-import uuid
-
-PORT_VERBS = {
-"source": "nothing -> JSONL (emits; no meaningful stdin)",
-"transform": "JSONL -> JSONL (record in, record out)",
-"filter": "JSONL -> JSONL' (record in, subset out; output type <= input)",
-"fold": "JSONL -> JSONL_agg (records in, an aggregate/narrower record out)",
-"sink": "JSONL -> nothing (terminal side effect, no pipeable stdout)",
-}
-
-def emits(verb):
-"""True iff a stage with this verb produces pipeable stdout (can feed right)."""
-return verb!= "sink"
-
-def accepts(verb):
-"""True iff a stage with this verb consumes stdin (can be fed from the left)."""
-return verb!= "source"
-
-def typecheck_stages(stages):
-"""Decide a pipeline of (slug, verb, cmd) or (slug, verb) tuples.
-
-Returns (ok, broken). Raises ValueError on an undeclared/unknown verb. The
-same gate `typecheck`/`declare` carry — copied, per the single-file covenant."""
-for st in stages:
-slug, verb = st[0], st[1]
-if verb not in PORT_VERBS:
-raise ValueError(
-"stage '%s' declares port_verb '%s', not one of the five (%s) — "
-"cannot decide" % (slug, verb, ", ".join(sorted(PORT_VERBS)))
-)
-broken = []
-for i in range(len(stages) - 1):
-a_slug, a_verb = stages[i][0], stages[i][1]
-b_slug, b_verb = stages[i + 1][0], stages[i + 1][1]
-reasons = []
-if not emits(a_verb):
-reasons.append({"side": "from", "slug": a_slug, "verb": a_verb,
-"why": "a sink emits nothing to feed the next stage — "
-"a sink is only legal as the last stage"})
-if not accepts(b_verb):
-reasons.append({"side": "to", "slug": b_slug, "verb": b_verb,
-"why": "a source accepts nothing from the previous stage — "
-"a source is only legal as the first stage"})
-if reasons:
-broken.append({"index": i, "from": a_slug, "to": b_slug, "reasons": reasons})
-return (len(broken) == 0, broken)
-
-def _emit(obj):
-"""Print one JSON-line, deterministically (sorted keys, compact separators)."""
-sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
-
-def _parse_stage_token(tok):
-"""Parse 'slug:verb' or 'slug:verb:cmd' -> (slug, verb, cmd_list_or_None).
-
-Only the first two colons split slug/verb; the remainder is the command
-(shell-split), so a cmd may itself contain colons."""
-parts = tok.split(":", 2)
-if len(parts) < 2:
-raise ValueError("stage token '%s' must be slug:verb[:cmd]" % tok)
-slug, verb = parts[0], parts[1]
-cmd = shlex.split(parts[2]) if len(parts) == 3 and parts[2] else None
-return (slug, verb, cmd)
-
-def _collect_stages(args):
-"""Collect stages from --stage tokens or stdin JSON-lines. Returns (stages, err)."""
-stages = []
-if getattr(args, "stage", None):
-for tok in args.stage:
-try:
-stages.append(_parse_stage_token(tok))
-except ValueError as exc:
-sys.stderr.write("conductor: %s\n" % exc)
-return None, 2
-if getattr(args, "from_stdin", False):
-for line in sys.stdin:
-line = line.strip()
-if not line:
-continue
-try:
-obj = json.loads(line)
-except ValueError:
-sys.stderr.write("conductor: stdin line is not JSON: %s\n" % line)
-return None, 2
-slug = obj.get("slug")
-if slug is None:
-sys.stderr.write("conductor: stdin record has no 'slug': %s\n" % line)
-return None, 2
-stages.append((slug, obj.get("port_verb", ""), obj.get("cmd")))
-if not stages:
-sys.stderr.write("conductor: no stages (use --stage, or --stdin with JSON-lines)\n")
-return None, 2
-return stages, None
-
-def _typecheck_or_report(stages):
-"""Run the gate; emit a report on failure. Returns exit code (0 ok, 3/4 fail)."""
-try:
-ok, broken = typecheck_stages(stages)
-except ValueError as exc:
-_emit({"kind": "error", "status": "undeclared", "detail": str(exc)})
-return 4
-if not ok:
-_emit({"kind": "refused", "reason": "pipeline does not typecheck", "broken_joins": broken})
-return 3
-return 0
-
-def cmd_verbs(args):
-for name in ["source", "transform", "filter", "fold", "sink"]:
-_emit({"port_verb": name, "contract": PORT_VERBS[name]})
-return 0
-
-def cmd_check(args):
-stages, err = _collect_stages(args)
-if err is not None:
-return err
-code = _typecheck_or_report(stages)
-if code == 0:
-_emit({"kind": "check", "typechecks": True, "n_stages": len(stages)})
-return code
-
-def _append_ledger(ledger_path, record):
-with open(ledger_path, "a") as f:
-f.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
-
-def cmd_run(args):
-stages, err = _collect_stages(args)
-if err is not None:
-return err
-# 1. Typecheck first — never launch a stage of a broken pipeline.
-code = _typecheck_or_report(stages)
-if code!= 0:
-return code
-# Every stage must carry a cmd to be run.
-for slug, verb, cmd in stages:
-if not cmd:
-sys.stderr.write("conductor: stage '%s' has no cmd — cannot run "
-"(use slug:verb:cmd)\n" % slug)
-return 2
-ledger_path = args.ledger or "conductor.ledger.jsonl"
-trace_id = args.trace or str(uuid.uuid4())
-# Seed input.
-if args.input:
-try:
-with open(args.input, "rb") as f:
-data = f.read()
-except OSError as exc:
-sys.stderr.write("conductor: cannot read --input %s: %s\n" % (args.input, exc))
-return 2
-else:
-data = b""
-_append_ledger(ledger_path, {"kind": "run-start", "trace_id": trace_id,
-"n_stages": len(stages)})
-failed_index = None
-for i, (slug, verb, cmd) in enumerate(stages):
-if failed_index is not None:
-_append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
-"index": i, "slug": slug, "cmd": cmd,
-"verdict": "skipped", "reason": "an earlier stage failed"})
-continue
-try:
-proc = subprocess.run(cmd, input=data, stdout=subprocess.PIPE,
-stderr=subprocess.PIPE)
-except (OSError, ValueError) as exc:
-_append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
-"index": i, "slug": slug, "cmd": cmd,
-"verdict": "failed", "exit": None,
-"error": str(exc)})
-failed_index = i
-continue
-rec = {"kind": "stage", "trace_id": trace_id, "index": i, "slug": slug,
-"cmd": cmd, "exit": proc.returncode,
-"bytes_in": len(data), "bytes_out": len(proc.stdout),
-"verdict": "ok" if proc.returncode == 0 else "failed"}
-if proc.returncode!= 0:
-rec["stderr_tail"] = proc.stderr.decode("utf-8", "replace")[-500:]
-_append_ledger(ledger_path, rec)
-if proc.returncode!= 0:
-failed_index = i
-continue
-data = proc.stdout
-if failed_index is None:
-# Final stage's stdout is conductor's stdout (a sink typically emits none).
-sys.stdout.buffer.write(data)
-_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id, "verdict": "ok"})
-_emit_run_summary(trace_id, ledger_path, ok=True, failed_index=None, stages=stages)
-return 0
-_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id, "verdict": "failed",
-"failed_index": failed_index})
-_emit_run_summary(trace_id, ledger_path, ok=False, failed_index=failed_index, stages=stages)
-return 5
-
-def _emit_run_summary(trace_id, ledger_path, ok, failed_index, stages):
-summary = {"kind": "run-summary", "trace_id": trace_id, "ledger": ledger_path,
-"n_stages": len(stages), "ok": ok}
-if not ok:
-summary["failed_stage"] = {"index": failed_index, "slug": stages[failed_index][0]}
-# summary goes to stderr so it never pollutes the passed-through final stdout
-sys.stderr.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
-
-def cmd_replay(args):
-if not args.ledger or not args.trace:
-sys.stderr.write("conductor: replay needs --ledger and --trace\n")
-return 2
-try:
-with open(args.ledger, "r") as f:
-lines = f.readlines()
-except OSError as exc:
-sys.stderr.write("conductor: cannot read ledger %s: %s\n" % (args.ledger, exc))
-return 2
-found = False
-for line in lines:
-line = line.strip()
-if not line:
-continue
-try:
-rec = json.loads(line)
-except ValueError:
-continue
-if rec.get("trace_id") == args.trace:
-found = True
-_emit(rec)
-if not found:
-sys.stderr.write("conductor: no records for trace-id %s in %s\n" % (args.trace, args.ledger))
-return 2
-return 0
-
-def build_parser():
-p = argparse.ArgumentParser(prog="conductor",
-description="Run a declared pipeline of JSONL tools, with a record.")
-sub = p.add_subparsers(dest="cmd", required=True)
-
-sp_verbs = sub.add_parser("verbs", help="print the five port-verbs and contracts")
-sp_verbs.set_defaults(func=cmd_verbs)
-
-sp_check = sub.add_parser("check", help="typecheck the pipeline without running it")
-sp_check.add_argument("--stage", action="append", help="slug:verb[:cmd] (repeatable, in order)")
-sp_check.add_argument("--stdin", dest="from_stdin", action="store_true", help="read stages as JSON-lines on stdin")
-sp_check.set_defaults(func=cmd_check)
-
-sp_run = sub.add_parser("run", help="typecheck then run the stages in order, with a record")
-sp_run.add_argument("--stage", action="append", help="slug:verb:cmd (repeatable, in order)")
-sp_run.add_argument("--stdin", dest="from_stdin", action="store_true", help="read stages as JSON-lines on stdin")
-sp_run.add_argument("--ledger", help="append per-stage records here (default: conductor.ledger.jsonl)")
-sp_run.add_argument("--input", help="file to seed the first stage's stdin (default: empty)")
-sp_run.add_argument("--trace", help="use this trace-id (default: a fresh uuid4)")
-sp_run.set_defaults(func=cmd_run)
-
-sp_replay = sub.add_parser("replay", help="print every stage record for a trace-id")
-sp_replay.add_argument("--ledger", required=True)
-sp_replay.add_argument("--trace", required=True)
-sp_replay.set_defaults(func=cmd_replay)
-
-return p
-
-def main(argv=None):
-parser = build_parser()
-args = parser.parse_args(argv)
-return args.func(args)
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_conductor.py 210 lines on GitHub →
-#!/usr/bin/env python3
-"""Tests for the conductor gift.
-
-Mutation-bitten. The load-bearing behaviors, each asserted so that deleting the
-behavior would fail the test:
-* typecheck-first: a broken pipeline must NOT launch any stage (assert no
-ledger records for stages, exit 3);
-* fail-clean: a failing stage stops the run, is recorded 'failed', and every
-later stage is recorded 'skipped' (assert both, exit 5);
-* the ledger records every stage in order with exit/bytes;
-* replay returns exactly the records for a trace-id.
-
-Uses tiny real python subprocess stages so execution is genuinely exercised.
-Run: python3 -m unittest test_conductor -v (stdlib only, no deps)
-"""
-import io
-import json
-import os
-import sys
-import tempfile
-import unittest
-from contextlib import redirect_stdout, redirect_stderr
-
-import conductor as cd
-
-PY = sys.executable
-
-# tiny real stages (as shell-quotable command strings for slug:verb:cmd tokens)
-# emit: prints two json-lines, ignores stdin (a source)
-EMIT = "%s -c \"print('{\\\"a\\\":1}');print('{\\\"a\\\":2}')\"" % PY
-# pass: echoes stdin to stdout unchanged (a transform)
-PASS = "%s -c \"import sys;sys.stdout.write(sys.stdin.read())\"" % PY
-# count: reads stdin, prints one summary line (a fold)
-COUNT = "%s -c \"import sys;n=len([l for l in sys.stdin if l.strip()]);print('{\\\"n\\\":%%d}'%%n)\"" % PY
-# boom: exits 1 after reading stdin (a failing stage)
-BOOM = "%s -c \"import sys;sys.stdin.read();sys.exit(1)\"" % PY
-# sink: reads stdin, writes nothing to stdout, exit 0
-SINK = "%s -c \"import sys;sys.stdin.read()\"" % PY
-
-def run(argv, stdin_text=None):
-obuf, ebuf = io.StringIO(), io.StringIO()
-old_stdin = sys.stdin
-if stdin_text is not None:
-sys.stdin = io.StringIO(stdin_text)
-# conductor.run writes final stdout via sys.stdout.buffer; capture that too
-old_stdout_buffer = getattr(sys.stdout, "buffer", None)
-try:
-with redirect_stdout(obuf), redirect_stderr(ebuf):
-# give the redirected StringIO a.buffer that tees to bytes
-class _B:
-def __init__(self, s): self.s = s
-def write(self, b): self.s.write(b.decode("utf-8", "replace"))
-sys.stdout.buffer = _B(obuf)
-code = cd.main(argv)
-finally:
-sys.stdin = old_stdin
-out_recs = [json.loads(l) for l in obuf.getvalue().splitlines() if l.strip().startswith("{")]
-err_recs = [json.loads(l) for l in ebuf.getvalue().splitlines() if l.strip().startswith("{")]
-return code, out_recs, err_recs
-
-def read_ledger(path):
-recs = []
-if os.path.exists(path):
-with open(path) as f:
-for line in f:
-line = line.strip()
-if line:
-recs.append(json.loads(line))
-return recs
-
-class TmpCase(unittest.TestCase):
-def setUp(self):
-self.d = tempfile.mkdtemp()
-self.ledger = os.path.join(self.d, "l.jsonl")
-
-def tearDown(self):
-import shutil
-shutil.rmtree(self.d, ignore_errors=True)
-
-class TestGate(unittest.TestCase):
-def test_emits_accepts(self):
-self.assertFalse(cd.emits("sink"))
-self.assertFalse(cd.accepts("source"))
-self.assertTrue(cd.emits("source"))
-self.assertTrue(cd.accepts("sink"))
-
-class TestCheck(unittest.TestCase):
-def test_check_valid(self):
-code, out, _ = run(["check", "--stage", "a:source", "--stage", "b:fold"])
-self.assertEqual(code, 0)
-self.assertTrue(out[-1]["typechecks"])
-
-def test_check_broken_is_3(self):
-code, out, _ = run(["check", "--stage", "a:sink", "--stage", "b:transform"])
-self.assertEqual(code, 3)
-self.assertEqual(out[-1]["kind"], "refused")
-
-def test_check_undeclared_is_4(self):
-code, out, _ = run(["check", "--stage", "a:source", "--stage", "b:emits"])
-self.assertEqual(code, 4)
-
-class TestTypecheckFirstNoLaunch(TmpCase):
-"""THE typecheck-first guarantee: a broken pipeline must NOT run any stage.
-Assert exit 3 AND zero stage records in the ledger — deleting the pre-run
-typecheck would let a stage launch and write a record."""
-
-def test_broken_pipeline_launches_nothing(self):
-code, out, err = run(["run",
-"--stage", "a:sink:%s" % SINK, # sink not last
-"--stage", "b:transform:%s" % PASS,
-"--ledger", self.ledger])
-self.assertEqual(code, 3)
-led = read_ledger(self.ledger)
-stage_recs = [r for r in led if r.get("kind") == "stage"]
-self.assertEqual(stage_recs, [], "a broken pipeline launched a stage — typecheck-first failed")
-
-class TestRunCleanRecords(TmpCase):
-def test_full_run_records_every_stage_in_order(self):
-code, out, err = run(["run",
-"--stage", "emit:source:%s" % EMIT,
-"--stage", "pass:transform:%s" % PASS,
-"--stage", "count:fold:%s" % COUNT,
-"--ledger", self.ledger, "--trace", "T1"])
-self.assertEqual(code, 0)
-led = read_ledger(self.ledger)
-stage_recs = [r for r in led if r.get("kind") == "stage"]
-self.assertEqual([r["index"] for r in stage_recs], [0, 1, 2])
-self.assertEqual([r["slug"] for r in stage_recs], ["emit", "pass", "count"])
-self.assertTrue(all(r["verdict"] == "ok" for r in stage_recs))
-# bytes flow: emit produces >0, count reads what pass passed
-self.assertGreater(stage_recs[0]["bytes_out"], 0)
-self.assertEqual(stage_recs[1]["bytes_in"], stage_recs[0]["bytes_out"])
-# run-summary on stderr says ok
-self.assertTrue(err[-1]["ok"])
-
-class TestFailClean(TmpCase):
-"""A failing stage stops the run: it is recorded 'failed', every LATER stage
-'skipped', exit 5, and the summary names the failed stage. Deleting the
-fail-stop would let a later stage run on broken input."""
-
-def test_failure_stops_and_marks_skipped(self):
-code, out, err = run(["run",
-"--stage", "emit:source:%s" % EMIT,
-"--stage", "boom:transform:%s" % BOOM, # fails
-"--stage", "count:fold:%s" % COUNT, # must be skipped
-"--ledger", self.ledger, "--trace", "T2"])
-self.assertEqual(code, 5)
-led = read_ledger(self.ledger)
-by_slug = {r["slug"]: r for r in led if r.get("kind") == "stage"}
-self.assertEqual(by_slug["boom"]["verdict"], "failed")
-self.assertEqual(by_slug["count"]["verdict"], "skipped")
-# summary names the failed stage
-summ = err[-1]
-self.assertFalse(summ["ok"])
-self.assertEqual(summ["failed_stage"]["slug"], "boom")
-
-def test_missing_cmd_on_run_is_exit2(self):
-code, out, err = run(["run", "--stage", "a:source", "--ledger", self.ledger])
-self.assertEqual(code, 2)
-
-class TestReplay(TmpCase):
-def test_replay_returns_only_that_trace(self):
-run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
-"--ledger", self.ledger, "--trace", "TA"])
-run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
-"--ledger", self.ledger, "--trace", "TB"])
-code, out, _ = run(["replay", "--ledger", self.ledger, "--trace", "TA"])
-self.assertEqual(code, 0)
-self.assertTrue(out)
-self.assertTrue(all(r["trace_id"] == "TA" for r in out))
-# TB records are NOT in TA's replay
-self.assertFalse(any(r["trace_id"] == "TB" for r in out))
-
-def test_replay_unknown_trace_is_exit2(self):
-run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
-"--ledger", self.ledger, "--trace", "TA"])
-code, _, _ = run(["replay", "--ledger", self.ledger, "--trace", "NOPE"])
-self.assertEqual(code, 2)
-
-class TestStdinStages(TmpCase):
-def test_stages_from_stdin_run(self):
-stdin = "\n".join([
-json.dumps({"slug": "emit", "port_verb": "source", "cmd": cd.shlex.split(EMIT)}),
-json.dumps({"slug": "sink", "port_verb": "sink", "cmd": cd.shlex.split(SINK)}),
-])
-code, out, err = run(["run", "--stdin", "--ledger", self.ledger, "--trace", "TS"],
-stdin_text=stdin)
-self.assertEqual(code, 0)
-
-class TestVerbs(unittest.TestCase):
-def test_verbs_five_in_order(self):
-code, out, _ = run(["verbs"])
-self.assertEqual(code, 0)
-self.assertEqual([r["port_verb"] for r in out],
-["source", "transform", "filter", "fold", "sink"])
-
-if __name__ == "__main__":
-unittest.main()
-
-Take the whole folder →
-MIT
-Python 3, standard library only
-
----
-
-# Conflict — a Loop MMT gift
-https://loopmmt.com/gifts/conflict/
-[coverage: optional · branch: gifts]
-
-A Broken Merge Can't Land filter ← all gifts
-
-Conflict
-
-A merge that goes wrong leaves <<<<<<<, =======, >>>>>>> markers wedged into a file; once committed, that file no longer parses — it isn't 'a merge in progress,' it's broken source that landed, and it hides until something tries to read it. Conflict is the one-command gate: wire it into a pre-commit hook or CI and a file carrying the marker triad simply cannot land. The clever part is the TRIAD RULE — ======= alone is a legal line (a Markdown rule, a comment banner), so conflict fires only on all three markers together, line-start only, and never cries wolf on a legal ======= or a marker mid-line.
-
-The honest edge
-
-This is a check, not an immunity — it protects you only when it is RUN, so wire it into a hook or CI rather than trusting a human to remember. And it detects the standard git marker triad; a tool that uses different markers needs a different pattern. Visibility, not immunity.
-
-Run it
-
-python3 conflict.py --help
-test_conflict.py (18 checks / 7 tests, mutation-bitten, triad-rule + line-start guards + throwaway-repo end-to-end)
-Python standard library only, read-only, deterministic
-
-The code — every file that ships
-
-conflict.py 172 lines on GitHub →
-#!/usr/bin/env python3
-"""conflict — refuse to commit a file that no longer parses.
-
-A merge that goes wrong leaves `<<<<<<<`, `=======`, `>>>>>>>` markers wedged
-into a file. Once committed, that file no longer parses — it isn't "a merge in
-progress," it's broken source that landed. Worse, it hides: the failure surfaces
-only when something tries to read the file, and if that read happens in a quiet
-place, it can sit on your main branch for days while everything downstream of it
-silently degrades.
-
-`conflict` is the one-command gate that catches it. It scans a git tree for the
-merge-marker triad and exits non-zero if any file carries an unresolved merge, so
-you can wire it into a pre-commit hook or CI and a broken file simply cannot land.
-
-WHY IT'S HONEST
-
-- **The triad, never the lone middle.** `=======` on its own is a legal line — a
-Markdown horizontal rule, a Python separator comment, an ASCII banner. It is a
-conflict marker ONLY in the company of `<<<<<<<` and `>>>>>>>` in the same
-file. `conflict` fires on the *triad within one file*, never on a bare
-`=======`. A lint that cries wolf on a legal line gets disabled, and a disabled
-lint is worse than none.
-
-- **Decidable from bytes.** A conflict marker on a branch needs no judgment, no
-review, no discussion — it is arithmetic. `conflict` reports the finding as an
-exit code, not a paragraph: exit codes don't decay, don't need finding, and
-cost nothing to re-run.
-
-- **It is read-only.** It reads blobs out of git (or off disk) and compares. It
-writes nothing and fixes nothing.
-
-THE HONEST EDGE
-
-This is a check, not an immunity — it protects you only when it is RUN. Wire it
-into a hook or CI so "run it" isn't something a human has to remember. And it
-detects the standard git marker triad; a tool that uses different markers needs a
-different pattern. Visibility, not immunity.
-
-USAGE
-python3 conflict.py # scan the working tree (tracked files)
-python3 conflict.py --ref main # scan any committed tree by ref
-python3 conflict.py --ignore _snapshots/ --ignore vendor/
-# skip path substrings (repeatable)
-
-EXIT 0 = clean · 3 = unresolved merge found (the alarm) · 2 = error/usage
-
-MIT licensed. Python standard library only. Read-only. Deterministic.
-"""
-from __future__ import annotations
-
-import subprocess
-import sys
-
-# The three markers git leaves on a conflicted merge. `=======` is only a marker
-# in the company of the other two — see the triad rule in main().
-MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
-
-def git_files(ref: str | None) -> list[str]:
-"""List tracked files at `ref` (committed tree) or in the working tree."""
-if ref:
-out = subprocess.run(
-["git", "ls-tree", "-r", "--name-only", ref],
-capture_output=True, text=True,
-).stdout
-else:
-out = subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout
-return out.split()
-
-def read_blob(f: str, ref: str | None) -> bytes:
-"""Read a file's bytes at `ref` or from the working tree."""
-if ref:
-return subprocess.run(["git", "show", f"{ref}:{f}"], capture_output=True).stdout
-with open(f, "rb") as fh:
-return fh.read()
-
-def marker_lines(text: str) -> dict[str, list[int]]:
-"""Map each marker to the 1-based line numbers where a line STARTS with it."""
-lines = text.split("\n")
-return {m: [i + 1 for i, ln in enumerate(lines) if ln.startswith(m)] for m in MARKERS}
-
-def has_conflict(text: str) -> bool:
-"""True iff `text` contains the full marker TRIAD (not a lone `=======`)."""
-found = marker_lines(text)
-return all(found[m] for m in MARKERS)
-
-def is_ignored(path: str, ignore: tuple[str,...]) -> bool:
-"""True iff `path` contains any ignore substring (skip it)."""
-return any(ig in path for ig in ignore)
-
-def scan(ref: str | None = None, ignore: tuple[str,...] = ()) -> list[tuple[str, dict]]:
-"""Return [(path, marker_lines)] for every tracked file carrying the triad."""
-hits: list[tuple[str, dict]] = []
-for f in git_files(ref):
-if is_ignored(f, ignore):
-continue
-try:
-raw = read_blob(f, ref)
-except (OSError, FileNotFoundError):
-continue
-try:
-text = raw.decode("utf-8")
-except UnicodeDecodeError:
-continue # a binary blob has no markers to read
-if has_conflict(text):
-hits.append((f, marker_lines(text)))
-return hits
-
-def _parse_args(argv: list[str]) -> tuple[str | None, tuple[str,...]]:
-ref: str | None = None
-ignore: list[str] = []
-i = 0
-while i < len(argv):
-a = argv[i]
-if a == "--ref":
-if i + 1 >= len(argv):
-raise ValueError("--ref needs a git ref")
-ref = argv[i + 1]
-i += 2
-elif a == "--ignore":
-if i + 1 >= len(argv):
-raise ValueError("--ignore needs a path substring")
-ignore.append(argv[i + 1])
-i += 2
-elif a in ("-h", "--help"):
-raise ValueError("__help__")
-else:
-raise ValueError(f"unknown argument: {a}")
-return ref, tuple(ignore)
-
-def main(argv: list[str]) -> int:
-try:
-ref, ignore = _parse_args(argv)
-except ValueError as exc:
-if str(exc) == "__help__":
-sys.stdout.write(__doc__)
-return 2
-sys.stderr.write(f"conflict: {exc}\n")
-return 2
-
-hits = scan(ref, ignore)
-where = f"`{ref}`" if ref else "the working tree"
-
-if not hits:
-sys.stdout.write(f"conflict: clean — no unresolved merge in {where}.\n")
-return 0
-
-sys.stderr.write(
-f"conflict: {len(hits)} file(s) in {where} carry an UNRESOLVED MERGE.\n"
-)
-for f, found in hits:
-ln = found["<<<<<<< "][0]
-sys.stderr.write(
-f" {f}:{ln} <<<<<<< / ======= / >>>>>>> "
-f"({len(found['<<<<<<< '])} conflict block(s))\n"
-)
-sys.stderr.write(
-"\nA conflict marker on a branch is not a merge in progress — it is a "
-"FILE THAT NO LONGER PARSES, landed. Resolve it. Do not commit over it.\n"
-)
-return 3
-
-if __name__ == "__main__":
-raise SystemExit(main(sys.argv[1:]))
-
-test_conflict.py 181 lines on GitHub →
-#!/usr/bin/env python3
-"""test_conflict.py — the certifying properties of the conflict gift.
-
-Run: python3 test_conflict.py (exit 0 = all pass, 1 = a failure)
-
-The load-bearing property is the TRIAD RULE: a lone `=======` (a legal line) must
-NOT fire, while the full marker triad must. Each test is MUTATION-BITTEN — it is
-here because a plausible mutation of conflict.py makes it fail loud. The core is
-pure (marker_lines / has_conflict / is_ignored), so it's tested directly; the
-git-facing shell is exercised in a throwaway repo.
-"""
-import os
-import subprocess
-import sys
-
-import conflict as c
-
-_FAILURES: list[str] = []
-_PASSES = 0
-
-def check(cond: bool, msg: str) -> None:
-global _PASSES
-if cond:
-_PASSES += 1
-else:
-_FAILURES.append(msg)
-
-CONFLICTED = """\
-line before
-<<<<<<< HEAD
-ours
-=======
-theirs
->>>>>>> origin/main
-line after
-"""
-
-# a lone `=======` in legal, innocent company — MUST NOT fire
-INNOCENT_RULE = """\
-Section One
-=======
-Section Two
-
-Some prose under a Markdown setext rule.
-"""
-
-INNOCENT_BANNER = """\
-# ============================================================
-# a decorative comment banner, not a conflict
-# ============================================================
-def f(): pass
-"""
-
-# --- 1. the triad fires; a lone middle does not (the core property) ----------
-def test_triad_rule():
-check(c.has_conflict(CONFLICTED), "the full marker triad must be detected")
-check(not c.has_conflict(INNOCENT_RULE), "a lone ======= (Markdown rule) must NOT fire")
-check(not c.has_conflict(INNOCENT_BANNER), "a ==== banner must NOT fire")
-# a triad that is missing one leg must NOT fire
-missing_close = CONFLICTED.replace(">>>>>>> origin/main\n", "")
-check(not c.has_conflict(missing_close), "two-of-three markers must NOT fire (needs the triad)")
-
-# --- 2. golden: marker_lines reports the exact line numbers ------------------
-def test_marker_lines_golden():
-found = c.marker_lines(CONFLICTED)
-check(found["<<<<<<< "] == [2], f"open marker line wrong: {found['<<<<<<< ']}")
-check(found["======="] == [4], f"middle marker line wrong: {found['=======']}")
-check(found[">>>>>>> "] == [6], f"close marker line wrong: {found['>>>>>>> ']}")
-# the three exact line-number asserts above ARE the golden: they pin the
-# detected positions, not merely the count.
-
-# --- 3. only a line that STARTS with a marker counts ------------------------
-def test_startswith_only():
-# a single marker mid-line (e.g. inside a string) is not a line-start conflict
-embedded = 'x = "<<<<<<< not a real marker"\n'
-check(not c.has_conflict(embedded), "a marker mid-line must not count as a conflict")
-# the discriminating case: ALL THREE markers mid-line. Under startswith this
-# is clean (no line STARTS with a marker); a naive `m in ln` would flag it.
-triad_midline = "a <<<<<<< b\nc ======= d\ne >>>>>>> f\n"
-check(
-not c.has_conflict(triad_midline),
-"three markers mid-line must NOT fire (startswith, not substring)",
-)
-
-# --- 4. is_ignored honors substrings ----------------------------------------
-def test_is_ignored():
-check(c.is_ignored("a/_snapshots/x.txt", ("_snapshots/",)), "ignore substring should match")
-check(not c.is_ignored("a/src/x.txt", ("_snapshots/",)), "non-matching path must not be ignored")
-check(not c.is_ignored("anything", ()), "empty ignore never ignores")
-
-# --- 5. arg parse: --ref, --ignore (repeatable), unknown ---------------------
-def test_parse_args():
-ref, ig = c._parse_args(["--ref", "main", "--ignore", "a/", "--ignore", "b/"])
-check(ref == "main", f"--ref not parsed: {ref}")
-check(ig == ("a/", "b/"), f"--ignore not repeatable: {ig}")
-raised = False
-try:
-c._parse_args(["--bogus"])
-except ValueError:
-raised = True
-check(raised, "unknown arg must raise")
-
-# --- 6. END-TO-END against a throwaway repo ---------------------------------
-def _run_git(cwd, *args):
-subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
-
-def test_end_to_end():
-import tempfile
-with tempfile.TemporaryDirectory() as repo:
-_run_git(repo, "init", "-q")
-_run_git(repo, "config", "user.email", "t@t")
-_run_git(repo, "config", "user.name", "t")
-# one clean file, one conflicted file
-with open(os.path.join(repo, "clean.py"), "w") as fh:
-fh.write("def ok(): pass\n")
-with open(os.path.join(repo, "broken.py"), "w") as fh:
-fh.write(CONFLICTED)
-_run_git(repo, "add", "-A")
-_run_git(repo, "commit", "-qm", "with a conflict")
-
-cwd0 = os.getcwd()
-os.chdir(repo)
-try:
-hits = c.scan(ref=None)
-finally:
-os.chdir(cwd0)
-paths = sorted(f for f, _ in hits)
-check(paths == ["broken.py"], f"end-to-end should flag only broken.py: {paths}")
-
-# --- 7. ignore actually excludes a conflicted file --------------------------
-def test_end_to_end_ignore():
-import tempfile
-with tempfile.TemporaryDirectory() as repo:
-_run_git(repo, "init", "-q")
-_run_git(repo, "config", "user.email", "t@t")
-_run_git(repo, "config", "user.name", "t")
-os.makedirs(os.path.join(repo, "_snapshots"))
-with open(os.path.join(repo, "_snapshots", "past.txt"), "w") as fh:
-fh.write(CONFLICTED) # a deliberate record of a past conflict
-_run_git(repo, "add", "-A")
-_run_git(repo, "commit", "-qm", "snapshot")
-cwd0 = os.getcwd()
-os.chdir(repo)
-try:
-with_ignore = c.scan(ref=None, ignore=("_snapshots/",))
-without = c.scan(ref=None)
-finally:
-os.chdir(cwd0)
-check(with_ignore == [], f"ignored path should not be flagged: {with_ignore}")
-check(len(without) == 1, f"without ignore the file should flag: {without}")
-
-def run() -> int:
-tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-for t in tests:
-try:
-t()
-except Exception as exc:
-_FAILURES.append(f"{t.__name__} raised: {exc!r}")
-total = _PASSES + len(_FAILURES)
-if _FAILURES:
-print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
-for f in _FAILURES:
-print(f" ✗ {f}")
-return 1
-print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
-return 0
-
-if __name__ == "__main__":
-sys.exit(run())
-
-Take the whole folder →
-MIT
-Python standard library only, read-only, deterministic
 
 ---

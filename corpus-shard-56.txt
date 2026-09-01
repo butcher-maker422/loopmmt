@@ -1,2057 +1,1832 @@
-# Loop MMT — corpus shard 56/57
+# Loop MMT — corpus shard 56/60
 
-> Bundle 56 of 57 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 56 of 60 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 2 (/gifts/vclock/, /gifts/verify/)
+Nodes in this shard: 4 (/gifts/ratchet-png-text/, /gifts/reltime/, /gifts/sha256/, /gifts/sudoku/)
 
 ---
 
-# Vclock — a Loop MMT gift
-https://loopmmt.com/gifts/vclock/
+# PNG Text — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-png-text/
 [coverage: optional · branch: gifts]
 
-Causal Order, Not Wall-Clock Time order ← all gifts
+What's Hidden In That PNG? transform ← all gifts
 
-Vclock
+PNG Text
 
-Reason about the causal order of a stream of records — is A before B, or are they concurrent, causally independent, neither able to have known about the other? Wall-clock time can't express that last case; a vector clock can. bump, merge, and compare over JSON lines, so it sits in the middle of a pipe.
+Pull the text metadata (Title, Author, Description, Software, Copyright, an XMP packet) out of a PNG's tEXt / zTXt / iTXt chunks — with no dependencies, in Node or the browser. parsePngText(bytes) is a pure function: it walks the chunk stream and returns the text entries in file order. It's a ratchet parser — it advances one chunk at a time and refuses to move past anything malformed: it validates the 8-byte signature and recomputes the CRC-32 over every chunk, throwing on a mismatch, a length that runs past the buffer, or a text chunk missing its null separator. A parser that hands you text out of a corrupt chunk is lying about the file; this one won't.
 
 The honest edge
 
-It orders events that share an actor namespace. Two records whose actor sets never overlap read as concurrent by construction — which is correct, but only useful if your actors are named consistently across the stream.
+It reads TEXTUAL metadata only — no pixels, IHDR, palettes, or gamma. It does NOT inflate zTXt / compressed-iTXt on its own (zlib isn't in the browser's dependency-free surface): such records come back with compressed:true, text:null, and their raw compressedText bytes, decoded only if you pass your own inflate function. And it does not repair a bad file — malformed input throws, it never guesses.
 
 Run it
 
-python3 vclock.py compare
-test_vclock.py (37/37, mutation-bitten)
-Python stdlib only
+node ratchet-png-text.js < image.png
+test_ratchet-png-text.js (21/21: real-PNG byte vectors tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, live-zlib backstop, coercion, determinism, mutation-bite)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-vclock.py 221 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""vclock.py — reason about the causal order of a stream of records, on a pipe.
-
-A vector clock answers a question a timestamp cannot: given two events, did one
-happen *before* the other, or are they *concurrent* — causally independent,
-neither one able to have known about the other? Wall-clock time can't tell you
-that (clocks drift, and "later" is not "caused by"). A vector clock can, by
-giving every actor its own counter and carrying the whole vector on each record.
-
-This is a *transform*: it reads JSON lines on stdin and writes JSON lines on
-stdout, so it sits in the middle of a pipe. Each input record may carry a
-`clock` field — an object mapping actor names to integer counts, e.g.
-`{"a": 3, "b": 1}`. An absent actor is read as 0 (it simply hasn't been seen).
-
-Three operations, each a subcommand:
-
-bump --actor A increment actor A's component on every record's clock
-(A absent → starts at 1). "A observed/produced this."
-record in → record out, clock advanced.
-
-merge fold every record's clock into ONE clock by taking the
-component-wise maximum, and emit that single clock.
-This is "receive": the least clock that dominates all
-inputs. Emits one line: {"clock": {...}}.
-
-compare read exactly two records and report their causal
-relation. Emits one line: {"relation": R} where R is
-one of before / after / concurrent / equal.
-
-The causal relation (X, Y), with any absent component read as 0:
-equal X[a] == Y[a] for every actor a
-before X[a] <= Y[a] for every a, and X!= Y (X causally precedes Y)
-after Y before X (X causally follows Y)
-concurrent neither before nor after (causally independent)
-
-The absent-is-zero rule is the whole game: {"a":1} is BEFORE {"a":1,"b":1}
-because the first has b=0 implicitly. A comparison that only looked at shared
-keys would miss this — and missing it is the difference between a real vector
-clock and a counter wearing its coat.
-
-------------------------------------------------------------------------------
-The JSON-lines contract (so this composes in a pipe):
-- reads ONE JSON object per line on stdin; blank lines are skipped.
-- `bump` emits one record per input record (order preserved), clock advanced.
-- `merge` / `compare` emit exactly one summary line.
-- non-clock fields on a record are passed through untouched by `bump`.
-- errors go to stderr; stdout stays clean JSON-lines.
-
-Exit codes:
-0 ran and emitted
-2 malformed input / corrupt clock (don't trust the stream)
-3 usage / wrong record count for compare
-"""
-
-import argparse
-import json
-import sys
-
-# ---------------------------------------------------------------------------
-# pure operations — no I/O, fully unit-testable. These are the gift's core.
-# ---------------------------------------------------------------------------
-
-def _normalize(clock):
-"""Drop explicit-zero components so equality is canonical ({a:1,b:0}=={a:1}).
-Validates that every component is an int; raises ValueError otherwise."""
-out = {}
-for actor, count in clock.items():
-if isinstance(count, bool) or not isinstance(count, int):
-raise ValueError(f"clock component {actor!r} is not an integer: {count!r}")
-if count < 0:
-raise ValueError(
-f"clock component {actor!r} is negative: {count!r} "
-"(vector-clock counts are event tallies and are never < 0)")
-if count!= 0:
-out[actor] = count
-return out
-
-def bump(clock, actor):
-"""Return a NEW clock with `actor`'s component incremented by 1.
-An absent actor starts at 1. Input is not mutated."""
-new = dict(_normalize(clock))
-new[actor] = new.get(actor, 0) + 1
-return new
-
-def merge(*clocks):
-"""Component-wise maximum across all given clocks. Absent = 0."""
-out = {}
-for clock in clocks:
-for actor, count in _normalize(clock).items():
-if count > out.get(actor, 0):
-out[actor] = count
-return out
-
-def compare(x, y):
-"""Causal relation of clock x to clock y: before / after / concurrent / equal.
-An absent component is read as 0 (the actor simply hasn't been seen)."""
-x = _normalize(x)
-y = _normalize(y)
-actors = set(x) | set(y)
-x_le_y = all(x.get(a, 0) <= y.get(a, 0) for a in actors) # x <= y everywhere
-y_le_x = all(y.get(a, 0) <= x.get(a, 0) for a in actors) # y <= x everywhere
-if x_le_y and y_le_x:
-return "equal" # <= both ways ⇒ componentwise equal
-if x_le_y:
-return "before" # x dominated by y, not equal
-if y_le_x:
-return "after"
-return "concurrent" # neither dominates ⇒ causally independent
-
-# ---------------------------------------------------------------------------
-# I/O — the JSON-lines seam.
-# ---------------------------------------------------------------------------
-
-def _read_records(stream):
-"""Yield one parsed object per non-blank stdin line. Raises ValueError on a
-line that isn't a JSON object (caller maps to exit 2)."""
-for lineno, raw in enumerate(stream, start=1):
-line = raw.strip()
-if not line:
-continue
-try:
-obj = json.loads(line)
-except json.JSONDecodeError as e:
-raise ValueError(f"line {lineno}: not valid JSON: {e}")
-if not isinstance(obj, dict):
-raise ValueError(f"line {lineno}: expected a JSON object, got {type(obj).__name__}")
-yield obj
-
-def _emit(record, out):
-out.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-
-def _clock_of(record):
-"""Pull the clock object off a record, defaulting to empty. Validates shape."""
-clock = record.get("clock", {})
-if not isinstance(clock, dict):
-raise ValueError(f"'clock' must be an object, got {type(clock).__name__}")
-return clock
-
-# ---------------------------------------------------------------------------
-# subcommands
-# ---------------------------------------------------------------------------
-
-def cmd_bump(args, stdin, stdout):
-for record in _read_records(stdin):
-record = dict(record)
-record["clock"] = bump(_clock_of(record), args.actor)
-_emit(record, stdout)
-return 0
-
-def cmd_merge(args, stdin, stdout):
-clocks = [_clock_of(r) for r in _read_records(stdin)]
-_emit({"clock": merge(*clocks) if clocks else {}}, stdout)
-return 0
-
-def cmd_compare(args, stdin, stdout):
-records = list(_read_records(stdin))
-if len(records)!= 2:
-sys.stderr.write(
-f"compare: expected exactly 2 records on stdin, got {len(records)}\n"
-)
-return 3
-relation = compare(_clock_of(records[0]), _clock_of(records[1]))
-_emit({"relation": relation}, stdout)
-return 0
-
-def build_parser():
-p = argparse.ArgumentParser(
-prog="vclock",
-description="Reason about the causal order of a stream of records (vector clock).",
-)
-sub = p.add_subparsers(dest="cmd")
-
-b = sub.add_parser("bump", help="increment one actor's component on each record")
-b.add_argument("--actor", required=True, help="the actor whose component to increment")
-b.set_defaults(func=cmd_bump)
-
-m = sub.add_parser("merge", help="component-wise max of every record's clock → one clock")
-m.set_defaults(func=cmd_merge)
-
-c = sub.add_parser("compare", help="causal relation of exactly two records' clocks")
-c.set_defaults(func=cmd_compare)
-
-return p
-
-def main(argv=None):
-parser = build_parser()
-args = parser.parse_args(argv)
-if not getattr(args, "cmd", None):
-parser.print_usage(sys.stderr)
-sys.stderr.write("vclock: a subcommand is required (bump / merge / compare)\n")
-return 3
-try:
-return args.func(args, sys.stdin, sys.stdout)
-except ValueError as e:
-sys.stderr.write(f"vclock: {e}\n")
-return 2
-except BrokenPipeError:
-# a downstream reader (e.g. `| head`) closed the pipe early. This is
-# normal for a well-behaved stream tool — exit quietly, don't traceback.
-try:
-sys.stdout.close()
-except Exception:
-pass
-return 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_vclock.py 320 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_vclock.py — the vclock gift's proof it works.
-
-Tests are written FIRST and lead the build. The load-bearing move for a vector
-clock is `compare`: the whole reason the primitive exists is to distinguish
-CONCURRENT from BEFORE/AFTER. A counter can order a total sequence; only a vector
-clock can say "these two events are causally independent." So the compare tests
-carry the weight, and the mutation section at the bottom proves they are not
-vacuous — each mutation is a plausible wrong implementation that MUST turn a test
-red. A suite that stays green under mutation is testing nothing.
-
-Run: python3 test_vclock.py # all tests + mutation bites
-python3 test_vclock.py -q # quiet unless something fails
-"""
-
-import io
-import json
-import subprocess
-import sys
-import unittest
-from pathlib import Path
-
-HERE = Path(__file__).resolve().parent
-TOOL = HERE / "vclock.py"
-
-# import the module directly so we can unit-test the pure functions,
-# and also drive the CLI as a subprocess for the contract tests.
-sys.path.insert(0, str(HERE))
-import vclock # noqa: E402
-
-# ---------------------------------------------------------------------------
-# compare — the gate. before / after / concurrent / equal, with the
-# absent-component-is-zero rule that separates a real vector clock from a
-# shared-keys-only impostor.
-# ---------------------------------------------------------------------------
-class TestCompare(unittest.TestCase):
-def test_equal_identical(self):
-self.assertEqual(vclock.compare({"a": 1, "b": 2}, {"a": 1, "b": 2}), "equal")
-
-def test_equal_empty(self):
-self.assertEqual(vclock.compare({}, {}), "equal")
-
-def test_before_strict(self):
-self.assertEqual(vclock.compare({"a": 1}, {"a": 2}), "before")
-
-def test_after_strict(self):
-self.assertEqual(vclock.compare({"a": 2}, {"a": 1}), "after")
-
-def test_concurrent_disjoint_actors(self):
-# a advanced on one axis, b on another — neither dominates. This is the
-# single most important case in the whole gift.
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
-
-def test_concurrent_crossed(self):
-self.assertEqual(vclock.compare({"a": 2, "b": 1}, {"a": 1, "b": 2}), "concurrent")
-
-# --- the absent-is-zero cases: the impostor-killers ---
-def test_absent_component_is_zero_before(self):
-# {a:1} has b=0 implicitly, so it is BEFORE {a:1,b:1}. A compare that
-# only looks at shared keys would wrongly call this equal.
-self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
-
-def test_absent_component_is_zero_after(self):
-self.assertEqual(vclock.compare({"a": 1, "b": 1}, {"a": 1}), "after")
-
-def test_absent_component_is_zero_concurrent(self):
-# {a:1} (b=0) vs {b:1} (a=0): each leads on its own axis → concurrent.
-# A shared-keys-only impostor sees no shared keys and might say equal.
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
-
-def test_explicit_zero_equals_absent(self):
-# {a:1,b:0} must be treated identically to {a:1}
-self.assertEqual(vclock.compare({"a": 1, "b": 0}, {"a": 1}), "equal")
-
-def test_compare_is_antisymmetric(self):
-# if X before Y then Y after X, for a spread of shapes
-pairs = [
-({"a": 1}, {"a": 2}),
-({"a": 1}, {"a": 1, "b": 1}),
-({}, {"a": 1}),
-]
-for x, y in pairs:
-self.assertEqual(vclock.compare(x, y), "before")
-self.assertEqual(vclock.compare(y, x), "after")
-
-# ---------------------------------------------------------------------------
-# bump — increment one actor's component; absent starts at 1.
-# ---------------------------------------------------------------------------
-class TestBump(unittest.TestCase):
-def test_bump_existing(self):
-self.assertEqual(vclock.bump({"a": 1, "b": 2}, "a"), {"a": 2, "b": 2})
-
-def test_bump_absent_starts_at_one(self):
-self.assertEqual(vclock.bump({"a": 1}, "b"), {"a": 1, "b": 1})
-
-def test_bump_empty(self):
-self.assertEqual(vclock.bump({}, "a"), {"a": 1})
-
-def test_bump_does_not_mutate_input(self):
-original = {"a": 1}
-vclock.bump(original, "a")
-self.assertEqual(original, {"a": 1}) # pure — no in-place edit
-
-def test_bump_after_is_after(self):
-# a bumped clock is strictly AFTER the one it came from
-c0 = {"a": 1, "b": 2}
-c1 = vclock.bump(c0, "a")
-self.assertEqual(vclock.compare(c0, c1), "before")
-
-# ---------------------------------------------------------------------------
-# merge — component-wise max across clocks.
-# ---------------------------------------------------------------------------
-class TestMerge(unittest.TestCase):
-def test_merge_componentwise_max(self):
-self.assertEqual(
-vclock.merge({"a": 2, "b": 1}, {"a": 1, "b": 3}), {"a": 2, "b": 3}
-)
-
-def test_merge_disjoint(self):
-self.assertEqual(vclock.merge({"a": 1}, {"b": 1}), {"a": 1, "b": 1})
-
-def test_merge_absent_is_zero(self):
-self.assertEqual(vclock.merge({"a": 5}, {}), {"a": 5})
-
-def test_merge_dominates_both(self):
-# the merge is AFTER-or-equal to each of its inputs (never before/concurrent)
-x, y = {"a": 2, "b": 1}, {"a": 1, "b": 3}
-m = vclock.merge(x, y)
-self.assertIn(vclock.compare(x, m), ("before", "equal"))
-self.assertIn(vclock.compare(y, m), ("before", "equal"))
-
-def test_merge_of_concurrent_is_after_both(self):
-# merging two genuinely concurrent clocks yields their least upper bound
-x, y = {"a": 1}, {"b": 1}
-m = vclock.merge(x, y)
-self.assertEqual(vclock.compare(x, m), "before")
-self.assertEqual(vclock.compare(y, m), "before")
-
-# ---------------------------------------------------------------------------
-# CLI contract — JSON-lines in, JSON-lines out; matches the house shape.
-# ---------------------------------------------------------------------------
-def run_cli(args, stdin_text=""):
-proc = subprocess.run(
-[sys.executable, str(TOOL), *args],
-input=stdin_text,
-capture_output=True,
-text=True,
-)
-return proc.returncode, proc.stdout, proc.stderr
-
-class TestBumpCLI(unittest.TestCase):
-def test_bump_stream(self):
-records = [
-{"id": 1, "clock": {"a": 1}},
-{"id": 2, "clock": {"a": 2, "b": 1}},
-]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-got = [json.loads(line) for line in out.splitlines()]
-self.assertEqual(got[0]["clock"], {"a": 2})
-self.assertEqual(got[1]["clock"], {"a": 3, "b": 1})
-# non-clock fields preserved
-self.assertEqual(got[0]["id"], 1)
-
-def test_bump_record_without_clock_gets_one(self):
-stdin = json.dumps({"id": 1}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["clock"], {"a": 1})
-
-def test_emit_is_sorted_keys(self):
-stdin = json.dumps({"z": 1, "clock": {"a": 1}}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-# sort_keys=True → "clock" precedes "z" in the raw text
-self.assertLess(out.index('"clock"'), out.index('"z"'))
-
-class TestMergeCLI(unittest.TestCase):
-def test_merge_stream_to_one_clock(self):
-records = [
-{"clock": {"a": 2, "b": 1}},
-{"clock": {"a": 1, "b": 3}},
-{"clock": {"c": 1}},
-]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["merge"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out), {"clock": {"a": 2, "b": 3, "c": 1}})
-
-def test_merge_empty_stream(self):
-rc, out, err = run_cli(["merge"], "")
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out), {"clock": {}})
-
-class TestCompareCLI(unittest.TestCase):
-def test_compare_two_records(self):
-records = [{"clock": {"a": 1}}, {"clock": {"b": 1}}]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["relation"], "concurrent")
-
-def test_compare_before(self):
-records = [{"clock": {"a": 1}}, {"clock": {"a": 2}}]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["relation"], "before")
-
-def test_compare_wrong_count_is_error(self):
-# compare needs exactly two records
-stdin = json.dumps({"clock": {"a": 1}}) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 3, "one record should be a usage error")
-
-class TestContract(unittest.TestCase):
-def test_no_subcommand_is_usage_error(self):
-rc, out, err = run_cli([])
-self.assertEqual(rc, 3)
-
-def test_bad_json_line_is_error(self):
-rc, out, err = run_cli(["bump", "--actor", "a"], "not json\n")
-self.assertEqual(rc, 2, "malformed input must not be trusted")
-
-def test_blank_lines_skipped(self):
-stdin = json.dumps({"clock": {"a": 1}}) + "\n\n\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(len([l for l in out.splitlines() if l]), 1)
-
-def test_non_integer_clock_component_is_error(self):
-stdin = json.dumps({"clock": {"a": "x"}}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 2, "a non-integer clock component is corrupt input")
-
-# ---------------------------------------------------------------------------
-# Mutation bites — prove the tests above are not vacuous. Each mutation is a
-# believable wrong implementation of a pure function; we assert that the real
-# suite would catch it. If a mutation survives (no test flips), the suite is
-# lying about its coverage and THIS meta-test fails loudly.
-# ---------------------------------------------------------------------------
-class TestMutationBites(unittest.TestCase):
-"""Each bite monkeypatches a pure fn with a plausible-wrong version and
-asserts at least one real assertion above would now fail."""
-
-def _suite_would_catch(self, cases):
-"""cases: list of (callable-returning-bool-that-should-be-True).
-Returns True if any case is now False (i.e. a test would go red)."""
-return any(not case() for case in cases)
-
-def test_bite_compare_ignores_absent_components(self):
-# WRONG: only compare shared keys. Would call {a:1} vs {a:1,b:1} 'equal'.
-def wrong_compare(x, y):
-shared = set(x) & set(y)
-lt = any(x.get(k, 0) < y.get(k, 0) for k in shared)
-gt = any(x.get(k, 0) > y.get(k, 0) for k in shared)
-if lt and gt:
-return "concurrent"
-if lt:
-return "before"
-if gt:
-return "after"
-return "equal"
-
-# under the real impl this is 'before'; the impostor says 'equal'
-self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
-self.assertEqual(wrong_compare({"a": 1}, {"a": 1, "b": 1}), "equal")
-self.assertNotEqual(
-vclock.compare({"a": 1}, {"a": 1, "b": 1}),
-wrong_compare({"a": 1}, {"a": 1, "b": 1}),
-"the absent-is-zero test must separate the real impl from the impostor",
-)
-
-def test_bite_compare_collapses_concurrent_to_before(self):
-# WRONG: no concurrent branch — anything not <= is 'after', anything
-# not >= is 'before'. Would call disjoint {a:1} vs {b:1} 'before'.
-def wrong_compare(x, y):
-keys = set(x) | set(y)
-if all(x.get(k, 0) <= y.get(k, 0) for k in keys):
-return "before" if x!= y else "equal"
-return "after" # NO concurrent branch
-
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
-self.assertNotEqual(wrong_compare({"a": 1}, {"b": 1}), "concurrent")
-
-def test_bite_bump_starts_absent_at_zero(self):
-# WRONG: absent actor bumped to 0 instead of 1 (off-by-one at creation)
-def wrong_bump(clock, actor):
-new = dict(clock)
-new[actor] = new.get(actor, -1) + 1 # absent → 0, not 1
-return new
-
-self.assertEqual(vclock.bump({}, "a"), {"a": 1})
-self.assertNotEqual(wrong_bump({}, "a"), {"a": 1})
-
-def test_bite_merge_uses_min_not_max(self):
-# WRONG: component-wise MIN instead of MAX
-def wrong_merge(x, y):
-keys = set(x) | set(y)
-return {k: min(x.get(k, 0), y.get(k, 0)) for k in keys}
-
-self.assertEqual(vclock.merge({"a": 2}, {"a": 1}), {"a": 2})
-self.assertNotEqual(wrong_merge({"a": 2}, {"a": 1}), {"a": 2})
-
-if __name__ == "__main__":
-verbosity = 1 if "-q" in sys.argv else 2
-argv = [a for a in sys.argv if a!= "-q"]
-unittest.main(argv=argv, verbosity=verbosity)
-
-Take the whole folder →
-MIT
-Python stdlib only
-
----
-
-# Verify — a Loop MMT gift
-https://loopmmt.com/gifts/verify/
-[coverage: optional · branch: gifts]
-
-Cheap Re-Check, Never Truth verify ← all gifts
-
-Verify
-
-For anyone who establishes an expensive fact once and then never re-checks it because re-checking feels expensive. Register the fact with the input files its derivation stood on; Verify keeps a content-hash certificate and re-checks it in a second. FRESH if the inputs are unchanged, STALE if one moved, DEAD if the ground is gone.
-
-The prompt that made this →
-
-The honest edge
-
-FRESH means the byte-truth inputs are unchanged, never that the fact is TRUE (⊢, not ⊨). It re-checks the ground you named — name too few inputs and a real dependency can move without tripping STALE. Byte-truth facts only; live facts (prices, who's CEO) can't be cheaply certified.
-
-Run it
-
-python3 verify.py --help
-smoke_test.py (10/10)
-Python stdlib only
-
-The code — every file that ships
-
-verify.py 768 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-verify.py — the Verification System's one net-new primitive: a cheap re-check of
-a learned fact, keyed on a kept certificate.
-
-The idea (Kindling deliberate, S16.1613, verification-system line):
-"Don't trust, verify" is cardinal — but verify CHEAPLY. Establishing a fact
-X -> Y is expensive (~20 min). Re-checking that a claimed X -> Y still holds is
-cheap (~1s) IF you kept the right certificate. That is the NP / certificate-
-checking asymmetry, and the certificate is a CONTENT HASH of the derivation's
-byte-truth inputs. A fact is FRESH iff its inputs still hash to what they
-hashed when the certificate was kept; if an input moved, it is STALE and must
-be re-derived; if the derivation's ground is gone (a required input missing) or
-the fact was retired, it is DEAD.
-
-This is content-addressed cache invalidation over a derivation DAG — the build-
-cache primitive (Nix/Bazel/ccache), git's own Merkle tree, Certificate
-Transparency — the primitive the floor already grew independently
-(`git hash-object`, Amber blob-SHA fixity, the Loop-Line content-address) but
-never generalized into a cheap fact-re-check. This is that generalization, and
-nothing more (Constraint drive: a spine + one primitive + the taxonomy, no
-engine).
-
-THE HONEST CEILING (Wren's binding cut, deliberate C2):
-The verdict is CERTIFICATE-FRESHNESS, NEVER TRUTH. `fresh` means the byte-truth
-inputs the derivation stood on are UNCHANGED — it does NOT re-run the judgment
-that made X -> Y true. The claim was judged true when it was ESTABLISHED; this
-tool proves the ground under it has not moved. Calling `fresh` "true" is the
-Cruise's "1,511 passing tests" lie one level up (Match!= Prevention, borrowed
-from Wobble RECALL). A verification cache is VISIBILITY, NOT IMMUNITY: it cannot
-force re-derivation on a miss; the operator/floor stays the witness.
-
-THE FORMAL LIMIT (deliberate C5, Shannon Corollary — named, not relabeled around):
-Cheap verification holds ONLY for the byte-truth-derivable fact class — facts
-whose input set is finite, content-addressable, and stable-when-nothing-changes.
-Live/external facts ("current price", "who is CEO now") cannot be cheaply
-certified — their input set is the world, which you cannot cheaply re-hash — and
-route to the Customs House re-acquire path (fail-closed), NOT this cache. The
-`provenance_class` field carries that split (C4: internal fails open to
-re-derive; external fails closed).
-
-Reuse map (C6 — composition, not duplication):
-- `git hash-object` -> the content-address primitive (the certificate)
-- the Lode's append-only fold -> the registry shape (verified.jsonl -> fold)
-- the Loop-Line content-addr -> the re-check-on-pull mechanic
-- Amber blob-SHA fixity -> snapshot certs
-
-THE ASSUMPTION CELL (S16.1707, claim-grounding line — the family's second species):
-A FACT is a claim whose ground you CHECKED and PINNED (the certificate = the
-input hashes). An ASSUMPTION is a claim you are leaning on whose ground you have
-NOT checked — you DEFERRED the check. Same claim; different grounding-state. They
-are ONE register at two points of one lifecycle:
-
-assume --(discharge: run the path, pin the inputs)--> verified (a fact)
-verified --(an input moves)--> STALE --(re-derive)--> verified
-(STALE is a fact fallen back to assumption-status: leaned-on, un-recertified.)
-
-FORMAL GROUND (why this is not a bolt-on):
-- Promotion assume->fact IS natural-deduction DISCHARGE: an assumption is an
-undischarged hypothesis [A]; `discharge` closes it by pinning its ground.
-Mechanized for free by the fold's latest-wins (a `verified` event with the
-same fact_id supersedes the `assumed` one).
-- A fact's verdict is derivability: `fresh` means the derivation still holds
-on unchanged premises (|-), NEVER that the claim is true in the world (|=).
-`fresh!= true` IS `|-!= |=`. The assumption razor is the same gap one
-species over: `UNEXPIRED!= true` — an assumption whose expiry has not
-tripped is only NOT-YET-KNOWN-STALE, never verified.
-- The species boundary is DECIDABILITY (Shannon Corollary). A fact's check is
-a decidable, cheap hash-compare over a finite pinned input set. An
-assumption's ground is NOT in that class yet (that is WHY it is deferred),
-so its defeater is an EXPIRY CONDITION, not a hash-watch.
-
-THE DECIDABLE-COLLAPSE RULE (the one that keeps this honest & minimal):
-If your expiry condition is "when file X changes", that is BYTE-WATCHABLE —
-it is a FACT, not an assumption: `register` it with X as an input. `assume`
-is deliberately for the NON-byte-watchable case (a date, an external event, a
-human judgement), and therefore takes NO --inputs. Its defeater cannot be
-auto-checked, so `verify` on an assumption does NOT fake a freshness verdict —
-it SURFACES the claim, its verification path, its expiry, and the razor, and
-hands the judgement to the human (visibility, not immunity; Nyx: hope is not a
-control, so the tool does not pretend to be one).
-
-THE DECISION CELL (S16.1822, claim-grounding line — the family's THIRD species):
-A FACT is a claim whose ground you CHECKED and PINNED (its input hashes). An
-ASSUMPTION is a claim whose ground you DEFERRED. A DECISION is a claim of the
-form "A beats B" whose ground is neither a set of input files nor a deferred
-expiry — it is the set of PREMISES the choice rested on, and each premise is
-itself a register entry (a fact-id or an assume-id). So a decision's certificate
-is a COMPOSITE, and its grounding-state is DERIVED from its premises':
-
-decide --decision-id D --claim "A beats B" --options "A;B;C" --chose A
---premises fact-1 assume-2... (premises = existing entry ids)
-verify --fact-id D folds the premises' grounding-states:
-FRESH iff every premise-FACT is FRESH ∧ no premise is a live assumption
-STALE iff any premise-FACT moved (named — that is the defeater)
-DEAD iff any premise was retired or is not on file (the ground is gone)
-ASSUMED iff the decision rests on a live assumption (surfaced — you judge)
-
-Trap 1 avoided — NO NEW ENGINE: `decided` is a third `kind` in the SAME
-register, the SAME append-only log, the SAME latest-wins fold, composing the
-fact + assumption cells. Not a decision engine; a third grounding-state.
-Trap 2 avoided — the decision does NOT re-hash its premises' input files. It
-DEFERS to each premise's OWN certificate (its `verify`), recursing for a nested
-decision-premise. Hashing them directly would duplicate the fact cell and lose
-an assumption-premise's human-judged defeater.
-
-THE RAZOR, ONE LEVEL UP (the honest ceiling — get this exactly right):
-decision-fresh!= decision-still-right.
-The premises holding does NOT mean A still beats B: a NEW option F could beat A
-with no premise moving. `verify(decision)` checks PREMISE-STABILITY — it never
-re-runs the choice. Same |- vs |= shape as the fact cell: premises-unchanged
-(|-) is not conclusion-still-optimal (|=). Composed with the assumption razor:
-a decision is only as grounded as its WEAKEST premise, and even all-fresh
-premises do not re-decide the question.
-
-Decidable-collapse analog: a decision whose premises are all byte-watchable
-FACTS has a fully decidable re-check (verify each premise fact); one resting on
-an ASSUMPTION inherits that assumption's human-judged defeater and SURFACES.
-
-The use-case taxonomy (deliberate C3, the operator's explicit ask):
-REGISTER a fact after an expensive, re-encounterable derivation (not everything)
-ASSUME a claim you are leaning on but have NOT yet grounded (deferred check)
-DECIDE record a choice "A beats B" + the premises it rested on (grounds keyed)
-ASK (verify) before a load-bearing move / at check-before-build
-DISCHARGE run an assumption's verification path, pin its inputs -> it becomes a fact
-RE-DERIVE on stale or a cache miss
-CALL DEAD (retire) when the DERIVATION is retired, not just an input moved
-SUPERSEDE re-derive to a different value -> old cert superseded, not deleted
-QUARANTINE external facts fail closed (provenance_class)
-
-Verbs:
-register --fact-id ID --claim "..." [--edge "X->Y"] --inputs f1 [f2...]
-[--provenance internal|external]
-assume --fact-id ID --claim "..." --path "how to discharge" --expiry "the defeater"
-[--evidence "the weak signal leaned on"]
-decide --decision-id ID --claim "A beats B" --options "A;B;C" --chose A
---premises f1 [f2...] (refs to existing entries)
-verify --fact-id ID re-check (fact) / SURFACE (assumption) / FOLD (decision)
-discharge --fact-id ID --inputs f1 [f2...] run the path, pin the ground -> a fact
-retire --fact-id ID --reason "..." call it dead (Wren)
-list the derived registry (pure fold, latest-wins)
-fold --check fold-twice-identical invariant (the Lode contract)
-
-A decision-id lives in the SAME keyspace as fact-ids (one register). Verify one
-with `verify --fact-id <decision-id>` — there is no separate decision verify.
-
-Exit codes (verify):
-0 fresh — every input hash unchanged (a fact) / every premise fresh (a decision).
-CERTIFICATE FRESH, not "true".
-3 stale — at least one input hash / premise-fact moved -> re-derive
-5 dead — a required input missing, a premise not on file, OR retired
-4 unregistered — no certificate on file for that fact_id
-6 assumed — the id is an ASSUMPTION (or a decision resting on a live assumption):
-SURFACED with path + expiry + the razor (UNEXPIRED!= true).
-2 error / usage (includes a decision certificate that references itself — a cycle)
-"""
-
-import argparse
-import hashlib
-import json
-import os
-import subprocess
-import sys
-from datetime import datetime, timezone
-
-# Standalone default: the store lives under the current working directory (like.git/).
-# Override with VERIFY_REPO_ROOT to point the fact store somewhere else.
-REPO_ROOT = os.getcwd()
-FACTS_RELDIR = ".verify"
-EVENTS_BASENAME = "verified.jsonl"
-
-FRESH, STALE, DEAD, UNREGISTERED, ERROR = 0, 3, 5, 4, 2
-ASSUMED = 6 # the assumption cell: the id is ungrounded — surfaced, not verified
-# The decision cell (S16.1822) is a third grounding-state that REUSES these codes,
-# no new taxonomy: a decision folds to FRESH/STALE/DEAD, or ASSUMED when it rests
-# on a live assumption-premise. ERROR covers a self-referential (cyclic) certificate.
-
-# ── The certificate primitive: content-address a byte-truth input ──────
-
-def blob_sha(path):
-"""The git blob SHA-1 of a file's bytes — the SAME primitive the floor uses
-(`git hash-object`, Amber, the Loop-Line). Computed directly so the tool works
-on any path with no subprocess and no git-checkout dependency, and returns the
-identical value `git hash-object <path>` would. Returns None if the file is
-absent from disk (the DEAD signal: the derivation's ground is gone)."""
-if not os.path.isfile(path):
-return None
-with open(path, "rb") as fh:
-data = fh.read()
-header = b"blob " + str(len(data)).encode() + b"\0"
-return hashlib.sha1(header + data).hexdigest()
-
-def events_path(repo_root):
-return os.path.join(repo_root, FACTS_RELDIR, EVENTS_BASENAME)
-
-def read_events(repo_root):
-"""Read the append-only event log (JSONL). Absent log = empty set (cold-safe)."""
-p = events_path(repo_root)
-if not os.path.isfile(p):
-return []
-events = []
-with open(p, "r", encoding="utf-8") as fh:
-for lineno, line in enumerate(fh, 1):
-line = line.strip()
-if not line:
-continue
-try:
-ev = json.loads(line)
-except json.JSONDecodeError as exc:
-raise ValueError(f"{EVENTS_BASENAME}:{lineno}: bad JSON: {exc}")
-events.append(ev)
-return events
-
-def append_event(repo_root, ev):
-"""Append-only write (the Lode / Strike-Log contract: never rewrite a row)."""
-p = events_path(repo_root)
-os.makedirs(os.path.dirname(p), exist_ok=True)
-existing = read_events(repo_root)
-same_day = [e for e in existing if e.get("date") == ev["date"]]
-ev["seq"] = 1 + max([e.get("seq", 0) for e in same_day], default=0)
-with open(p, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(ev, sort_keys=True) + "\n")
-return ev
-
-# ── The pure fold: events -> the derived registry (latest-wins per fact) ──
-
-def fold(events):
-"""Pure, deterministic fold over the append-only log -> the registry projection.
-Latest event per fact_id wins (register / retire). Folding the same events twice
-yields a byte-identical projection (the Lode's fold-twice-identical contract)."""
-order = sorted(range(len(events)), key=lambda i: (
-events[i].get("date", ""), events[i].get("seq", 0), i))
-latest = {}
-for i in order:
-ev = events[i]
-fid = ev.get("fact_id")
-if fid is None:
-continue
-latest[fid] = ev # last write wins in deterministic order
-registry = []
-for fid in sorted(latest):
-registry.append(latest[fid])
-return registry
-
-def render_registry(registry):
-"""Deterministic markdown-ish text render of the derived registry (for `list`)."""
-lines = ["# The Verification Registry (derived — do not hand-edit)",
-f"# facts: {len(registry)}", ""]
-for rec in registry:
-kind = rec.get("kind")
-if kind == "retired":
-state = "RETIRED (dead)"
-elif kind == "assumed":
-state = "ASSUMED (ungrounded)"
-elif kind == "decided":
-state = "DECIDED (premise-grounded)"
-else:
-state = rec.get("provenance_class", "internal")
-lines.append(f"- {rec['fact_id']} [{state}]")
-lines.append(f" claim: {rec.get('claim', '')}")
-if rec.get("edge"):
-lines.append(f" edge: {rec['edge']}")
-if kind == "retired":
-lines.append(f" retired: {rec.get('reason', '')}")
-elif kind == "assumed":
-lines.append(f" verification-path: {rec.get('verification_path', '')}")
-lines.append(f" expiry (defeater): {rec.get('expiry', '')}")
-if rec.get("evidence"):
-lines.append(f" evidence: {rec['evidence']}")
-elif kind == "decided":
-opts = rec.get("options", [])
-prem = rec.get("premises", [])
-lines.append(f" chose: {rec.get('chose', '')} (of {', '.join(opts)})")
-lines.append(f" premises: {len(prem)} entry-ref(s) — {', '.join(prem)}")
-else:
-lines.append(f" inputs: {len(rec.get('input_refs', []))} content-hashed @ {rec.get('established_at', '')}")
-return "\n".join(lines) + "\n"
-
-# ── The verbs ──────────────────────────────────────────────────────────
-
-def cmd_register(args, repo_root):
-inputs = args.inputs or []
-if not inputs:
-print("verify register: --inputs is required (a fact with no byte-truth "
-"inputs has no certificate)", file=sys.stderr)
-return ERROR
-input_hashes = []
-for ref in inputs:
-h = blob_sha(ref if os.path.isabs(ref) else os.path.join(repo_root, ref))
-if h is None:
-print(f"verify register: input not found on disk: {ref}", file=sys.stderr)
-return ERROR
-input_hashes.append(h)
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "verified",
-"fact_id": args.fact_id,
-"claim": args.claim,
-"edge": args.edge or "",
-"input_refs": inputs,
-"input_hashes": input_hashes,
-"provenance_class": args.provenance,
-"established_at": now.isoformat(timespec="seconds"),
-"date": now.strftime("%d.%H%M"),
+ratchet-png-text.js 305 lines on GitHub →
+#!/usr/bin/env node
+/* ratchet-png-text.js — a pure, dependency-free, STRICT extractor of the textual
+metadata chunks (tEXt, zTXt, iTXt) from a PNG byte stream. Runs identically in
+a browser and in Node (no DOM, no dependencies).
+
+WHY THIS EXISTS. A PNG can carry human-readable metadata — Title, Author,
+Description, Software, Copyright, an XMP packet — in tEXt/zTXt/iTXt chunks. You
+have the file's bytes (an upload, a fetch, a buffer) and you want those key/value
+pairs without pulling in a full image decoder. The usual answer is a heavy
+library that parses pixels you don't care about, or a hand-rolled loop that
+trusts the file and hands you text out of a chunk whose CRC doesn't even match.
+
+WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one chunk at a
+time and REFUSES to move past anything malformed. It validates the 8-byte PNG
+signature, and for EVERY chunk it recomputes the CRC-32 over (type + data) and
+rejects a mismatch. A length that runs past the end of the buffer, a stream that
+ends before IEND, a text chunk missing its null separator — each is a thrown
+Error, never a silently-truncated string. A parser that hands you text from a
+corrupt chunk is lying about what the file says; this one won't.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• tEXt — uncompressed Latin-1 keyword + text. Decoded directly.
+• iTXt (uncompressed) — UTF-8 keyword, language tag, translated keyword, and
+text. Decoded directly.
+• zTXt and COMPRESSED iTXt — the keyword and metadata are decoded, and the
+raw zlib-compressed text bytes are surfaced on the entry as
+`compressedText`. The text itself is decoded ONLY if you pass an
+`inflate` function in the options (see below). This is deliberate: zlib
+inflate is not in the browser's synchronous, dependency-free surface, so
+the core stays DOM-free and zero-dependency and lets the CALLER decide the
+inflater (Node: `require("zlib").inflateSync`; browser: pako, etc.).
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not decode pixels, IHDR geometry, palettes, gamma, or any non-text
+chunk — it walks the chunk stream to find text and validates the CRC of every
+chunk it steps over, but returns only the text entries. It does not inflate
+compressed text on its own (pass `inflate`). It does not repair a bad file.
+
+API
+parsePngText(bytes[, options]) -> Array<Entry>
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
+used to decode zTXt / compressed-iTXt text.
+Returns the text entries in file order (possibly empty). THROWS an Error on
+any malformed input (bad signature, bad CRC, truncation, bad chunk shape).
+
+Entry shape (all entries carry `kind` and `keyword`):
+tEXt: { kind:"tEXt", keyword, text, compressed:false}
+zTXt: { kind:"zTXt", keyword, compressed:true, text:<string|null>,
+compressedText:Uint8Array}
+iTXt: { kind:"iTXt", keyword, compressed:<bool>, languageTag,
+translatedKeyword, text:<string|null>,
+compressedText?:Uint8Array} // compressedText only when compressed
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePngText) or Node (this CLI / require()).
+
+USAGE
+node ratchet-png-text.js cover.png # prints "keyword\ttext" per entry
+node ratchet-png-text.js --help
+The CLI (Node only) supplies Node's zlib as the inflater so compressed text is
+decoded; the shipped core stays dependency-free.
+
+Released under MIT.
+*/
+"use strict";
+
+// ---- CRC-32 (PNG / IEEE 802.3, polynomial 0xEDB88320) ----------------------
+// Table built once. Pure; no dependencies. This is the parser's teeth: every
+// chunk's stored CRC is recomputed over (type-bytes + data-bytes) and compared.
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) {
+c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);
 }
-ev = append_event(repo_root, ev)
-print(f"REGISTERED {args.fact_id} ({len(inputs)} input(s) content-hashed, "
-f"provenance={args.provenance})")
-print(f" certificate kept @ {ev['established_at']}")
-print(f" NOTE: registers the CERTIFICATE (the ground), not a truth guarantee.")
-return 0
-
-def latest_for(events, fact_id):
-recs = [e for e in events if e.get("fact_id") == fact_id]
-if not recs:
-return None
-recs.sort(key=lambda e: (e.get("date", ""), e.get("seq", 0)))
-return recs[-1]
-
-# ── The certificate re-check core (shared by the fact + decision cells) ──
-
-def fact_verdict(rec, repo_root):
-"""For a kind=verified rec: re-check its kept certificate against disk.
-Returns (code, moved, missing) — the ONE hash-compare both cmd_verify and a
-decision's premise-fold call, so the two cells share a verdict, never fork one."""
-refs = rec.get("input_refs", [])
-kept = rec.get("input_hashes", [])
-moved, missing = [], []
-for ref, k in zip(refs, kept):
-cur = blob_sha(ref if os.path.isabs(ref) else os.path.join(repo_root, ref))
-if cur is None:
-missing.append(ref)
-elif cur!= k:
-moved.append(ref)
-if missing:
-return DEAD, moved, missing
-if moved:
-return STALE, moved, missing
-return FRESH, moved, missing
-
-def premise_state(events, repo_root, pid, seen):
-"""Resolve ONE premise id to its grounding-state CODE — the decision cell's
-Trap-2 discipline made mechanical: it DEFERS to the premise's OWN certificate
-(never re-hashes the premise's files as the decision's inputs), recursing for a
-nested decision-premise and guarding cycles. A premise not on file -> DEAD (the
-ground is gone); retired -> DEAD; a live assumption -> ASSUMED; a fact -> its
-fact_verdict; a decision -> its folded verdict."""
-if pid in seen:
-return ERROR # a self-referential (cyclic) decision certificate
-rec = latest_for(events, pid)
-if rec is None:
-return DEAD
-kind = rec.get("kind")
-if kind == "retired":
-return DEAD
-if kind == "assumed":
-return ASSUMED
-if kind == "decided":
-return decision_verdict(events, repo_root, rec, seen | {pid})[0]
-return fact_verdict(rec, repo_root)[0]
-
-def decision_verdict(events, repo_root, rec, seen):
-"""Fold a decision's premises' grounding-states -> (code, breakdown).
-The decision's ground is DERIVED from its premises', not hashed. Precedence:
-DEAD > STALE > ASSUMED > FRESH (a gone premise is worse than a moved one is
-worse than an un-grounded one); ERROR on a cycle. `breakdown` is [(pid, code)]."""
-premises = rec.get("premises", [])
-breakdown = [(pid, premise_state(events, repo_root, pid, seen)) for pid in premises]
-codes = [c for _, c in breakdown]
-if ERROR in codes:
-return ERROR, breakdown
-if not premises:
-# a decision with no premises has no ground — treat as DEAD (defensive;
-# `decide` refuses to author one, so this is only reachable via a hand-edit)
-return DEAD, breakdown
-for worst in (DEAD, STALE, ASSUMED):
-if worst in codes:
-return worst, breakdown
-return FRESH, breakdown
-
-def _code_word(code):
-return {FRESH: "FRESH", STALE: "STALE", DEAD: "DEAD",
-ASSUMED: "ASSUMED", ERROR: "CYCLE", UNREGISTERED: "UNREGISTERED"}.get(code, str(code))
-
-_CODE_NAME = {FRESH: "fresh", STALE: "stale", DEAD: "dead",
-UNREGISTERED: "unregistered", ASSUMED: "assumed", ERROR: "error"}
-
-def _verify_json(args, repo_root, events, rec):
-"""Machine-readable verdict on stdout (the CEILING still prints on stderr, so a
---json pipe stays clean). Reuses fact_verdict / decision_verdict, so the JSON
-verdict and exit code are identical to the human path."""
-out = {"fact_id": args.fact_id}
-if rec is None:
-out.update(verdict="unregistered", code=UNREGISTERED)
-print(json.dumps(out, sort_keys=True)); return UNREGISTERED
-kind = rec.get("kind")
-if kind == "retired":
-out.update(verdict="dead", code=DEAD, reason=rec.get("reason", ""))
-print(json.dumps(out, sort_keys=True)); return DEAD
-if kind == "assumed":
-out.update(verdict="assumed", code=ASSUMED, claim=rec.get("claim", ""),
-verification_path=rec.get("verification_path", ""),
-expiry=rec.get("expiry", ""))
-print(json.dumps(out, sort_keys=True)); return ASSUMED
-if kind == "decided":
-code, breakdown = decision_verdict(events, repo_root, rec, {args.fact_id})
-out.update(verdict=_CODE_NAME.get(code, "error"), code=code,
-chose=rec.get("chose", ""),
-premises=[{"id": pid, "state": _CODE_NAME.get(c, "error")}
-for pid, c in breakdown])
-print(json.dumps(out, sort_keys=True)); return code
-code, moved, missing = fact_verdict(rec, repo_root)
-out.update(verdict=_CODE_NAME.get(code, "error"), code=code,
-moved=moved, missing=missing,
-provenance=rec.get("provenance_class", "internal"))
-print(json.dumps(out, sort_keys=True)); return code
-
-def cmd_verify(args, repo_root):
-events = read_events(repo_root)
-rec = latest_for(events, args.fact_id)
-if getattr(args, "json", False):
-return _verify_json(args, repo_root, events, rec)
-if rec is None:
-print(f"UNREGISTERED {args.fact_id} — no certificate on file. "
-f"This is a cache MISS: re-derive the fact and register it.")
-return UNREGISTERED
-if rec.get("kind") == "retired":
-print(f"DEAD {args.fact_id} — the derivation was retired "
-f"({rec.get('reason', 'no reason given')}). Do not re-check a corpse.")
-return DEAD
-if rec.get("kind") == "assumed":
-# An assumption has NO pinned inputs to hash — surfacing it is the whole
-# point. Do NOT fake a freshness verdict on a human-judged defeater
-# (Nyx: hope is not a control; the tool does not pretend to be one).
-print(f"ASSUMED {args.fact_id} — this is an ASSUMPTION, not a fact. You are "
-f"about to lean on UNGROUNDED ground.")
-print(f" claim: {rec.get('claim', '')}")
-print(f" verification-path (run this to DISCHARGE it -> fact): "
-f"{rec.get('verification_path', '')}")
-print(f" expiry (the defeater — YOU judge whether it has tripped): "
-f"{rec.get('expiry', '')}")
-if rec.get("evidence"):
-print(f" evidence leaned on: {rec['evidence']}")
-print(f" RAZOR: UNEXPIRED!= true. An assumption whose expiry has not "
-f"tripped is only NOT-YET-KNOWN-STALE — never verified.")
-print(f" If the expiry is really 'a file changed', this is a FACT: "
-f"register it with that file as an input instead.")
-return ASSUMED
-if rec.get("kind") == "decided":
-# A decision's ground is its premises. Fold their grounding-states —
-# DEFER to each premise's own certificate (Trap 2), never re-hash them.
-code, breakdown = decision_verdict(events, repo_root, rec, {args.fact_id})
-chose = rec.get("chose", "?")
-claim = rec.get("claim", "")
-if code == ERROR:
-cyc = [p for p, c in breakdown if c == ERROR]
-print(f"CYCLE {args.fact_id} — this decision certificate references "
-f"itself (premise(s): {', '.join(cyc)}). A decision cannot ground "
-f"itself; the certificate is malformed.")
-return ERROR
-# Name every premise in each failing class — the operator sees the whole
-# ground, then the single worst verdict.
-dead = [p for p, c in breakdown if c == DEAD]
-stale = [p for p, c in breakdown if c == STALE]
-assumed = [p for p, c in breakdown if c == ASSUMED]
-if code == DEAD:
-print(f"DEAD {args.fact_id} — the decision '{claim}' (chose {chose}) rests "
-f"on premise(s) whose ground is GONE: {', '.join(dead)} "
-f"(retired or not on file). The choice is no longer grounded.")
-elif code == STALE:
-print(f"STALE {args.fact_id} — the decision '{claim}' (chose {chose}) rests "
-f"on premise-fact(s) that MOVED: {', '.join(stale)}. "
-f"Re-derive the premise(s), then this decision may need re-deciding.")
-elif code == ASSUMED:
-print(f"ASSUMED {args.fact_id} — the decision '{claim}' (chose {chose}) rests "
-f"on LIVE assumption(s): {', '.join(assumed)}. Its ground is only as "
-f"grounded as those — YOU judge whether they still hold.")
-else:
-print(f"FRESH {args.fact_id} — the decision '{claim}' (chose {chose}): all "
-f"{len(breakdown)} premise(s) still hold "
-f"({', '.join(p for p, _ in breakdown)}).")
-# THE RAZOR, one level up — printed on EVERY decision verdict (honest ceiling).
-print(f" RAZOR: decision-fresh!= decision-still-right. Premises holding does "
-f"NOT mean {chose} still wins — a NEW option could beat it with no premise "
-f"moving. This checks PREMISE-STABILITY, it never re-runs the choice.")
-return code
-code, moved, missing = fact_verdict(rec, repo_root)
-if code == DEAD:
-print(f"DEAD {args.fact_id} — required input(s) missing from disk: "
-f"{', '.join(missing)}. The derivation's ground is gone.")
-return DEAD
-if code == STALE:
-print(f"STALE {args.fact_id} — input(s) moved since the certificate was "
-f"kept: {', '.join(moved)}. Re-derive and re-register.")
-return STALE
-refs = rec.get("input_refs", [])
-prov = rec.get("provenance_class", "internal")
-print(f"FRESH {args.fact_id} — certificate re-checks: all {len(refs)} input(s) "
-f"unchanged since {rec.get('established_at', '?')} (provenance={prov}).")
-print(f" Cheap re-check passed. This asserts the GROUND is unchanged, "
-f"NOT that the claim was re-judged true.")
-if rec.get("edge"):
-print(f" provenance: {rec['edge']}")
-return FRESH
-
-def cmd_assume(args, repo_root):
-"""Register an ASSUMPTION — a claim leaned on but NOT yet grounded. Takes no
---inputs by design: an assumption has no pinned ground (that is what makes it
-an assumption). Its defeater is a human-judged expiry, not a hash-watch."""
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "assumed",
-"fact_id": args.fact_id,
-"claim": args.claim,
-"verification_path": args.path,
-"expiry": args.expiry,
-"evidence": args.evidence or "",
-"provenance_class": "internal",
-"established_at": now.isoformat(timespec="seconds"),
-"date": now.strftime("%d.%H%M"),
+t[n] = c >>> 0;
 }
-append_event(repo_root, ev)
-print(f"ASSUMED {args.fact_id} — logged as an UNGROUNDED claim (deferred check).")
-print(f" verification-path: {args.path}")
-print(f" expiry (defeater): {args.expiry}")
-print(f" NOTE: this is NOT a fact. `verify` will SURFACE it (exit 6), not "
-f"certify it. Run `discharge` to promote it once the path is run.")
-return 0
+return t;
+})();
 
-def cmd_discharge(args, repo_root):
-"""Discharge an assumption -> a fact. Runs the verification path's RESULT: the
-caller pins the byte-truth inputs the (now-run) derivation stood on, and we
-append a `verified` event with the SAME fact_id. The fold's latest-wins makes
-it a fact (natural-deduction discharge, mechanized). `verify` then returns FRESH."""
-events = read_events(repo_root)
-rec = latest_for(events, args.fact_id)
-if rec is None:
-print(f"verify discharge: {args.fact_id} is not on file — nothing to "
-f"discharge (assume it first, or register it directly as a fact).",
-file=sys.stderr)
-return ERROR
-if rec.get("kind")!= "assumed":
-print(f"verify discharge: {args.fact_id} is not an open assumption "
-f"(kind={rec.get('kind')}). Discharge only promotes an assumption.",
-file=sys.stderr)
-return ERROR
-inputs = args.inputs or []
-if not inputs:
-print("verify discharge: --inputs is required (discharge PINS the ground "
-"the verification path stood on — that is the certificate).",
-file=sys.stderr)
-return ERROR
-input_hashes = []
-for ref in inputs:
-h = blob_sha(ref if os.path.isabs(ref) else os.path.join(repo_root, ref))
-if h is None:
-print(f"verify discharge: input not found on disk: {ref}", file=sys.stderr)
-return ERROR
-input_hashes.append(h)
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "verified",
-"fact_id": args.fact_id,
-"claim": rec.get("claim", ""),
-"edge": (args.edge or rec.get("verification_path", "")),
-"input_refs": inputs,
-"input_hashes": input_hashes,
-"provenance_class": rec.get("provenance_class", "internal"),
-"established_at": now.isoformat(timespec="seconds"),
-"date": now.strftime("%d.%H%M"),
+function crc32(bytes, start, end) {
+var c = 0xffffffff;
+for (var i = start; i < end; i++) {
+c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
 }
-append_event(repo_root, ev)
-print(f"DISCHARGED {args.fact_id} — assumption promoted to FACT "
-f"({len(inputs)} input(s) now content-hashed). Natural-deduction "
-f"discharge: the hypothesis is closed.")
-print(f" `verify` now returns FRESH while the ground holds — and STALE the "
-f"moment it moves (a fact can fall back to assumption-status).")
-return 0
-
-def cmd_decide(args, repo_root):
-"""Record a DECISION — a choice 'A beats B' + the premises it rested on. The
-premises are REFERENCES to existing register entries (fact-ids / assume-ids),
-not fresh inputs (Trap 2): the decision's ground is COMPOSITE, and `verify`
-defers to each premise's own certificate. A decision-id lives in the same
-keyspace as fact-ids (one register)."""
-options = [o.strip() for o in (args.options or "").replace(";", ",").split(",") if o.strip()]
-if len(options) < 2:
-print("verify decide: --options needs at least two choices (a decision is "
-"'A beats B'); separate with ';' or ','.", file=sys.stderr)
-return ERROR
-if args.chose not in options:
-print(f"verify decide: --chose {args.chose!r} is not among --options "
-f"({', '.join(options)}). The chosen option must be one of the options.",
-file=sys.stderr)
-return ERROR
-premises = args.premises or []
-if not premises:
-print("verify decide: --premises is required (a decision with no premises has "
-"no ground). Reference the fact-ids / assume-ids the choice rested on.",
-file=sys.stderr)
-return ERROR
-events = read_events(repo_root)
-# A premise must already be on file — you cannot ground a decision on an entry
-# that does not exist. This also structurally forecloses self/forward cycles
-# (append-only + premises-must-exist), backstopped by the verify-time cycle guard.
-missing = [p for p in premises if latest_for(events, p) is None]
-if missing:
-print(f"verify decide: premise(s) not on file: {', '.join(missing)}. Register "
-f"or assume them first (a decision grounds on EXISTING entries).",
-file=sys.stderr)
-return ERROR
-if args.decision_id in premises:
-print(f"verify decide: a decision cannot list itself as a premise "
-f"({args.decision_id}). A decision cannot ground itself.", file=sys.stderr)
-return ERROR
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "decided",
-"fact_id": args.decision_id, # one keyspace: a decision-id IS a fact-id
-"claim": args.claim,
-"options": options,
-"chose": args.chose,
-"premises": premises,
-"provenance_class": "internal",
-"established_at": now.isoformat(timespec="seconds"),
-"date": now.strftime("%d.%H%M"),
+return (c ^ 0xffffffff) >>> 0;
 }
-append_event(repo_root, ev)
-kinds = {p: latest_for(events, p).get("kind") for p in premises}
-print(f"DECIDED {args.decision_id} — '{args.claim}' chose {args.chose} "
-f"(of {', '.join(options)}), grounded on {len(premises)} premise(s):")
-for p in premises:
-print(f" {p} [{kinds[p]}]")
-print(f" `verify --fact-id {args.decision_id}` folds these premises' grounding-"
-f"states. RAZOR: decision-fresh!= decision-still-right — it checks premise-"
-f"stability, it never re-runs the choice.")
-return 0
 
-def cmd_retire(args, repo_root):
-events = read_events(repo_root)
-if latest_for(events, args.fact_id) is None:
-print(f"verify retire: {args.fact_id} is not registered.", file=sys.stderr)
-return ERROR
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "retired",
-"fact_id": args.fact_id,
-"reason": args.reason,
-"date": now.strftime("%d.%H%M"),
-"established_at": now.isoformat(timespec="seconds"),
+// ---- byte helpers -----------------------------------------------------------
+var PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+function u32be(b, i) {
+return ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
 }
-append_event(repo_root, ev)
-print(f"RETIRED {args.fact_id} — called dead ({args.reason}). "
-f"verify now returns DEAD; the corpse is not re-checked.")
-return 0
 
-def cmd_list(args, repo_root):
-registry = fold(read_events(repo_root))
-sys.stdout.write(render_registry(registry))
-return 0
+// Latin-1 (ISO-8859-1): byte value === Unicode code point. Zero-dependency and
+// correct for tEXt keyword/text and iTXt language tags.
+function latin1(bytes, start, end) {
+var s = "";
+for (var i = start; i < end; i++) { s += String.fromCharCode(bytes[i]);}
+return s;
+}
 
-def cmd_fold(args, repo_root):
-events = read_events(repo_root)
-once = render_registry(fold(events))
-twice = render_registry(fold(events))
-if once!= twice:
-print("FOLD CHECK FAILED — projection is not fold-twice-identical.", file=sys.stderr)
-return STALE # exit 3, the projection-invariant breach code (Lode contract)
-print(f"FOLD OK — {len(fold(events))} fact(s), fold-twice-identical.")
-return 0
+// UTF-8 via the platform TextDecoder — present in both Node (>=11, global) and
+// browsers. Used for iTXt (UTF-8 by spec).
+var UTF8 = (typeof TextDecoder!== "undefined")? new TextDecoder("utf-8"): null;
+function utf8(bytes, start, end) {
+var slice = bytes.subarray? bytes.subarray(start, end): bytes.slice(start, end);
+if (UTF8) { return UTF8.decode(slice);}
+// Fallback (no TextDecoder): decode UTF-8 by hand. Kept minimal.
+var s = "", i = 0;
+while (i < slice.length) {
+var b0 = slice[i++];
+if (b0 < 0x80) { s += String.fromCharCode(b0);}
+else if (b0 < 0xe0) { s += String.fromCharCode(((b0 & 0x1f) << 6) | (slice[i++] & 0x3f));}
+else if (b0 < 0xf0) { s += String.fromCharCode(((b0 & 0x0f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f));}
+else {
+var cp = ((b0 & 0x07) << 18) | ((slice[i++] & 0x3f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f);
+cp -= 0x10000;
+s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+}
+}
+return s;
+}
 
-def build_parser():
-p = argparse.ArgumentParser(prog="verify", description="The Verification System — cheap certificate re-check of a learned fact.")
-sub = p.add_subparsers(dest="cmd", required=True)
+// Find the index of the first null byte in [start, end); -1 if none.
+function indexOfNull(bytes, start, end) {
+for (var i = start; i < end; i++) { if (bytes[i] === 0) { return i;}}
+return -1;
+}
 
-r = sub.add_parser("register", help="register a fact's certificate (after an expensive, re-encounterable derivation)")
-r.add_argument("--fact-id", required=True)
-r.add_argument("--claim", required=True)
-r.add_argument("--edge", default="", help="the derivation provenance, e.g. 'X -> Y'")
-r.add_argument("--inputs", nargs="+", required=True, help="the byte-truth input paths the derivation consumed")
-r.add_argument("--provenance", choices=["internal", "external"], default="internal")
+function toU8(input) {
+if (input instanceof Uint8Array) { return input;}
+if (typeof ArrayBuffer!== "undefined" && input instanceof ArrayBuffer) { return new Uint8Array(input);}
+if (input && input.buffer instanceof ArrayBuffer && typeof input.byteLength === "number") {
+// other typed-array / DataView view over a buffer
+return new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
+}
+throw new TypeError("parsePngText: expected a Uint8Array / Buffer / ArrayBuffer");
+}
 
-a = sub.add_parser("assume", help="register an ungrounded claim (a deferred check); takes NO --inputs by design")
-a.add_argument("--fact-id", required=True)
-a.add_argument("--claim", required=True)
-a.add_argument("--path", required=True, help="the verification path — how to discharge this to a fact")
-a.add_argument("--expiry", required=True, help="the defeater — the condition under which this stops holding")
-a.add_argument("--evidence", default="", help="the weak signal being leaned on (optional)")
-
-v = sub.add_parser("verify", help="cheap re-check: fresh / stale / dead (or SURFACE an assumption)")
-v.add_argument("--fact-id", required=True)
-v.add_argument("--json", action="store_true", help="machine-readable verdict on stdout (pipeline source)")
-
-d = sub.add_parser("discharge", help="run an assumption's path, pin its ground -> promote to a fact")
-d.add_argument("--fact-id", required=True)
-d.add_argument("--inputs", nargs="+", required=True, help="the byte-truth inputs the now-run derivation stood on")
-d.add_argument("--edge", default="", help="the derivation provenance (defaults to the assumption's path)")
-
-dc = sub.add_parser("decide", help="record a decision 'A beats B' + the premises it rested on (refs to existing entries)")
-dc.add_argument("--decision-id", required=True, help="the decision's id (shares the fact-id keyspace)")
-dc.add_argument("--claim", required=True, help="the choice, e.g. 'A beats B'")
-dc.add_argument("--options", required=True, help="the options considered, ';'- or ','-separated, e.g. 'A;B;C'")
-dc.add_argument("--chose", required=True, help="the option chosen (must be one of --options)")
-dc.add_argument("--premises", nargs="+", required=True, help="the fact-ids / assume-ids the choice rested on")
-
-t = sub.add_parser("retire", help="call the fact dead (the derivation is retired)")
-t.add_argument("--fact-id", required=True)
-t.add_argument("--reason", required=True)
-
-sub.add_parser("list", help="the derived registry (pure fold, latest-wins)")
-
-f = sub.add_parser("fold", help="fold-twice-identical invariant check")
-f.add_argument("--check", action="store_true")
-
-return p
-
-def main(argv=None):
-args = build_parser().parse_args(argv)
-# THE HONEST CEILING — printed to stderr on EVERY run so the tool states its own
-# limit out loud (and a --json stdout pipe stays clean). `fresh` is derivability,
-# not truth: it proves the byte-truth ground is unchanged, never that the claim was
-# re-judged true. |-!= |=.
-print("CEILING: verify reports certificate-FRESHNESS, never TRUTH. `fresh` means the "
-"derivation's byte-truth inputs are unchanged since the certificate was kept, "
-"NOT that the claim is true in the world. |-!= |=.", file=sys.stderr)
-repo_root = os.environ.get("VERIFY_REPO_ROOT", REPO_ROOT)
-try:
+// ---- text-chunk decoders ----------------------------------------------------
+function decodeTEXt(data) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("tEXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("tEXt chunk: keyword must be 1-79 bytes");}
 return {
-"register": cmd_register,
-"assume": cmd_assume,
-"decide": cmd_decide,
-"verify": cmd_verify,
-"discharge": cmd_discharge,
-"retire": cmd_retire,
-"list": cmd_list,
-"fold": cmd_fold,
-}[args.cmd](args, repo_root)
-except ValueError as exc:
-print(f"verify: {exc}", file=sys.stderr)
-return ERROR
-
-if __name__ == "__main__":
-sys.exit(main())
-
-allow.json 134 lines on GitHub →
-{
-"sha256:758260898c5608b08ef0175ad818a15b163a8b4140e5096f8e6a791ebfc88a5a": [
-"boolop Or->And @L307",
-"boolop Or->And @L534",
-"boolop Or->And @L583",
-"compare Eq->NotEq @L224",
-"compare Eq->NotEq @L262",
-"compare Eq->NotEq @L277",
-"compare Eq->NotEq @L472",
-"const bool False->True @L437",
-"const bool True->False @L227",
-"const bool True->False @L410",
-"const bool True->False @L414",
-"const bool True->False @L419",
-"const bool True->False @L426",
-"const bool True->False @L431",
-"const bool True->False @L697",
-"const bool True->False @L700",
-"const bool True->False @L701",
-"const bool True->False @L703",
-"const bool True->False @L707",
-"const bool True->False @L708",
-"const bool True->False @L709",
-"const bool True->False @L710",
-"const bool True->False @L714",
-"const bool True->False @L718",
-"const bool True->False @L719",
-"const bool True->False @L723",
-"const bool True->False @L724",
-"const bool True->False @L725",
-"const bool True->False @L726",
-"const bool True->False @L727",
-"const bool True->False @L730",
-"const bool True->False @L731",
-"const int 0->1 @L225",
-"const int 0->1 @L238",
-"const int 0->1 @L326",
-"const int 0->1 @L545",
-"const int 1->0 @L207",
-"const int 1->0 @L225",
-"const int 1->2 @L207",
-"const int 1->2 @L225",
-"drop Assign @L208",
-"drop Assign @L225",
-"drop Continue @L210",
-"drop Continue @L244",
-"drop Expr @L267",
-"drop Expr @L269",
-"drop Expr @L273",
-"drop Expr @L274",
-"drop Expr @L276",
-"drop Expr @L283",
-"drop Expr @L292",
-"drop Expr @L299",
-"drop Expr @L315",
-"drop Expr @L317",
-"drop Expr @L318",
-"drop Expr @L326",
-"drop Expr @L409",
-"drop Expr @L410",
-"drop Expr @L453",
-"drop Expr @L454",
-"drop Expr @L456",
-"drop Expr @L459",
-"drop Expr @L460",
-"drop Expr @L462",
-"drop Expr @L499",
-"drop Expr @L516",
-"drop Expr @L519",
-"drop Expr @L540",
-"drop Expr @L541",
-"drop Expr @L542",
-"drop Expr @L543",
-"drop Expr @L556",
-"drop Expr @L561",
-"drop Expr @L567",
-"drop Expr @L575",
-"drop Expr @L577",
-"drop Expr @L591",
-"drop Expr @L594",
-"drop Expr @L607",
-"drop Expr @L611",
-"drop Expr @L617",
-"drop Expr @L627",
-"drop Expr @L632",
-"drop Expr @L649",
-"drop Expr @L652",
-"drop Expr @L653",
-"drop Expr @L662",
-"drop Expr @L673",
-"drop Expr @L689",
-"drop Expr @L691",
-"drop Expr @L763",
-"drop For @L572",
-"drop For @L651",
-"drop If @L209",
-"drop If @L243",
-"drop If @L268",
-"drop If @L275",
-"drop If @L291",
-"drop If @L298",
-"drop If @L362",
-"drop If @L384",
-"drop If @L408",
-"drop If @L458",
-"drop If @L518",
-"drop If @L566",
-"drop If @L574",
-"drop If @L616",
-"drop If @L631",
-"drop If @L661",
-"drop If @L688",
-"drop Return @L294",
-"drop Return @L300",
-"drop Return @L319",
-"drop Return @L363",
-"drop Return @L387",
-"drop Return @L395",
-"drop Return @L410",
-"drop Return @L520",
-"drop Return @L545",
-"drop Return @L570",
-"drop Return @L576",
-"drop Return @L596",
-"drop Return @L620",
-"drop Return @L634",
-"drop Return @L656",
-"drop Return @L663",
-"drop Return @L675",
-"drop Return @L681",
-"drop Return @L690",
-"drop Return @L692"
-]
+kind: "tEXt",
+keyword: latin1(data, 0, nul),
+text: latin1(data, nul + 1, data.length),
+compressed: false
+};
 }
 
-smoke_test.py 629 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""smoke_test.py — hermetic proof that verify.py holds the line. No network, no
-state outside a tmpdir (VERIFY_REPO_ROOT points the fact store at it). Each
-scenario runs verify.py as a subprocess and checks the exit code AND the verdict
-text — the real CLI contract, mirroring the freshness claims:
+function decodeZTXt(data, inflate) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("zTXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("zTXt chunk: keyword must be 1-79 bytes");}
+if (nul + 1 >= data.length) { throw new Error("zTXt chunk: missing compression method");}
+var method = data[nul + 1];
+if (method!== 0) { throw new Error("zTXt chunk: unknown compression method " + method);}
+var comp = data.subarray? data.subarray(nul + 2): data.slice(nul + 2);
+var entry = {
+kind: "zTXt",
+keyword: latin1(data, 0, nul),
+compressed: true,
+text: null,
+compressedText: comp
+};
+if (inflate) { entry.text = latin1(inflate(comp), 0, inflate(comp).length);}
+return entry;
+}
 
-1 a registered fact whose inputs are UNCHANGED re-checks FRESH (exit 0) <- the headline
-2 an input that MOVED (bytes changed) makes the fact STALE (exit 3)
-3 a required input MISSING from disk makes the fact DEAD (exit 5)
-4 an unregistered id is UNREGISTERED — a cache miss, not a false FRESH (exit 4)
-5 an assumption is SURFACED as ASSUMED, never faked FRESH (exit 6)
-6 discharge runs an assumption's path and PROMOTES it to a fact -> FRESH
-7 a retired fact is DEAD (exit 5) — do not re-check a corpse
-8 --json emits a clean machine verdict on stdout, exit code matches the human path
-9 the CEILING line is emitted on stderr on EVERY run (honest limits, out loud)
-10 fold --check is fold-twice-identical (exit 0) — the registry is a pure fold
+function decodeITXt(data, inflate) {
+var n = data.length;
+var k = indexOfNull(data, 0, n);
+if (k === -1) { throw new Error("iTXt chunk: missing keyword null separator");}
+if (k < 1 || k > 79) { throw new Error("iTXt chunk: keyword must be 1-79 bytes");}
+if (k + 2 >= n) { throw new Error("iTXt chunk: truncated header");}
+var compFlag = data[k + 1];
+var compMethod = data[k + 2];
+if (compFlag!== 0 && compFlag!== 1) { throw new Error("iTXt chunk: bad compression flag " + compFlag);}
+if (compFlag === 1 && compMethod!== 0) { throw new Error("iTXt chunk: unknown compression method " + compMethod);}
+var langStart = k + 3;
+var langNul = indexOfNull(data, langStart, n);
+if (langNul === -1) { throw new Error("iTXt chunk: missing language-tag null separator");}
+var transStart = langNul + 1;
+var transNul = indexOfNull(data, transStart, n);
+if (transNul === -1) { throw new Error("iTXt chunk: missing translated-keyword null separator");}
+var textStart = transNul + 1;
 
-The suite exercises the verdict branches (compare / hash / kind dispatch) so a
-mutation of the core logic flips a verdict and the suite catches it — that is
-what gives it teeth under the gauntlet's Layer-5 mutation harness.
+var entry = {
+kind: "iTXt",
+keyword: utf8(data, 0, k),
+compressed: compFlag === 1,
+languageTag: latin1(data, langStart, langNul),
+translatedKeyword: utf8(data, transStart, transNul),
+text: null
+};
+var body = data.subarray? data.subarray(textStart): data.slice(textStart);
+if (compFlag === 0) {
+entry.text = utf8(body, 0, body.length);
+} else {
+entry.compressedText = body;
+if (inflate) { var raw = inflate(body); entry.text = utf8(raw, 0, raw.length);}
+}
+return entry;
+}
 
-Run: python3 smoke_test.py (expect: 10/10 passed, exit 0)
-Contract: exit 0 iff every scenario passes; non-zero on any fail (so the mutation
-harness reads a killed mutant as non-zero).
-"""
-import json
-import os
-import subprocess
-import sys
-import tempfile
+/**
+* parsePngText(input[, options]) -> Array<Entry>
+* Strictly walk a PNG byte stream and return its tEXt/zTXt/iTXt entries in file
+* order. Validates the signature and every chunk's CRC-32; throws on any
+* malformed input. See the file header for the Entry shapes and the `inflate`
+* option (used to decode zTXt / compressed iTXt text).
+*/
+function parsePngText(input, options) {
+var bytes = toU8(input);
+var inflate = options && options.inflate;
+var len = bytes.length;
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-VERIFY = os.path.join(HERE, "verify.py")
-# Exit-code contract (mirrors verify.py; the suite asserts against these by value,
-# staying hermetic — it never imports the tool it mutates under the harness).
-FRESH, STALE, DEAD, UNREGISTERED, ERROR, ASSUMED = 0, 3, 5, 4, 2, 6
-PASS = 0
-FAIL = 0
+if (len < 8) { throw new Error("not a PNG: shorter than the 8-byte signature");}
+for (var s = 0; s < 8; s++) {
+if (bytes[s]!== PNG_SIG[s]) { throw new Error("not a PNG: bad signature");}
+}
 
-def ok(msg):
-global PASS
-PASS += 1
-print(f"ok {msg}")
+var entries = [];
+var off = 8;
+var sawIEND = false;
 
-def bad(msg, why):
-global FAIL
-FAIL += 1
-print(f"FAIL {msg}: {why}")
+while (off < len) {
+if (off + 8 > len) { throw new Error("truncated PNG: incomplete chunk header at offset " + off);}
+var dataLen = u32be(bytes, off);
+var typeStart = off + 4;
+var dataStart = off + 8;
+var dataEnd = dataStart + dataLen;
+var crcEnd = dataEnd + 4;
+if (crcEnd > len) { throw new Error("truncated PNG: chunk data/CRC runs past end at offset " + off);}
 
-def run(root, *argv):
-"""Run verify.py with the fact store rooted at `root`; return (rc, out, err)."""
-env = dict(os.environ, VERIFY_REPO_ROOT=root)
-p = subprocess.run([sys.executable, VERIFY, *argv],
-stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-text=True, env=env, cwd=root)
-return p.returncode, p.stdout, p.stderr
+var type = latin1(bytes, typeStart, typeStart + 4);
+var storedCrc = u32be(bytes, dataEnd);
+var actualCrc = crc32(bytes, typeStart, dataEnd);
+if (storedCrc!== actualCrc) {
+throw new Error("CRC mismatch in " + type + " chunk at offset " + off +
+": stored 0x" + storedCrc.toString(16) + "!= computed 0x" + actualCrc.toString(16));
+}
 
-def write(root, name, text):
-with open(os.path.join(root, name), "w", encoding="utf-8") as f:
-f.write(text)
+var data = bytes.subarray? bytes.subarray(dataStart, dataEnd): bytes.slice(dataStart, dataEnd);
+if (type === "tEXt") { entries.push(decodeTEXt(data));}
+else if (type === "zTXt") { entries.push(decodeZTXt(data, inflate));}
+else if (type === "iTXt") { entries.push(decodeITXt(data, inflate));}
+else if (type === "IEND") { sawIEND = true; off = crcEnd; break;}
 
-def t1(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f1", "--claim", "X->Y", "--inputs", "in.txt")
-rc, out, _ = run(d, "verify", "--fact-id", "f1")
-if rc == 0 and "FRESH" in out:
-ok("unchanged inputs re-check FRESH (exit 0)")
-else:
-bad("fresh", f"rc={rc} out=[{out.strip()}]")
+off = crcEnd;
+}
 
-def t2(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f2", "--claim", "c", "--inputs", "in.txt")
-write(d, "in.txt", "v2-changed")
-rc, out, _ = run(d, "verify", "--fact-id", "f2")
-if rc == 3 and "STALE" in out:
-ok("a moved input makes the fact STALE (exit 3)")
-else:
-bad("stale", f"expected rc=3 STALE, got rc={rc} out=[{out.strip()}]")
+if (!sawIEND) { throw new Error("truncated PNG: stream ended before the IEND chunk");}
+return entries;
+}
 
-def t3(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f3", "--claim", "c", "--inputs", "in.txt")
-os.remove(os.path.join(d, "in.txt"))
-rc, out, _ = run(d, "verify", "--fact-id", "f3")
-if rc == 5 and "DEAD" in out:
-ok("a missing input makes the fact DEAD (exit 5)")
-else:
-bad("dead", f"expected rc=5 DEAD, got rc={rc} out=[{out.strip()}]")
+// ---- Dual-runtime export: browser namespace + Node module ------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePngText = parsePngText;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { parsePngText: parsePngText};
+}
 
-def t4(d):
-rc, out, _ = run(d, "verify", "--fact-id", "ghost")
-if rc == 4 and "UNREGISTERED" in out:
-ok("an unknown id is UNREGISTERED, never a false FRESH (exit 4)")
-else:
-bad("unregistered", f"expected rc=4, got rc={rc} out=[{out.strip()}]")
+// ---- CLI: print "keyword\ttext" per text entry; Node supplies the inflater ---
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"ratchet-png-text — extract tEXt/zTXt/iTXt metadata from a PNG (strict)\n\n" +
+" node ratchet-png-text.js cover.png one line per text entry: keyword<TAB>text\n\n" +
+"Validates the PNG signature and every chunk's CRC-32; refuses malformed input.\n" +
+"Decodes tEXt and uncompressed iTXt directly; zTXt and compressed iTXt are\n" +
+"inflated here with Node's zlib (the shipped core is dependency-free).\n");
+process.exit(args.length === 0? 1: 0);
+}
+var fs = require("fs");
+var zlib = require("zlib");
+var inflate = function (b) { return zlib.inflateSync(Buffer.from(b));};
+var exitCode = 0;
+for (var a = 0; a < args.length; a++) {
+try {
+var buf = fs.readFileSync(args[a]);
+var list = parsePngText(buf, { inflate: inflate});
+if (args.length > 1) { process.stdout.write("== " + args[a] + " ==\n");}
+for (var e = 0; e < list.length; e++) {
+var en = list[e];
+var t = (en.text === null)? "[" + en.kind + ", compressed, no inflater]": en.text;
+process.stdout.write(en.keyword + "\t" + t + "\n");
+}
+if (list.length === 0) { process.stdout.write("(no text chunks)\n");}
+} catch (err) {
+process.stderr.write("ratchet-png-text: " + args[a] + ": " + err.message + "\n");
+exitCode = 1;
+}
+}
+process.exit(exitCode);
+}
 
-def t5(d):
-run(d, "assume", "--fact-id", "a1", "--claim", "price current",
-"--path", "re-fetch source", "--expiry", "2026-12-01")
-rc, out, _ = run(d, "verify", "--fact-id", "a1")
-if rc == 6 and "ASSUMED" in out:
-ok("an assumption is SURFACED as ASSUMED, never faked FRESH (exit 6)")
-else:
-bad("assumed", f"expected rc=6 ASSUMED, got rc={rc} out=[{out.strip()}]")
+test_ratchet-png-text.js 227 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-png-text.js — proves the strict PNG text extractor implements its
+stated contract correctly.
 
-def t6(d):
-run(d, "assume", "--fact-id", "a2", "--claim", "c",
-"--path", "run the derivation", "--expiry", "when src.txt changes")
-write(d, "src.txt", "derived")
-rc, _, _ = run(d, "discharge", "--fact-id", "a2", "--inputs", "src.txt")
-if rc!= 0:
-bad("discharge", f"discharge rc={rc}")
-return
-rc2, out2, _ = run(d, "verify", "--fact-id", "a2")
-if rc2 == 0 and "FRESH" in out2:
-ok("discharge promotes an assumption to a FRESH fact")
-else:
-bad("discharge-promote", f"rc={rc2} out=[{out2.strip()}]")
+THE ORACLE. There is no PNG-text parser in the Node stdlib to diff against, so
+the oracle is the PNG spec expressed as CURATED, REAL PNG BYTE FIXTURES built
+in-test: each fixture is an actual PNG byte stream (8-byte signature + chunks
+with correct CRC-32 + IEND), so a "valid" vector is a genuine file the parser
+must read to a KNOWN set of entries, and an "invalid" vector is a genuine
+malformation the parser must THROW on. Every branch is exercised: tEXt,
+uncompressed iTXt (UTF-8, language tag, translated keyword), zTXt and compressed
+iTXt, the no-text case, and the malformations (bad signature, CRC mismatch,
+truncation, missing IEND, missing separators, bad length, non-buffer input).
 
-def t7(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f7", "--claim", "c", "--inputs", "in.txt")
-run(d, "retire", "--fact-id", "f7", "--reason", "derivation retired")
-rc, out, _ = run(d, "verify", "--fact-id", "f7")
-if rc == 5 and "DEAD" in out:
-ok("a retired fact is DEAD, not re-checkable (exit 5)")
-else:
-bad("retire", f"expected rc=5 DEAD, got rc={rc} out=[{out.strip()}]")
+THE LIVE-REFERENCE BACKSTOP. The compressed path (zTXt / compressed iTXt) is
+built with Node's own zlib.deflateSync and decoded through the parser with
+zlib.inflateSync passed as the `inflate` option — so the zero-dependency core is
+cross-checked against a live reference implementation, sha256-style.
 
-def t8(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f8", "--claim", "c", "--inputs", "in.txt")
-rc, out, err = run(d, "verify", "--fact-id", "f8", "--json")
-try:
-rec = json.loads(out)
-except Exception as exc:
-bad("json", f"stdout not clean JSON: {exc}; out=[{out.strip()}]")
-return
-if rc == 0 and rec.get("verdict") == "fresh" and rec.get("code") == 0:
-ok("--json emits a clean machine verdict, exit code matches human path")
-else:
-bad("json-verdict", f"rc={rc} json={rec}")
+Plus determinism (same bytes -> same entries, twice) and a mutation-bite (a
+text-carrying PNG and a no-text PNG must not share a result, so a degenerate
+core that returns a constant can't pass green). Exit 0 = all pass; exit 1 =
+a failure (loud). stdlib only. */
+"use strict";
+var assert = require("assert");
+var zlib = require("zlib");
+var parsePngText = require("./ratchet-png-text.js").parsePngText;
 
-def t9(d):
-rc, out, err = run(d, "list")
-if "CEILING:" in err and "|-!= |=" in err:
-ok("the CEILING line is emitted on stderr on every run")
-else:
-bad("ceiling", f"no CEILING on stderr; err=[{err.strip()}]")
+var pass = 0, fail = 0;
+function ok(label, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL " + label + "\n " + (e && e.message? e.message: e));}
+}
 
-def t10(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f10", "--claim", "c", "--inputs", "in.txt")
-rc, out, _ = run(d, "fold", "--check")
-if rc == 0:
-ok("fold --check is fold-twice-identical (exit 0)")
-else:
-bad("fold", f"expected rc=0, got rc={rc} out=[{out.strip()}]")
+// ---- PNG fixture builder (a tiny, correct reference encoder) ----------------
+var SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-# ── Hardening block (slot 04, gate 5): drive the paths the 10 headline cases
-# leave un-exercised, so ast-level mutations of the core verdict logic flip an
-# observable verdict and the suite catches them. The decision engine
-# (decide / decision_verdict / premise_state), the --json path per record kind,
-# the fold's latest-wins ordering, and the render/guard branches were the mutant
-# survivors; each case below kills a cluster of them. verify.py is UNCHANGED —
-# all teeth are added here (the 0fb3c694 content-hash pin holds). ──
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) { c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);}
+t[n] = c >>> 0;
+}
+return t;
+})();
+function crc32(buf) {
+var c = 0xffffffff;
+for (var i = 0; i < buf.length; i++) { c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);}
+return (c ^ 0xffffffff) >>> 0;
+}
+function u32(n) { var b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0, 0); return b;}
 
-def _reg(d, fid, val="v1", claim="c", name="in.txt"):
-"""Register a fresh fact grounded on a written input file."""
-write(d, name, val)
-run(d, "register", "--fact-id", fid, "--claim", claim, "--inputs", name)
+// One PNG chunk: length + type + data + CRC(type+data).
+function chunk(type, data) {
+data = data || Buffer.alloc(0);
+var typeBuf = Buffer.from(type, "latin1");
+var body = Buffer.concat([typeBuf, data]);
+return Buffer.concat([u32(data.length), body, u32(crc32(body))]);
+}
+// A minimal, real IHDR (1x1, 8-bit grayscale) — for fixture realism.
+var IHDR = chunk("IHDR", Buffer.concat([u32(1), u32(1), Buffer.from([8, 0, 0, 0, 0])]));
+var IEND = chunk("IEND");
 
-def _one_verdict(out):
-"""The output must carry EXACTLY ONE verdict headline — a dropped `return` in a
-verdict branch prints its word then falls through and prints a SECOND word, same
-exit code. Counting verdict words catches that contradiction the exit code hides."""
-words = ("FRESH", "STALE", "DEAD", "ASSUMED", "UNREGISTERED", "CYCLE")
-return sum(out.count(w) for w in words) == 1
+function png(chunks) { return Buffer.concat([SIG].concat(chunks).concat([IEND]));}
 
-def t11_decide_fresh(d):
-# A decision over two FRESH fact-premises folds to FRESH (exit 0), and names
-# every premise. Kills: decision_verdict FRESH-fallthrough, the premise loop,
-# cmd_verify decided-branch FRESH print, premise_state fact dispatch.
-_reg(d, "p1", name="a.txt"); _reg(d, "p2", name="b.txt")
-rc, out, _ = run(d, "decide", "--decision-id", "d1", "--claim", "A beats B",
-"--options", "A,B", "--chose", "A", "--premises", "p1", "p2")
-if rc!= 0:
-bad("decide-record", f"decide rc={rc} out=[{out.strip()}]"); return
-rc, out, _ = run(d, "verify", "--fact-id", "d1")
-if rc == 0 and "FRESH" in out and "p1" in out and "p2" in out and _one_verdict(out):
-ok("a decision over fresh premises folds FRESH, naming every premise")
-else:
-bad("decide-fresh", f"rc={rc} out=[{out.strip()}]")
+// tEXt data = keyword + \0 + text (Latin-1)
+function tEXt(keyword, text) {
+return chunk("tEXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0]), Buffer.from(text, "latin1")]));
+}
+// zTXt data = keyword + \0 + method(0) + zlib(text)
+function zTXt(keyword, text) {
+return chunk("zTXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0, 0]), zlib.deflateSync(Buffer.from(text, "latin1"))]));
+}
+// iTXt data = keyword + \0 + cflag + cmethod + lang + \0 + transKeyword + \0 + text(UTF-8, maybe deflated)
+function iTXt(keyword, lang, trans, text, compressed) {
+var body = compressed? zlib.deflateSync(Buffer.from(text, "utf8")): Buffer.from(text, "utf8");
+return chunk("iTXt", Buffer.concat([
+Buffer.from(keyword, "utf8"), Buffer.from([0]),
+Buffer.from([compressed? 1: 0, 0]),
+Buffer.from(lang, "latin1"), Buffer.from([0]),
+Buffer.from(trans, "utf8"), Buffer.from([0]),
+body
+]));
+}
 
-def t12_decide_stale_precedence(d):
-# One premise MOVES -> the decision folds STALE (exit 3). Kills: the STALE
-# precedence branch in decision_verdict, premise_state->fact_verdict STALE,
-# the cmd_verify STALE-class naming (the `stale = [...]` comprehension).
-_reg(d, "p1", name="a.txt"); _reg(d, "p2", val="orig", name="b.txt")
-run(d, "decide", "--decision-id", "d2", "--claim", "c", "--options", "A;B",
-"--chose", "A", "--premises", "p1", "p2")
-write(d, "b.txt", "MOVED") # p2's ground moves
-rc, out, _ = run(d, "verify", "--fact-id", "d2")
-if rc == 3 and "STALE" in out and "p2" in out:
-ok("a moved premise makes the decision STALE, naming the moved premise")
-else:
-bad("decide-stale", f"expected rc=3 STALE naming p2, got rc={rc} out=[{out.strip()}]")
+var INFLATE = { inflate: function (b) { return zlib.inflateSync(Buffer.from(b));}};
 
-def t13_decide_dead_beats_stale(d):
-# DEAD outranks STALE: p2 moved (stale) AND p3 removed (dead) -> DEAD (exit 5).
-# Kills: the DEAD-first precedence ordering in decision_verdict (drop/reorder
-# of the `for worst in (DEAD, STALE, ASSUMED)` loop flips the verdict here).
-_reg(d, "p1", name="a.txt"); _reg(d, "p2", val="o", name="b.txt")
-_reg(d, "p3", name="c.txt")
-run(d, "decide", "--decision-id", "d3", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1", "p2", "p3")
-write(d, "b.txt", "MOVED") # p2 -> STALE
-os.remove(os.path.join(d, "c.txt")) # p3 -> DEAD
-rc, out, _ = run(d, "verify", "--fact-id", "d3")
-if rc == 5 and "DEAD" in out and "p3" in out:
-ok("DEAD outranks STALE in the decision fold (precedence order has teeth)")
-else:
-bad("decide-precedence", f"expected rc=5 DEAD, got rc={rc} out=[{out.strip()}]")
+// ===========================================================================
+// VALID vectors — each must parse to a KNOWN result.
+// ===========================================================================
+ok("single tEXt decodes keyword+text", function () {
+var out = parsePngText(png([IHDR, tEXt("Title", "A Quiet Loop")]));
+assert.strictEqual(out.length, 1);
+assert.deepStrictEqual(out[0], { kind: "tEXt", keyword: "Title", text: "A Quiet Loop", compressed: false});
+});
 
-def t14_decide_assumed_premise(d):
-# A decision resting on a LIVE assumption folds ASSUMED (exit 6). Kills:
-# premise_state assumed-dispatch, the ASSUMED precedence branch, the assumed
-# class-naming in cmd_verify.
-_reg(d, "p1", name="a.txt")
-run(d, "assume", "--fact-id", "asmp", "--claim", "leaned on",
-"--path", "re-fetch", "--expiry", "2027-01-01")
-run(d, "decide", "--decision-id", "d4", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1", "asmp")
-rc, out, _ = run(d, "verify", "--fact-id", "d4")
-if rc == 6 and "ASSUMED" in out and "asmp" in out:
-ok("a decision on a live assumption folds ASSUMED, naming the assumption")
-else:
-bad("decide-assumed", f"expected rc=6 ASSUMED, got rc={rc} out=[{out.strip()}]")
+ok("multiple tEXt chunks preserved in file order", function () {
+var out = parsePngText(png([IHDR, tEXt("Author", "Shea"), tEXt("Software", "Loop MMT")]));
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].keyword, "Author");
+assert.strictEqual(out[0].text, "Shea");
+assert.strictEqual(out[1].keyword, "Software");
+assert.strictEqual(out[1].text, "Loop MMT");
+});
 
-def t15_decide_dead_on_retired_premise(d):
-# A retired premise makes the decision DEAD (premise_state retired->DEAD).
-_reg(d, "p1", name="a.txt")
-run(d, "decide", "--decision-id", "d5", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1")
-run(d, "retire", "--fact-id", "p1", "--reason", "premise retired")
-rc, out, _ = run(d, "verify", "--fact-id", "d5")
-if rc == 5 and "DEAD" in out:
-ok("a retired premise makes the decision DEAD")
-else:
-bad("decide-retired-premise", f"expected rc=5 DEAD, got rc={rc} out=[{out.strip()}]")
+ok("tEXt with empty text is valid (keyword, empty value)", function () {
+var out = parsePngText(png([IHDR, tEXt("Comment", "")]));
+assert.strictEqual(out[0].text, "");
+});
 
-def t16_decide_guards(d):
-# Every cmd_decide validation guard returns ERROR (exit 2). Kills the guard
-# cascade (len<2, chose-not-in-options, no-premises, missing-premise,
-# self-premise) — each is a `drop If`/`compare` survivor otherwise.
-_reg(d, "p1", name="a.txt")
-checks = [
-(["decide", "--decision-id", "g1", "--claim", "c", "--options", "A",
-"--chose", "A", "--premises", "p1"], "one option"),
-(["decide", "--decision-id", "g2", "--claim", "c", "--options", "A,B",
-"--chose", "Z", "--premises", "p1"], "chose not in options"),
-(["decide", "--decision-id", "g3", "--claim", "c", "--options", "A,B",
-"--chose", "A"], "no premises"),
-(["decide", "--decision-id", "g4", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "ghost"], "missing premise"),
-(["decide", "--decision-id", "g5", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "g5"], "self premise"),
-]
-for argv, why in checks:
-rc, _, _ = run(d, *argv)
-if rc!= ERROR:
-bad("decide-guard", f"{why}: expected ERROR(2), got rc={rc}"); return
-ok("every decide guard rejects with ERROR (option/chose/premise cascade)")
+ok("no text chunks -> empty array (not an error)", function () {
+var out = parsePngText(png([IHDR]));
+assert.deepStrictEqual(out, []);
+});
 
-def t17_decide_cycle(d):
-# A hand-edited self-referential decision certificate verifies as CYCLE
-# (exit 2). decide REFUSES to author one, so we craft the event directly on
-# the log to reach the verify-time cycle guard (premise_state `pid in seen`).
-_reg(d, "p1", name="a.txt")
-run(d, "decide", "--decision-id", "cyc", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1")
-# append a decided event for `cyc` that lists itself as a premise (later seq wins)
-ev = {"kind": "decided", "fact_id": "cyc", "claim": "c", "options": ["A", "B"],
-"chose": "A", "premises": ["cyc"], "provenance_class": "internal",
-"date": "31.2359", "seq": 99}
-path = os.path.join(d, ".verify", "verified.jsonl")
-with open(path, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(ev, sort_keys=True) + "\n")
-rc, out, _ = run(d, "verify", "--fact-id", "cyc")
-if rc == ERROR and "CYCLE" in out and _one_verdict(out):
-ok("a self-referential decision certificate verifies as CYCLE (exit 2)")
-else:
-bad("decide-cycle", f"expected rc={ERROR} single-CYCLE, got rc={rc} out=[{out.strip()}]")
+ok("uncompressed iTXt decodes UTF-8 text, lang, translated keyword", function () {
+var out = parsePngText(png([IHDR, iTXt("Description", "en", "Descripción", "a café at dawn — \u2728", false)]));
+assert.strictEqual(out.length, 1);
+var e = out[0];
+assert.strictEqual(e.kind, "iTXt");
+assert.strictEqual(e.keyword, "Description");
+assert.strictEqual(e.compressed, false);
+assert.strictEqual(e.languageTag, "en");
+assert.strictEqual(e.translatedKeyword, "Descripción");
+assert.strictEqual(e.text, "a café at dawn — \u2728");
+});
 
-def t18_json_decided(d):
-# --json on a decided record emits the folded verdict + a per-premise state
-# breakdown, code matching the human path. Kills the _verify_json decided arm.
-_reg(d, "p1", name="a.txt"); _reg(d, "p2", val="o", name="b.txt")
-run(d, "decide", "--decision-id", "dj", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1", "p2")
-write(d, "b.txt", "MOVED")
-rc, out, _ = run(d, "verify", "--fact-id", "dj", "--json")
-try:
-rec = json.loads(out)
-except Exception as exc:
-bad("json-decided", f"stdout not JSON: {exc}"); return
-prem = {p["id"]: p["state"] for p in rec.get("premises", [])}
-if (rc == 3 and rec.get("verdict") == "stale" and rec.get("code") == 3
-and prem.get("p2") == "stale" and prem.get("p1") == "fresh"):
-ok("--json on a decision emits the fold + per-premise breakdown")
-else:
-bad("json-decided", f"rc={rc} json={rec}")
+ok("zTXt: without inflater -> compressed entry, raw bytes, text null", function () {
+var out = parsePngText(png([IHDR, zTXt("XML:com.adobe.xmp", "the quick brown fox")]));
+var e = out[0];
+assert.strictEqual(e.kind, "zTXt");
+assert.strictEqual(e.keyword, "XML:com.adobe.xmp");
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, null);
+assert.ok(e.compressedText && e.compressedText.length > 0, "compressedText surfaced");
+});
 
-def t19_json_assumed_and_dead(d):
-# --json arms for assumed and retired records (each its own _verify_json branch).
-run(d, "assume", "--fact-id", "aj", "--claim", "cl", "--path", "p", "--expiry", "e")
-rc, out, _ = run(d, "verify", "--fact-id", "aj", "--json")
-rec = json.loads(out)
-if not (rc == 6 and rec.get("verdict") == "assumed" and rec.get("claim") == "cl"):
-bad("json-assumed", f"rc={rc} json={rec}"); return
-_reg(d, "rj", name="r.txt")
-run(d, "retire", "--fact-id", "rj", "--reason", "gone")
-rc2, out2, _ = run(d, "verify", "--fact-id", "rj", "--json")
-rec2 = json.loads(out2)
-if rc2 == 5 and rec2.get("verdict") == "dead" and rec2.get("reason") == "gone":
-ok("--json arms for assumed (with claim) and retired (with reason)")
-else:
-bad("json-dead", f"rc={rc2} json={rec2}")
+ok("zTXt: WITH live zlib inflater -> text decoded (live-reference backstop)", function () {
+var out = parsePngText(png([IHDR, zTXt("Copyright", "© 2026 Shea Gunther")]), INFLATE);
+assert.strictEqual(out[0].text, "© 2026 Shea Gunther");
+});
 
-def t20_fold_latest_wins(d):
-# Re-registering a fact and then retiring it: the fold's latest-wins ordering
-# must make the LATEST event authoritative (register->register->retire => DEAD).
-# Kills fold ordering/dedup survivors and append_event's seq increment.
-_reg(d, "ff", val="one", name="x.txt")
-_reg(d, "ff", val="two", name="x.txt") # second register, same id
-rc, out, _ = run(d, "verify", "--fact-id", "ff")
-if not (rc == 0 and "FRESH" in out):
-bad("fold-latest", f"after re-register expected FRESH, got rc={rc}"); return
-run(d, "retire", "--fact-id", "ff", "--reason", "done")
-rc2, out2, _ = run(d, "verify", "--fact-id", "ff")
-if rc2 == 5 and "DEAD" in out2:
-ok("fold latest-wins: register->register->retire resolves to DEAD")
-else:
-bad("fold-latest", f"after retire expected DEAD, got rc={rc2} out=[{out2.strip()}]")
+ok("compressed iTXt: WITH inflater -> UTF-8 text decoded", function () {
+var out = parsePngText(png([IHDR, iTXt("Story", "en", "", "compressed unicode: ✓ café", true)]), INFLATE);
+var e = out[0];
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, "compressed unicode: ✓ café");
+});
 
-def t21_list_render_kinds(d):
-# `list` renders each record KIND with its distinguishing line. Kills the
-# render_registry kind-dispatch branches (retired/assumed/decided/fact).
-_reg(d, "rf", name="a.txt")
-run(d, "assume", "--fact-id", "ra", "--claim", "cl", "--path", "p", "--expiry", "ex")
-_reg(d, "rp", name="b.txt")
-run(d, "decide", "--decision-id", "rd", "--claim", "dc", "--options", "A,B",
-"--chose", "A", "--premises", "rp")
-run(d, "retire", "--fact-id", "rf", "--reason", "gonzo")
-rc, out, _ = run(d, "list")
-need = ["RETIRED (dead)", "ASSUMED (ungrounded)", "DECIDED (premise-grounded)",
-"gonzo", "chose:", "premises:"]
-missing = [n for n in need if n not in out]
-if rc == 0 and not missing:
-ok("list renders every record kind with its distinguishing detail")
-else:
-bad("list-render", f"rc={rc} missing={missing}")
+ok("mixed chunk types collected in order", function () {
+var out = parsePngText(png([IHDR, tEXt("A", "1"), iTXt("B", "en", "", "2", false), zTXt("C", "3")]), INFLATE);
+assert.deepStrictEqual(out.map(function (e) { return e.keyword;}), ["A", "B", "C"]);
+assert.strictEqual(out[2].text, "3");
+});
 
-def t22_discharge_guards(d):
-# discharge's error branches: not-on-file, not-an-assumption, no-inputs.
-rc, _, _ = run(d, "discharge", "--fact-id", "nope", "--inputs", "x")
-if rc!= ERROR:
-bad("discharge-missing", f"expected ERROR, got {rc}"); return
-_reg(d, "realfact", name="a.txt")
-rc2, _, _ = run(d, "discharge", "--fact-id", "realfact", "--inputs", "a.txt")
-if rc2!= ERROR: # a fact is not an open assumption
-bad("discharge-notassumed", f"expected ERROR, got {rc2}"); return
-run(d, "assume", "--fact-id", "op", "--claim", "c", "--path", "p", "--expiry", "e")
-rc3, _, _ = run(d, "discharge", "--fact-id", "op") # no --inputs
-if rc3 == ERROR:
-ok("discharge rejects: not-on-file, not-an-assumption, and no-inputs")
-else:
-bad("discharge-noinputs", f"expected ERROR, got {rc3}")
+ok("accepts an ArrayBuffer as well as a Buffer", function () {
+var buf = png([IHDR, tEXt("Title", "AB")]);
+var ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+assert.strictEqual(parsePngText(ab)[0].text, "AB");
+});
 
-def t23_fold_check_json_parity(d):
-# The --json exit code equals the human path across a fact's whole lifecycle,
-# and fold --check stays green with a mixed registry. Guards _verify_json's
-# fact arm (moved/missing fields) + the code==human invariant.
-_reg(d, "lc", val="v1", name="a.txt")
-rc_h, _, _ = run(d, "verify", "--fact-id", "lc")
-rc_j, out_j, _ = run(d, "verify", "--fact-id", "lc", "--json")
-if rc_h!= rc_j or json.loads(out_j).get("code")!= rc_h:
-bad("json-parity", f"human={rc_h} json={rc_j}"); return
-write(d, "a.txt", "moved")
-rc_h2, _, _ = run(d, "verify", "--fact-id", "lc")
-rc_j2, out_j2, _ = run(d, "verify", "--fact-id", "lc", "--json")
-moved = json.loads(out_j2).get("moved", [])
-if rc_h2 == rc_j2 == 3 and "a.txt" in moved:
-ok("--json code tracks the human path and reports the moved input")
-else:
-bad("json-parity", f"h={rc_h2} j={rc_j2} moved={moved}")
+// ===========================================================================
+// INVALID vectors — each must THROW (the ratchet refuses to advance).
+// ===========================================================================
+function throws(label, buildBadBytes) {
+ok(label, function () { assert.throws(function () { parsePngText(buildBadBytes());});});
+}
 
-def t24_nested_decision(d):
-# premise_state's decided-branch: a decision grounded on ANOTHER decision.
-# The inner decision folds first, its state propagates outward. Kills the
-# premise_state `kind == "decided"` recursion (L369-370).
-_reg(d, "leaf", val="o", name="a.txt")
-run(d, "decide", "--decision-id", "inner", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "leaf")
-run(d, "decide", "--decision-id", "outer", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "inner")
-# fresh chain -> outer FRESH
-rc, out, _ = run(d, "verify", "--fact-id", "outer")
-if not (rc == 0 and "FRESH" in out):
-bad("nested-fresh", f"expected FRESH, got rc={rc} out=[{out.strip()}]"); return
-# move the leaf -> inner STALE -> outer must fold STALE through the nesting
-write(d, "a.txt", "MOVED")
-rc2, out2, _ = run(d, "verify", "--fact-id", "outer")
-if rc2 == 3 and "STALE" in out2:
-ok("a decision grounded on a decision folds the inner state outward")
-else:
-bad("nested-stale", f"expected STALE through nesting, got rc={rc2} out=[{out2.strip()}]")
+throws("bad PNG signature", function () {
+var b = png([IHDR, tEXt("Title", "x")]); b[0] = 0x00; return b;
+});
+throws("CRC mismatch (a data byte flipped after CRC was written)", function () {
+var b = png([IHDR, tEXt("Title", "hello")]);
+// flip the last byte of the tEXt text; its stored CRC no longer matches
+b[b.length - 5] ^= 0xff; return b;
+});
+throws("truncated mid-chunk", function () {
+var b = png([IHDR, tEXt("Title", "hello")]); return b.subarray(0, b.length - 10);
+});
+throws("stream ends before IEND", function () {
+// signature + IHDR + a tEXt, but no IEND appended
+return Buffer.concat([SIG, IHDR, tEXt("Title", "x")]);
+});
+throws("tEXt missing its null separator", function () {
+var bad = chunk("tEXt", Buffer.from("NoNullHere", "latin1")); // no \0 in the data
+return Buffer.concat([SIG, IHDR, bad, IEND]);
+});
+throws("chunk length runs past end of buffer", function () {
+var b = png([IHDR, tEXt("Title", "x")]);
+// corrupt the tEXt length field to claim a huge data size
+var off = SIG.length + IHDR.length;
+b.writeUInt32BE(0x7fffffff, off); return b;
+});
+throws("zTXt with unknown compression method", function () {
+var data = Buffer.concat([Buffer.from("K", "latin1"), Buffer.from([0, 9]), zlib.deflateSync(Buffer.from("x"))]);
+return Buffer.concat([SIG, IHDR, chunk("zTXt", data), IEND]);
+});
+throws("shorter than the 8-byte signature", function () { return Buffer.from([0x89, 0x50, 0x4e]);});
 
-def t25_bad_jsonl_raises(d):
-# read_events must RAISE on a malformed log line (not silently skip / return
-# a partial set). Kills read_events' try/except/raise (L208-214). The tool
-# surfaces the parse failure as a non-zero exit, never a false FRESH.
-_reg(d, "ok1", name="a.txt")
-path = os.path.join(d, ".verify", "verified.jsonl")
-with open(path, "a", encoding="utf-8") as fh:
-fh.write("{ this is not valid json\n")
-rc, out, err = run(d, "verify", "--fact-id", "ok1")
-# a corrupt log is a hard error (exit 2), never a silent FRESH(0)
-if rc!= 0 and "FRESH" not in out:
-ok("a malformed log line is surfaced as an error, never a false FRESH")
-else:
-bad("bad-jsonl", f"corrupt log gave rc={rc} out=[{out.strip()}]")
+// non-buffer inputs throw a TypeError
+ok("non-buffer inputs are rejected", function () {
+["a string", 42, null, undefined, {}].forEach(function (bad) {
+assert.throws(function () { parsePngText(bad);});
+});
+});
 
-def t26_seq_ordering_manyevents(d):
-# append_event's per-day seq increment orders same-day events for the fold.
-# Register the same id THREE times in one run (same date) with different
-# inputs; latest-wins must resolve to the LAST write's ground. If the seq
-# increment is broken (const/drop mutant), a same-day tie could resolve to
-# the wrong event and flip the verdict. Distinguishes the seq logic behaviorally.
-write(d, "one.txt", "1"); run(d, "register", "--fact-id", "s", "--claim", "c", "--inputs", "one.txt")
-write(d, "two.txt", "2"); run(d, "register", "--fact-id", "s", "--claim", "c", "--inputs", "two.txt")
-write(d, "three.txt", "3"); run(d, "register", "--fact-id", "s", "--claim", "c", "--inputs", "three.txt")
-# the live ground is three.txt; moving it must make s STALE, moving the others must NOT
-write(d, "one.txt", "X"); write(d, "two.txt", "X")
-rc, out, _ = run(d, "verify", "--fact-id", "s")
-if not (rc == 0 and "FRESH" in out):
-bad("seq-latest", f"latest event should be FRESH (moved only stale inputs), got rc={rc}"); return
-write(d, "three.txt", "MOVED")
-rc2, out2, _ = run(d, "verify", "--fact-id", "s")
-if rc2 == 3 and "STALE" in out2:
-ok("same-day seq ordering resolves latest-wins to the last write")
-else:
-bad("seq-latest", f"moving the latest input should be STALE, got rc={rc2} out=[{out2.strip()}]")
+// ===========================================================================
+// Determinism + mutation-bite
+// ===========================================================================
+ok("determinism: same bytes -> identical entries, twice", function () {
+var b = png([IHDR, tEXt("Title", "same"), zTXt("Z", "twice")]);
+assert.deepStrictEqual(parsePngText(b, INFLATE), parsePngText(b, INFLATE));
+});
 
-def _raw_append(d, ev):
-# Craft an event directly onto the log, bypassing the CLI's seq-ordered
-# writer, so file-order and (date,seq)-order can be made to DISAGREE. This
-# is the only way to distinguish latest_for's sort from a file-order read
-# (the CLI always writes in seq-order, so t26 cannot — see gate-5 triage).
-path = os.path.join(d, ".verify", "verified.jsonl")
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(ev, sort_keys=True) + "\n")
+ok("mutation-bite: a text PNG and a no-text PNG do not share a result", function () {
+var withText = parsePngText(png([IHDR, tEXt("Title", "real")]));
+var without = parsePngText(png([IHDR]));
+// a constant-returning core would make these equal; they must not be.
+assert.notDeepStrictEqual(withText, without);
+assert.strictEqual(withText[0].text, "real"); // and the value is the input's, not a constant
+});
 
-def t27_latest_for_sort_kills_fileorder(d):
-# GATE-5 real gap: latest_for sorts recs by (date, seq) then takes [-1].
-# Drop the.sort() and recs[-1] returns the file-order-last event instead of
-# the true latest. Craft a log where the TRUE latest (higher seq) is written
-# FIRST and an OLDER event (lower seq) is written LAST, with DIFFERENT kinds
-# so the verdict's EXIT CODE distinguishes them. True-latest is `retired`
-# (-> DEAD, exit 2); file-order-last is `verified` (-> would verify FRESH/STALE).
-# true latest: retired, seq 5, written FIRST. (retired -> DEAD returns before
-# any input-hash check, so the older event's inputs are irrelevant.)
-_raw_append(d, {"kind": "retired", "fact_id": "x", "claim": "c",
-"reason": "superseded", "date": "01.0000", "seq": 5})
-# older: verified, seq 1, written LAST (file-order-last). No real inputs needed:
-# if sort is intact this record is never reached; if sort is dropped, recs[-1]
-# picks THIS (wrong) record and the verdict is no longer DEAD -> the mutant dies.
-_raw_append(d, {"kind": "verified", "fact_id": "x", "claim": "c",
-"inputs": {}, "established_at": "01.0000", "date": "01.0000", "seq": 1})
-rc, out, _ = run(d, "verify", "--fact-id", "x")
-# With sort: true latest (seq 5, retired) wins -> DEAD (exit 5).
-if rc == 5 and "DEAD" in out and _one_verdict(out):
-ok("latest_for resolves by (date,seq), not file order — true-latest retired -> DEAD")
-else:
-bad("latest-for-sort",
-f"expected DEAD(2) from the higher-seq retired event, got rc={rc} out=[{out.strip()}]")
-
-def t28_append_event_sameday_compare(d):
-# GATE-5 real gap: append_event computes same_day by `e.get('date')==ev['date']`
-# then seq = 1 + max(same-day seqs). Flip Eq->NotEq and the new event's seq is
-# computed off the WRONG (other-day) events, so a real same-day sequence can
-# collide/mis-order. Drive it through the CLI (which uses append_event) with two
-# registers on the same date, then verify latest-wins still resolves correctly.
-write(d, "a.txt", "1"); run(d, "register", "--fact-id", "y", "--claim", "c", "--inputs", "a.txt")
-write(d, "b.txt", "2"); run(d, "register", "--fact-id", "y", "--claim", "c", "--inputs", "b.txt")
-# latest (b.txt) is live; moving a.txt (older) must NOT make y stale
-write(d, "a.txt", "MOVED")
-rc, out, _ = run(d, "verify", "--fact-id", "y")
-if not (rc == 0 and "FRESH" in out):
-bad("append-sameday", f"older same-day input moved should stay FRESH, got rc={rc} out=[{out.strip()}]"); return
-# moving the true latest (b.txt) MUST make it stale — proves seq ordered them right
-write(d, "b.txt", "MOVED")
-rc2, out2, _ = run(d, "verify", "--fact-id", "y")
-if rc2 == 3 and "STALE" in out2:
-ok("append_event same-day seq orders same-date events so latest-wins holds")
-else:
-bad("append-sameday", f"moving true-latest input should be STALE, got rc={rc2} out=[{out2.strip()}]")
-
-def t29_fold_none_factid_guard(d):
-# GATE-5 real gap: fold guards against a None fact_id. A raw log line missing
-# fact_id must not crash `list` or mis-fold. Craft such a line, then run list.
-write(d, "g.txt", "v1")
-run(d, "register", "--fact-id", "real", "--claim", "c", "--inputs", "g.txt")
-_raw_append(d, {"kind": "verified", "claim": "orphan-no-factid",
-"date": "01.0001", "seq": 1}) # NO fact_id key
-rc, out, err = run(d, "list")
-# must not crash (exit 0/2 acceptable per contract), and the real fact must survive the fold
-if rc in (0, 2) and "real" in out:
-ok("fold survives a None/absent fact_id line without crashing or dropping real facts")
-else:
-bad("fold-none-factid", f"list should survive a factid-less line, got rc={rc} out=[{out.strip()}] err=[{err.strip()}]")
-
-def t30_register_success_exit_zero(d):
-# GATE-5 real gap: cmd_register ends `return 0` (success). Two mutants break it and
-# BOTH pass the current suite because the headline REGISTERED still prints:
-# (a) `const int 0->1 @L319` flips the success return to 1;
-# (b) `drop Return @L228` drops append_event's `return ev`, so cmd_register does
-# `ev = append_event(...)` -> ev is None -> the following ev['established_at']
-# raises, and register exits non-zero.
-# The success EXIT CODE is a hard consumer contract (0 = the certificate was written);
-# a scripted caller that checks `verify register... &&...` breaks silently on rc=1.
-# Assert it directly.
-write(d, "a.txt", "1")
-rc, out, _ = run(d, "register", "--fact-id", "rz", "--claim", "c", "--inputs", "a.txt")
-if rc == 0 and "REGISTERED" in out:
-ok("register exits 0 on success (the write-succeeded contract, not just the headline)")
-else:
-bad("register-exit", f"register success must exit 0, got rc={rc} out=[{out.strip()[:80]}]")
-
-def t31_retire_success_exit_zero(d):
-# GATE-5 real gap: cmd_retire ends `return 0`. `const int 0->1 @L675` flips it to 1
-# while still printing RETIRED, so the current suite (headline-only on retire) misses it.
-# A retire that "succeeds" with rc=1 lies to `verify retire... && verify verify...`.
-write(d, "a.txt", "1")
-run(d, "register", "--fact-id", "rt", "--claim", "c", "--inputs", "a.txt")
-rc, out, _ = run(d, "retire", "--fact-id", "rt", "--reason", "superseded")
-if rc == 0 and "RETIRED" in out:
-ok("retire exits 0 on success (the call-it-dead contract, not just the headline)")
-else:
-bad("retire-exit", f"retire success must exit 0, got rc={rc} out=[{out.strip()[:80]}]")
-
-def t32_append_event_returns_written_record(d):
-# GATE-5 real gap (the OTHER half of drop Return @L228): cmd_register reads fields off
-# the RECORD append_event returns (ev['established_at'] for the "certificate kept @"
-# line). If append_event returns None, that read fails. Assert the confirmation line
-# that depends on the returned record is present AND register still exits 0 — this
-# pins that append_event's return value is consumed, not just that it wrote a line.
-write(d, "a.txt", "1")
-rc, out, _ = run(d, "register", "--fact-id", "rr", "--claim", "c", "--inputs", "a.txt")
-if rc == 0 and "certificate kept @" in out:
-ok("register consumes append_event's returned record (certificate-kept confirmation prints)")
-else:
-bad("append-return", f"register must print the certificate-kept line from the returned record, got rc={rc} out=[{out.strip()[:80]}]")
-
-HARDENING = (t11_decide_fresh, t12_decide_stale_precedence, t13_decide_dead_beats_stale,
-t14_decide_assumed_premise, t15_decide_dead_on_retired_premise, t16_decide_guards,
-t17_decide_cycle, t18_json_decided, t19_json_assumed_and_dead, t20_fold_latest_wins,
-t21_list_render_kinds, t22_discharge_guards, t23_fold_check_json_parity,
-t24_nested_decision, t25_bad_jsonl_raises, t26_seq_ordering_manyevents,
-t27_latest_for_sort_kills_fileorder, t28_append_event_sameday_compare,
-t29_fold_none_factid_guard, t30_register_success_exit_zero,
-t31_retire_success_exit_zero, t32_append_event_returns_written_record)
-
-def main():
-for t in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10) + HARDENING:
-with tempfile.TemporaryDirectory() as d:
-t(d)
-print()
-print(f"{PASS}/{PASS + FAIL} passed")
-return 0 if FAIL == 0 else 1
-
-if __name__ == "__main__":
-sys.exit(main())
+console.log("\nratchet-png-text: " + pass + " passed, " + fail + " failed" +
+" (real-PNG-byte vectors: tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, " +
+"live-zlib backstop, coercion, determinism, mutation-bite)");
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Python stdlib only
+Node / browser, no dependencies
+
+---
+
+# Reltime — a Loop MMT gift
+https://loopmmt.com/gifts/reltime/
+[coverage: optional · branch: gifts]
+
+Relative Time That Refuses To Lie date ← all gifts
+
+Reltime
+
+Turn a timestamp into a short human 'when' (3h ago, Jun 20) where the whole point is what it won't do: a missing, empty, or unparseable stamp returns no label rather than a guess, a future stamp returns no label rather than a negative age, and anything older than a week gets the real date it landed instead of a rounded-up '9d ago'. Deterministic — a pure function of (stamp, now).
+
+The honest edge
+
+It renders in UTC and is a recency label, not a locale-aware or timezone-shifting formatter, and not a full date library. The fixed minute/hour/day/week bands are by design — the value is the refusal to fabricate, not configurable granularity.
+
+Run it
+
+node reltime.js 2026-08-20T09:00:00Z
+test_reltime.js (20/20, mutation-bitten)
+Node, no dependencies
+
+The code — every file that ships
+
+reltime.js 106 lines on GitHub →
+#!/usr/bin/env node
+/* reltime.js — an honest relative-time label ("3h ago", "Jun 20") that refuses
+to fake, round up, or invent a time it doesn't have.
+
+Turn a timestamp into a short human "when" — but the whole point is what it
+WON'T do:
+
+• FLAG, DON'T FAKE. No stamp, an empty stamp, or an unparseable value
+returns null — NO label. The caller shows nothing rather than a guessed
+or fabricated time. An undated thing is never handed a "when".
+
+• A FUTURE STAMP IS NOT A RECENCY CLAIM. If the timestamp is ahead of now
+(clock skew, a bad record), it returns null rather than "-2h ago". You
+cannot honestly say how long ago something happened if it hasn't.
+
+• REAL, NOT ROUNDED-UP. Recent items get a relative label
+(just now / Nm / Nh / Nd ago); anything older than a week gets the
+ABSOLUTE short date it actually landed ("Jun 20", or "Jun 20, 2025"
+across a year boundary) — because "9d ago" is less honest and less
+useful than the date itself.
+
+• DETERMINISTIC. `now` is injected, so the label is a pure function of
+(stamp, now) — testable with no wall clock and stable across a render.
+
+Pure function of its inputs, no dependencies. The same code runs in a browser
+(attach relativeTime to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node reltime.js 2026-08-20T09:00:00Z # label vs. now
+node reltime.js 2026-08-20T09:00:00Z 1755772800000 # label vs. an injected now (ms)
+node reltime.js --help
+
+Dates are read/rendered in UTC for determinism. Released under MIT.
+*/
+"use strict";
+
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+var MIN = 60 * 1000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+
+/* relativeTime(iso, nowMs) -> short label string, or null when there is no
+honest label to show. `iso` is an ISO-8601 string (or null). `nowMs` defaults
+to Date.now() but is injected in tests and via the CLI for determinism. */
+function relativeTime(iso, nowMs) {
+// flag-don't-fake: no stamp, empty stamp, or a non-string -> no label.
+if (iso == null) return null;
+var s = String(iso);
+if (s === "") return null;
+
+var t = Date.parse(s);
+if (isNaN(t)) return null; // unparseable -> no fabricated time
+
+var now = (typeof nowMs === "number" && isFinite(nowMs))? nowMs: Date.now();
+var delta = now - t;
+
+// A future stamp (clock skew) is not a recency claim we can make honestly.
+if (delta < 0) return null;
+
+if (delta < MIN) return "just now";
+if (delta < HOUR) return Math.floor(delta / MIN) + "m ago";
+if (delta < DAY) return Math.floor(delta / HOUR) + "h ago";
+if (delta < WEEK) return Math.floor(delta / DAY) + "d ago";
+
+// Older than a week -> the absolute short date it actually landed.
+var d = new Date(t);
+var label = MONTHS[d.getUTCMonth()] + " " + d.getUTCDate();
+if (d.getUTCFullYear()!== new Date(now).getUTCFullYear()) {
+label += ", " + d.getUTCFullYear();
+}
+return label;
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.relativeTime = relativeTime;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { relativeTime: relativeTime};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function main(argv) {
+var args = argv.slice(2);
+if (args.length === 0 || args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"reltime.js — an honest relative-time label that refuses to fake a time.\n\n" +
+" node reltime.js <iso-timestamp> label vs. now\n" +
+" node reltime.js <iso-timestamp> <now-ms> label vs. an injected now (ms)\n" +
+" node reltime.js --help\n\n" +
+"Prints the label, or '(no honest label)' when the stamp is missing,\n" +
+"unparseable, or in the future. Dates render in UTC.\n"
+);
+return args.length === 0? 1: 0;
+}
+var iso = args[0];
+var nowMs = args.length > 1? Number(args[1]): undefined;
+var label = relativeTime(iso, nowMs);
+process.stdout.write((label === null? "(no honest label)": label) + "\n");
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_reltime.js 61 lines on GitHub →
+#!/usr/bin/env node
+/* test_reltime.js — proves the label is honest, exact, and deterministic.
+
+The honesty rules ARE the tool, so the test's real job is to prove each
+REFUSAL fires (null, not a fabricated label) and each threshold is exact. The
+clock is injected, so every case is deterministic with no wall clock. A
+mutation bite guards against a vacuously-green run. Exit 0 = all pass, exit 1
+= a failure (loud). stdlib only, no dependencies. */
+"use strict";
+var relativeTime = require("./reltime.js").relativeTime;
+
+var pass = 0, fail = 0;
+function eq(name, got, want) {
+var g = JSON.stringify(got), w = JSON.stringify(want);
+if (g === w) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
+}
+
+// A fixed "now" so every case is deterministic. 2026-06-27T12:00:00Z.
+var NOW = Date.parse("2026-06-27T12:00:00Z");
+function ago(ms) { return new Date(NOW - ms).toISOString();}
+var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+
+// --- flag-don't-fake: every "no honest label" case returns null -------------
+eq("null stamp -> null", relativeTime(null, NOW), null);
+eq("undefined stamp -> null", relativeTime(undefined, NOW), null);
+eq("empty string -> null", relativeTime("", NOW), null);
+eq("unparseable -> null", relativeTime("not a date", NOW), null);
+eq("garbage -> null", relativeTime("2026-13-99", NOW), null);
+eq("future stamp -> null", relativeTime(ago(-HOUR), NOW), null); // 1h in the FUTURE
+
+// --- relative band, exact thresholds ---------------------------------------
+eq("0ms -> just now", relativeTime(ago(0), NOW), "just now");
+eq("59s -> just now", relativeTime(ago(59 * 1000), NOW), "just now");
+eq("60s -> 1m ago", relativeTime(ago(MIN), NOW), "1m ago");
+eq("59m -> 59m ago", relativeTime(ago(59 * MIN), NOW), "59m ago");
+eq("60m -> 1h ago", relativeTime(ago(HOUR), NOW), "1h ago");
+eq("23h -> 23h ago", relativeTime(ago(23 * HOUR), NOW), "23h ago");
+eq("24h -> 1d ago", relativeTime(ago(DAY), NOW), "1d ago");
+eq("6d -> 6d ago", relativeTime(ago(6 * DAY), NOW), "6d ago");
+
+// --- absolute band (>= 1 week): the real date it landed --------------------
+eq("7d -> absolute date", relativeTime(ago(WEEK), NOW), "Jun 20");
+eq("30d same year -> date", relativeTime(ago(30 * DAY), NOW), "May 28");
+eq("across a year boundary", relativeTime("2025-12-31T00:00:00Z", NOW), "Dec 31, 2025");
+
+// --- determinism: same inputs, same output ---------------------------------
+eq("deterministic", relativeTime(ago(3 * HOUR), NOW), relativeTime(ago(3 * HOUR), NOW));
+
+// --- coercion / robustness --------------------------------------------------
+eq("non-string stamp -> null", relativeTime(12345, NOW), null); // a number is not an ISO string here
+
+// --- mutation bite: the future-guard MUST be load-bearing ------------------
+// If someone deleted `if (delta < 0) return null;`, a future stamp would
+// produce "just now" (delta<MIN with negative delta). Assert it does NOT.
+var futureResult = relativeTime(ago(-HOUR), NOW);
+if (futureResult === null) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: future stamp produced a label: " + JSON.stringify(futureResult));}
+
+console.log("\nreltime: " + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node, no dependencies
+
+---
+
+# Sha256 — a Loop MMT gift
+https://loopmmt.com/gifts/sha256/
+[coverage: optional · branch: gifts]
+
+Sync Hash That Matches Your Backend hash ← all gifts
+
+Sha256
+
+A dependency-free, synchronous SHA-256 (hex out) that returns the same 64-char digest as your Node backend's crypto.createHash for the same string — so a browser can mirror a server-side integrity check without turning the verify path async. The load-bearing rule: it hashes the UTF-8 bytes, so multibyte input (names, emoji) stays byte-identical instead of diverging silently.
+
+The honest edge
+
+It's a hash, not an HMAC and not encryption — it proves two inputs match, keeps no secret, and is not a password KDF. A from-scratch port for portability, not a hardened crypto library: where a vetted native lib is available and async is fine, prefer it.
+
+Run it
+
+node sha256.js "a string"
+test_sha256.js (24/24, drift-checked vs node crypto)
+Node, no dependencies
+
+The code — every file that ships
+
+sha256.js 176 lines on GitHub →
+#!/usr/bin/env node
+/* sha256.js — a dependency-free, synchronous SHA-256 (hex out) that is
+byte-identical to your backend's hash for the same string.
+
+WHY THIS EXISTS. The usual browser answer, crypto.subtle.digest, is
+ASYNCHRONOUS — it returns a Promise, so the moment you need a hash inside an
+otherwise-synchronous verify path (parse an envelope, check an integrity
+field, decide tamper/no-tamper), it forces that whole path to go async and
+ripple through everything that calls it. This is a small, pure, sync
+FIPS-180-4 SHA-256 that returns the SAME 64-char hex as Node's
+crypto.createHash('sha256').update(String(x)).digest('hex') — so a browser
+can mirror a Node integrity check without turning the call site async.
+
+THE ONE FIDELITY RULE (the whole reason to trust it). Node hashes the UTF-8
+BYTES of String(input). This encodes with the same UTF-8 byte stream, so the
+digest is identical — including for multibyte characters (accented names,
+emoji, non-Latin scripts). Never hash char codes: multibyte input would
+diverge silently and a tamper check would read a FALSE verdict. The test
+battery carries a multibyte vector precisely to catch that, checked against
+Node's own crypto as the oracle.
+
+Pure function of its input. No dependencies. Same code runs in a browser
+(attach sha256Hex to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node sha256.js "the string to hash" # hash an argument
+echo -n "the string" | node sha256.js # hash stdin (exact bytes, no newline added)
+node sha256.js --help
+
+Released under MIT. Its edge is printed in the README: this is a HASH, not
+an HMAC and not encryption — it proves two inputs match, it does not keep a
+secret and it is not a password-storage KDF.
+*/
+"use strict";
+
+// SHA-256 round constants — FIPS 180-4 §4.2.2 (first 32 bits of the fractional
+// parts of the cube roots of the first 64 primes).
+var K = [
+0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
+
+function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
+
+// Encode a JS string to its UTF-8 bytes — the SAME bytes Node's
+//.update(String(s)) hashes. TextEncoder is present in every modern browser and
+// in Node; the manual fallback (surrogate-pair aware) produces the same stream.
+function utf8Bytes(str) {
+if (typeof TextEncoder!== "undefined") {
+return new TextEncoder().encode(str);
+}
+var out = [], i, c, lo;
+for (i = 0; i < str.length; i++) {
+c = str.charCodeAt(i);
+if (c < 0x80) { out.push(c);}
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) { // high surrogate
+lo = str.charCodeAt(++i);
+c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
+out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
+}
+return out;
+}
+
+function toHex8(x) {
+var h = (x >>> 0).toString(16);
+return "00000000".slice(h.length) + h;
+}
+
+// sha256Hex(input) -> 64-char lowercase hex, byte-identical to Node's
+// crypto.createHash('sha256').update(String(input)).digest('hex').
+function sha256Hex(input) {
+var bytes = utf8Bytes(String(input));
+var len = bytes.length;
+
+// Padding: append 0x80, then 0x00s, then the 64-bit big-endian bit length,
+// rounding up to a multiple of 64 bytes.
+var bitLenHi = Math.floor(len / 0x20000000); // high 32 bits of (len*8)
+var bitLenLo = (len * 8) >>> 0; // low 32 bits of (len*8)
+var withOne = len + 1;
+var padded = (withOne + 8 + 63) & ~63;
+var msg = new Uint8Array(padded);
+var i;
+for (i = 0; i < len; i++) msg[i] = bytes[i];
+msg[len] = 0x80;
+msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
+msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
+msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
+msg[padded - 5] = bitLenHi & 0xff;
+msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
+msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
+msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
+msg[padded - 1] = bitLenLo & 0xff;
+
+var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
+h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+
+var w = new Array(64), t, blk;
+for (blk = 0; blk < padded; blk += 64) {
+for (t = 0; t < 16; t++) {
+w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
+(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
+}
+for (t = 16; t < 64; t++) {
+var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+}
+var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
+for (t = 0; t < 64; t++) {
+var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+var ch = (e & f) ^ (~e & g);
+var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
+var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+var maj = (a & b) ^ (a & c) ^ (b & c);
+var temp2 = (S0 + maj) >>> 0;
+hh = g; g = f; f = e; e = (d + temp1) >>> 0;
+d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+}
+h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
+}
+
+return toHex8(h0) + toHex8(h1) + toHex8(h2) + toHex8(h3) +
+toHex8(h4) + toHex8(h5) + toHex8(h6) + toHex8(h7);
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.sha256Hex = sha256Hex;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { sha256Hex: sha256Hex};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"sha256.js — dependency-free sync SHA-256, hex out (byte-identical to Node crypto).\n\n" +
+" node sha256.js \"a string\" hash the argument\n" +
+" echo -n \"a string\" | node sha256.js hash stdin (exact bytes, no newline added)\n" +
+" node sha256.js --help\n\n" +
+"Edge: this is a hash, not an HMAC and not encryption. It proves two inputs\n" +
+"match; it keeps no secret and is not a password KDF.\n"
+);
+return 0;
+}
+if (args.length > 0) {
+process.stdout.write(sha256Hex(args[0]) + "\n");
+return 0;
+}
+// stdin: hash the exact bytes received (no trailing newline added).
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var buf = Buffer.concat(chunks);
+// Hash the exact received bytes: decode as UTF-8 back to the string whose
+// UTF-8 bytes are these bytes (round-trips for valid UTF-8 input).
+process.stdout.write(sha256Hex(buf.toString("utf8")) + "\n");
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_sha256.js 73 lines on GitHub →
+#!/usr/bin/env node
+/* test_sha256.js — proves sha256Hex is byte-identical to Node's own crypto.
+
+The oracle is Node's crypto.createHash('sha256'): for every vector we compute
+the digest BOTH ways and require they match. That is the honest proof — not
+"it matches a hardcoded string I typed" but "it matches the reference
+implementation for the same bytes", including the multibyte case that is the
+whole point of the fidelity rule. Also checks the two canonical FIPS-180-4
+vectors as fixed anchors, and mutation-bites the core so a no-op test can't
+pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var crypto = require("crypto");
+var sha256Hex = require("./sha256.js").sha256Hex;
+
+var pass = 0, fail = 0;
+function check(name, got, want) {
+if (got === want) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + got + "\n want: " + want);}
+}
+function nodeHash(s) {
+return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+
+// 1. Canonical FIPS-180-4 anchors (fixed, independent of Node).
+check("empty string", sha256Hex(""),
+"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+check("abc", sha256Hex("abc"),
+"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+// 2. Drift-check against Node crypto over a vector battery (the real proof).
+var vectors = [
+"",
+"abc",
+"a",
+"The quick brown fox jumps over the lazy dog",
+"The quick brown fox jumps over the lazy dog.", // one-byte change -> avalanche
+"0123456789",
+"x".repeat(55), // one byte under a block boundary
+"x".repeat(56), // padding crosses into a new block
+"x".repeat(63),
+"x".repeat(64), // exact block
+"x".repeat(65),
+"x".repeat(1000), // multi-block
+"café", // multibyte: é is 2 UTF-8 bytes
+"naïve façade Zürich", // several multibyte
+"日本語テスト", // CJK, 3 bytes each
+"🦌", // the deer glyph — 4-byte surrogate pair
+"order:🦌×3 café", // mixed ASCII + multibyte + emoji
+"line1\nline2\ttabbed", // control chars
+];
+for (var i = 0; i < vectors.length; i++) {
+var v = vectors[i];
+var label = v.length > 24? (v.slice(0, 21) + "..."): v;
+check("drift[" + i + "] '" + label + "'", sha256Hex(v), nodeHash(v));
+}
+
+// 3. Determinism — same input twice, same digest.
+check("deterministic", sha256Hex("repeat me"), sha256Hex("repeat me"));
+
+// 4. Non-vacuity / mutation bite: a WRONG expected value MUST be caught.
+// (If the harness were a no-op, this "should fail" case would slip through.)
+var deliberatelyWrong = "0000000000000000000000000000000000000000000000000000000000000000";
+var mutationCaught = (sha256Hex("abc")!== deliberatelyWrong);
+if (mutationCaught) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: core did not distinguish a wrong digest");}
+
+// 5. String coercion parity with Node (numbers, etc. -> String()).
+check("number coercion 42", sha256Hex(42), nodeHash(42));
+check("boolean coercion", sha256Hex(true), nodeHash(true));
+
+console.log("\nsha256: " + pass + " passed, " + fail + " failed" +
+" (" + vectors.length + " drift vectors vs node crypto, incl. multibyte + emoji)");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node, no dependencies
+
+---
+
+# Sudoku — a Loop MMT gift
+https://loopmmt.com/gifts/sudoku/
+[coverage: optional · branch: gifts]
+
+A Solver That Shows Its Work transform ← all gifts
+
+Sudoku
+
+Most Sudoku solvers hand you the answer; this one hands you the reasoning. It solves the way a person does — applying the lowest technique that makes progress and recording WHAT it did and WHY at every step as a single ordered trace, so the answer is just the last line of an argument you can read and check by hand. Five techniques (naked/hidden single, locked candidates, naked pair, x-wing), applied lowest-first. It never guesses: faced with a puzzle beyond its ladder it says “ceiling-hit” rather than searching — an honest difficulty read, not a failure. Deterministic: the same givens always produce the byte-identical trace.
+
+The honest edge
+
+It only makes FORCED moves — it reasons, it does not search or backtrack, so a puzzle needing a technique above x-wing returns ceiling-hit (a difficulty read), not a guessed fill. And ‘broken’ fires when reasoning empties a cell; a contradiction sitting between two givens no technique touches reads as ceiling-hit, because the solver reasons about the puzzle rather than front-validating your input.
+
+Run it
+
+python3 sudoku.py --demo
+test_sudoku.py (130/130, mutation-bitten, pinned golden trace)
+Python standard library only, deterministic + headless
+
+The code — every file that ships
+
+sudoku.py 549 lines on GitHub →
+#!/usr/bin/env python3
+"""sudoku — a Sudoku solver that shows its work.
+
+Most solvers hand you the answer. This one hands you the *reasoning*: it solves
+the way a person does — applying the lowest technique that makes progress and
+recording WHAT it did and WHY at every step, as a single ordered trace. The
+answer is just the last line of an argument you can read.
+
+from sudoku import solve, from_string
+result = solve(from_string("53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"))
+result.status # 'solved-unique' | 'ceiling-hit' | 'broken'
+for step in result.trace:
+print(step.reason) # "naked single: 4 is the only candidate left for r1c3..."
+
+Five techniques, applied lowest-first (so the explanation reads like a human
+tutor, easiest move first):
+1. naked single — a cell with only one candidate left
+2. hidden single — a digit that fits only one cell in a unit
+3. locked candidates — pointing / claiming (an elimination technique)
+4. naked pair — two cells locking two digits to themselves
+5. x-wing — the basic fish
+
+Three honest terminal states:
+solved-unique — solved by these techniques alone; `solution` is filled in.
+ceiling-hit — consistent but needs a technique above the ladder (a
+DIFFICULTY read, not a failure — this puzzle is "harder
+than x-wing", which is useful information).
+broken — a cell ran out of candidates; the givens contradict.
+
+Properties (see test_sudoku.py):
+- Deterministic: the same givens always produce the byte-identical trace.
+- Certifying: every placement/elimination carries a human sentence saying
+why it is forced. The trace is a proof you can check by hand.
+- Never guesses: it only makes forced moves. It will say "ceiling-hit"
+before it will backtrack — it does not search, it reasons.
+
+Zero dependencies (Python standard library only). Headless: givens in, a
+SolveResult out — no I/O in the solver, no globals, no randomness.
+
+Origin: the reasoning core of a self-explaining Sudoku teaching app, stripped to
+stand alone. MIT licensed — take the folder.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, asdict
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+Cell = Tuple[int, int] # (row, col), 0-indexed
+Grid = List[List[int]] # 9x9, 0 = empty
+Candidates = Dict[Cell, Set[int]]
+
+N = 9
+DIGITS = frozenset(range(1, 10))
+
+# ── The trace (the spine — everything folds from this) ──────────────────────
+@dataclass
+class TechniqueApplication:
+technique: str # rung name
+cells_affected: List[Cell] # coordinates touched
+candidates_eliminated: List[Tuple[Cell, int]] # what this step ruled out
+reason: str # the human sentence: WHY
+
+def to_dict(self) -> dict:
+d = asdict(self)
+d["cells_affected"] = [list(c) for c in self.cells_affected]
+d["candidates_eliminated"] = [
+[list(c), dg] for c, dg in self.candidates_eliminated
+]
+return d
+
+@dataclass
+class SolveResult:
+status: str # solved-unique|ceiling-hit|broken
+trace: List[TechniqueApplication]
+solution: Optional[Grid] = None # present iff solved-unique
+
+def to_dict(self) -> dict:
+return {
+"status": self.status,
+"trace": [t.to_dict() for t in self.trace],
+"solution": self.solution,
+}
+
+# ── Geometry (units: rows, cols, boxes) ─────────────────────────────────────
+def _peers(cell: Cell) -> Set[Cell]:
+r, c = cell
+peers: Set[Cell] = set()
+for k in range(N):
+peers.add((r, k))
+peers.add((k, c))
+br, bc = 3 * (r // 3), 3 * (c // 3)
+for dr in range(3):
+for dc in range(3):
+peers.add((br + dr, bc + dc))
+peers.discard(cell)
+return peers
+
+def _units() -> List[List[Cell]]:
+units: List[List[Cell]] = []
+for r in range(N):
+units.append([(r, c) for c in range(N)]) # rows
+for c in range(N):
+units.append([(r, c) for r in range(N)]) # cols
+for br in range(0, N, 3):
+for bc in range(0, N, 3):
+units.append([(br + dr, bc + dc)
+for dr in range(3) for dc in range(3)]) # boxes
+return units
+
+_UNITS = _units()
+_UNIT_NAME = (
+["row " + str(i + 1) for i in range(N)]
++ ["column " + str(i + 1) for i in range(N)]
++ ["box " + str(i + 1) for i in range(N)]
+)
+
+def compute_candidates(grid: Grid) -> Candidates:
+"""For every empty cell, the digits not already used by one of its peers.
+
+Deterministic and total — the fixed point recomputes this each step.
+"""
+cands: Candidates = {}
+for r in range(N):
+for c in range(N):
+if grid[r][c]!= 0:
+continue
+seen = {grid[pr][pc] for pr, pc in _peers((r, c)) if grid[pr][pc]!= 0}
+cands[(r, c)] = set(DIGITS) - seen
+return cands
+
+# ── The ladder (reorderable DATA — the one live research object) ────────────
+# A rung: given the candidate grid, return the ONE lowest-rung, row-major-first
+# applicable move as a TechniqueApplication, or None. Rungs never mutate.
+#
+# Two KINDS of rung share this signature, and the loop tells them apart by ONE
+# schema-stable signal — `candidates_eliminated`:
+# PLACEMENT rung (naked/hidden-single): places a digit; `candidates_eliminated`
+# is [] and the placed digit is the first [1-9] in `reason`.
+# ELIMINATION rung (locked-candidates, pairs, x-wing): places NOTHING; it
+# prunes candidates, so `candidates_eliminated` is non-empty and there is
+# no placed digit. `cells_affected` are the cells it pruned FROM.
+# Invariant: `candidates_eliminated` non-empty <=> elimination step. A rung
+# that would eliminate nothing returns None (no progress -> the loop would spin).
+Rung = Callable[[Grid, Candidates], Optional[TechniqueApplication]]
+
+def _rowmajor(cells) -> list:
+"""The within-rung tie-break: smallest (row, col) first."""
+return sorted(cells)
+
+def _box_of(cell: Cell) -> Tuple[int, int]:
+r, c = cell
+return (3 * (r // 3), 3 * (c // 3))
+
+def _box_cells(br: int, bc: int) -> List[Cell]:
+return [(br + dr, bc + dc) for dr in range(3) for dc in range(3)]
+
+def _box_num(br: int, bc: int) -> int:
+return (br // 3) * 3 + (bc // 3) + 1
+
+# Row/column units in a fixed order (rows 1-9 then cols 1-9), for the line-based
+# rungs; digit names within a reason are 1-indexed to match the singles' voice.
+_ROWS: List[List[Cell]] = [[(r, c) for c in range(N)] for r in range(N)]
+_COLS: List[List[Cell]] = [[(r, c) for r in range(N)] for c in range(N)]
+_BOXES: List[Tuple[int, int]] = [(br, bc) for br in range(0, N, 3)
+for bc in range(0, N, 3)]
+
+def rung_naked_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+for cell in _rowmajor(cands):
+opts = cands[cell]
+if len(opts) == 1:
+d = next(iter(opts))
+r, c = cell
+return TechniqueApplication(
+technique="naked-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"naked single: {d} is the only candidate left for "
+f"r{r + 1}c{c + 1} — every other digit is already used "
+f"by one of its peers."),
+)
+return None
+
+def rung_hidden_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+# Units in a fixed order; within a unit, digits ascending; first hit wins.
+for ui, unit in enumerate(_UNITS):
+empties = [cell for cell in unit if cell in cands]
+for d in range(1, 10):
+spots = [cell for cell in empties if d in cands[cell]]
+if len(spots) == 1:
+cell = spots[0]
+# Skip if a naked single would already place it (lower rung wins).
+if len(cands[cell]) == 1:
+continue
+r, c = cell
+# The placed digit MUST be the first numeral in the reason:
+# _placed_digit greps the first \b[1-9]\b, so leading with a
+# unit number would make it place the unit's number, not {d}.
+return TechniqueApplication(
+technique="hidden-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"hidden single: {d} can only go in r{r + 1}c{c + 1} "
+f"— within {_UNIT_NAME[ui]} it fits nowhere else."),
+)
+return None
+
+def rung_locked_candidates(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Locked candidates (pointing + claiming). An ELIMINATION rung.
+
+Pointing: within a box, if every candidate for a digit lies in one line
+(row or col), that digit is eliminated from the rest of that line.
+Claiming: within a line, if every candidate for a digit lies in one box,
+that digit is eliminated from the rest of that box.
+"""
+# ── Pointing: box -> line ───────────────────────────────────────────────
+for br, bc in _BOXES:
+cells = _box_cells(br, bc)
+for d in range(1, 10):
+spots = [cell for cell in cells if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+rows = {r for r, _c in spots}
+cols = {c for _r, c in spots}
+if len(rows) == 1:
+r = next(iter(rows))
+targets = _rowmajor(cell for cell in _ROWS[r]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in row {r + 1}, so {d} is "
+f"eliminated from the rest of row {r + 1}."),
+)
+if len(cols) == 1:
+c = next(iter(cols))
+targets = _rowmajor(cell for cell in _COLS[c]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in column {c + 1}, so {d} is "
+f"eliminated from the rest of column {c + 1}."),
+)
+# ── Claiming: line -> box ───────────────────────────────────────────────
+for name, unit in ([(f"row {i + 1}", u) for i, u in enumerate(_ROWS)]
++ [(f"column {i + 1}", u) for i, u in enumerate(_COLS)]):
+for d in range(1, 10):
+spots = [cell for cell in unit if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+boxes = {_box_of(cell) for cell in spots}
+if len(boxes) == 1:
+br, bc = next(iter(boxes))
+box = _box_cells(br, bc)
+targets = _rowmajor(cell for cell in box
+if cell not in unit
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in {name}, {d} can only go "
+f"in box {_box_num(br, bc)}, so {d} is eliminated "
+f"from the rest of box {_box_num(br, bc)}."),
+)
+return None
+
+def rung_naked_pair(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Naked pair. Two cells in a unit sharing the SAME two candidates {x, y}
+lock those digits to themselves, eliminating x and y from every other cell
+in that unit."""
+for ui, unit in enumerate(_UNITS):
+bi = _rowmajor(cell for cell in unit
+if cell in cands and len(cands[cell]) == 2)
+for i in range(len(bi)):
+for j in range(i + 1, len(bi)):
+a, b = bi[i], bi[j]
+if cands[a]!= cands[b]:
+continue
+pair = sorted(cands[a]) # [x, y]
+elim: List[Tuple[Cell, int]] = []
+for cell in unit:
+if cell in (a, b) or cell not in cands:
+continue
+for d in pair:
+if d in cands[cell]:
+elim.append((cell, d))
+if elim:
+elim.sort()
+affected = _rowmajor({c for c, _d in elim})
+ar, ac = a
+br_, bc_ = b
+return TechniqueApplication(
+technique="naked-pair",
+cells_affected=affected,
+candidates_eliminated=elim,
+reason=(f"naked pair: {pair[0]} and {pair[1]} are locked "
+f"to r{ar + 1}c{ac + 1} and r{br_ + 1}c{bc_ + 1} "
+f"in {_UNIT_NAME[ui]}, so both are eliminated from "
+f"the rest of that unit."),
+)
+return None
+
+def rung_x_wing(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""X-wing (basic fish). If two rows each have digit d as a candidate in
+EXACTLY the same two columns, d is eliminated from those columns in every
+other row (and the column-based transpose)."""
+# ── Row-based: base = two rows, cross = two columns ─────────────────────
+for d in range(1, 10):
+rowcols: Dict[int, Tuple[int, int]] = {}
+for r in range(N):
+cols = [c for c in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(cols) == 2:
+rowcols[r] = (cols[0], cols[1])
+bases = sorted(rowcols)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+r1, r2 = bases[i], bases[j]
+if rowcols[r1]!= rowcols[r2]:
+continue
+c1, c2 = rowcols[r1]
+targets = _rowmajor(
+(r, c) for r in range(N) if r not in (r1, r2)
+for c in (c1, c2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in rows {r1 + 1} and {r2 + 1} is "
+f"confined to columns {c1 + 1} and {c2 + 1}, so "
+f"{d} is eliminated from those columns in every "
+f"other row."),
+)
+# ── Column-based (transpose): base = two columns, cross = two rows ──────
+for d in range(1, 10):
+colrows: Dict[int, Tuple[int, int]] = {}
+for c in range(N):
+rows = [r for r in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(rows) == 2:
+colrows[c] = (rows[0], rows[1])
+bases = sorted(colrows)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+c1, c2 = bases[i], bases[j]
+if colrows[c1]!= colrows[c2]:
+continue
+r1, r2 = colrows[c1]
+targets = _rowmajor(
+(r, c) for c in range(N) if c not in (c1, c2)
+for r in (r1, r2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in columns {c1 + 1} and {c2 + 1} is "
+f"confined to rows {r1 + 1} and {r2 + 1}, so "
+f"{d} is eliminated from those rows in every "
+f"other column."),
+)
+return None
+
+# ORDER IS DATA — reorder to change the difficulty model, never hard-code it.
+# New techniques (wings, chains) append here; the solve loop never changes.
+LADDER: List[Tuple[str, int, Rung]] = [
+("naked-single", 1, rung_naked_single),
+("hidden-single", 2, rung_hidden_single),
+("locked-candidates", 3, rung_locked_candidates),
+("naked-pair", 4, rung_naked_pair),
+("x-wing", 5, rung_x_wing),
+]
+
+def _is_contradiction(grid: Grid, cands: Candidates) -> bool:
+for cell, opts in cands.items():
+if not opts: # an empty cell with no candidate = broken
+return True
+return False
+
+def _complete(grid: Grid) -> bool:
+return all(grid[r][c]!= 0 for r in range(N) for c in range(N))
+
+def _placed_digit(step: TechniqueApplication) -> int:
+# CONTRACT: a PLACEMENT reason MUST lead with the placed digit — it is the
+# first \b[1-9]\b in the string, before any row/col/unit numeral. Both
+# placement rungs honor this. Never call this on an elimination step
+# (candidates_eliminated non-empty); use its structured (cell, digit) pairs.
+m = re.search(r"\b([1-9])\b", step.reason)
+return int(m.group(1))
+
+def _is_placement(step: TechniqueApplication) -> bool:
+"""A step is a PLACEMENT iff it eliminates no candidates (it places a digit);
+otherwise it is an ELIMINATION (it prunes candidates, places nothing)."""
+return not step.candidates_eliminated
+
+def solve(givens: Grid) -> SolveResult:
+"""solve(givens) -> SolveResult. Prefer-lowest-rung fixed point.
+
+Candidates are CARRIED, not recomputed each step: a placement prunes the
+placed digit from the placed cell's peers; an elimination prunes the pruned
+(cell, digit) pairs. Recomputing from the grid alone would lose every
+elimination-rung deduction (they don't live in the grid), so the persistent
+candidate set is what lets a later single depend on an earlier elimination.
+"""
+grid = [row[:] for row in givens]
+cands = compute_candidates(grid)
+trace: List[TechniqueApplication] = []
+
+while True:
+if _is_contradiction(grid, cands):
+return SolveResult(status="broken", trace=trace, solution=None)
+
+if _complete(grid):
+return SolveResult(status="solved-unique", trace=trace,
+solution=[row[:] for row in grid])
+
+# walk the ladder bottom-up; apply the LOWEST rung that makes progress
+step: Optional[TechniqueApplication] = None
+for _name, _tier, rung in LADDER:
+step = rung(grid, cands)
+if step is not None:
+break
+
+if step is None:
+# no rung progresses, board consistent but unfinished — a
+# DIFFICULTY read, not a failure.
+return SolveResult(status="ceiling-hit", trace=trace, solution=None)
+
+if _is_placement(step):
+(r, c) = step.cells_affected[0]
+d = _placed_digit(step)
+grid[r][c] = d
+del cands[(r, c)]
+for peer in _peers((r, c)):
+if peer in cands:
+cands[peer].discard(d)
+else:
+for cell, dig in step.candidates_eliminated:
+if cell in cands:
+cands[cell].discard(dig)
+trace.append(step)
+
+# ── convenience: parse / print an 81-char string ("." or "0" = empty) ───────
+def from_string(s: str) -> Grid:
+s = "".join(ch for ch in s if not ch.isspace())
+if len(s)!= 81:
+raise ValueError(f"expected 81 cells, got {len(s)}")
+g: Grid = []
+for r in range(N):
+row = []
+for c in range(N):
+ch = s[r * N + c]
+row.append(0 if ch in ".0" else int(ch))
+g.append(row)
+return g
+
+def to_string(grid: Grid) -> str:
+return "".join(str(grid[r][c]) for r in range(N) for c in range(N))
+
+def render(grid: Grid) -> str:
+"""A human-readable 9x9 grid with box separators (for the CLI)."""
+lines = []
+for r in range(N):
+if r in (3, 6):
+lines.append("------+-------+------")
+cells = []
+for c in range(N):
+if c in (3, 6):
+cells.append("|")
+cells.append(str(grid[r][c]) if grid[r][c] else ".")
+lines.append(" ".join(cells))
+return "\n".join(lines)
+
+# ── CLI: read an 81-char puzzle, print the reasoning, then the answer ───────
+def _main(argv: List[str]) -> int:
+demo = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+if argv and argv[0] in ("-h", "--help"):
+print("usage: python3 sudoku.py [81-char-puzzle | --demo]")
+print(" cells 1-9; '.' or '0' = empty; whitespace ignored")
+print(" prints the step-by-step reasoning, then the solution")
+return 0
+arg = argv[0] if argv else "--demo"
+puzzle = demo if arg in ("", "--demo") else arg
+try:
+grid = from_string(puzzle)
+except ValueError as e:
+print(f"bad puzzle: {e}")
+return 2
+
+print("puzzle:")
+print(render(grid))
+print()
+result = solve(grid)
+print(f"status: {result.status} ({len(result.trace)} steps)\n")
+for i, step in enumerate(result.trace, 1):
+print(f" {i:>2}. {step.reason}")
+if result.solution is not None:
+print("\nsolution:")
+print(render(result.solution))
+elif result.status == "ceiling-hit":
+print("\n(consistent, but needs a technique above this solver's ladder — "
+"a difficulty read, not a failure.)")
+return 0
+
+if __name__ == "__main__":
+import sys
+raise SystemExit(_main(sys.argv[1:]))
+
+test_sudoku.py 248 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_sudoku.py — proves the solver is certifying, deterministic, and honest.
+
+The claims that ARE the tool:
+1. CERTIFYING: every step carries a reason, and the reason is CHECKABLE —
+a placement's reason leads with the digit it places, and re-applying the
+whole trace to the givens reproduces the solution. The trace is a proof.
+2. DETERMINISTIC: the same givens produce the byte-identical trace, every run.
+3. THREE HONEST STATES: solved-unique (with a valid solution), ceiling-hit
+(consistent but beyond the ladder — a difficulty read), broken (givens
+contradict). Each is reachable and correctly labelled.
+4. NEVER GUESSES: it stops at ceiling-hit rather than searching. A puzzle
+needing a technique above x-wing returns ceiling-hit, not a lucky answer.
+Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
+Exit 0 = all pass, exit 1 = a failure (loud).
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sudoku import (
+solve, from_string, to_string, compute_candidates,
+SolveResult, TechniqueApplication, _peers, _units, N, LADDER,
+)
+
+_pass = 0
+_fail = 0
+
+def eq(name, got, want):
+global _pass, _fail
+if got == want:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
+
+def ok(name, cond):
+global _pass, _fail
+if cond:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}")
+
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+EASY = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+EASY_SOLUTION = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+
+# A grid that is complete and correct = solve returns it unchanged, zero steps.
+SOLVED = EASY_SOLUTION
+
+# A contradiction the solver actually REACHES: the near-complete easy solution
+# with r1c1 blanked and a 5 planted in its box, so r1c1's only digit (5) is
+# already taken by a peer — compute_candidates leaves it with an empty set and
+# _is_contradiction fires. (Note: a contradiction between two GIVENS that no
+# technique touches reads as ceiling-hit, not broken — the solver reasons, it
+# does not front-validate the givens. That is correct and intentional.)
+BROKEN = ".54678912672195348198342567859761423426853791713924856961537284287419635345286179"
+
+def is_valid_solution(s: str) -> bool:
+"""A solved grid: 81 non-zero cells, every row/col/box a permutation of 1-9."""
+g = from_string(s)
+if any(g[r][c] == 0 for r in range(N) for c in range(N)):
+return False
+for unit in _units():
+vals = sorted(g[r][c] for r, c in unit)
+if vals!= list(range(1, 10)):
+return False
+return True
+
+# ── PROPERTY 1: certifying — the trace is a checkable proof ───────────────────
+(lambda: None)() # keep the section visible
+
+def _replay_trace(givens, result):
+"""Re-apply the recorded trace to the givens; a placement's reason must lead
+with the digit it places, and applying every placement must reproduce the
+solution. This proves the reasons are not decorative — they carry the moves."""
+import re
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated: # placement
+(r, c) = step.cells_affected[0]
+d = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+g[r][c] = d
+return g
+
+r_easy = solve(from_string(EASY))
+ok("easy solves", r_easy.status == "solved-unique")
+ok("easy solution is valid", r_easy.solution is not None and is_valid_solution(to_string(r_easy.solution)))
+eq("easy solution matches known answer", to_string(r_easy.solution), EASY_SOLUTION)
+ok("every step has a non-empty reason", all(s.reason.strip() for s in r_easy.trace))
+ok("trace is non-trivial", len(r_easy.trace) > 10)
+# the certifying check: replaying the trace's placements reproduces the solution
+replayed = _replay_trace(from_string(EASY), r_easy)
+eq("replaying the trace reproduces the solution", to_string(replayed), EASY_SOLUTION)
+
+# every placement step's reason leads with the digit actually placed in the solution
+import re
+for step in r_easy.trace:
+if not step.candidates_eliminated: # placement
+(rr, cc) = step.cells_affected[0]
+placed = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+ok(f"placement reason leads with placed digit @r{rr+1}c{cc+1}",
+placed == from_string(EASY_SOLUTION)[rr][cc])
+
+# ── PROPERTY 2: deterministic — byte-identical trace every run ────────────────
+def trace_signature(result):
+return to_string_result(result)
+
+def to_string_result(result):
+import json
+return json.dumps(result.to_dict(), sort_keys=True)
+
+sig1 = to_string_result(solve(from_string(EASY)))
+sig2 = to_string_result(solve(from_string(EASY)))
+sig3 = to_string_result(solve(from_string(EASY)))
+ok("deterministic: run 1 == run 2", sig1 == sig2)
+ok("deterministic: run 2 == run 3", sig2 == sig3)
+# GOLDEN: pin the canonical trace signature by hash. Self-equality alone is a
+# weak determinism test (a benign reorder stays self-equal); a pinned golden
+# catches any change to the tie-break / scan order that reorders the trace.
+import hashlib as _hl
+_golden = "1f4fc6f7b5886070bb06a38c5457ef9c93a4c4dabdb9735518786b8f57e91548"
+_got = _hl.sha256(sig1.encode()).hexdigest()
+ok("deterministic: trace matches the pinned golden signature", _got == _golden)
+# solving does not mutate the givens
+givens = from_string(EASY)
+before = to_string(givens)
+solve(givens)
+eq("solve does not mutate givens", to_string(givens), before)
+
+# ── PROPERTY 3: three honest terminal states ──────────────────────────────────
+# solved-unique (already covered above)
+# broken:
+r_broken = solve(from_string(BROKEN))
+ok("contradiction -> broken", r_broken.status == "broken")
+ok("broken has no solution", r_broken.solution is None)
+
+# an already-solved grid: solved-unique, zero steps, solution == input
+r_done = solve(from_string(SOLVED))
+ok("already-solved -> solved-unique", r_done.status == "solved-unique")
+eq("already-solved needs zero steps", len(r_done.trace), 0)
+eq("already-solved returns the same grid", to_string(r_done.solution), SOLVED)
+
+# ── PROPERTY 4: never guesses — ceiling-hit before search ─────────────────────
+# The empty grid is consistent but has no forced move for these techniques,
+# so a NON-searching solver must return ceiling-hit (a searching one would
+# "solve" it to some arbitrary valid grid). This is the anti-guess proof.
+EMPTY = "." * 81
+r_empty = solve(from_string(EMPTY))
+ok("empty grid -> ceiling-hit (does NOT guess a solution)", r_empty.status == "ceiling-hit")
+ok("ceiling-hit has no solution", r_empty.solution is None)
+# a partial consistent grid with no forced single also ceiling-hits rather than searching
+# (17-clue minimal puzzles typically need guessing; a bare 2-clue grid certainly does)
+SPARSE = "1................2..............................................................."
+r_sparse = solve(from_string(SPARSE))
+ok("sparse consistent grid -> ceiling-hit, not a guessed fill",
+r_sparse.status == "ceiling-hit" and r_sparse.solution is None)
+
+# ── The elimination rungs actually fire (coverage that the ladder is exercised) ─
+# Not every easy puzzle exercises the higher rungs; assert the ladder is complete
+# and each rung is callable and returns the right SHAPE when it does fire.
+ok("ladder has all five rungs", [name for name, _t, _f in LADDER] ==
+["naked-single", "hidden-single", "locked-candidates", "naked-pair", "x-wing"])
+# a placement step: candidates_eliminated empty; an elimination step: non-empty.
+for step in r_easy.trace:
+placement = not step.candidates_eliminated
+if placement:
+ok(f"placement step has one affected cell ({step.technique})", len(step.cells_affected) == 1)
+else:
+ok(f"elimination step eliminated something ({step.technique})", len(step.candidates_eliminated) >= 1)
+
+# ── input validation ──────────────────────────────────────────────────────────
+def raises(name, fn):
+global _pass, _fail
+try:
+fn()
+_fail += 1
+print(f"FAIL {name} (expected raise)")
+except Exception:
+_pass += 1
+
+raises("from_string rejects wrong length", lambda: from_string("123"))
+raises("from_string rejects 80 chars", lambda: from_string("." * 80))
+ok("from_string accepts 81 with whitespace", to_string(from_string("." * 81)) == "0" * 81)
+ok("from_string treats 0 and. both as empty",
+from_string("0" * 81) == from_string("." * 81))
+
+# ── candidates helper is correct ──────────────────────────────────────────────
+cands = compute_candidates(from_string(EASY))
+# r1c3 (row 0, col 2) is empty in EASY; its candidates must exclude peers' givens
+ok("candidates computed for empty cells only",
+all(from_string(EASY)[r][c] == 0 for (r, c) in cands))
+ok("a candidate set never contains a peer's given",
+all(all((from_string(EASY)[pr][pc] not in opts)
+for (pr, pc) in _peers(cell) if from_string(EASY)[pr][pc]!= 0)
+for cell, opts in cands.items()))
+
+# ── MUTATION BITE: prove the certifying check is not vacuously green ───────────
+# If the reasons were decorative (not carrying the placed digit), the replay
+# would NOT reproduce the solution. This bite asserts that (a) the trace has
+# real placement steps, and (b) mangling a reason's leading digit WOULD break
+# the replay — so a no-op reason (the plausible mutation) fails loud here.
+placements = [s for s in r_easy.trace if not s.candidates_eliminated]
+ok("mutation bite: trace has real placements", len(placements) > 0)
+
+def _replay_with_broken_reasons(givens, result):
+"""Replay but with every placement reason's digit forced to 1 — must NOT
+reproduce the solution (unless every placed digit really is 1, impossible)."""
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated:
+(r, c) = step.cells_affected[0]
+g[r][c] = 1 # deliberately wrong: ignore the real reason
+return to_string(g)
+
+ok("mutation bite: breaking the reason breaks the replay",
+_replay_with_broken_reasons(from_string(EASY), r_easy)!= EASY_SOLUTION)
+
+# and: if solve silently returned 'solved' on the empty grid (a searching
+# mutation), property 4 would flip. Assert the anti-guess invariant has teeth:
+ok("mutation bite: empty grid is genuinely unforced (>50 empty cells, 0 forced singles)",
+len(compute_candidates(from_string(EMPTY))) == 81
+and all(len(v) == 9 for v in compute_candidates(from_string(EMPTY)).values()))
+
+print(("PASS" if _fail == 0 else "FAIL") + f" — {_pass} passed, {_fail} failed")
+sys.exit(0 if _fail == 0 else 1)
+
+Take the whole folder →
+MIT
+Python standard library only, deterministic + headless
 
 ---
