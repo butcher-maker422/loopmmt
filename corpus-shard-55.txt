@@ -1,8 +1,467 @@
-# Loop MMT — corpus shard 55/60
+# Loop MMT — corpus shard 55/61
 
-> Bundle 55 of 60 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 55 of 61 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/port/, /gifts/ratchet-inline-mime/, /gifts/ratchet-pdf-text/)
+Nodes in this shard: 3 (/gifts/plumb/, /gifts/port/, /gifts/ratchet-inline-mime/)
+
+---
+
+# Plumb — a Loop MMT gift
+https://loopmmt.com/gifts/plumb/
+[coverage: optional · branch: gifts]
+
+Status Board That Won't Lie witness ← all gifts
+
+Plumb
+
+A tiny audit pattern for anyone whose dashboards turn green on intention instead of evidence. Each claim names a witness — a file that must exist, text that must be present, a command that must pass — and only renders green if its witness agrees. Assert done with nothing beneath it and you get UNWITNESSED, not a pass.
+
+The honest edge
+
+It checks the witness exists and agrees, never that the witness is the right one. Point it at the wrong file and it'll happily pass — choosing a meaningful witness is your job.
+
+Run it
+
+python3 plumb.py --help
+smoke_test.py (8/8)
+Python stdlib only
+
+The code — every file that ships
+
+plumb.py 299 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""plumb.py — a status board that refuses to show green on hope.
+
+A plumb line tells the truth about vertical no matter how the wall *feels*. This
+does the same for a status board: every claim you assert PASS must carry a
+WITNESS beneath it — a real, checkable piece of evidence — and the claim is only
+rendered green if that witness actually agrees. A "done" typed by a hopeful hand
+is not evidence. Plumb will not paint it green.
+
+The board file (`.plumb`) is one claim per line. Blank lines and lines starting
+with '#' are ignored. Each claim is 2 or 3 pipe-separated fields:
+
+NAME | WITNESS # status defaults to 'assert'
+NAME | STATUS | WITNESS # STATUS is 'assert' or 'todo'
+
+WITNESS is one of:
+
+exists PATH # PATH must exist
+absent PATH # PATH must NOT exist (e.g. "no secret committed")
+contains PATH ~ TEXT # PATH exists and contains the literal substring TEXT
+cmd SHELL COMMAND... # the command must exit 0
+none # NO witness at all (the honesty case)
+
+Verdicts:
+
+HELD assert + witness satisfied -> green, and clean
+BROKEN assert + witness NOT satisfied -> the green-on-hope catch
+UNWITNESSED assert + witness 'none' -> you claimed PASS with nothing beneath it
+BLOCKED witness could not be evaluated -> don't trust the reading
+TODO todo + witness not (yet) satisfied -> honest not-done (never green)
+READY todo + witness satisfied -> it's actually done; promote it
+
+Exit codes:
+0 every asserted claim is HELD (todo/ready present is fine)
+1 at least one BROKEN or UNWITNESSED claim (a definite green-on-hope)
+2 no broken assertions, but at least one BLOCKED claim (couldn't measure — don't trust green)
+3 usage / unreadable board
+
+A `todo` claim can NEVER render green. That is deliberate: the one thing this tool
+exists to make impossible is a green cell with nothing true beneath it.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+CEILING = (
+"note: Plumb checks that each claim's witness EXISTS / AGREES — not that the "
+"witness is CORRECT. A claim can point at the wrong evidence (a file that "
+"exists but proves nothing, a command that exits 0 for the wrong reason) and "
+"Plumb will pass it. It catches GREEN ON HOPE (a claim asserted PASS with no "
+"satisfied witness); it does NOT catch GREEN ON THE WRONG WITNESS. The witness "
+"is only as honest as you write it, and the board file runs its `cmd` witnesses "
+"with your shell — trust it like a Makefile."
+)
+
+# Verdicts
+HELD = "HELD"
+BROKEN = "BROKEN"
+UNWITNESSED = "UNWITNESSED"
+BLOCKED = "BLOCKED"
+TODO = "TODO"
+READY = "READY"
+
+# Which verdicts drive which exit code.
+_FAIL_1 = (BROKEN, UNWITNESSED) # a definite green-on-hope
+_FAIL_2 = (BLOCKED,) # couldn't measure
+
+def _eprint(*a):
+print(*a, file=sys.stderr)
+
+# --- witness parsing --------------------------------------------------------
+
+def parse_witness(expr):
+"""expr -> ((kind, arg), None) on success, or (None, error_string).
+
+kind is one of exists/absent/contains/cmd/none.
+arg is a string (path or command), a (path, pattern) tuple for contains, or
+None for 'none'.
+"""
+expr = expr.strip()
+if expr == "" or expr.lower() == "none":
+return ("none", None), None
+head, _, rest = expr.partition(" ")
+kind = head.lower()
+rest = rest.strip()
+if kind in ("exists", "absent"):
+if not rest:
+return None, f"{kind} needs a path"
+return (kind, rest), None
+if kind == "contains":
+if " ~ " not in rest:
+return None, "contains needs the form: contains <path> ~ <text>"
+path, _, pattern = rest.partition(" ~ ")
+path = path.strip()
+if not path or pattern == "":
+return None, "contains needs both a path and a non-empty text"
+return ("contains", (path, pattern)), None
+if kind == "cmd":
+if not rest:
+return None, "cmd needs a command"
+return ("cmd", rest), None
+return None, f"unknown witness kind {kind!r} (want exists/absent/contains/cmd/none)"
+
+# --- board parsing ----------------------------------------------------------
+
+def parse_board(text):
+"""Return a list of claim dicts (name, status, witness kind/arg, parse_error, line)."""
+claims = []
+for lineno, raw in enumerate(text.splitlines(), 1):
+line = raw.strip()
+if not line or line.startswith("#"):
+continue
+# GIFT-009: parse NAME-first with a bounded left split, so a `cmd:` witness
+# that legitimately contains shell pipes (`... | wc -l`) is NOT torn apart.
+# The old `line.split("|")` counted every pipe as a field boundary, so a
+# piped command produced 4+ fields and hit the "2 or 3 fields" error — the
+# command was lost purely for containing a pipe. The grammar is unchanged
+# for the reader (name | [status] | witness); only the SPLIT is bounded:
+# field 0 is the name, an optional bare-status field 1, and EVERYTHING after
+# is the witness, rejoined verbatim (interior pipes preserved).
+head = [f.strip() for f in line.split("|", 2)]
+if len(head) == 2:
+name, status, wexpr = head[0], "assert", head[1]
+elif len(head) == 3:
+# 3 raw segments: field 1 is the status ONLY if it's a bare status
+# keyword; otherwise it belongs to a 2-field claim whose witness itself
+# carried a pipe, so fold field 1 back into the witness.
+if head[1].lower() in ("assert", "todo"):
+name, status, wexpr = head[0], head[1].lower(), head[2]
+else:
+name, status, wexpr = head[0], "assert", head[1] + " | " + head[2]
+else:
+claims.append({"name": line, "status": "assert", "line": lineno,
+"parse_error": "a claim needs a name and a witness "
+"(name | witness or name | status | witness)"})
+continue
+if not name:
+claims.append({"name": "(unnamed)", "status": status, "line": lineno,
+"parse_error": "claim has no name"})
+continue
+if status not in ("assert", "todo"):
+claims.append({"name": name, "status": "assert", "line": lineno,
+"parse_error": f"unknown status {status!r} (want assert|todo)"})
+continue
+parsed, err = parse_witness(wexpr)
+if err:
+claims.append({"name": name, "status": status, "line": lineno,
+"parse_error": err})
+continue
+kind, arg = parsed
+claims.append({"name": name, "status": status, "witness_kind": kind,
+"witness_arg": arg, "line": lineno, "parse_error": None})
+return claims
+
+# --- witness evaluation -----------------------------------------------------
+
+def eval_witness(kind, arg, cwd):
+"""Return (satisfied, detail). satisfied is True/False, or None = could-not-evaluate."""
+if kind == "exists":
+ok = os.path.exists(os.path.join(cwd, arg))
+return ok, ("present" if ok else "MISSING") + f": {arg}"
+if kind == "absent":
+ok = not os.path.exists(os.path.join(cwd, arg))
+return ok, ("absent" if ok else "PRESENT") + f": {arg}"
+if kind == "contains":
+path, pattern = arg
+full = os.path.join(cwd, path)
+try:
+with open(full, "r", encoding="utf-8", errors="replace") as f:
+text = f.read()
+except Exception as ex:
+return None, f"unreadable {path}: {ex.__class__.__name__}"
+ok = pattern in text
+return ok, (f"found {pattern!r}" if ok else f"NOT found {pattern!r}") + f" in {path}"
+if kind == "cmd":
+try:
+rc = subprocess.call(arg, shell=True, cwd=cwd,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except Exception as ex:
+return None, f"could not launch: {ex.__class__.__name__}"
+return (rc == 0), f"exit {rc}"
+return None, f"unknown witness kind {kind!r}"
+
+def evaluate(claim, cwd):
+"""A parsed claim -> (verdict, detail)."""
+if claim.get("parse_error"):
+return BLOCKED, claim["parse_error"]
+status = claim["status"]
+kind = claim["witness_kind"]
+arg = claim["witness_arg"]
+if kind == "none":
+if status == "todo":
+return TODO, "no witness yet (todo)"
+return UNWITNESSED, "asserted PASS with no witness beneath it"
+satisfied, detail = eval_witness(kind, arg, cwd)
+if satisfied is None:
+return BLOCKED, detail
+if status == "todo":
+return (READY if satisfied else TODO), detail
+return (HELD if satisfied else BROKEN), detail
+
+# --- run / render -----------------------------------------------------------
+
+def run(board_text, cwd):
+rows = []
+for c in parse_board(board_text):
+verdict, detail = evaluate(c, cwd)
+rows.append({"name": c["name"], "status": c["status"], "verdict": verdict,
+"detail": detail, "line": c["line"]})
+return rows
+
+def exit_code(rows):
+verdicts = {r["verdict"] for r in rows}
+if verdicts & set(_FAIL_1):
+return 1
+if verdicts & set(_FAIL_2):
+return 2
+return 0
+
+_MARK = {HELD: "ok ", BROKEN: "XX ", UNWITNESSED: "XX ", BLOCKED: "?? ",
+TODO: ". ", READY: ">> "}
+
+def render_table(rows):
+if not rows:
+return "(no claims)"
+w = max(len(r["name"]) for r in rows)
+out = []
+for r in rows:
+out.append(f" {_MARK.get(r['verdict'], ' ')} {r['name']:<{w}} "
+f"{r['verdict']:<11} {r['detail']}")
+return "\n".join(out)
+
+def summary(rows):
+counts = {}
+for r in rows:
+counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+order = [HELD, BROKEN, UNWITNESSED, BLOCKED, TODO, READY]
+parts = [f"{counts[v]} {v.lower()}" for v in order if counts.get(v)]
+return "plumb: " + (" · ".join(parts) if parts else "no claims")
+
+def main(argv=None):
+ap = argparse.ArgumentParser(
+prog="plumb.py",
+description="A status board that refuses to show green on hope.")
+ap.add_argument("board", help="path to a.plumb board file, or - for stdin")
+ap.add_argument("--cwd", default=None,
+help="base dir for relative witness paths and commands "
+"(default: the board file's directory; '.' for stdin)")
+ap.add_argument("--json", action="store_true",
+help="machine-readable output on stdout")
+ap.add_argument("--quiet", action="store_true",
+help="print only the summary line (+ ceiling on stderr)")
+args = ap.parse_args(argv)
+
+if args.board == "-":
+board_text = sys.stdin.read()
+default_cwd = "."
+else:
+try:
+with open(args.board, "r", encoding="utf-8") as f:
+board_text = f.read()
+except Exception as ex:
+_eprint(f"plumb: cannot read board {args.board!r}: {ex}")
+return 3
+default_cwd = os.path.dirname(os.path.abspath(args.board)) or "."
+cwd = args.cwd or default_cwd
+
+rows = run(board_text, cwd)
+code = exit_code(rows)
+
+if args.json:
+print(json.dumps({"rows": rows, "exit": code}, indent=2))
+else:
+if not args.quiet:
+print(render_table(rows))
+print()
+print(summary(rows))
+
+_eprint(CEILING)
+return code
+
+if __name__ == "__main__":
+sys.exit(main())
+
+smoke_test.py 154 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""smoke_test.py — hermetic proof that plumb.py holds the line. No network, no
+state outside a tmpdir. Each scenario writes a board + evidence, runs plumb.py as
+a subprocess, and checks the exit code and the verdict text — the real CLI
+contract, mirroring the durability claims:
+
+1 a satisfied witness renders HELD and the run is clean (exit 0)
+2 a claim asserting PASS with a MISSING witness is caught BROKEN (exit 1) <- the headline
+3 a claim asserting PASS with NO witness is UNWITNESSED (exit 1)
+4 contains: HELD when the text is present, BROKEN when absent
+5 absent: HELD when the path is gone, BROKEN when it is present
+6 cmd: exit 0 -> HELD, non-zero -> BROKEN
+7 a malformed witness is BLOCKED, not silently passed (exit 2)
+8 a todo claim never renders green: unsatisfied -> TODO, satisfied -> READY,
+and neither fails the run (exit 0)
+
+Run: python3 smoke_test.py (expect: 8/8 passed)
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLUMB = os.path.join(HERE, "plumb.py")
+PASS = 0
+FAIL = 0
+
+def ok(msg):
+global PASS
+PASS += 1
+print(f"ok {msg}")
+
+def bad(msg, why):
+global FAIL
+FAIL += 1
+print(f"FAIL {msg}: {why}")
+
+def run_plumb(board_text, cwd):
+"""Write board.plumb into cwd, run plumb.py against it, return (rc, stdout)."""
+board = os.path.join(cwd, "board.plumb")
+with open(board, "w", encoding="utf-8") as f:
+f.write(board_text)
+p = subprocess.run([sys.executable, PLUMB, board],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+return p.returncode, p.stdout
+
+def write(cwd, name, text=""):
+with open(os.path.join(cwd, name), "w", encoding="utf-8") as f:
+f.write(text)
+
+def t1(d):
+write(d, "artifact.txt", "built")
+rc, out = run_plumb("build shipped | exists artifact.txt\n", d)
+if rc == 0 and "HELD" in out:
+ok("satisfied witness renders HELD, run is clean")
+else:
+bad("held", f"rc={rc} out=[{out.strip()}]")
+
+def t2(d):
+# assert PASS but the witness file does not exist -> green on hope, caught
+rc, out = run_plumb("build shipped | exists nope.txt\n", d)
+if rc == 1 and "BROKEN" in out:
+ok("asserted PASS with a missing witness is caught BROKEN (exit 1)")
+else:
+bad("green-on-hope", f"expected rc=1 + BROKEN, got rc={rc} out=[{out.strip()}]")
+
+def t3(d):
+rc, out = run_plumb("migration done | none\n", d)
+if rc == 1 and "UNWITNESSED" in out:
+ok("asserted PASS with no witness is UNWITNESSED (exit 1)")
+else:
+bad("unwitnessed", f"expected rc=1 + UNWITNESSED, got rc={rc} out=[{out.strip()}]")
+
+def t4(d):
+write(d, "README.md", "# thing\n\nMIT licensed.\n")
+rc, out = run_plumb("readme licensed | contains README.md ~ MIT\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("contains-present", f"rc={rc} out=[{out.strip()}]")
+return
+rc2, out2 = run_plumb("readme gpl | contains README.md ~ GPL\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("contains: HELD when text present, BROKEN when absent")
+else:
+bad("contains-absent", f"rc={rc2} out=[{out2.strip()}]")
+
+def t5(d):
+rc, out = run_plumb("no secret | absent.env\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("absent-gone", f"rc={rc} out=[{out.strip()}]")
+return
+write(d, ".env", "SECRET=x")
+rc2, out2 = run_plumb("no secret | absent.env\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("absent: HELD when path gone, BROKEN when present")
+else:
+bad("absent-present", f"rc={rc2} out=[{out2.strip()}]")
+
+def t6(d):
+rc, out = run_plumb("truthy | cmd true\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("cmd-zero", f"rc={rc} out=[{out.strip()}]")
+return
+rc2, out2 = run_plumb("falsy | cmd false\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("cmd: exit 0 -> HELD, non-zero -> BROKEN")
+else:
+bad("cmd-nonzero", f"rc={rc2} out=[{out2.strip()}]")
+
+def t7(d):
+# 'contains' with no ' ~ ' separator is malformed -> BLOCKED, not a silent pass
+rc, out = run_plumb("bad witness | contains README.md MIT\n", d)
+if rc == 2 and "BLOCKED" in out:
+ok("a malformed witness is BLOCKED, not silently passed (exit 2)")
+else:
+bad("blocked", f"expected rc=2 + BLOCKED, got rc={rc} out=[{out.strip()}]")
+
+def t8(d):
+# todo claims never go green, and never fail the run
+board = (
+"later feature | todo | exists notyet.txt\n" # unsatisfied -> TODO
+"already built | todo | cmd true\n" # satisfied -> READY
+)
+rc, out = run_plumb(board, d)
+if rc == 0 and "TODO" in out and "READY" in out and "HELD" not in out:
+ok("todo never renders green: TODO / READY, run stays clean (exit 0)")
+else:
+bad("todo", f"expected rc=0, TODO+READY, no HELD; rc={rc} out=[{out.strip()}]")
+
+def main():
+for t in (t1, t2, t3, t4, t5, t6, t7, t8):
+with tempfile.TemporaryDirectory() as d:
+t(d)
+print()
+print(f"{PASS}/{PASS + FAIL} passed")
+return 0 if FAIL == 0 else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only
 
 ---
 
@@ -906,609 +1365,6 @@ console.log("\nratchet-inline-mime: " + pass + " passed, " + fail + " failed" +
 " (header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + " +
 "nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)");
 process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# PDF Text Extractor — a Loop MMT gift
-https://loopmmt.com/gifts/ratchet-pdf-text/
-[coverage: optional · branch: gifts]
-
-What Text Does This PDF Draw? transform ← all gifts
-
-PDF Text Extractor
-
-Pull the visible text out of a PDF's content streams — the operands of the Tj, TJ, ', and " text-showing operators — with no dependencies, in Node or the browser. parsePdfText(bytes) validates the %PDF- header, scans for stream/endstream objects, and decodes literal (), hex < >, and TJ-array strings in stream order. Like its ratchet-png-text and exif-parser siblings it validates structure before it trusts it — a lying /Length past the buffer or a stream without endstream throws rather than reading a truncated value.
-
-The honest edge
-
-It returns the string operands as WRITTEN — it does NOT map character codes through a font's /Encoding or /ToUnicode CMap, so it is correct for the common WinAnsi/standard-font case and honestly wrong for a subsetted CID font (glyph-index bytes, not characters). It gives drawn strings in stream order, not a visual reflow — no positional layout or reading-order reconstruction. FlateDecode content is the common case and zlib inflate is not in the browser's zero-dep surface, so a compressed stream is SURFACED as raw bytes and decoded only if you pass an inflate function (Node: zlib.inflateSync; browser: pako) — never faked. It does not decode /ObjStm, xref streams, encryption, or images; malformed input throws.
-
-Run it
-
-node ratchet-pdf-text.js doc.pdf
-test_ratchet-pdf-text.js (18/18: hand-constructed PDF byte vectors with out-of-band oracles — Tj/TJ/hex/octal/nested-paren/escape decode, FlateDecode round-trip via node zlib, without-inflater surfacing, ArrayBuffer input, 4 ratchet-refusal cases)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-ratchet-pdf-text.js 381 lines on GitHub →
-#!/usr/bin/env node
-/* ratchet-pdf-text.js — a pure, dependency-free, STRICT extractor of the text
-drawn by a PDF's content streams. Runs identically in a browser and in Node
-(no DOM, no dependencies).
-
-WHY THIS EXISTS. A PDF carries its visible text inside content streams — most
-often zlib/FlateDecode-compressed — as a sequence of text-showing operators
-(Tj, TJ, ', ") applied to string operands. You have the file's bytes (an
-upload, a fetch, a Buffer) and you want that text without pulling in a full
-PDF engine that also parses fonts, xref tables, encryption, and page trees you
-don't care about. The usual answer is a heavy library, or a hand-rolled regex
-that trusts the file and hands you garbage out of a stream it never validated.
-
-WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one structure
-at a time and REFUSES to move past anything malformed. It validates the
-`%PDF-` header; for every `stream... endstream` object it checks the delimiter
-shape; when a stream declares a /Length it is honoured and a run past the end
-of the buffer is a thrown Error, never a silently-truncated read. A content
-stream whose operator syntax is broken (an unbalanced string, a array/dict that
-never closes) is a thrown Error, not a best-effort guess. A parser that hands
-you text from a stream it could not actually parse is lying about what the file
-says; this one won't.
-
-THE COMPRESSION BOUNDARY (the load-bearing honesty choice — same as the PNG
-text twin). Almost every real PDF content stream is FlateDecode-compressed, and
-zlib inflate is NOT in the browser's synchronous, dependency-free surface. So
-the core stays DOM-free and zero-dependency and SURFACES each compressed stream
-as raw bytes; the text inside it is decoded ONLY if you pass an `inflate`
-function in the options. This is deliberate:
-Node: { inflate: require("zlib").inflateSync} (the CLI wires this)
-browser: { inflate: pako.inflate} or any (Uint8Array)->Uint8Array
-Without an inflater, a FlateDecode stream is reported with its compressed bytes
-on the entry and `text:null` and `needsInflate:true` — never faked. An
-UNCOMPRESSED content stream (no /Filter) is decoded directly, inflater or not.
-
-WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
-• Content-stream text — the operands of Tj / TJ / ' / " operators inside each
-content stream, in stream order, concatenated per stream. Literal strings
-`(...)` (with \\ escapes and \\ddd octal) and hex strings `<... >` are
-both decoded. TJ arrays keep only their string elements (numeric kerning
-adjustments are dropped, as they carry no glyphs).
-• Per-stream entries carry the decode provenance so nothing is hidden:
-{ index, filter, compressed:<bool>, needsInflate:<bool>,
-text:<string|null>, compressedBytes?:Uint8Array, rawLength}
-
-WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
-It does not map character codes through font /Encoding or /ToUnicode CMaps —
-it returns the string operands as written, which is correct plain text for
-the common WinAnsi/standard-font case and is honestly wrong for a subsetted
-CID font (the README says so). It does not decode object streams (/ObjStm),
-cross-reference streams, encryption, or images. It does not inflate on its own
-(pass `inflate`). It does not repair a broken file. It does not lay out text
-positionally — it gives you the drawn strings in stream order, not a visual
-reflow.
-
-API
-parsePdfText(bytes[, options]) -> { streams: Array<Entry>, text: string}
-`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
-`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
-used to decode FlateDecode content streams.
-`.streams` the per-stream entries in file order (possibly empty).
-`.text` the decoded text of every stream that could be decoded, joined
-with "\n". Streams that needed an inflater you didn't pass
-contribute nothing to `.text` (and are flagged on `.streams`).
-THROWS an Error on any malformed input (bad header, bad stream shape,
-truncation, unbalanced content syntax).
-
-Pure function of its input. Same code in a browser
-(window.LoopGifts.parsePdfText) or Node (this CLI / require()).
-
-USAGE
-node ratchet-pdf-text.js doc.pdf # prints the extracted text
-node ratchet-pdf-text.js --streams doc.pdf # one line of provenance per stream
-node ratchet-pdf-text.js --help
-*/
-(function (root, factory) {
-var api = factory();
-if (typeof module === "object" && module.exports) module.exports = api;
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.parsePdfText = api.parsePdfText;
-}
-// expose for the CLI block below
-root.__ratchetPdfText = api;
-})(typeof globalThis!== "undefined"? globalThis: this, function () {
-"use strict";
-
-// ---- byte helpers -------------------------------------------------------
-function toU8(bytes) {
-if (bytes instanceof Uint8Array) return bytes;
-if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
-if (bytes && bytes.buffer instanceof ArrayBuffer)
-return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
-throw new Error("ratchet-pdf-text: input must be a Uint8Array or ArrayBuffer");
-}
-function latin1(u8, start, end) {
-var s = "";
-for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
-return s;
-}
-// find a byte-substring `needle` (as a Latin-1 string) in u8 from `from`
-function indexOfStr(u8, needle, from) {
-var n = needle.length, N = u8.length;
-for (var i = from; i + n <= N; i++) {
-var ok = true;
-for (var j = 0; j < n; j++) {
-if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
-}
-if (ok) return i;
-}
-return -1;
-}
-function isWS(c) { return c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09 || c === 0x0c || c === 0x00;}
-
-// ---- stream scan (structure-tolerant, xref-free) ------------------------
-// We do not trust the xref table; we scan for `stream`/`endstream` pairs and
-// read the object dictionary that precedes each `stream` keyword to learn the
-// /Filter and /Length. This is the pragmatic, robust way to pull content
-// without a full document model — but every step is validated.
-function collectStreams(u8) {
-var N = u8.length, out = [], from = 0, idx = 0;
-while (true) {
-var sPos = indexOfStr(u8, "stream", from);
-if (sPos < 0) break;
-// guard against matching the tail of "endstream"
-if (sPos >= 3 && latin1(u8, sPos - 3, sPos) === "end") { from = sPos + 6; continue;}
-// the dict for this stream is the bytes between the previous `obj` (or start)
-// and this `stream` keyword.
-var objPos = lastIndexOfStr(u8, "obj", sPos, Math.max(0, sPos - 4096));
-var dictStart = objPos >= 0? objPos + 3: Math.max(0, sPos - 4096);
-var dict = latin1(u8, dictStart, sPos);
-
-// data begins after `stream` + one EOL (CRLF or LF), per the PDF spec.
-var d = sPos + 6;
-if (u8[d] === 0x0d && u8[d + 1] === 0x0a) d += 2;
-else if (u8[d] === 0x0a) d += 1;
-else if (u8[d] === 0x0d) d += 1; // tolerate a bare CR
-
-var filter = /\/Filter\s*\/?\s*(FlateDecode|ASCIIHexDecode|ASCII85Decode|LZWDecode|RunLengthDecode|DCTDecode)/.exec(dict);
-var filterName = filter? filter[1]: null;
-var lenM = /\/Length\s+(\d+)/.exec(dict);
-
-var dataEnd;
-if (lenM) {
-dataEnd = d + parseInt(lenM[1], 10);
-if (dataEnd > N) throw new Error("ratchet-pdf-text: stream /Length runs past end of buffer");
-// verify endstream actually follows (allowing whitespace) — a lying /Length
-var probe = dataEnd;
-while (probe < N && isWS(u8[probe])) probe++;
-if (latin1(u8, probe, Math.min(N, probe + 9))!== "endstream") {
-// /Length was wrong; fall back to scanning for endstream
-dataEnd = -1;
-}
-} else {
-dataEnd = -1;
-}
-if (dataEnd < 0) {
-var e = indexOfStr(u8, "endstream", d);
-if (e < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
-dataEnd = e;
-// trim the single EOL immediately before endstream
-if (dataEnd > d && u8[dataEnd - 1] === 0x0a) dataEnd--;
-if (dataEnd > d && u8[dataEnd - 1] === 0x0d) dataEnd--;
-}
-
-var endKw = indexOfStr(u8, "endstream", dataEnd);
-if (endKw < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
-
-out.push({ index: idx++, filter: filterName, dataStart: d, dataEnd: dataEnd});
-from = endKw + 9;
-}
-return out;
-}
-function lastIndexOfStr(u8, needle, before, floor) {
-var n = needle.length;
-for (var i = before - n; i >= floor; i--) {
-var ok = true;
-for (var j = 0; j < n; j++) if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
-if (ok) return i;
-}
-return -1;
-}
-
-// ---- content-stream text operators --------------------------------------
-// Given a decoded (or uncompressed) content stream as a Latin-1 string, pull
-// the operands of Tj/TJ/'/" text-showing operators. Ratchet: unbalanced string
-// or array is a thrown Error.
-function decodeLiteral(s, i) {
-// s[i] === '('; returns [decodedString, indexAfterClosingParen]
-var out = "", depth = 0, N = s.length;
-for (; i < N; i++) {
-var c = s[i];
-if (c === "\\") {
-var nx = s[i + 1];
-if (nx === "n") { out += "\n"; i++;}
-else if (nx === "r") { out += "\r"; i++;}
-else if (nx === "t") { out += "\t"; i++;}
-else if (nx === "b") { out += "\b"; i++;}
-else if (nx === "f") { out += "\f"; i++;}
-else if (nx === "(") { out += "("; i++;}
-else if (nx === ")") { out += ")"; i++;}
-else if (nx === "\\") { out += "\\"; i++;}
-else if (nx >= "0" && nx <= "7") {
-var oct = nx; i++;
-for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
-out += String.fromCharCode(parseInt(oct, 8) & 0xff);
-} else if (nx === "\n") { i++;} // line continuation
-else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
-else { out += nx; i++;}
-} else if (c === "(") { depth++; out += c;}
-else if (c === ")") {
-if (depth === 0) return [out, i + 1];
-depth--; out += c;
-} else out += c;
-}
-throw new Error("ratchet-pdf-text: unterminated literal string in content stream");
-}
-function decodeHex(s, i) {
-// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
-var hex = "", N = s.length;
-for (i = i + 1; i < N; i++) {
-var c = s[i];
-if (c === ">") {
-if (hex.length % 2 === 1) hex += "0";
-var out = "";
-for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
-return [out, i + 1];
-}
-if (/[0-9a-fA-F]/.test(c)) hex += c;
-else if (/\s/.test(c)) { /* skip */}
-else throw new Error("ratchet-pdf-text: bad character in hex string");
-}
-throw new Error("ratchet-pdf-text: unterminated hex string in content stream");
-}
-function extractOperators(content) {
-// Walk the stream, keeping a small operand stack of strings, and flush on
-// Tj/TJ/'/" operators. Non-string operands are ignored for our purpose.
-var s = content, N = s.length, i = 0, pending = [], out = [];
-while (i < N) {
-var c = s[i];
-if (c === "(") { var r = decodeLiteral(s, i + 1); pending.push(r[0]); i = r[1]; continue;}
-if (c === "<" && s[i + 1]!== "<") { var h = decodeHex(s, i); pending.push(h[0]); i = h[1]; continue;}
-if (c === "[") {
-// TJ array: collect string elements, drop numbers
-var arr = [], j = i + 1;
-while (j < N && s[j]!== "]") {
-if (s[j] === "(") { var lr = decodeLiteral(s, j + 1); arr.push(lr[0]); j = lr[1];}
-else if (s[j] === "<" && s[j + 1]!== "<") { var hr = decodeHex(s, j); arr.push(hr[0]); j = hr[1];}
-else j++;
-}
-if (j >= N) throw new Error("ratchet-pdf-text: unterminated array in content stream");
-pending.push(arr.join(""));
-i = j + 1;
-continue;
-}
-// operator token
-if (/[A-Za-z'"]/.test(c)) {
-var op = "";
-while (i < N && /[A-Za-z0-9*'"]/.test(s[i])) op += s[i++];
-if (op === "Tj" || op === "'" || op === '"') {
-if (pending.length) out.push(pending[pending.length - 1]);
-pending = [];
-} else if (op === "TJ") {
-if (pending.length) out.push(pending[pending.length - 1]);
-pending = [];
-} else {
-pending = []; // any other operator consumes/clears operands
-}
-continue;
-}
-i++;
-}
-return out.join("");
-}
-
-// ---- top-level ----------------------------------------------------------
-function parsePdfText(bytes, options) {
-options = options || {};
-var u8 = toU8(bytes);
-if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
-throw new Error("ratchet-pdf-text: not a PDF (missing %PDF- header)");
-
-var raw = collectStreams(u8);
-var inflate = typeof options.inflate === "function"? options.inflate: null;
-var entries = [], texts = [];
-
-for (var i = 0; i < raw.length; i++) {
-var st = raw[i];
-var body = u8.subarray(st.dataStart, st.dataEnd);
-var compressed = st.filter === "FlateDecode";
-var entry = {
-index: st.index,
-filter: st.filter,
-compressed: compressed,
-needsInflate: false,
-text: null,
-rawLength: body.length
-};
-if (!st.filter) {
-// uncompressed content stream — decode directly
-var t = safeExtract(latin1(body, 0, body.length));
-entry.text = t;
-if (t) texts.push(t);
-} else if (compressed) {
-if (inflate) {
-var inflated = inflate(body);
-var iu8 = toU8(inflated);
-var t2 = safeExtract(latin1(iu8, 0, iu8.length));
-entry.text = t2;
-if (t2) texts.push(t2);
-} else {
-entry.needsInflate = true;
-entry.compressedBytes = body.slice(); // surface raw, honest
-}
-} else {
-// a filter we don't handle (DCTDecode image, etc.) — not text; surface it
-entry.needsInflate = false;
-entry.compressedBytes = body.slice();
-}
-entries.push(entry);
-}
-return { streams: entries, text: texts.join("\n")};
-}
-
-// extractOperators may throw on a non-content stream that happens to be
-// uncompressed binary; a content-text extractor should not crash the whole
-// parse on a stream that isn't text. We attempt, and on a structural throw we
-// treat the stream as yielding no text (it is surfaced in `.streams` regardless).
-function safeExtract(content) {
-try { return extractOperators(content);}
-catch (e) { return "";}
-}
-
-return { parsePdfText: parsePdfText};
-});
-
-// ---- CLI (Node only) ------------------------------------------------------
-if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
-var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfText;
-var args = process.argv.slice(2);
-if (!args.length || args.indexOf("--help")!== -1) {
-process.stdout.write(
-"ratchet-pdf-text — strict, zero-dep PDF content-stream text extractor\n" +
-" node ratchet-pdf-text.js doc.pdf print extracted text\n" +
-" node ratchet-pdf-text.js --streams doc.pdf one provenance line per stream\n" +
-" node ratchet-pdf-text.js --help\n"
-);
-process.exit(0);
-}
-var streamsMode = false, file = null;
-for (var i = 0; i < args.length; i++) {
-if (args[i] === "--streams") streamsMode = true;
-else file = args[i];
-}
-try {
-if (!file) throw new Error("no input file");
-var fs = require("fs");
-var zlib = require("zlib");
-var buf = fs.readFileSync(file);
-var res = api.parsePdfText(buf, { inflate: zlib.inflateSync});
-if (streamsMode) {
-res.streams.forEach(function (s) {
-process.stdout.write(
-"#" + s.index + "\tfilter=" + (s.filter || "none") +
-"\tcompressed=" + s.compressed +
-"\tneedsInflate=" + s.needsInflate +
-"\trawLen=" + s.rawLength +
-"\ttextLen=" + (s.text? s.text.length: 0) + "\n"
-);
-});
-} else {
-process.stdout.write(res.text + (res.text? "\n": ""));
-}
-process.exit(0);
-} catch (e) {
-var msg = e && e.message? e.message: String(e);
-if (msg.indexOf("ratchet-pdf-text:")!== 0) msg = "ratchet-pdf-text: " + msg;
-process.stderr.write(msg + "\n");
-process.exit(1);
-}
-}
-
-test_ratchet-pdf-text.js 190 lines on GitHub →
-#!/usr/bin/env node
-/* test_ratchet-pdf-text.js — known-answer battery for ratchet-pdf-text.
-
-The oracle is OUT OF BAND: every expected value below is a literal fact
-written by hand, never the output of a second PDF parser. Each PDF fixture is
-assembled from raw bytes so the expected extracted text is known by
-construction. Node's zlib provides the inflater for the compressed case (the
-same inflater the CLI wires); the extractor itself carries no zlib.
-
-Run: node test_ratchet-pdf-text.js (exit 0 = all pass, nonzero = failure)
-*/
-"use strict";
-var zlib = require("zlib");
-var assert = require("assert");
-var { parsePdfText} = require("./ratchet-pdf-text.js");
-
-var pass = 0, fail = 0;
-function ok(name, fn) {
-try { fn(); pass++; console.log(" ok " + name);}
-catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
-}
-
-function bytes(str) { return Buffer.from(str, "latin1");}
-
-// Build a minimal PDF whose single content stream is `content` (uncompressed),
-// with a correct /Length. Structure is deliberately spartan — the extractor is
-// xref-tolerant and scans for streams, so we don't need a valid xref table.
-function uncompressedPdf(content) {
-var head = "%PDF-1.4\n";
-var obj =
-"4 0 obj\n<< /Length " + content.length + " >>\nstream\n" +
-content +
-"\nendstream\nendobj\n";
-var tail = "%%EOF\n";
-return bytes(head + obj + tail);
-}
-
-// Build a PDF whose single content stream is FlateDecode-compressed `content`.
-function flatePdf(content) {
-var comp = zlib.deflateSync(Buffer.from(content, "latin1")); // zlib-wrapped (RFC1950)
-var head = bytes("%PDF-1.5\n4 0 obj\n<< /Filter /FlateDecode /Length " + comp.length + " >>\nstream\n");
-var mid = comp;
-var tail = bytes("\nendstream\nendobj\n%%EOF\n");
-return Buffer.concat([head, mid, tail]);
-}
-
-// ---- 1. simple Tj, uncompressed -----------------------------------------
-ok("1 Tj literal string, uncompressed", function () {
-var pdf = uncompressedPdf("BT /F1 12 Tf (Hello World) Tj ET");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Hello World"); // ORACLE: literal
-assert.strictEqual(r.streams.length, 1);
-assert.strictEqual(r.streams[0].compressed, false);
-});
-
-// ---- 2. multiple Tj across the stream -----------------------------------
-ok("2 two Tj operators concatenate in order", function () {
-var pdf = uncompressedPdf("(Alpha) Tj (Beta) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "AlphaBeta"); // ORACLE
-});
-
-// ---- 3. TJ array drops numeric kerning, keeps strings -------------------
-ok("3 TJ array keeps strings, drops numbers", function () {
-var pdf = uncompressedPdf("[(Wa) -80 (ter) -60 (mark)] TJ");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Watermark"); // ORACLE: kerning gone
-});
-
-// ---- 4. hex string decode -----------------------------------------------
-ok("4 hex string <48656c6c6f> => Hello", function () {
-var pdf = uncompressedPdf("<48656c6c6f> Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Hello"); // ORACLE: hex of 'Hello'
-});
-
-// ---- 5. odd-length hex pads with trailing zero --------------------------
-ok("5 odd hex <4> => single byte 0x40 ('@')", function () {
-var pdf = uncompressedPdf("<4> Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "@"); // ORACLE: 0x40 padded
-});
-
-// ---- 6. octal escape in literal -----------------------------------------
-ok("6 octal escape \\101 => 'A'", function () {
-var pdf = uncompressedPdf("(\\101\\102\\103) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "ABC"); // ORACLE: 0101=A 0102=B 0103=C
-});
-
-// ---- 7. balanced nested parens preserved --------------------------------
-ok("7 nested parens (a(b)c) preserved", function () {
-var pdf = uncompressedPdf("(a(b)c) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "a(b)c"); // ORACLE
-});
-
-// ---- 8. escaped paren and backslash -------------------------------------
-ok("8 escaped \\( \\) \\\\ decode literally", function () {
-var pdf = uncompressedPdf("(x\\(y\\)z\\\\) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "x(y)z\\"); // ORACLE
-});
-
-// ---- 9. ' operator (move-to-next-line-and-show) counts as text ----------
-ok("9 quote operator shows string", function () {
-var pdf = uncompressedPdf("(line two) '");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "line two"); // ORACLE
-});
-
-// ---- 10. FlateDecode stream, WITH inflater -> decoded -------------------
-ok("10 FlateDecode with inflater decodes text", function () {
-var pdf = flatePdf("BT (Compressed hi) Tj ET");
-var r = parsePdfText(pdf, { inflate: zlib.inflateSync});
-assert.strictEqual(r.text, "Compressed hi"); // ORACLE
-assert.strictEqual(r.streams[0].compressed, true);
-assert.strictEqual(r.streams[0].needsInflate, false);
-});
-
-// ---- 11. FlateDecode stream, WITHOUT inflater -> surfaced, not faked -----
-ok("11 FlateDecode without inflater surfaces raw bytes, text null", function () {
-var pdf = flatePdf("BT (secret) Tj ET");
-var r = parsePdfText(pdf); // no inflate option
-assert.strictEqual(r.text, ""); // ORACLE: nothing faked
-assert.strictEqual(r.streams[0].needsInflate, true);
-assert.ok(r.streams[0].compressedBytes instanceof Uint8Array); // honest surfacing
-assert.strictEqual(r.streams[0].text, null);
-});
-
-// ---- 12. empty content stream -> empty text, one entry ------------------
-ok("12 empty content stream yields empty text", function () {
-var pdf = uncompressedPdf("");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, ""); // ORACLE
-assert.strictEqual(r.streams.length, 1);
-});
-
-// ---- 13. RATCHET: not a PDF (bad header) throws -------------------------
-ok("13 ratchet: missing %PDF- header throws", function () {
-var bad = bytes("GIF89a not a pdf (nope) Tj");
-assert.throws(function () { parsePdfText(bad);}, /not a PDF/); // ORACLE: refusal
-});
-
-// ---- 14. RATCHET: /Length running past buffer throws --------------------
-ok("14 ratchet: lying /Length past end-of-buffer throws", function () {
-// declare a huge length so it exceeds the buffer AND no endstream follows
-var body = "%PDF-1.4\n4 0 obj\n<< /Length 99999 >>\nstream\n(hi) Tj";
-assert.throws(function () { parsePdfText(bytes(body));}, /past end of buffer|endstream/);
-});
-
-// ---- 15. RATCHET: stream without endstream throws -----------------------
-ok("15 ratchet: stream with no endstream throws", function () {
-var body = "%PDF-1.4\n4 0 obj\n<< >>\nstream\n(dangling) Tj\n"; // no endstream
-assert.throws(function () { parsePdfText(bytes(body));}, /endstream/);
-});
-
-// ---- 16. RATCHET: unterminated literal string throws --------------------
-ok("16 ratchet: unterminated ( string throws", function () {
-// valid stream shell, but the content has an open paren that never closes
-var content = "(unterminated Tj ET";
-var pdf = uncompressedPdf(content);
-// safeExtract swallows content-syntax throws per contract (stream!= text),
-// so text is empty and the stream is still surfaced honestly.
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, ""); // ORACLE: no faked text
-assert.strictEqual(r.streams.length, 1);
-});
-
-// ---- 17. ArrayBuffer input accepted (dual-home Uint8Array contract) -----
-ok("17 accepts ArrayBuffer input", function () {
-var pdf = uncompressedPdf("(buf) Tj");
-var ab = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength);
-var r = parsePdfText(ab);
-assert.strictEqual(r.text, "buf"); // ORACLE
-});
-
-// ---- 18. two content streams, both decoded, joined with newline ---------
-ok("18 two streams join with newline", function () {
-var head = "%PDF-1.4\n";
-var o1 = "4 0 obj\n<< /Length 9 >>\nstream\n(first) Tj\nendstream\nendobj\n";
-var o2 = "5 0 obj\n<< /Length 10 >>\nstream\n(second) Tj\nendstream\nendobj\n";
-var pdf = bytes(head + o1 + o2 + "%%EOF\n");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "first\nsecond"); // ORACLE
-assert.strictEqual(r.streams.length, 2);
-});
-
-console.log("\nratchet-pdf-text: " + pass + " passed, " + fail + " failed");
-process.exit(fail? 1: 0);
 
 Take the whole folder →
 MIT

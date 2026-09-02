@@ -1,8 +1,369 @@
-# Loop MMT — corpus shard 58/60
+# Loop MMT — corpus shard 58/61
 
-> Bundle 58 of 60 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 58 of 61 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/tracebus/, /gifts/trellis/, /gifts/typecheck/)
+Nodes in this shard: 3 (/gifts/timesheet/, /gifts/tracebus/, /gifts/trellis/)
+
+---
+
+# Timesheet — a Loop MMT gift
+https://loopmmt.com/gifts/timesheet/
+[coverage: optional · branch: gifts]
+
+How Many Hours Did That Actually Take? fold ← all gifts
+
+Timesheet
+
+Pipe a git log in, get an honest effort estimate out. worked(day) = sum over consecutive commits of min(gap, break-gap) — the day's span minus every gap longer than a break threshold. Floor-biased so it under-counts rather than inflates, deterministic (same input → byte-identical report), and zero-dependency: it folds a piped stdin stream, so it needs no git subprocess and no repo.
+
+The honest edge
+
+Commit timestamps BOUND work, they do not MEASURE it — a floor-biased model output (⊢), never a measured truth (⊨). It under-counts on purpose (isolated commit = 0, invisible thinking = 0). NOT a timeclock: do not bill a client to the minute or adjudicate hours with it. The --break-gap assumption is printed in every report.
+
+Run it
+
+git log --format='%H %at %s' | node timesheet.js
+test_timesheet.js (20/20, hand-computed arithmetic oracle + overnight-gap floor-bias tripwire)
+Node, no dependencies
+
+The code — every file that ships
+
+timesheet.js 220 lines on GitHub →
+#!/usr/bin/env node
+/*
+* timesheet — a floor-biased time-worked report folded from git commit timestamps.
+* MIT · zero-dependency · standalone gift stripped from Loop MMT's The Timesheet.
+*
+* THE PRINTED EDGE (read before trusting a number):
+* Commit timestamps BOUND work; they do NOT MEASURE it. "Hours worked" here is a
+* MODEL OUTPUT, not a measured truth:
+* worked(day) = Σ over consecutive commits of min(gap, breakGap)
+* i.e. day-span minus every inter-commit gap longer than the break threshold.
+* It is FLOOR-BIASED on purpose: a gap over the threshold counts as a break worth
+* zero, and an isolated commit contributes zero span — so it UNDER-counts real time
+* rather than inflating it. It is a derivation (⊢), never a measured truth (⊨). It
+* is NOT a timeclock: do not bill a client to the minute or adjudicate hours with it.
+* The one judgment call, --break-gap (default 30 min), is printed in every report so
+* the number always carries its own assumption.
+*
+* USAGE:
+* git log --format='%H %at %s' | node timesheet.js
+* git log --format='%H %at %s' | node timesheet.js --break-gap 45 --tz America/New_York
+* node timesheet.js --help
+*
+* INPUT: one commit per line on stdin: "<sha> <author-epoch-seconds> <subject...>".
+* %at is the AUTHOR epoch (integer seconds, timezone-independent). committer-date
+* (%ct) works too but author-date is the conventional "when the work happened".
+*
+* DETERMINISM: the output is a pure function of (input lines, --break-gap, --tz). No
+* wall-clock is read; the report stamps the commit range, not a generation time — so
+* the same input always produces byte-identical output.
+*/
+'use strict';
+
+const SEC = 1000; // this file works in SECONDS throughout; epochs are integer seconds.
+const DEFAULT_BREAK_GAP_MIN = 30;
+const DEFAULT_TZ = 'UTC';
+
+// ---- core fold (the whole gift; pure, exported for require) --------------------
+function computeTimesheet(commits, opts) {
+// commits: [{ sha, epoch (int seconds), subject}]
+// opts: { breakGapMin, tz}
+const breakGap = (opts.breakGapMin!= null? opts.breakGapMin: DEFAULT_BREAK_GAP_MIN) * 60; // seconds
+const tz = opts.tz || DEFAULT_TZ;
+
+// sort by epoch ascending (stable, deterministic)
+const cs = commits.slice().sort((a, b) => a.epoch - b.epoch || (a.sha < b.sha? -1: a.sha > b.sha? 1: 0));
+
+// bucket by calendar day IN the report timezone
+const byDay = new Map();
+for (const c of cs) {
+const day = dayKey(c.epoch, tz);
+if (!byDay.has(day)) byDay.set(day, []);
+byDay.get(day).push(c);
+}
+
+const days = [];
+for (const day of Array.from(byDay.keys()).sort()) {
+const dcs = byDay.get(day); // already epoch-ascending (built from sorted cs)
+let worked = 0, brk = 0, runs = 1;
+for (let i = 0; i + 1 < dcs.length; i++) {
+const gap = dcs[i + 1].epoch - dcs[i].epoch;
+if (gap > breakGap) { brk += gap; runs += 1;}
+else { worked += gap;}
+}
+days.push({
+date: day,
+startEpoch: dcs[0].epoch,
+endEpoch: dcs[dcs.length - 1].epoch,
+worked, breakTime: brk, runs, nCommits: dcs.length,
+});
+}
+
+const totalWorked = days.reduce((s, d) => s + d.worked, 0);
+const totalCommits = days.reduce((s, d) => s + d.nCommits, 0);
+
+return {
+days,
+totalWorked, // seconds
+totalCommits,
+nDays: days.length,
+breakGapMin: breakGap / 60,
+tz,
+firstSha: cs.length? cs[0].sha: null,
+lastSha: cs.length? cs[cs.length - 1].sha: null,
+byWeek: rollup(days, weekKey),
+byMonth: rollup(days, d => d.date.slice(0, 7)),
+};
+}
+
+function rollup(days, keyfn) {
+const buckets = new Map();
+const order = [];
+for (const d of days) {
+const k = keyfn(d);
+if (!buckets.has(k)) { buckets.set(k, { label: k, worked: 0, nCommits: 0, nDays: 0}); order.push(k);}
+const b = buckets.get(k);
+b.worked += d.worked; b.nCommits += d.nCommits; b.nDays += 1;
+}
+return order.map(k => buckets.get(k));
+}
+
+// ---- timezone-aware day + ISO-week keys, stdlib Intl only (no deps) -------------
+function dayKey(epochSec, tz) {
+// Format the epoch in the target tz as YYYY-MM-DD, deterministically.
+const d = new Date(epochSec * SEC);
+const parts = new Intl.DateTimeFormat('en-CA', {
+timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+}).formatToParts(d);
+const g = t => parts.find(p => p.type === t).value;
+return `${g('year')}-${g('month')}-${g('day')}`;
+}
+
+function weekKey(dayRec) {
+// ISO week from the day's YYYY-MM-DD (tz already applied when the day was bucketed).
+const [y, m, dd] = dayRec.date.split('-').map(Number);
+const dt = new Date(Date.UTC(y, m - 1, dd));
+const dayNum = (dt.getUTCDay() + 6) % 7; // Mon=0..Sun=6
+dt.setUTCDate(dt.getUTCDate() - dayNum + 3); // Thursday of this week
+const firstThu = new Date(Date.UTC(dt.getUTCFullYear(), 0, 4));
+const week = 1 + Math.round(((dt - firstThu) / (7 * 24 * 3600 * SEC)));
+return `${dt.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+}
+
+// ---- render (plain text, deterministic) ----------------------------------------
+function fmtHM(sec) {
+const t = Math.floor(sec);
+const h = Math.floor(t / 3600);
+const m = Math.floor((t % 3600) / 60);
+return `${h}h ${String(m).padStart(2, '0')}m`;
+}
+function hours(sec) { return Math.round((sec / 3600) * 100) / 100;}
+function grp(n) { return typeof n === 'number' && Number.isInteger(n)? n.toLocaleString('en-US'): String(n);}
+
+function render(ts) {
+if (ts.nDays === 0) return 'Work Timesheet\n\nNo commits in input.\n';
+const L = [];
+L.push('Work Timesheet');
+L.push('');
+L.push(`Span: ${ts.days[0].date}.. ${ts.days[ts.nDays - 1].date} · Days worked: ${grp(ts.nDays)} · Commits: ${grp(ts.totalCommits)}`);
+L.push(`Total time (model): ${fmtHM(ts.totalWorked)} (${hours(ts.totalWorked)} h)`);
+L.push(`Timezone: ${ts.tz} · Break threshold: ${ts.breakGapMin} min · Range: ${ts.firstSha}..${ts.lastSha}`);
+L.push('');
+L.push('What this measures: time bracketed by commits, not time at the keyboard.');
+L.push('worked = day-span − every gap longer than the break threshold. Floor-biased:');
+L.push('it under-counts (isolated commit = 0, invisible thinking = 0), never inflates.');
+L.push('A derivation (⊢), not a truth (⊨). Not a timeclock.');
+L.push('');
+L.push('By month');
+for (const b of ts.byMonth) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
+L.push('');
+L.push('By week');
+for (const b of ts.byWeek) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
+L.push('');
+L.push('By day');
+for (const d of ts.days) L.push(` ${d.date} · ${fmtHM(d.worked)} · ${grp(d.nCommits)} commit(s) · ${d.runs} run(s)`);
+L.push('');
+return L.join('\n') + '\n';
+}
+
+// ---- parse stdin lines ----------------------------------------------------------
+function parseLines(text) {
+const commits = [];
+for (const raw of text.split('\n')) {
+const line = raw.trim();
+if (!line) continue;
+const m = line.match(/^(\S+)\s+(\d+)\s?(.*)$/);
+if (!m) continue;
+commits.push({ sha: m[1], epoch: parseInt(m[2], 10), subject: m[3] || ''});
+}
+return commits;
+}
+
+// ---- CLI ------------------------------------------------------------------------
+function parseArgs(argv) {
+const o = { breakGapMin: DEFAULT_BREAK_GAP_MIN, tz: DEFAULT_TZ, help: false};
+for (let i = 0; i < argv.length; i++) {
+const a = argv[i];
+if (a === '--help' || a === '-h') o.help = true;
+else if (a === '--break-gap') o.breakGapMin = parseInt(argv[++i], 10);
+else if (a === '--tz') o.tz = argv[++i];
+}
+return o;
+}
+
+const HELP = `timesheet — floor-biased time-worked report from git commit timestamps (MIT, zero-dep)
+
+git log --format='%H %at %s' | node timesheet.js [--break-gap MIN] [--tz ZONE]
+
+--break-gap MIN gap over MIN minutes counts as a break worth zero (default 30)
+--tz ZONE IANA timezone for day bucketing (default UTC)
+--help this text
+
+EDGE: commit timestamps BOUND work, they do not MEASURE it. This is a floor-biased
+model output (⊢), never a measured truth (⊨) — it under-counts on purpose. Not a
+timeclock; do not bill or adjudicate hours with it. The --break-gap assumption is
+printed in every report.
+`;
+
+function main() {
+const opts = parseArgs(process.argv.slice(2));
+if (opts.help) { process.stdout.write(HELP); return;}
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', d => { input += d;});
+process.stdin.on('end', () => {
+const commits = parseLines(input);
+const ts = computeTimesheet(commits, opts);
+process.stdout.write(render(ts));
+});
+}
+
+if (typeof window!== 'undefined') {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.timesheet = { computeTimesheet, render, parseLines};
+}
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { computeTimesheet, render, parseLines, fmtHM, weekKey, dayKey};
+}
+if (typeof require!== 'undefined' && require.main === module) {
+main();
+}
+
+test_timesheet.js 109 lines on GitHub →
+#!/usr/bin/env node
+/*
+* test_timesheet — drift-check battery for the timesheet gift.
+* MIT · zero-dependency · stdlib-only.
+*
+* THE ORACLE RULE: the oracle here is HAND-COMPUTED ARITHMETIC. The model
+* worked(day) = Σ min(gap, breakGap) over consecutive commits
+* is simple enough that a human computes the expected number independently of the
+* implementation — a stronger out-of-band oracle than a second code path. Each
+* fixture below carries its hand-computed expected value and the arithmetic.
+*/
+'use strict';
+const { computeTimesheet} = require('./timesheet.js');
+
+let pass = 0, fail = 0;
+function eq(got, want, msg) {
+if (got === want) { pass++;}
+else { fail++; console.error(`FAIL: ${msg}\n got: ${got}\n want: ${want}`);}
+}
+function ok(cond, msg) { if (cond) pass++; else { fail++; console.error(`FAIL: ${msg}`);}}
+
+// helper: build commits at given UTC times on one day (2026-01-05, a Monday)
+const BASE = Math.floor(Date.UTC(2026, 0, 5, 0, 0, 0) / 1000); // 2026-01-05 00:00:00Z
+const at = (hh, mm) => BASE + hh * 3600 + mm * 60;
+const C = (n, epoch) => ({ sha: `sha${n}`.padEnd(7, '0'), epoch, subject: `commit ${n}`});
+
+// ---- 1. Fixed model anchors (hand-computed) -----------------------------------
+// Two commits 10 min apart, same day. gap=600s <= break(1800s) -> worked=600.
+{
+const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
+eq(ts.totalWorked, 600, 'anchor A: two commits 10min apart -> worked=600s');
+eq(ts.nDays, 1, 'anchor A: one day');
+eq(ts.totalCommits, 2, 'anchor A: two commits');
+}
+// Two commits 90 min apart with break-gap 30. gap=5400s > 1800 -> break, worked=0.
+{
+const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(10, 30))], { breakGapMin: 30, tz: 'UTC'});
+eq(ts.totalWorked, 0, 'anchor B: 90min gap > 30min break -> worked=0 (clamped)');
+}
+// A lone commit in a day -> worked=0 (no neighbor).
+{
+const ts = computeTimesheet([C(1, at(14, 0))], { breakGapMin: 30, tz: 'UTC'});
+eq(ts.totalWorked, 0, 'anchor C: isolated commit -> worked=0');
+eq(ts.nDays, 1, 'anchor C: still one day recorded');
+}
+// Three commits: 9:00, 9:20, 9:35 (gaps 20m, 15m; both <=30) -> worked=35m=2100s.
+{
+const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 20)), C(3, at(9, 35))], { breakGapMin: 30, tz: 'UTC'});
+eq(ts.totalWorked, 2100, 'anchor D: 20m+15m consecutive -> worked=2100s');
+eq(ts.days[0].runs, 1, 'anchor D: one run (no break)');
+}
+
+// ---- 2. Floor-bias tripwire (the known-bad vector) ----------------------------
+// A day with an overnight-shaped 3h gap in the middle. Naive first-to-last span
+// would count the whole ~3h20m as work; the model must clamp the 3h gap to a break.
+// Commits: 9:00, 9:10 (gap 10m -> worked 600), 12:15 (gap 3h05m=11100s > 1800 ->
+// BREAK, worked +0), 12:25 (gap 10m -> worked +600). Hand-computed worked = 1200s.
+// Naive span = 12:25 - 9:00 = 3h25m = 12300s. The gap between them is the test.
+{
+const ts = computeTimesheet(
+[C(1, at(9, 0)), C(2, at(9, 10)), C(3, at(12, 15)), C(4, at(12, 25))],
+{ breakGapMin: 30, tz: 'UTC'});
+eq(ts.totalWorked, 1200, 'TRIPWIRE: floor-biased worked=1200s (not the 12300s naive span)');
+ok(ts.totalWorked < 12300, 'TRIPWIRE: model under-counts the naive first-to-last span');
+eq(ts.days[0].runs, 2, 'TRIPWIRE: the 3h gap splits the day into 2 runs');
+}
+
+// ---- 3. Determinism: same input twice -> identical result ----------------------
+{
+const input = [C(1, at(9, 0)), C(2, at(9, 25)), C(3, at(11, 0))];
+const a = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
+const b = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
+eq(a, b, 'determinism: same input -> byte-identical fold');
+}
+
+// ---- 4. Break-gap sensitivity (the assumption is live) -------------------------
+// Commits 9:00 and 9:40 (gap 40m=2400s). At break-gap 30 -> break (worked 0).
+// At break-gap 45 -> within threshold (worked 2400). The number moves with --break-gap.
+{
+const input = [C(1, at(9, 0)), C(2, at(9, 40))];
+const at30 = computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'});
+const at45 = computeTimesheet(input, { breakGapMin: 45, tz: 'UTC'});
+eq(at30.totalWorked, 0, 'sensitivity: 40m gap at break-gap 30 -> worked=0');
+eq(at45.totalWorked, 2400, 'sensitivity: 40m gap at break-gap 45 -> worked=2400s');
+}
+
+// ---- 5. Mutation bite: a deliberately-wrong expectation MUST be caught ----------
+// (Proves the harness is not a no-op: assert the RIGHT value is NOT the wrong one.)
+{
+const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
+ok(ts.totalWorked!== 999, 'mutation-bite: harness rejects a wrong expected value (worked!== 999)');
+ok(ts.totalWorked === 600, 'mutation-bite: harness confirms the right value (worked === 600)');
+}
+
+// ---- 6. Multi-day rollup + week/month keys -------------------------------------
+{
+const day2 = BASE + 24 * 3600; // 2026-01-06
+const ts = computeTimesheet(
+[C(1, at(9, 0)), C(2, at(9, 15)), { sha: 'sha3000', epoch: day2 + 10 * 3600, subject: 'd2'},
+{ sha: 'sha4000', epoch: day2 + 10 * 3600 + 600, subject: 'd2b'}],
+{ breakGapMin: 30, tz: 'UTC'});
+eq(ts.nDays, 2, 'rollup: two distinct days');
+eq(ts.totalWorked, 900 + 600, 'rollup: day1 15m + day2 10m = 1500s total');
+eq(ts.byMonth.length, 1, 'rollup: both days in one month bucket');
+eq(ts.byMonth[0].label, '2026-01', 'rollup: month key = 2026-01');
+}
+
+console.log(`\ntimesheet drift-check: ${pass} passed, ${fail} failed`);
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node, no dependencies
 
 ---
 
@@ -1656,572 +2017,5 @@ sys.exit(main())
 Take the whole folder →
 MIT
 Python stdlib only
-
----
-
-# typecheck — a Loop MMT gift
-https://loopmmt.com/gifts/typecheck/
-[coverage: optional · branch: gifts]
-
-Composition Typecheck check ← all gifts
-
-typecheck
-
-Give it a pipeline of small JSONL tools you mean to chain — A,B,C — and, before you run anything and with no side effects, typecheck says whether it is well-formed: does each stage EMIT what the next one ACCEPTS. It walks the adjacent pairs and the endpoints, names the exact hop that breaks (a sink piped into a transform, a source stranded mid-pipeline), and exits non-zero so you can gate on it.
-
-The honest edge
-
-It validates the PORT type — can the pipe carry data at all — NOT the RECORD shape. Two tools can both speak JSON-lines so the ports agree, while the records one emits are not the records the other expects; that pipeline typechecks clean here and still fails at runtime. typecheck flags the record-shape layer as unproven and never asserts semantic fit. A slug not in the manifest is reported UNRESOLVED, never guessed.
-
-Run it
-
-python3 typecheck.py text --pipeline A,B,C --manifest gifts-manifest.json
-test_typecheck.py (15/15 golden, 8/8 mutations caught)
-Python 3, standard library only
-
-The code — every file that ships
-
-typecheck.py 385 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-typecheck — validate a composition before you run it.
-
-You have a pipeline in mind: A | B | C. Before you run it, this tells you —
-decidably, with no side effects — whether it typechecks: does each stage EMIT
-what the next one ACCEPTS. It catches "you piped a sink into a transform" at
-declare-time, as a clear per-hop verdict, instead of as a confusing runtime
-error three stages deep.
-
-THE TYPE MODEL (flat, five verbs)
-source ∅ -> JSONL emits, never accepts (ignores stdin)
-transform JSONL -> JSONL emits and accepts
-filter JSONL -> JSONL' emits and accepts
-fold JSONL -> agg emits and accepts
-sink JSONL -> ∅ accepts, never emits (no pipeable stdout)
-
-THE GATE (decidable, total)
-A can feed B iff EMITS(A) and ACCEPTS(B)
-EMITS(v) = v!= "sink" (a sink produces no pipeable stdout)
-ACCEPTS(v) = v!= "source" (a source ignores its stdin)
-Plus the endpoint rule: a mid-pipeline stage that does not ACCEPT (a source in
-a non-first position) is an error — it ignores the stream handed to it; and a
-mid-pipeline stage that does not EMIT (a sink before the end) is an error — it
-swallows the stream the downstream stage needs.
-
-WHAT THIS IS A STRIP OF
-An internal tree-spec validator (AGPL-3.0) carried a subtype relation `<:` +
-type lattice + conformance check (conformsTo, seeded FLAT: SUBTYPE_EDGES={},
-so it is nominal equality on day one) and an emit/accept edge-compatibility
-gate. This gift keeps conformsTo as the flat lattice SEAM — a
-future variance edge slots into SUBTYPE_EDGES without rewriting the gate —
-and keeps the emit/accept gate, applied to the ADJACENT pairs of one linear
-pipeline (the walk A->B->C) rather than to a whole DAG. Re-licensed MIT,
-stdlib-only (the ancestor's yaml dep and tree-YAML machinery are dropped).
-It re-states the ~3-line gate rather than importing `map`: gifts are
-standalone — pipes all the way down, MIT, zero-dep — so they never import
-each other; the canonical port-verb roster keeps them consistent.
-
-WHAT IT DELIBERATELY DOES NOT DO (the honesty flag — a build requirement)
-typecheck validates the PORT type, NOT the record shape. An {event}-emitting
-stage piped into a {file}-expecting stage typechecks CLEAN here and still
-fails at runtime, because the ports agree (both JSONL) even though the
-records don't fit. The ancestor's V17/V18 schema-affinity heuristic (which
-only ever WARNed) is exactly that record-shape layer, and it is DROPPED on
-purpose: this gift claims port-compatibility and flags record-shape as
-UNPROVEN — it never asserts semantic fit.
-
-USAGE
-typecheck check --pipeline A,B,C --manifest gifts-manifest.json
-Walk the declared pipeline; per-hop verdict JSONL + a summary line.
-Exit 3 if any hop (or endpoint) is bad, 0 if the whole pipeline is clean.
-typecheck text --pipeline A,B,C --manifest gifts-manifest.json
-The same check, human-readable.
-typecheck --port
-Print typecheck's own port-verb (filter) as one JSON-line and exit.
-typecheck --selftest
-Run the built-in checks and exit 0/1.
-
-The manifest is any JSON list of entries (or an object with a
-'gifts'/'tools'/'entries' list); each entry carries a 'slug' and a 'port_verb'
-— the same shape `map` and `port` read. A slug named in the pipeline but absent
-from the manifest, or present with no valid port_verb, is reported as
-UNRESOLVED and fails the check — never guessed.
-"""
-import argparse
-import json
-import sys
-
-VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
-
-# -------------------------------------------------------------------
-# THE SUBTYPE RELATION (<:), seeded FLAT — the kept lattice seam.
-# Zero edges at seed, so conformsTo is bit-for-bit nominal equality on day one.
-# Variance is added LATER by adding edges here — never by rewriting the gate.
-# -------------------------------------------------------------------
-SUBTYPE_EDGES = {} # requiredVerb -> set(subVerbs). EMPTY at seed (discrete order).
-
-def subtypes(required):
-"""Declared subtypes of `required`. Empty at seed."""
-return SUBTYPE_EDGES.get(required, set())
-
-def conformsTo(candidate, required):
-"""Total, decidable subtype operator. At seed (no edges) this is exactly
-nominal equality:
-required == "" -> True (no constraint)
-candidate == required -> True (nominal match)
-candidate in subtypes(required) -> True (lattice edge; none at seed)
-"""
-if required == "":
-return True
-if candidate == required:
-return True
-return candidate in subtypes(required)
-
-def EMITS(v):
-"""A stage produces pipeable stdout iff it is not a sink."""
-return v!= "sink"
-
-def ACCEPTS(v):
-"""A stage consumes stdin iff it is not a source."""
-return v!= "source"
-
-def load_verbs(path):
-"""Return {slug: port_verb} for every manifest entry with a valid port_verb.
-
-Accepts a bare JSON list of entries or an object with a
-'gifts'/'tools'/'entries' list. Raises ValueError if no entry list can be
-found — never guesses the shape. An entry with no valid port_verb is simply
-absent from the map, so a pipeline naming it reports UNRESOLVED.
-"""
-with open(path) as f:
-data = json.load(f)
-if isinstance(data, list):
-entries = data
-elif isinstance(data, dict):
-entries = None
-for k in ("gifts", "tools", "entries"):
-if isinstance(data.get(k), list):
-entries = data[k]
-break
-if entries is None:
-raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
-else:
-raise ValueError(f"{path}: not a JSON list or object")
-
-verbs = {}
-for e in entries:
-slug = e.get("slug")
-pv = e.get("port_verb")
-if pv in VALID_VERBS:
-verbs[slug] = pv
-return verbs
-
-def typecheck_pipeline(pipeline, verbs):
-"""Walk a declared pipeline and check every adjacent pair + the endpoints.
-
-pipeline: ordered list of slugs [A, B, C]
-verbs: {slug: port_verb} resolved from the manifest
-
-Returns (hops, ok):
-hops: list of per-hop verdict dicts, in pipeline order. Two kinds:
-- {"kind": "stage",...} one per stage: its resolved verb, its
-endpoint role, and whether that role is valid at its position.
-- {"kind": "hop",...} one per adjacent pair (A->B): the gate.
-ok: True iff every stage resolved AND every endpoint role is valid AND
-every hop passes the emit/accept gate.
-"""
-n = len(pipeline)
-hops = []
-ok = True
-
-# Resolve every stage first; an unresolved stage is a hard fail (never guessed).
-resolved = []
-for i, slug in enumerate(pipeline):
-verb = verbs.get(slug)
-pos = "first" if i == 0 else ("last" if i == n - 1 else "middle")
-if verb is None:
-ok = False
-hops.append({
-"kind": "stage", "pos": i, "slug": slug, "verb": None,
-"role": pos, "role_ok": False,
-"reason": "UNRESOLVED — slug not in manifest, or no valid port_verb; not guessed",
-})
-resolved.append(None)
-continue
-
-# Endpoint rule. A stage in a non-first position must ACCEPT (else it
-# ignores the stream handed to it); a stage in a non-last position must
-# EMIT (else it swallows the stream the next stage needs).
-role_ok = True
-reason = "ok"
-if pos in ("middle", "last") and not ACCEPTS(verb):
-role_ok = False
-reason = f"a {verb} accepts no stdin, but it is not the first stage — it would ignore its input"
-if pos in ("first", "middle") and not EMITS(verb):
-role_ok = False
-reason = f"a {verb} emits no stdout, but it is not the last stage — downstream gets nothing"
-if not role_ok:
-ok = False
-hops.append({
-"kind": "stage", "pos": i, "slug": slug, "verb": verb,
-"role": pos, "role_ok": role_ok, "reason": reason,
-})
-resolved.append(verb)
-
-# The gate on each adjacent pair.
-for i in range(n - 1):
-a_slug, b_slug = pipeline[i], pipeline[i + 1]
-a_verb, b_verb = resolved[i], resolved[i + 1]
-if a_verb is None or b_verb is None:
-hops.append({
-"kind": "hop", "pos": i, "from": a_slug, "to": b_slug,
-"from_verb": a_verb, "to_verb": b_verb,
-"typechecks": False,
-"reason": "UNRESOLVED — one endpoint has no resolved port_verb",
-})
-ok = False
-continue
-emits = EMITS(a_verb)
-accepts = ACCEPTS(b_verb)
-passes = emits and accepts
-if not passes:
-ok = False
-if not emits:
-reason = f"{a_slug} is a {a_verb} — it emits no stdout, so {b_slug} has nothing to read"
-elif not accepts:
-reason = f"{b_slug} is a {b_verb} — it ignores stdin, so {a_slug}'s output is dropped"
-else:
-reason = "ok — emitter feeds an acceptor (TYPE gate only; record shape unproven)"
-hops.append({
-"kind": "hop", "pos": i, "from": a_slug, "to": b_slug,
-"from_verb": a_verb, "to_verb": b_verb,
-"typechecks": passes, "reason": reason,
-})
-
-return hops, ok
-
-SEMANTIC_FLAG = (
-"UNPROVEN — typecheck validates the PORT type (can the pipe carry data), "
-"NOT the RECORD shape. A pipeline can typecheck clean here and still fail at "
-"runtime because the records don't fit. That semantic layer is a finer "
-"question the uniform JSONL type cannot settle, and this gift never asserts it."
-)
-
-def summary_record(pipeline, hops, ok):
-bad_hops = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
-bad_stages = [h for h in hops if h["kind"] == "stage" and not h["role_ok"]]
-return {
-"kind": "summary",
-"pipeline": list(pipeline),
-"stages": len(pipeline),
-"hops": sum(1 for h in hops if h["kind"] == "hop"),
-"typechecks": ok,
-"bad_hops": len(bad_hops),
-"bad_stages": len(bad_stages),
-"semantic_layer": SEMANTIC_FLAG,
-}
-
-def emit_jsonl(pipeline, hops, ok, out):
-for h in hops:
-out.write(json.dumps(h) + "\n")
-out.write(json.dumps(summary_record(pipeline, hops, ok)) + "\n")
-
-def emit_text(pipeline, hops, ok, out):
-out.write("typecheck — " + " -> ".join(pipeline) + "\n")
-out.write("=" * 56 + "\n")
-for h in hops:
-if h["kind"] == "stage":
-mark = " " if h["role_ok"] else "!!"
-verb = h["verb"] if h["verb"] is not None else "?"
-out.write(f"{mark} stage {h['pos']}: {h['slug']} [{verb}] ({h['role']}) — {h['reason']}\n")
-else:
-mark = "ok" if h["typechecks"] else "XX"
-out.write(f"{mark} hop {h['from']} -> {h['to']} "
-f"[{h['from_verb']} -> {h['to_verb']}] — {h['reason']}\n")
-out.write("-" * 56 + "\n")
-out.write(f"RESULT: {'TYPECHECKS' if ok else 'DOES NOT TYPECHECK'}\n")
-out.write("\nNOTE: this is the TYPE-level check. Record-shape fit is UNPROVEN —\n")
-out.write("a clean result means the ports agree, not that the records fit.\n")
-
-def parse_pipeline(s):
-parts = [p.strip() for p in s.split(",")]
-parts = [p for p in parts if p]
-if len(parts) < 2:
-raise ValueError("a pipeline needs at least two stages (A,B)")
-return parts
-
-def _selftest():
-# A tiny fixed manifest covering all five verbs.
-verbs = {
-"src": "source",
-"xf": "transform",
-"flt": "filter",
-"fold": "fold",
-"snk": "sink",
-}
-checks = []
-
-# 1. A clean pipeline: source -> transform -> sink.
-hops, ok = typecheck_pipeline(["src", "xf", "snk"], verbs)
-checks.append(("clean src->xf->snk typechecks", ok is True))
-
-# 2. A sink in the middle must fail (it emits nothing downstream).
-hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
-checks.append(("sink-in-middle fails", ok is False))
-
-# 3. A source in the middle must fail (it ignores its stdin).
-hops, ok = typecheck_pipeline(["src", "src", "snk"], verbs)
-checks.append(("source-in-middle fails", ok is False))
-
-# 4. The bad HOP is identified: src -> snk is fine, snk -> xf is the break.
-hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
-bad = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
-checks.append(("bad hop is snk->xf", len(bad) == 1 and bad[0]["from"] == "snk" and bad[0]["to"] == "xf"))
-
-# 5. An unresolved slug fails and is never guessed.
-hops, ok = typecheck_pipeline(["src", "ghost", "snk"], verbs)
-stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "ghost"][0]
-checks.append(("unresolved slug fails, verb is None", ok is False and stage["verb"] is None))
-
-# 6. transform->filter->fold is all-middle-legal and clean.
-hops, ok = typecheck_pipeline(["xf", "flt", "fold"], verbs)
-checks.append(("xf->flt->fold typechecks", ok is True))
-
-# 6a. The stage-role verdict is isolated (not just the aggregate): a sink in
-# the middle sets role_ok False on that stage (endpoint EMITS rule).
-hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
-snk_stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "snk"][0]
-checks.append(("sink-middle stage role_ok False", snk_stage["role_ok"] is False))
-
-# 6b. A hop bad ONLY on the accept side (xf -> src) fails the gate — pins the
-# ACCEPTS conjunct independently of the emit side.
-hops, ok = typecheck_pipeline(["xf", "src", "snk"], verbs)
-accept_hop = [h for h in hops if h["kind"] == "hop" and h["from"] == "xf" and h["to"] == "src"][0]
-checks.append(("accept-only-bad hop xf->src fails", accept_hop["typechecks"] is False))
-
-# 7. conformsTo is nominal equality at seed (flat lattice).
-checks.append(("conformsTo flat: transform~transform, not transform~filter",
-conformsTo("transform", "transform") and not conformsTo("filter", "transform")))
-
-# 8. conformsTo empty-required is the no-constraint path.
-checks.append(("conformsTo empty-required is True", conformsTo("anything", "") is True))
-
-passed = sum(1 for _, ok_ in checks if ok_)
-for name, ok_ in checks:
-print(f" {'PASS' if ok_ else 'FAIL'} {name}")
-print(f"{passed}/{len(checks)} checks passed")
-return passed == len(checks)
-
-def main(argv=None):
-ap = argparse.ArgumentParser(
-description="Validate a declared gift pipeline before you run it — the TYPE gate, not the record shape."
-)
-ap.add_argument("--port", action="store_true", help="print typecheck's own port-verb (filter) and exit")
-ap.add_argument("--selftest", action="store_true", help="run built-in checks and exit")
-sub = ap.add_subparsers(dest="cmd")
-for name in ("check", "text"):
-p = sub.add_parser(name)
-p.add_argument("--pipeline", required=True, help="comma-separated slugs, e.g. gitlog,vclock,cairn")
-p.add_argument("--manifest", required=True, help="path to the gifts manifest JSON")
-args = ap.parse_args(argv)
-
-if args.port:
-print(json.dumps({"slug": "typecheck", "port_verb": "filter"}))
-return 0
-
-if args.selftest:
-return 0 if _selftest() else 1
-
-if args.cmd not in ("check", "text"):
-ap.print_help()
-return 2
-
-try:
-pipeline = parse_pipeline(args.pipeline)
-verbs = load_verbs(args.manifest)
-except (ValueError, OSError, json.JSONDecodeError) as e:
-sys.stderr.write(f"typecheck: {e}\n")
-return 2
-
-hops, ok = typecheck_pipeline(pipeline, verbs)
-if args.cmd == "check":
-emit_jsonl(pipeline, hops, ok, sys.stdout)
-else:
-emit_text(pipeline, hops, ok, sys.stdout)
-return 0 if ok else 3
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_typecheck.py 170 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-Mutation-bitten test for the typecheck gift.
-
-Two halves:
-1. GOLDEN — the behavior contract: clean pipelines pass, broken pipelines
-fail at the right hop/stage, unresolved slugs are flagged not guessed,
-conformsTo is flat at seed.
-2. MUTATION BATTERY — each load-bearing predicate is flipped in a copy of the
-module and the golden checks are re-run; the suite is only meaningful if
-every mutation is CAUGHT (turns some golden check RED). A mutation that
-nothing catches is a hole in the test, and this file fails loud on it.
-
-Run: python3 test_typecheck.py (asserts golden green + every bite caught)
-python3 test_typecheck.py --show (verbose)
-"""
-import copy
-import importlib.util
-import sys
-import types
-from pathlib import Path
-
-HERE = Path(__file__).resolve().parent
-MODPATH = HERE / "typecheck.py"
-
-def _load_module(src_text=None):
-"""Load typecheck.py fresh (optionally from mutated source text)."""
-spec = importlib.util.spec_from_file_location("typecheck_under_test", MODPATH)
-mod = importlib.util.module_from_spec(spec)
-if src_text is None:
-spec.loader.exec_module(mod)
-else:
-code = compile(src_text, str(MODPATH), "exec")
-exec(code, mod.__dict__)
-return mod
-
-VERBS = {
-"src": "source", "xf": "transform", "flt": "filter",
-"fold": "fold", "snk": "sink",
-}
-
-def golden_checks(m):
-"""Return a list of (name, bool) — the behavior contract, evaluated on module m."""
-out = []
-
-hops, ok = m.typecheck_pipeline(["src", "xf", "snk"], VERBS)
-out.append(("clean src->xf->snk typechecks", ok is True))
-
-hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
-out.append(("sink-in-middle fails", ok is False))
-
-hops, ok = m.typecheck_pipeline(["src", "src", "snk"], VERBS)
-out.append(("source-in-middle fails", ok is False))
-
-hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
-bad = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
-out.append(("bad hop is exactly snk->xf",
-len(bad) == 1 and bad[0]["from"] == "snk" and bad[0]["to"] == "xf"))
-
-hops, ok = m.typecheck_pipeline(["src", "ghost", "snk"], VERBS)
-stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "ghost"][0]
-out.append(("unresolved slug fails and verb is None",
-ok is False and stage["verb"] is None))
-
-hops, ok = m.typecheck_pipeline(["xf", "flt", "fold"], VERBS)
-out.append(("all-middle-legal xf->flt->fold typechecks", ok is True))
-
-hops, ok = m.typecheck_pipeline(["snk", "xf"], VERBS)
-out.append(("sink as FIRST stage fails (emits nothing downstream)", ok is False))
-
-hops, ok = m.typecheck_pipeline(["xf", "src"], VERBS)
-out.append(("source as LAST stage fails (ignores its input)", ok is False))
-
-# Isolate the STAGE-ROLE verdict (not just the aggregate ok) — a sink in the
-# middle must set role_ok False on that stage, independent of the hop gate.
-hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
-snk_stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "snk"][0]
-out.append(("sink-middle stage role_ok is False (endpoint EMITS rule)", snk_stage["role_ok"] is False))
-
-# And a source in the middle must set role_ok False on THAT stage (endpoint
-# ACCEPTS rule) — isolated the same way.
-hops, ok = m.typecheck_pipeline(["src", "src", "snk"], VERBS)
-mid_src = [h for h in hops if h["kind"] == "stage" and h["pos"] == 1][0]
-out.append(("source-middle stage role_ok is False (endpoint ACCEPTS rule)", mid_src["role_ok"] is False))
-
-# A hop that is bad ONLY on the ACCEPTS side: xf (emits) -> src (a source in
-# a non-first slot ignores stdin). The HOP itself must fail on accept, which
-# pins the ACCEPTS conjunct in the gate independently of the emit side.
-hops, ok = m.typecheck_pipeline(["xf", "src", "snk"], VERBS)
-accept_hop = [h for h in hops if h["kind"] == "hop" and h["from"] == "xf" and h["to"] == "src"][0]
-out.append(("hop bad only on ACCEPTS side (xf->src) fails the gate", accept_hop["typechecks"] is False))
-
-out.append(("conformsTo flat: nominal only",
-m.conformsTo("transform", "transform") and not m.conformsTo("filter", "transform")))
-out.append(("conformsTo empty-required True", m.conformsTo("x", "") is True))
-
-out.append(("EMITS(sink) False / EMITS(source) True", (m.EMITS("sink") is False) and (m.EMITS("source") is True)))
-out.append(("ACCEPTS(source) False / ACCEPTS(sink) True", (m.ACCEPTS("source") is False) and (m.ACCEPTS("sink") is True)))
-
-return out
-
-# Each mutation is a (name, find, replace) source edit that BREAKS a load-bearing
-# predicate. A correct test suite turns at least one golden check RED for each.
-MUTATIONS = [
-("EMITS always True", 'return v!= "sink"', "return True"),
-("ACCEPTS always True", 'return v!= "source"', "return True"),
-("EMITS inverted", 'return v!= "sink"', 'return v == "sink"'),
-("conformsTo always True", "return candidate in subtypes(required)", "return True"),
-("endpoint ACCEPTS check disabled",
-'if pos in ("middle", "last") and not ACCEPTS(verb):',
-'if False and pos in ("middle", "last") and not ACCEPTS(verb):'),
-("endpoint EMITS check disabled",
-'if pos in ("first", "middle") and not EMITS(verb):',
-'if False and pos in ("first", "middle") and not EMITS(verb):'),
-("unresolved slug silently guessed transform",
-"verb = verbs.get(slug)",
-'verb = verbs.get(slug) or "transform"'),
-("gate ignores ACCEPTS", "passes = emits and accepts", "passes = emits"),
-]
-
-def run():
-show = "--show" in sys.argv
-src = MODPATH.read_text()
-
-# Half 1 — golden must be all-green on the real module.
-base = _load_module()
-gold = golden_checks(base)
-gold_ok = all(ok for _, ok in gold)
-if show or not gold_ok:
-for name, ok in gold:
-print(f" {'PASS' if ok else 'FAIL'} {name}")
-print(f"GOLDEN: {sum(ok for _, ok in gold)}/{len(gold)} passed")
-if not gold_ok:
-print("GOLDEN FAILED — the gift is broken, not the test.")
-return 1
-
-# Half 2 — every mutation must be caught (turn >=1 golden check RED).
-all_caught = True
-for name, find, repl in MUTATIONS:
-if find not in src:
-print(f" BITE-BROKEN {name}: anchor not found in source — test is stale")
-all_caught = False
-continue
-mutated = src.replace(find, repl, 1)
-try:
-mut_mod = _load_module(mutated)
-res = golden_checks(mut_mod)
-caught = any(not ok for _, ok in res)
-except Exception:
-# A mutation that makes the module explode is also 'caught'.
-caught = True
-mark = "caught" if caught else "ESCAPED"
-if show or not caught:
-print(f" {mark:8s} mutation: {name}")
-if not caught:
-all_caught = False
-
-print(f"MUTATIONS: {sum(1 for n, f, r in MUTATIONS if f in src)}/{len(MUTATIONS)} biteable; "
-f"{'ALL CAUGHT' if all_caught else 'SOME ESCAPED'}")
-return 0 if (gold_ok and all_caught) else 1
-
-if __name__ == "__main__":
-sys.exit(run())
-
-Take the whole folder →
-MIT
-Python 3, standard library only
 
 ---
