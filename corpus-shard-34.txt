@@ -287,7 +287,7 @@ No dependencies
 
 Rule 3
 
-No npm install. No package.json. No node_modules. Any external library the tool needs is bundled into the single file at build time. The only runtime requirement is Node.js 18+. Vendored source is permitted and documented.
+No npm install. No package.json. No node_modules. Any external library the tool needs is bundled into the single file at build time. The only runtime requirement is Node.js 22.13+ (the version where the built-in node:sqlite module ships unflagged). Vendored source is permitted and documented.
 
 Why it is a rule, not a preference. A dependency is a bet that someone else’s code, and the registry that serves it, will still exist and still behave the same way when your user runs the tool. Most tools lose to bit rot not because their own code broke but because a dependency moved, a registry went down, or an install step failed on a machine slightly unlike the author’s. Vendoring the source you actually use — and only the source you actually use — converts a runtime bet into a fact that ships inside the file. The tool becomes something you can run from an archive with no network at all.
 
@@ -369,6 +369,19 @@ db.prepare('INSERT INTO ledger (prev,hash,event,ts) VALUES (?,?,?,?)')
 .run(prevHash, hash, event, ts);
 }
 
+// Rule 5, held structurally: no state change happens WITHOUT its receipt.
+// Route every write through mutate() — one atomic transaction that does the
+// change and records it. A future programmer cannot forget the ledger line,
+// because there is no path to the state that goes around this wrapper.
+function mutate(event, change) {
+db.exec('BEGIN');
+try { const r = change(); record(event); db.exec('COMMIT'); return r;}
+catch (e) { db.exec('ROLLBACK'); throw e;}
+}
+
+const esc = s => String(s).replace(/[&<>"]/g,
+c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
 // Rule 1: server, logic, and (inline) UI live in this same file.
 http.createServer((req, res) => {
 if (req.method === 'POST' && req.url === '/item') {
@@ -376,19 +389,19 @@ let body = '';
 req.on('data', c => body += c);
 req.on('end', () => {
 const id = crypto.randomUUID(), ts = new Date().toISOString();
-db.prepare('INSERT INTO item (id,body,ts) VALUES (?,?,?)').run(id, body, ts);
-record('item.create:' + id); // every significant op is proven
+mutate('item.create:' + id, () => // state + receipt: one transaction
+db.prepare('INSERT INTO item (id,body,ts) VALUES (?,?,?)').run(id, body, ts));
 res.writeHead(201).end(id);
 });
 return;
 }
 const rows = db.prepare('SELECT id,body,ts FROM item ORDER BY ts DESC').all();
 res.writeHead(200, { 'content-type': 'text/html'})
-.end('<h1>Items</h1>' + rows.map(r => `<p>${r.body}</p>`).join(''));
+.end('<h1>Items</h1>' + rows.map(r => `<p>${esc(r.body)}</p>`).join(''));
 // Rule 2: one command, useful in sixty seconds — no build step, no config.
-}).listen(3000, () => console.log('http://localhost:3000'));
+}).listen(3000, '127.0.0.1', () => console.log('http://localhost:3000'));
 
-That is roughly forty lines and it already holds all five rules: it is one file (Rule 1), it starts with node tool.js and initializes itself (Rule 2), it imports only node:* (Rule 3), it keeps its data in SQLite (Rule 4), and it writes an append-only, hash-chained ledger the database itself refuses to edit (Rule 5). Grow a real tool by adding routes and tables — each new operation gets its own record(…) line, and the constraints stay held for free. When you want the fully worked versions rather than the skeleton, the apps each link their own complete source, and the Walk-Through follows one from its first blueprint to the shipped file.
+That is roughly forty lines and it already holds all five rules: it is one file (Rule 1), it starts with node tool.js and initializes itself (Rule 2), it imports only node:* (Rule 3), it keeps its data in SQLite (Rule 4), and it writes an append-only, hash-chained ledger the database itself refuses to edit (Rule 5). Grow a real tool by adding routes and tables — route every write through mutate(…) and the receipt is taken in the same transaction as the change, so a new operation cannot land its state without its proof. That is the difference between a rule you remember and a rule the design holds: there is no path to the data that goes around the ledger. When you want the fully worked versions rather than the skeleton, the apps each link their own complete source, and the Walk-Through follows one from its first blueprint to the shipped file.
 
 One honest boundary
 
