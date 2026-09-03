@@ -1,1228 +1,1380 @@
-# Loop MMT — corpus shard 49/61
+# Loop MMT — corpus shard 49/63
 
-> Bundle 49 of 61 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 49 of 63 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/declare/, /gifts/derived/, /gifts/dwell/)
+Nodes in this shard: 3 (/gifts/cairn/, /gifts/callsigns/, /gifts/census/)
 
 ---
 
-# declare — a Loop MMT gift
-https://loopmmt.com/gifts/declare/
+# Cairn — a Loop MMT gift
+https://loopmmt.com/gifts/cairn/
 [coverage: optional · branch: gifts]
 
-Named Pipeline Score save ← all gifts
+Multi-Store Git Redundancy survive ← all gifts
 
-declare
+Cairn
 
-Turn an ad-hoc shell pipe — A | B | C — into a saved, named, shareable artifact: a 'gift score'. declare emits a small canonical JSON object (a name + an ordered list of tool slugs) you keep, read, and re-run instead of retyping the sequence. The emit is deterministic by construction — fixed key order, stages in pipeline order (never sorted) — and `declare check` re-emits and byte-compares so a stored score can be proven current.
+Priority-ordered failover clone, a host-aware credential helper, and redundant push across distinct-class git stores — so your canonical history survives any one store going away. The load-bearing idea is the independence class: two mirrors on one provider aren't redundancy.
 
 The honest edge
 
-It SAVES a pipeline; it does not VALIDATE it (that's typecheck) and does not RUN it (that's a runner). declare will faithfully write down a score that would not typecheck — it claims only that the pipeline is recorded, never that it is runnable. With --manifest it flags any stage that isn't a declared tool, saving the score anyway and flagging it, never silently dropping a stage.
+It survives store loss, not corruption you push yourself. Push a bad commit and every mirror faithfully keeps your mistake.
 
 Run it
 
-python3 declare.py write --name NAME --stages A,B,C
-test_declare.py (12/12 golden, 7/7 mutations caught)
-Python 3, standard library only
+./cairn.sh
+smoke_test.sh (5/5)
+Bash + git
 
 The code — every file that ships
 
-declare.py 297 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-declare — save a named, reusable pipeline as a "gift score".
+cairn.sh 275 lines on GitHub →
+#!/usr/bin/env bash
+# cairn.sh — a self-healing, multi-store git fabric in one script.
+#
+# Keep the same repo on several INDEPENDENT git stores so the loss of any one
+# store (a host outage, a deleted account, a revoked token, a dead disk) never
+# costs you the repo. Three moves:
+#
+# clone Priority-ordered FAILOVER clone: try store 1, then 2, then 3;
+# the first reachable+authed store wins. LOUD STOP only when ALL
+# are dead. (This is the cold-boot path — how a fresh machine gets
+# the repo when you don't know which store is up.)
+#
+# push Redundant fan-out push to every enabled store, in parallel, with
+# a bounded per-store timeout. The write succeeds iff at least
+# THRESHOLD distinct INDEPENDENCE CLASSES confirm it — never a raw
+# store count. Two stores that share a class (two repos on the same
+# provider) count ONCE, because losing that provider loses both.
+# A store that fails is a "laggard": noted, never fatal, as long as
+# the class threshold is met. A laggard is behind, not wrong.
+#
+# frontier Probe every store's main head and REPORT the MAX head among ones
+# that are comparable (one is an ancestor of the other — a laggard
+# just catches up). READ-ONLY: it records discovered heads under
+# refs/cairn/heads/ and reports the frontier SHA — it moves nothing
+# (no main, no HEAD, no laggard heal). To adopt, run yourself:
+# git fetch && git merge --ff-only <frontier>. If two heads are
+# INCOMPARABLE — a real fork,
+# neither an ancestor of the other — that is a DIVERGENCE: it is
+# recorded under refs/cairn/divergence/<utc>/ and surfaced LOUD, and
+# is NEVER auto-merged. Divergence is a human decision.
+#
+# The whole point is expressed in the config, not the code: see `stores`
+# (`stores.example` to start). Each store is tagged with a failure CLASS; the
+# durability threshold is a number of DISTINCT CLASSES. Edit the config, never
+# this script.
+#
+# Credentials never live here. Private stores authenticate through git's askpass
+# (see `askpass.example.sh`): a helper that reads a token from a GITIGNORED file
+# at call time and writes it ONLY to git's stdin — never to disk, a log, an
+# argument, or a stored remote URL. This script contains no secret and needs to
+# know none.
+#
+# git-only + POSIX-ish bash. No dependencies. MIT licensed.
+#
+# Usage:
+# cairn.sh clone <dest> # failover clone into <dest>
+# cairn.sh push [ref] # fan-out push (ref default: HEAD)
+# cairn.sh frontier # REPORT max comparable head (read-only); loud on divergence
+# cairn.sh doctor # validate the stores config
+#
+# Config resolution: $CAIRN_STORES (default:./stores)
+# Knobs (env): CAIRN_TIMEOUT (per-store seconds, default 10)
+#
+# Exit codes: 0 ok · 1 loud failure (below threshold / all stores dead) ·
+# 2 frontier divergence · 3 config problem
+set -euo pipefail
 
-You keep retyping the same chain of little JSONL tools: `gitlog | vclock | cairn`.
-`declare` turns that ad-hoc shell pipe into a saved, named, shareable artifact —
-a *score* — that you (or anyone you hand it to) can keep, read, and re-run later
-instead of remembering the exact sequence. It is the one durable noun in the
-compose set: `port` labels a tool, `map` shows what chains, `typecheck` checks a
-chain, and `declare` writes a chain down so it survives the shell session.
+CAIRN_STORES="${CAIRN_STORES:-stores}"
+CAIRN_TIMEOUT="${CAIRN_TIMEOUT:-10}"
 
-WHAT A SCORE IS (a small, canonical JSON object)
-{
-"kind": "gift-score",
-"name": "commit-causality",
-"stages": ["gitlog", "vclock", "cairn"],
-"note": "git history -> causal order -> durable store" (optional)
+CEILING="note: the Cairn survives the LOSS of a store (host, account, token, disk) \
+— it does NOT survive corruption YOU push yourself; a bad commit fans out to every \
+mirror. It heals AVAILABILITY, not correctness. Incomparable heads are surfaced as a \
+divergence, never auto-merged."
+
+die() { echo "cairn: $*" >&2; exit 3;}
+
+# --- config parsing (git-only; no jq) ---------------------------------------
+# A store line is 5 pipe-separated fields: name | class | priority | url | enabled
+# The threshold is one line: threshold = <N> (default 2 if absent)
+# Blank lines and lines beginning with '#' are ignored.
+
+_threshold() {
+awk -F= '
+/^[[:space:]]*#/ {next}
+tolower($1) ~ /threshold/ { v=$2; gsub(/[^0-9]/,"",v); if (v!="") { print v; exit}}
+' "$1"
 }
-Just a name and an ordered list of gift slugs. No DAG, no branching, no
-executor — a linear pipeline, which is what a shell `A | B | C` actually is.
-(A future version could grow branches; the format leaves room, the seam is
-the `stages` list. Kept flat on purpose — the gift is the atom, not the IDE.)
 
-WHAT THIS IS A STRIP OF
-An internal composition architecture (CC-BY-NC) frames saved composition
-trees as programs: apps are the instruction set, the tree is the machine, and
-a user wires apps into a graph they keep and re-run. This gift is the
-gift-scale strip of exactly that idea — "a saved composition is a program you
-keep" — reduced to its atom: a named LINEAR pipeline of standalone tools,
-minus the app-suite, the executor, and the DAG machinery. Net-new code
-(nothing is lifted), re-licensed MIT, standard library only.
+# Emit enabled stores as "name|class|priority|url", priority-ascending.
+_enabled_stores() {
+awk -F'|' '
+/^[[:space:]]*#/ {next}
+NF < 5 {next}
+{
+for (i=1;i<=5;i++){ gsub(/^[ \t]+|[ \t]+$/,"",$i)}
+if ($5=="true") print $3"|"$1"|"$2"|"$4
+}
+' "$1" | sort -t'|' -k1,1n | awk -F'|' '{print $2"|"$3"|"$1"|"$4}'
+}
 
-DETERMINISTIC BY CONSTRUCTION
-The emitted score is a canonical fold of (name, stages, note): keys in a
-fixed order, `stages` in the order you gave them (never sorted — order is the
-pipeline), and `declare check` re-emits and byte-compares so a saved score
-can be proven current. Same score in, same bytes out, every time.
+_require_config() { [ -f "$CAIRN_STORES"] || die "no stores config at '$CAIRN_STORES' (set CAIRN_STORES, or copy stores.example -> stores)";}
 
-WHAT IT DELIBERATELY DOES NOT DO (the honesty boundary)
-declare SAVES a pipeline. It does not VALIDATE it and it does not RUN it.
-- It does not check that the stages typecheck (that a stage emits what the
-next accepts) — that is `typecheck`'s job; run `typecheck` on the score.
-- It does not execute the pipeline — that is a runner's job.
-declare will happily write down a score that does not typecheck; it makes no
-claim that a saved score is runnable, only that it is faithfully recorded.
-It does one honest structural check: every stage slug is non-empty and the
-score has at least one stage. It does NOT confirm the slugs name real tools
-(it has no manifest by default) — pass `--manifest` to have it flag any slug
-that is not a declared tool, still saving the score and flagging, never
-silently dropping.
+# --- doctor: validate the config --------------------------------------------
+cmd_doctor() {
+_require_config
+local stores thr classes ncanon problems=0
+stores="$(_enabled_stores "$CAIRN_STORES")"
+[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
+thr="$(_threshold "$CAIRN_STORES")"; thr="${thr:-2}"
+# distinct enabled classes
+classes="$(printf '%s\n' "$stores" | awk -F'|' '{print $2}' | sort -u | wc -l)"
+echo "cairn doctor: $(printf '%s\n' "$stores" | grep -c.) enabled store(s), $classes distinct class(es), threshold=$thr"
+if [ "$classes" -lt "$thr"]; then
+echo " WARN: only $classes distinct class(es) enabled but threshold is $thr — a push cannot meet durability until you enable more independent classes." >&2
+problems=1
+fi
+# duplicate priorities
+if printf '%s\n' "$stores" | awk -F'|' '{print $3}' | sort | uniq -d | grep -q.; then
+echo " WARN: duplicate priorities — failover order is ambiguous." >&2
+problems=1
+fi
+[ "$problems" -eq 0] && echo " ok."
+echo "$CEILING"
+# GIFT-005: doctor is a validation gate, not a pretty-printer. A below-threshold
+# or duplicate-priority config makes the durability contract impossible/ambiguous
+# -> loud failure (exit 1, per the documented convention above), never exit 0.
+[ "$problems" -eq 0] && return 0
+return 1
+}
+
+# --- clone: priority-ordered failover ---------------------------------------
+cmd_clone() {
+local dest="${1:-}"
+[ -n "$dest"] || die "usage: cairn.sh clone <dest>"
+_require_config
+local n=0 name class prio url
+while IFS='|' read -r name class prio url; do
+[ -n "$name"] || continue
+n=$((n+1))
+echo "cairn: trying $name ($class)..." >&2
+if timeout "$CAIRN_TIMEOUT" git clone --quiet "$url" "$dest" 2>/dev/null; then
+echo "cairn: cloned from $name ($class)." >&2
+echo "$CEILING" >&2
+return 0
+fi
+echo "cairn: $name unreachable/auth-fail — failing over." >&2
+done <<EOF
+$(_enabled_stores "$CAIRN_STORES")
+EOF
+[ "$n" -gt 0] || die "no enabled stores in '$CAIRN_STORES'"
+echo "cairn: LOUD STOP — every store is unreachable. Nothing to clone from." >&2
+exit 1
+}
+
+# --- push: distinct-class fan-out -------------------------------------------
+cmd_push() {
+local ref="${1:-HEAD}"
+_require_config
+local thr work stores name class prio url
+thr="$(_threshold "$CAIRN_STORES")"; thr="${thr:-2}"
+stores="$(_enabled_stores "$CAIRN_STORES")"
+[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
+work="$(mktemp -d)"
+
+# fan out, parallel, each store writes its own result file
+while IFS='|' read -r name class prio url; do
+[ -n "$name"] || continue
+(
+if timeout "$CAIRN_TIMEOUT" git push --quiet "$url" "${ref}:refs/heads/main" >/dev/null 2>&1; then
+echo "OK|$class"
+else
+echo "FAIL|$class"
+fi
+) >"$work/$name" &
+done <<EOF
+$stores
+EOF
+wait
+
+# aggregate by DISTINCT class
+local confirmed="" ok="" fail="" line st nc
+while IFS='|' read -r name class prio url; do
+[ -n "$name"] || continue
+line="$(cat "$work/$name")"; st="${line%%|*}"
+if [ "$st" = "OK"]; then
+ok="$ok $name($class)"
+case " $confirmed " in *" $class "*):;; *) confirmed="$confirmed $class";; esac
+else
+fail="$fail $name($class)"
+fi
+done <<EOF
+$stores
+EOF
+nc="$(echo $confirmed | wc -w)"
+
+echo "cairn push: confirmed classes=$nc (need >=$thr) |$ok | laggards:${fail:- none}"
+echo "$CEILING"
+rm -rf "$work"
+if [ "$nc" -ge "$thr"]; then
+return 0
+fi
+echo "cairn push LOUD-FAIL: only $nc distinct class(es) [$confirmed] confirmed, threshold is $thr — durability NOT met for this push." >&2
+return 1
+}
+
+# --- frontier: REPORT max comparable head (read-only), loud on divergence ----
+cmd_frontier() {
+_require_config
+git rev-parse --git-dir >/dev/null 2>&1 || die "frontier must run inside a git repo (it fetches store heads into refs/cairn/heads/)"
+local stores name class prio url sha names="" a b
+declare -A HEAD
+stores="$(_enabled_stores "$CAIRN_STORES")"
+[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
+
+while IFS='|' read -r name class prio url; do
+[ -n "$name"] || continue
+sha="$(timeout "$CAIRN_TIMEOUT" git ls-remote "$url" refs/heads/main 2>/dev/null | awk '{print $1}' | head -1)"
+if [ -z "$sha"]; then
+echo "cairn: $name ($class) — no main head or unreachable (skip)." >&2
+continue
+fi
+# fetch the objects so ancestry is decidable locally; a store that advertises
+# a head it cannot actually serve is corrupt-at-that-head — fail past it.
+if timeout "$CAIRN_TIMEOUT" git fetch --quiet "$url" refs/heads/main 2>/dev/null \
+&& git cat-file -e "$sha" 2>/dev/null; then
+git update-ref "refs/cairn/heads/$name" "$sha"
+HEAD[$name]="$sha"
+names="$names $name"
+else
+echo "cairn: $name ($class) advertises $sha but cannot serve it — failing past (fixity)." >&2
+fi
+done <<EOF
+$stores
+EOF
+
+[ -n "$names"] || die "frontier: no servable store heads found."
+
+# find a store whose head is a descendant-or-equal of every other head
+local best="" dominates
+for a in $names; do
+dominates=1
+for b in $names; do
+[ "$a" = "$b"] && continue
+if! git merge-base --is-ancestor "${HEAD[$b]}" "${HEAD[$a]}" 2>/dev/null; then
+dominates=0; break
+fi
+done
+if [ "$dominates" -eq 1]; then best="$a"; break; fi
+done
+
+if [ -n "$best"]; then
+echo "cairn frontier: frontier=${HEAD[$best]} (from $best). READ-ONLY report — nothing was moved. To adopt: git fetch && git merge --ff-only ${HEAD[$best]}"
+echo "$CEILING"
+return 0
+fi
+
+# no dominator => incomparable heads => divergence. Record, never merge.
+local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+for a in $names; do
+git update-ref "refs/cairn/divergence/$ts/$a" "${HEAD[$a]}"
+done
+echo "cairn frontier LOUD: incomparable store heads — this is a FORK, not a lag." >&2
+echo "cairn frontier: divergence recorded at refs/cairn/divergence/$ts/* — NOT auto-merged; resolve by hand." >&2
+echo "$CEILING" >&2
+return 2
+}
+
+# --- dispatch ---------------------------------------------------------------
+main() {
+local cmd="${1:-}"; shift || true
+case "$cmd" in
+clone) cmd_clone "$@";;
+push) cmd_push "$@";;
+frontier) cmd_frontier "$@";;
+reconverge) die "reconverge was renamed to 'frontier': it reports the max comparable head but never moved main or touched other stores (the old name overpromised). Use 'cairn frontier'.";;
+doctor) cmd_doctor "$@";;
+""|-h|--help|help)
+sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+;;
+*) die "unknown command '$cmd' (try: clone | push | frontier | doctor)";;
+esac
+}
+
+main "$@"
+
+askpass.example.sh 62 lines on GitHub →
+#!/bin/sh
+# askpass.example.sh — a host-aware git credential helper. COPY to askpass.sh
+# and edit the host arms + field names for your stores.
+#
+# WHY THIS EXISTS
+# Private stores need a token. The unsafe habits are (a) baking the token into
+# the remote URL (it lands in.git/config and every `git remote -v`), and
+# (b) exporting it as an environment variable (it leaks into child processes
+# and is gone across separate shells, so the NEXT push silently fails auth).
+# This helper avoids both: git calls it at push/fetch time, it reads the token
+# from a GITIGNORED file at CALL TIME, and writes it ONLY to git's stdin.
+#
+# SAFE TO COMMIT — once you've replaced the placeholders with your HOSTS and
+# FIELD NAMES (which are not secret). The SECRET never appears here: it lives in
+# a separate file you never commit. This example is verifiably credential-free.
+#
+# WIRE IT (before any push/fetch):
+# cp askpass.example.sh askpass.sh # then edit the host arms below
+# git config core.askpass "$PWD/askpass.sh"
+# git config credential.username x-access-token # if your host wants a user
+#
+# THE CRED FILE
+# Put your tokens in a file your.gitignore excludes, e.g. `cairn.cred`
+# (add `cairn.cred` and `*.cred` to.gitignore). One token per line, keyed:
+# HOST_A_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
+# HOST_B_TOKEN=yyyyyyyyyyyyyyyyyyyyyyyy
+# Point the helper at it: export CAIRN_CRED=/abs/path/to/cairn.cred
+#
+# Git passes the prompt string as $1, e.g. "Password for 'https://host-b.example':"
+# and, for username prompts, a string beginning "Username". Route by host so ONE
+# helper can serve MANY stores, each with its OWN scoped token (one leak reaches
+# one store — the independence the class model buys). Each token is written only
+# to git's stdin, never to disk, a log, or a URL.
+
+CRED="${CAIRN_CRED:-./cairn.cred}"
+
+# read a keyed value from the cred file, keeping only the value (no spaces/CR)
+_field() {
+grep -m1 -E "^[[:space:]]*$1[[:space:]]*=" "$CRED" 2>/dev/null \
+| sed -E 's/^[^=]*=[[:space:]]*//' | tr -d '[:space:]'
+}
+
+case "$1" in
+*host-b.example*)
+# Example: a public host that wants username=account, password=token.
+case "$1" in
+Username*) printf '%s\n' "your-host-b-account";; # public, not a secret
+*) printf '%s\n' "$(_field HOST_B_TOKEN)";;
+esac
+;;
+*box.example*)
+# Example: a self-hosted git server (git-over-HTTPS).
+case "$1" in
+Username*) printf '%s\n' "your-selfhost-account";; # public, not a secret
+*) printf '%s\n' "$(_field SELFHOST_TOKEN)";;
+esac
+;;
+*)
+# Default / your primary host. Adjust the field name to your store.
+printf '%s\n' "$(_field HOST_A_TOKEN)"
+;;
+esac
+
+stores.example 34 lines on GitHub →
+# cairn stores — copy this to `stores` and edit. This file ships as an EXAMPLE;
+# it contains NO real hosts, accounts, or credentials.
+#
+# One store per line, 5 pipe-separated fields:
+#
+# name | class | priority | url | enabled
+#
+# name a short handle for the store (used in output + ref namespacing)
+# class the INDEPENDENCE CLASS. This is the load-bearing field. Two stores
+# in the SAME class are NOT independent — if the thing that class
+# names goes down (a provider, a machine, an account), both go with
+# it. Give each genuinely-separate failure domain its own class.
+# Examples of distinct classes: a big public host (cloud-A), a
+# different public host (cloud-B), a box you run yourself
+# (self-host), an offline bundle (offline).
+# priority failover order for `clone` (lower first). Keep them unique.
+# url a git remote URL (https://…/repo.git, ssh://…, or a local path).
+# enabled true | false. Disabled stores are ignored entirely.
+#
+# The durability threshold is a number of DISTINCT CLASSES (not stores):
+threshold = 2
+# A push succeeds iff at least this many distinct classes confirm it. Set it to
+# the number of independent failures you want to survive, plus one.
+
+# name | class | priority | url | enabled
+primary | cloud-A | 1 | https://host-a.example/you/repo.git | true
+mirror-public | cloud-B | 2 | https://host-b.example/you/repo.git | true
+mirror-selfhost | self-host | 3 | https://box.example/you/repo.git | true
+
+# An offline class is real durability against a total network outage, but a live
+# `file://` store inside an ephemeral machine is a phantom — it vanishes with the
+# machine. Realize the offline class as an operator-held `git clone --all` bundle
+# regenerated on a cadence, and keep this entry disabled:
+# local-bundle | offline | 4 | file:///path/to/repo.bundle.git | false
+
+smoke_test.sh 157 lines on GitHub →
+#!/usr/bin/env bash
+# smoke_test.sh — hermetic proof that cairn.sh works. No network: every "store"
+# is a local bare git repo standing in for a remote. Five scenarios, mirroring
+# the durability claims:
+#
+# 1 failover clone skips a dead store and clones from the next live one
+# 2 a distinct-class fan-out push succeeds when >= threshold classes confirm
+# 3 two SAME-class stores count ONCE — below threshold => loud fail (exit 1)
+# 4 frontier REPORTS the MAX head (read-only) when heads are comparable
+# 5 frontier records INCOMPARABLE heads as divergence (exit 2), moves nothing
+#
+# Run: bash smoke_test.sh (expect: 5/5 passed)
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CAIRN="$HERE/cairn.sh"
+PASS=0; FAIL=0
+ROOT="$(mktemp -d)"; trap 'rm -rf "$ROOT"' EXIT
+
+ok() { echo "ok $1"; PASS=$((PASS+1));}
+bad() { echo "FAIL $1: $2"; FAIL=$((FAIL+1));}
+
+git_q() { git -c init.defaultBranch=main -c user.name=t -c user.email=t@t "$@";}
+
+mk_source() { # $1 dest; makes a repo on main with one commit
+git_q init -q "$1"
+( cd "$1"; echo "base" > file.txt; git_q add file.txt; git_q commit -q -m base)
+}
+mk_bare() { git_q init -q --bare "$1";}
+seed() { git_q -C "$1" push -q "$2" main:refs/heads/main;} # $1 src $2 bare
+head_of() { git_q -C "$1" rev-parse HEAD;}
+bare_main(){ git_q --git-dir="$1" rev-parse refs/heads/main 2>/dev/null;}
+
+# --- 1: failover clone ------------------------------------------------------
+t1() {
+local d="$ROOT/t1"; mkdir -p "$d"
+mk_source "$d/src"
+mk_bare "$d/live.git"; seed "$d/src" "$d/live.git"
+cat > "$d/stores" <<EOF
+threshold = 2
+dead | cloud-A | 1 | $d/does-not-exist.git | true
+live | cloud-B | 2 | $d/live.git | true
+EOF
+if CAIRN_STORES="$d/stores" bash "$CAIRN" clone "$d/clone" >/dev/null 2>&1 \
+&& [ -f "$d/clone/file.txt"] \
+&& [ "$(cat "$d/clone/file.txt")" = "base"]; then
+ok "failover clone skips dead store, clones from next"
+else
+bad "failover clone" "did not clone from the live store after the dead one"
+fi
+}
+
+# --- 2: distinct-class push succeeds ----------------------------------------
+t2() {
+local d="$ROOT/t2"; mkdir -p "$d"
+mk_source "$d/src"
+mk_bare "$d/a.git"; mk_bare "$d/b.git"; mk_bare "$d/c.git"
+cat > "$d/stores" <<EOF
+threshold = 2
+a | cloud-A | 1 | $d/a.git | true
+b | cloud-B | 2 | $d/b.git | true
+c | self-host | 3 | $d/c.git | true
+EOF
+local want; want="$(head_of "$d/src")"
+if ( cd "$d/src"; CAIRN_STORES="$d/stores" bash "$CAIRN" push HEAD) >/dev/null 2>&1 \
+&& [ "$(bare_main "$d/a.git")" = "$want"] \
+&& [ "$(bare_main "$d/b.git")" = "$want"] \
+&& [ "$(bare_main "$d/c.git")" = "$want"]; then
+ok "distinct-class push confirmed 3 classes >= threshold 2"
+else
+bad "distinct-class push" "not all stores received main, or exit nonzero"
+fi
+}
+
+# --- 3: two same-class stores count once => below threshold => loud fail -----
+t3() {
+local d="$ROOT/t3"; mkdir -p "$d"
+mk_source "$d/src"
+mk_bare "$d/a1.git"; mk_bare "$d/a2.git"
+cat > "$d/stores" <<EOF
+threshold = 2
+a1 | cloud-A | 1 | $d/a1.git | true
+a2 | cloud-A | 2 | $d/a2.git | true
+EOF
+# both pushes SUCCEED, but they share a class => 1 distinct class < 2 => exit 1
+( cd "$d/src"; CAIRN_STORES="$d/stores" bash "$CAIRN" push HEAD) >/dev/null 2>&1
+if [ "$?" -eq 1]; then
+ok "two same-class stores count once; below threshold is a loud fail"
+else
+bad "same-class threshold" "expected exit 1 (durability not met), got $?"
+fi
+}
+
+# --- 4: frontier REPORTS the max comparable head (read-only) ----------------
+t4() {
+local d="$ROOT/t4"; mkdir -p "$d"
+mk_source "$d/src"
+mk_bare "$d/a.git"; mk_bare "$d/b.git"
+seed "$d/src" "$d/a.git"; seed "$d/src" "$d/b.git" # both at base
+# A moves ahead by one commit; B stays behind (a laggard)
+( cd "$d/src"; echo more >> file.txt; git_q add file.txt; git_q commit -q -m ahead)
+seed "$d/src" "$d/a.git"
+local ahead; ahead="$(head_of "$d/src")"
+git_q clone -q "$d/b.git" "$d/recon" # recon starts behind
+cat > "$d/stores" <<EOF
+threshold = 2
+a | cloud-A | 1 | $d/a.git | true
+b | cloud-B | 2 | $d/b.git | true
+EOF
+# frontier is DISCOVERY-ONLY: it must REPORT the ahead head, RECORD it under
+# refs/cairn/heads/, and MOVE NOTHING. Assert by inspecting refs, never by
+# accepting printed prose as proof of adoption (the false-green this fixes).
+local before; before="$( cd "$d/recon"; git rev-parse HEAD)"
+local out rc
+out="$( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" frontier 2>&1)"; rc=$?
+local reported; reported="$( printf '%s' "$out" | sed -n 's/.*frontier=\([0-9a-f]\{7,\}\).*/\1/p' | head -1)"
+local after; after="$( cd "$d/recon"; git rev-parse HEAD)"
+local recorded; recorded="$( cd "$d/recon"; git rev-parse refs/cairn/heads/a 2>/dev/null)"
+if [ "$rc" -eq 0] && [ "$reported" = "$ahead"] && [ "$after" = "$before"] && [ "$recorded" = "$ahead"]; then
+ok "frontier reports the max comparable head, records it under refs/cairn/heads/, and does NOT move local HEAD (read-only)"
+else
+bad "frontier discovery" "rc=$rc reported=$reported ahead=$ahead before=$before after=$after recorded=$recorded"
+fi
+}
+
+# --- 5: frontier records incomparable heads as divergence (moves nothing) ---
+t5() {
+local d="$ROOT/t5"; mkdir -p "$d"
+mk_source "$d/base"
+mk_bare "$d/a.git"; mk_bare "$d/b.git"
+# two SIBLING commits on top of the same base => incomparable heads
+git_q clone -q "$d/base" "$d/x"
+( cd "$d/x"; echo x >> file.txt; git_q add file.txt; git_q commit -q -m fork-x)
+seed "$d/x" "$d/a.git"
+git_q clone -q "$d/base" "$d/y"
+( cd "$d/y"; echo y >> file.txt; git_q add file.txt; git_q commit -q -m fork-y)
+seed "$d/y" "$d/b.git"
+git_q clone -q "$d/a.git" "$d/recon" # recon has X
+cat > "$d/stores" <<EOF
+threshold = 2
+a | cloud-A | 1 | $d/a.git | true
+b | cloud-B | 2 | $d/b.git | true
+EOF
+( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" frontier) >/dev/null 2>&1
+local rc=$?
+local divs
+divs="$(git_q -C "$d/recon" for-each-ref --format='%(refname)' 'refs/cairn/divergence/' | wc -l)"
+if [ "$rc" -eq 2] && [ "$divs" -ge 2]; then
+ok "frontier records incomparable heads as a divergence, never merges (exit 2)"
+else
+bad "frontier divergence" "expected exit 2 with recorded divergence refs; rc=$rc divs=$divs"
+fi
+}
+
+t1; t2; t3; t4; t5
+echo
+echo "$((PASS))/$((PASS+FAIL)) passed"
+[ "$FAIL" -eq 0]
+
+Take the whole folder →
+MIT
+Bash + git
+
+---
+
+# Callsigns — a Loop MMT gift
+https://loopmmt.com/gifts/callsigns/
+[coverage: optional · branch: gifts]
+
+Memorable IDs, Safe by Construction source ← all gifts
+
+Callsigns
+
+A random identifier you can read aloud, remember for the length of a standup, and paste anywhere without escaping. Every token is word-word-hash (e.g. sunny-champion-8h3kq7): two human-readable words plus a six-character disambiguating hash. The point is that all three parts are ref-, path-, URL-, and shell-safe by construction — not “usually fine,” but safe as a proven property of the alphabet each part draws from, so a callsign drops straight into a git branch, a directory name, a URL segment, or a shell argument with no quoting. The hash alphabet is confusable-free (digits + a-z minus i/l/o/u) and lowercase-only, so there are no case-fold collisions. Seed it and the same seed yields the same token on any machine, forever.
+
+The honest edge
+
+A callsign is a memorable, SAFE identifier — not a guaranteed-unique one. The hash makes an accidental collision astronomically unlikely, but “unlikely” is not “impossible”: if your correctness depends on uniqueness, pair a callsign with a real uniqueness source (a timestamp, a sequence, a registry that rejects duplicates). It buys memorability and paste-safety, not a uniqueness authority.
+
+Run it
+
+python3 callsigns.py --demo
+test_callsigns.py (2061 checks / 10 tests, mutation-bitten, pinned golden batch hash)
+Python standard library only, deterministic under --seed, headless
+
+The code — every file that ships
+
+callsigns.py 203 lines on GitHub →
+#!/usr/bin/env python3
+"""callsigns — memorable IDs that are safe by construction.
+
+A random unique identifier you can read aloud, remember for the length of a
+standup, and paste anywhere without escaping. Every token has the shape
+
+word-word-hash e.g. sunny-champion-8h3kq7
+
+Two human-readable words drawn from a curated pool, then a six-character
+disambiguating hash. The point is that all three parts are *ref-, path-, URL-,
+and shell-safe by construction* — not "usually fine," but safe as a proven
+property of the alphabet each part draws from, so a callsign drops straight into
+a git branch name, a directory name, a URL segment, or a shell argument with no
+quoting and no surprises.
+
+WHY IT'S HONEST
+
+- **Safe by construction, not by hope.** The words pass a lowercase-ASCII
+allowlist; the hash draws from a confusable-free, case-safe base32 alphabet
+(digits + a-z minus i/l/o/u). Every character clears git refs, Windows and
+macOS filenames, RFC-3986 URL segments, and the shell. There is no escaping
+step to forget because there is nothing to escape.
+
+- **No case-fold collisions.** Everything is lowercase, so two callsigns can
+never collide only because a filesystem folded their case.
+
+- **The namespace is a stated number, not a vibe.** 64 x 64 word-pairs = 4096
+memorable prefixes; the six-char hash adds 32^6 (~1.07e9) per prefix, for
+~4.4e12 total. You can reason about collision odds because the size is exact.
+
+- **No degenerate pairs.** A token is never `word-word` with the two words
+equal; the draw rejects and redraws, so every callsign reads as two distinct
+words.
+
+- **Seed it and it's deterministic.** Pass a seed and the same seed yields the
+same callsign on any machine, forever — so a demo, a test, or a reproducible
+fixture is byte-identical. Leave the seed off and it draws from the system CSPRNG.
+
+THE HONEST EDGE
+
+A callsign is a *memorable, safe* identifier, not a *guaranteed-unique* one.
+The hash makes an accidental collision astronomically unlikely, but "unlikely"
+is not "impossible": if your system's correctness depends on uniqueness, pair a
+callsign with a real uniqueness source (a timestamp prefix, a sequence, a
+registry that rejects duplicates) — exactly as the Loop MMT session floor does,
+joining a callsign to a UTC timestamp. Callsigns buy you memorability and
+paste-safety; they do not replace a uniqueness authority.
 
 USAGE
-declare write --name NAME --stages A,B,C [--note "..."] [--manifest F]
-Emit a canonical gift-score (JSON) on stdout. With --manifest, annotate
-any stage slug absent from the manifest as unknown (flagged, not dropped).
-declare check --score score.json
-Re-emit the score canonically and byte-compare against the file.
-Exit 0 if the file is already canonical, 3 if it differs (and print the
-canonical form), 2 on a malformed score.
-declare --port
-Print declare's own port-verb (source) as one JSON-line and exit.
-declare --selftest
-Run the built-in checks and exit 0/1.
+python3 callsigns.py # one callsign
+python3 callsigns.py --n 5 # five callsigns, one per line
+python3 callsigns.py --seed 42 # deterministic: same seed, same token
+python3 callsigns.py --demo # a short, reproducible demonstration
 
-The score is plain JSON: pipe it into `typecheck` via its stages, keep it in a
-repo, hand it to a friend. It is yours the moment it is written down.
+MIT licensed. Python standard library only. Deterministic under --seed; headless.
 """
+from __future__ import annotations
+
 import argparse
 import json
+import os
+import random
 import sys
 
-VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORDLIST = os.path.join(HERE, "wordlist.json")
 
-def canonical_score(name, stages, note=None):
-"""The pure fold: (name, stages, note) -> a canonical score dict.
+# A drawn word must be ref-/path-/URL-/shell-safe by construction.
+SAFE = frozenset("abcdefghijklmnopqrstuvwxyz")
 
-Fixed key order, stages preserved in given order (never sorted — order IS
-the pipeline), note omitted when empty. Deterministic: same inputs, same
-dict, always.
+# Hash field: confusable-free, case-safe base32 — digits + a-z minus i,l,o,u.
+# Lowercase-only (no case-fold collision); every char clears git refs,
+# Windows/macOS filenames, RFC-3986 unreserved URL chars, and the shell.
+# Length is the lever, not the alphabet: 32^6 ~= 1.07e9 per word-pair.
+HASH_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz" # 32 chars: a-z drop i,l,o,u
+HASH_LEN = 6
+
+_MAX_REDRAW = 64 # attempts to avoid a degenerate equal-word pair before forcing
+
+def _is_safe(word: str) -> bool:
+"""True iff word is non-empty and every char is in the safe allowlist."""
+return bool(word) and all(c in SAFE for c in word)
+
+def draw_hash(rng: random.Random, length: int = HASH_LEN) -> str:
+"""Draw a `length`-char hash from the case-safe base32 alphabet."""
+if length < 0:
+raise ValueError("hash length must be non-negative")
+return "".join(rng.choice(HASH_ALPHABET) for _ in range(length))
+
+def load_pools(path: str = WORDLIST) -> tuple[list[str], list[str]]:
+"""Load and safety-filter the two word pools from the wordlist JSON.
+
+Raises ValueError if either pool is empty after the safety filter — a
+wordlist that can't produce a safe word is a loud failure, never a silent
+empty draw.
 """
-score = {
-"kind": "gift-score",
-"name": name,
-"stages": list(stages),
-}
-if note:
-score["note"] = note
-return score
+with open(path, "r", encoding="utf-8") as fh:
+data = json.load(fh)
+pool_one = [w for w in data["pool_one"] if _is_safe(w)]
+pool_two = [w for w in data["pool_two"] if _is_safe(w)]
+if not pool_one or not pool_two:
+raise ValueError("wordlist pools are empty after the safety filter")
+return pool_one, pool_two
 
-def score_to_bytes(score):
-"""Canonical serialization — sort_keys False (we control order), stable
-separators, trailing newline. The byte form `check` compares against."""
-# Emit keys in our fixed order by rebuilding in that order.
-ordered = {}
-for k in ("kind", "name", "stages", "note"):
-if k in score:
-ordered[k] = score[k]
-# Any extra keys (forward-compat) appended in sorted order, after ours.
-for k in sorted(score):
-if k not in ordered:
-ordered[k] = score[k]
-return json.dumps(ordered, ensure_ascii=False, indent=2) + "\n"
+def draw(
+rng: random.Random | None = None,
+path: str = WORDLIST,
+pools: tuple[list[str], list[str]] | None = None,
+) -> str:
+"""Draw one callsign: `word-word-hash`, the two words always distinct.
 
-def validate_shape(name, stages):
-"""Structural check only — returns a list of problems (empty = ok).
-
-Not a typecheck, not a runnability claim. Just: a score needs a name, at
-least one stage, and every stage slug non-empty.
+`rng` — a random.Random (seed it for determinism); defaults to the CSPRNG.
+`pools` — optional pre-loaded (pool_one, pool_two); loaded from `path` if omitted.
 """
-problems = []
-if not name or not str(name).strip():
-problems.append("score has no name")
-if not stages:
-problems.append("score has no stages (a pipeline needs at least one)")
-for i, s in enumerate(stages):
-if not s or not str(s).strip():
-problems.append(f"stage {i} is empty")
-return problems
+rng = rng or random.SystemRandom()
+pool_one, pool_two = pools if pools is not None else load_pools(path)
+# Reject the degenerate identical-word pair and redraw.
+for _ in range(_MAX_REDRAW):
+a, b = rng.choice(pool_one), rng.choice(pool_two)
+if a!= b:
+return f"{a}-{b}-{draw_hash(rng)}"
+# Vanishingly unlikely fallthrough: force a distinct pair.
+a = rng.choice(pool_one)
+alt = [w for w in pool_two if w!= a]
+if not alt:
+raise ValueError("cannot form a distinct word pair from these pools")
+b = rng.choice(alt)
+return f"{a}-{b}-{draw_hash(rng)}"
 
-def load_manifest_slugs(path):
-"""Return the set of slugs declared in a manifest (for the optional
-unknown-stage flag). Never guesses shape; raises ValueError if it can't
-find an entry list."""
-with open(path) as f:
-data = json.load(f)
-if isinstance(data, list):
-entries = data
-elif isinstance(data, dict):
-entries = None
-for k in ("gifts", "tools", "entries"):
-if isinstance(data.get(k), list):
-entries = data[k]
-break
-if entries is None:
-raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
-else:
-raise ValueError(f"{path}: not a JSON list or object")
-return {e.get("slug") for e in entries if e.get("slug")}
+def draw_many(
+count: int,
+rng: random.Random | None = None,
+path: str = WORDLIST,
+) -> list[str]:
+"""Draw `count` callsigns, reusing one loaded pool and one RNG."""
+if count < 0:
+raise ValueError("count must be non-negative")
+rng = rng or random.SystemRandom()
+pools = load_pools(path)
+return [draw(rng=rng, pools=pools) for _ in range(count)]
 
-def parse_stages(s):
-parts = [p.strip() for p in s.split(",")]
-parts = [p for p in parts if p]
-if not parts:
-raise ValueError("--stages needs at least one slug (comma-separated)")
-return parts
+def demo(rng: random.Random | None = None) -> str:
+"""A short, reproducible demonstration rendered as text.
 
-def cmd_write(args):
-stages = parse_stages(args.stages)
-problems = validate_shape(args.name, stages)
-if problems:
-for p in problems:
-sys.stderr.write(f"declare: {p}\n")
-return 2
-
-score = canonical_score(args.name, stages, args.note)
-
-unknown = []
-if args.manifest:
-try:
-known = load_manifest_slugs(args.manifest)
-except (ValueError, OSError, json.JSONDecodeError) as e:
-sys.stderr.write(f"declare: {e}\n")
-return 2
-unknown = [s for s in stages if s not in known]
-if unknown:
-# Annotate — flagged in the score, never silently dropped.
-score["unknown_stages"] = unknown
-
-sys.stdout.write(score_to_bytes(score))
-if unknown:
-sys.stderr.write(
-"declare: NOTE — these stages are not declared tools in the manifest "
-"(saved anyway, flagged): " + ", ".join(unknown) + "\n"
-)
-return 0
-
-def cmd_check(args):
-try:
-with open(args.score) as f:
-raw = f.read()
-data = json.loads(raw)
-except (OSError, json.JSONDecodeError) as e:
-sys.stderr.write(f"declare: {e}\n")
-return 2
-
-name = data.get("name")
-stages = data.get("stages")
-if not isinstance(stages, list):
-sys.stderr.write("declare: score has no 'stages' list\n")
-return 2
-problems = validate_shape(name, stages)
-if problems:
-for p in problems:
-sys.stderr.write(f"declare: {p}\n")
-return 2
-
-# Rebuild canonically from the score's own fields, preserving any extras.
-rebuilt = dict(data)
-canon = score_to_bytes(rebuilt)
-if canon == raw:
-return 0
-sys.stdout.write(canon)
-sys.stderr.write("declare: score is NOT canonical — the canonical form is above.\n")
-return 3
-
-def _selftest():
-checks = []
-
-# 1. write is deterministic — same inputs, same bytes.
-a = score_to_bytes(canonical_score("p", ["gitlog", "vclock", "cairn"]))
-b = score_to_bytes(canonical_score("p", ["gitlog", "vclock", "cairn"]))
-checks.append(("write is deterministic (same bytes)", a == b))
-
-# 2. stages are NEVER reordered (order is the pipeline).
-s = canonical_score("p", ["cairn", "gitlog", "vclock"])
-checks.append(("stages preserve order, not sorted", s["stages"] == ["cairn", "gitlog", "vclock"]))
-
-# 3. key order is fixed: kind, name, stages.
-out = score_to_bytes(canonical_score("p", ["a", "b"]))
-checks.append(("canonical key order kind<name<stages",
-out.index('"kind"') < out.index('"name"') < out.index('"stages"')))
-
-# 4. note omitted when empty, present when given.
-no_note = canonical_score("p", ["a"])
-with_note = canonical_score("p", ["a"], "hi")
-checks.append(("note omitted when empty", "note" not in no_note))
-checks.append(("note present when given", with_note.get("note") == "hi"))
-
-# 5. shape validation catches empty stages and no name.
-checks.append(("empty stages list is a problem", validate_shape("p", [])!= []))
-checks.append(("no name is a problem", validate_shape("", ["a"])!= []))
-checks.append(("empty stage slug is a problem", validate_shape("p", ["a", ""])!= []))
-checks.append(("good score has no problems", validate_shape("p", ["a", "b"]) == []))
-
-# 6. round-trip: a canonical score re-canonicalizes to itself (check == 0 path).
-canon = score_to_bytes(canonical_score("p", ["a", "b"], "n"))
-reparsed = json.loads(canon)
-recanon = score_to_bytes(reparsed)
-checks.append(("canonical score is a fixpoint of the fold", canon == recanon))
-
-# 7. a non-canonical byte form differs from the fold (check would flip to 3).
-messy = '{"stages": ["a","b"], "name": "p", "kind": "gift-score"}\n'
-reparsed2 = json.loads(messy)
-checks.append(("non-canonical bytes differ from canonical",
-score_to_bytes(reparsed2)!= messy))
-
-passed = sum(1 for _, ok in checks if ok)
-for name_, ok in checks:
-print(f" {'PASS' if ok else 'FAIL'} {name_}")
-print(f"{passed}/{len(checks)} checks passed")
-return passed == len(checks)
-
-def main(argv=None):
-ap = argparse.ArgumentParser(
-description="Save a named, reusable pipeline of small JSONL tools as a canonical 'gift score'."
-)
-ap.add_argument("--port", action="store_true", help="print declare's own port-verb (source) and exit")
-ap.add_argument("--selftest", action="store_true", help="run built-in checks and exit")
-sub = ap.add_subparsers(dest="cmd")
-
-pw = sub.add_parser("write", help="emit a canonical gift-score")
-pw.add_argument("--name", required=True)
-pw.add_argument("--stages", required=True, help="comma-separated slugs in pipeline order")
-pw.add_argument("--note", default=None)
-pw.add_argument("--manifest", default=None, help="optional: flag stages not declared in this manifest")
-
-pc = sub.add_parser("check", help="re-emit a score canonically and byte-compare")
-pc.add_argument("--score", required=True)
-
-args = ap.parse_args(argv)
-
-if args.port:
-print(json.dumps({"slug": "declare", "port_verb": "source"}))
-return 0
-if args.selftest:
-return 0 if _selftest() else 1
-if args.cmd == "write":
-return cmd_write(args)
-if args.cmd == "check":
-return cmd_check(args)
-ap.print_help()
-return 2
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_declare.py 130 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+Deterministic when `rng` is seeded — the same seed prints the same block.
 """
-Mutation-bitten test for the declare gift.
-
-GOLDEN — the behavior contract: the fold is deterministic, stages keep their
-order (never sorted), the key order is fixed, note is conditional, shape
-validation catches the real problems, and a canonical score is a fixpoint.
-
-MUTATION BATTERY — each load-bearing predicate is flipped in a copy of the
-module; a correct suite turns at least one golden check RED for each. A mutation
-nothing catches is a test hole (this file fails loud on it). Predicates are
-isolated on purpose — the sibling typecheck gift taught this line that a golden
-set which only checks the aggregate lets endpoint/conjunct mutations escape.
-"""
-import importlib.util
-import sys
-from pathlib import Path
-
-HERE = Path(__file__).resolve().parent
-MODPATH = HERE / "declare.py"
-
-def _load_module(src_text=None):
-spec = importlib.util.spec_from_file_location("declare_under_test", MODPATH)
-mod = importlib.util.module_from_spec(spec)
-if src_text is None:
-spec.loader.exec_module(mod)
-else:
-exec(compile(src_text, str(MODPATH), "exec"), mod.__dict__)
-return mod
-
-def golden_checks(m):
-out = []
-
-# Determinism: same inputs -> same bytes.
-a = m.score_to_bytes(m.canonical_score("p", ["gitlog", "vclock", "cairn"]))
-b = m.score_to_bytes(m.canonical_score("p", ["gitlog", "vclock", "cairn"]))
-out.append(("fold is deterministic (same bytes)", a == b))
-
-# Stages preserve order — isolated: a reversed input stays reversed.
-s = m.canonical_score("p", ["cairn", "gitlog", "vclock"])
-out.append(("stages NOT sorted (order preserved)", s["stages"] == ["cairn", "gitlog", "vclock"]))
-
-# A distinct order test that WOULD pass if stages were sorted — pins it hard.
-s2 = m.canonical_score("p", ["b", "a"])
-out.append(("stages ['b','a'] stay ['b','a'] not ['a','b']", s2["stages"] == ["b", "a"]))
-
-# Fixed key order.
-out2 = m.score_to_bytes(m.canonical_score("p", ["a", "b"]))
-out.append(("key order kind<name<stages",
-out2.index('"kind"') < out2.index('"name"') < out2.index('"stages"')))
-
-# Note conditional — isolate both directions.
-out.append(("note omitted when empty", "note" not in m.canonical_score("p", ["a"])))
-out.append(("note present when given", m.canonical_score("p", ["a"], "hi").get("note") == "hi"))
-
-# Shape validation — isolate EACH problem so a disabled clause is caught.
-out.append(("empty stages -> problem", m.validate_shape("p", [])!= []))
-out.append(("no name -> problem", m.validate_shape("", ["a"])!= []))
-out.append(("empty stage slug -> problem", m.validate_shape("p", ["a", ""])!= []))
-out.append(("good score -> no problem", m.validate_shape("p", ["a", "b"]) == []))
-
-# Canonical fixpoint.
-canon = m.score_to_bytes(m.canonical_score("p", ["a", "b"], "n"))
-import json as _j
-out.append(("canonical score is a fixpoint", canon == m.score_to_bytes(_j.loads(canon))))
-
-# kind is always the gift-score tag.
-out.append(("kind is 'gift-score'", m.canonical_score("p", ["a"])["kind"] == "gift-score"))
-
-return out
-
-MUTATIONS = [
-("stages sorted (order destroyed)", '"stages": list(stages),', '"stages": sorted(stages),'),
-("name validation disabled", 'if not name or not str(name).strip():', 'if False:'),
-("empty-stages check disabled", 'if not stages:', 'if False:'),
-("empty-stage-slug check disabled",
-'if not s or not str(s).strip():', 'if False:'),
-("note always included",
-'if note:\n score["note"] = note', 'score["note"] = note'),
-("kind tag wrong", ' "kind": "gift-score",', ' "kind": "wrong",'),
-("key order broken (name before kind)",
-'for k in ("kind", "name", "stages", "note"):',
-'for k in ("name", "kind", "stages", "note"):'),
+rng = rng or random.Random(42)
+pools = load_pools()
+lines = [
+"callsigns — memorable IDs safe by construction",
+"",
+"Five draws (seed=42):",
 ]
+for _ in range(5):
+lines.append(" " + draw(rng=rng, pools=pools))
+lines += [
+"",
+"Same seed, same tokens — reproducible anywhere.",
+f"Namespace: {len(pools[0])} x {len(pools[1])} pairs x {len(HASH_ALPHABET)}^{HASH_LEN}"
+f" ~= {len(pools[0]) * len(pools[1]) * len(HASH_ALPHABET) ** HASH_LEN:.2e} total.",
+]
+return "\n".join(lines)
 
-def run():
-show = "--show" in sys.argv
-src = MODPATH.read_text()
+def _build_arg_parser() -> argparse.ArgumentParser:
+p = argparse.ArgumentParser(
+prog="callsigns",
+description="Draw memorable, safe-by-construction identifiers (word-word-hash).",
+)
+p.add_argument("--n", type=int, default=1, help="how many callsigns to draw (default 1)")
+p.add_argument("--seed", type=int, default=None, help="seed for deterministic output")
+p.add_argument("--demo", action="store_true", help="print a short reproducible demonstration")
+return p
 
-base = _load_module()
-gold = golden_checks(base)
-gold_ok = all(ok for _, ok in gold)
-if show or not gold_ok:
-for name, ok in gold:
-print(f" {'PASS' if ok else 'FAIL'} {name}")
-print(f"GOLDEN: {sum(ok for _, ok in gold)}/{len(gold)} passed")
-if not gold_ok:
-print("GOLDEN FAILED — the gift is broken, not the test.")
+def main(argv: list[str] | None = None) -> int:
+args = _build_arg_parser().parse_args(argv)
+try:
+if args.demo:
+rng = random.Random(args.seed) if args.seed is not None else random.Random(42)
+sys.stdout.write(demo(rng=rng) + "\n")
+return 0
+if args.n < 0:
+sys.stderr.write("callsigns: FATAL: --n must be non-negative\n")
+return 1
+rng = random.Random(args.seed) if args.seed is not None else random.SystemRandom()
+pools = load_pools()
+for _ in range(args.n):
+sys.stdout.write(draw(rng=rng, pools=pools) + "\n")
+return 0
+except Exception as exc: # loud, never silent
+sys.stderr.write(f"callsigns: FATAL: {exc}\n")
 return 1
 
-all_caught = True
-for name, find, repl in MUTATIONS:
-if find not in src:
-print(f" BITE-BROKEN {name}: anchor not found — test is stale")
-all_caught = False
-continue
-mutated = src.replace(find, repl, 1)
-try:
-res = golden_checks(_load_module(mutated))
-caught = any(not ok for _, ok in res)
-except Exception:
-caught = True
-mark = "caught" if caught else "ESCAPED"
-if show or not caught:
-print(f" {mark:8s} mutation: {name}")
-if not caught:
-all_caught = False
+if __name__ == "__main__":
+raise SystemExit(main())
 
-print(f"MUTATIONS: {sum(1 for n, f, r in MUTATIONS if f in src)}/{len(MUTATIONS)} biteable; "
-f"{'ALL CAUGHT' if all_caught else 'SOME ESCAPED'}")
-return 0 if (gold_ok and all_caught) else 1
+wordlist.json 35 lines on GitHub →
+{
+"_meta": {
+"name": "callsign-wordlist",
+"version": "v1",
+"produced": "S05.1342 (Mature Maple)",
+"product_of": "Wes (FWW(C) vocabulary) + Tamar (structural guarantee)",
+"purpose": "Source vocabulary for The Callsign Convention. A session callsign is one word drawn from pool_one and one from pool_two, joined by a hyphen, e.g. sunny-champion, taco-disco, feral-biscuit.",
+"structure": "Cartesian product pool_one x pool_two. Draw is uniform-random over the product; reject and redraw the degenerate case where word_one == word_two (Tamar's exclusion rule).",
+"namespace": 4096,
+"namespace_note": "|pool_one| (64) x |pool_two| (64) = 4096 distinct callsigns, minus the handful of identical-word pairs the draw rejects. Same-minute twin-collision probability is 1/namespace ~ 0.024%; scaling is additive (add words to either pool).",
+"token_rule": "Every token is lowercase ASCII [a-z] only: no spaces, no punctuation, no path/ref-hostile characters. The drawn callsign 'word-word' is safe as a git branch segment and a directory name by construction. (Nyx: the callsign is never free user input, so there is no injection surface — the wordlist IS the allowlist.)",
+"display_form": "Stored/path form is lowercase-hyphenated (sunny-champion). Spoken/display form is Title-Case (Sunny-Champion).",
+"fwwc": "Pools are curated HEAVY with FWW(C) per operator directive: Taco-Disco energy, not Server-Node-7. Both pools individually vetted clean; the product of two clean pools reads clean (no slur, no unfortunate phrase) for this vocabulary."
+},
+"pool_one": [
+"sunny", "turbo", "velvet", "feral", "cosmic", "disco", "rowdy", "mellow",
+"plucky", "saucy", "zesty", "wobbly", "snazzy", "brisk", "crispy", "nimble",
+"goblin", "thunder", "mossy", "taco", "rascal", "dapper", "jazzy", "breezy",
+"fuzzy", "sneaky", "peppy", "glossy", "rugged", "swift", "gilded", "frosty",
+"hasty", "lucky", "moody", "nifty", "prickly", "quirky", "rusty", "spunky",
+"tidal", "vivid", "witty", "amber", "bouncy", "chunky", "drowsy", "eager",
+"frantic", "gallant", "husky", "ironic", "jolly", "keen", "lanky", "merry",
+"noble", "oaken", "pesky", "quiet", "ruddy", "stout", "twangy", "untamed"
+],
+"pool_two": [
+"champion", "disco", "taco", "walrus", "comet", "biscuit", "bandit", "lighthouse",
+"mango", "otter", "tuba", "cyclone", "pickle", "falcon", "wizard", "noodle",
+"dynamo", "llama", "kraken", "sprocket", "pumpkin", "raccoon", "satchel", "thunder",
+"vortex", "whistle", "anvil", "beacon", "cactus", "domino", "ember", "fjord",
+"gadget", "harpoon", "igloo", "jukebox", "kazoo", "lantern", "marmot", "nugget",
+"octopus", "pelican", "quartz", "rocket", "saxophone", "tangerine", "ukulele", "viper",
+"waffle", "xylophone", "yeti", "zeppelin", "badger", "conch", "dragon", "ferret",
+"gizmo", "hatchet", "jamboree", "koala", "lobster", "mammoth", "narwhal", "oyster"
+]
+}
+
+test_callsigns.py 166 lines on GitHub →
+#!/usr/bin/env python3
+"""test_callsigns.py — the certifying properties of the callsigns gift.
+
+Run: python3 test_callsigns.py (exit 0 = all pass, 1 = a failure)
+
+The tests are chosen to be MUTATION-BITTEN: each one is here because a plausible
+mutation of callsigns.py makes it fail loud. In particular the determinism test
+pins a GOLDEN sha256 of a seeded batch rather than checking self-equality — a
+weak self-equality test passes benign reorders (the Loop MMT sudoku lesson), a
+pinned golden does not.
+"""
+import hashlib
+import random
+import sys
+
+import callsigns as c
+
+# --- pinned golden: a seeded batch must reproduce this exact signature -------
+# Regenerate ONLY on an intentional change:
+# python3 -c "import hashlib,random,callsigns as c; \
+# rng=random.Random(1234); p=c.load_pools(); \
+# b=[c.draw(rng=rng,pools=p) for _ in range(50)]; \
+# print(hashlib.sha256('\n'.join(b).encode()).hexdigest())"
+GOLDEN_SEED = 1234
+GOLDEN_N = 50
+GOLDEN_SHA256 = "815a0dc83fa371ebb1df70e9a82961aeeea11cd3ad05b80e9e73a90c2e10448f"
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+def _batch(seed: int, n: int) -> list[str]:
+rng = random.Random(seed)
+pools = c.load_pools()
+return [c.draw(rng=rng, pools=pools) for _ in range(n)]
+
+# --- 1. determinism: seeded draw reproduces the pinned golden ----------------
+def test_golden_signature():
+batch = _batch(GOLDEN_SEED, GOLDEN_N)
+sig = hashlib.sha256("\n".join(batch).encode()).hexdigest()
+check(
+sig == GOLDEN_SHA256,
+f"golden signature drifted: got {sig[:16]}... expected {GOLDEN_SHA256[:16]}...",
+)
+# kills a mutation that drops the redraw and lets equal-word pairs through:
+for tok in batch:
+a, b, _ = tok.split("-")
+check(a!= b, f"golden batch contains a degenerate equal-word pair: {tok}")
+
+# --- 2. same seed => same first token; different seed => (almost surely) not --
+def test_seed_repeatability():
+r1 = random.Random(7)
+r2 = random.Random(7)
+p = c.load_pools()
+check(c.draw(rng=r1, pools=p) == c.draw(rng=r2, pools=p), "same seed produced different tokens")
+r3 = random.Random(8)
+# different seeds SHOULD differ (namespace ~4.4e12, collision astronomically rare)
+p2 = c.load_pools()
+check(
+c.draw(rng=random.Random(7), pools=p)!= c.draw(rng=r3, pools=p2),
+"different seeds produced identical tokens (namespace or seeding is broken)",
+)
+
+# --- 3. shape: exactly three dash-parts, word-word-hash ----------------------
+def test_shape():
+for tok in _batch(99, 200):
+parts = tok.split("-")
+check(len(parts) == 3, f"token is not word-word-hash: {tok!r}")
+
+# --- 4. every char of the words is in the safe allowlist ---------------------
+def test_words_safe():
+for tok in _batch(101, 200):
+a, b, _ = tok.split("-")
+check(all(ch in c.SAFE for ch in a), f"word 1 has an unsafe char: {a!r}")
+check(all(ch in c.SAFE for ch in b), f"word 2 has an unsafe char: {b!r}")
+
+# --- 5. the hash never contains a confusable (i/l/o/u) or an out-of-alphabet char
+def test_hash_alphabet():
+banned = set("ilou")
+for tok in _batch(202, 300):
+h = tok.split("-")[2]
+check(len(h) == c.HASH_LEN, f"hash wrong length: {h!r}")
+check(all(ch in c.HASH_ALPHABET for ch in h), f"hash has out-of-alphabet char: {h!r}")
+check(not (set(h) & banned), f"hash contains a confusable char (i/l/o/u): {h!r}")
+# kills a mutation that swaps HASH_ALPHABET for a plain base32 including i/l/o/u
+check(not (set(c.HASH_ALPHABET) & banned), "HASH_ALPHABET must not contain i/l/o/u")
+
+# --- 6. no degenerate equal-word pair, ever, across a large sample -----------
+def test_no_equal_pairs():
+for tok in _batch(303, 500):
+a, b, _ = tok.split("-")
+check(a!= b, f"degenerate equal-word pair produced: {tok}")
+
+# --- 7. empty-pool wordlist is a loud failure, not a silent empty draw -------
+def test_empty_pool_is_loud():
+import json
+import os
+import tempfile
+
+with tempfile.TemporaryDirectory() as d:
+bad = os.path.join(d, "wordlist.json")
+with open(bad, "w") as fh:
+json.dump({"pool_one": [], "pool_two": ["x"]}, fh)
+raised = False
+try:
+c.load_pools(bad)
+except ValueError:
+raised = True
+check(raised, "empty pool did not raise ValueError (silent-empty-draw regression)")
+
+# --- 8. namespace math is the stated exact number ---------------------------
+def test_namespace_is_exact():
+p1, p2 = c.load_pools()
+total = len(p1) * len(p2) * len(c.HASH_ALPHABET) ** c.HASH_LEN
+check(len(p1) == 64 and len(p2) == 64, f"pools not 64x64: {len(p1)}x{len(p2)}")
+check(len(c.HASH_ALPHABET) == 32, f"hash alphabet not 32 chars: {len(c.HASH_ALPHABET)}")
+check(total == 64 * 64 * 32 ** 6, f"namespace math changed: {total}")
+
+# --- 9. draw_many honors count and reuses one pool --------------------------
+def test_draw_many():
+got = c.draw_many(0, rng=random.Random(1))
+check(got == [], "draw_many(0) should be empty")
+got5 = c.draw_many(5, rng=random.Random(1))
+check(len(got5) == 5, f"draw_many(5) returned {len(got5)}")
+
+# --- 10. demo is deterministic under a seed ---------------------------------
+def test_demo_deterministic():
+d1 = c.demo(rng=random.Random(42))
+d2 = c.demo(rng=random.Random(42))
+check(d1 == d2, "demo(seed=42) is not reproducible")
+
+def run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+t()
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
+return 0
 
 if __name__ == "__main__":
 sys.exit(run())
 
 Take the whole folder →
 MIT
-Python 3, standard library only
+Python standard library only, deterministic under --seed, headless
 
 ---
 
-# derived — a Loop MMT gift
-https://loopmmt.com/gifts/derived/
+# Census — a Loop MMT gift
+https://loopmmt.com/gifts/census/
 [coverage: optional · branch: gifts]
 
-Derived-File Staleness Checker check ← all gifts
+Marker Census, Buried Ones Flagged count ← all gifts
 
-derived
+Census
 
-Is a generated file stale against the command that makes it? A derived file (one a build command produces, that no human should hand-edit) still exists on disk when it falls behind its source — so no presence check ever catches it. derived runs the build fresh in a private sandbox and byte-compares its output against the committed file: CURRENT (exit 0), STALE (exit 3, difference named), BUILD-FAILED, or a usage error. Non-mutating by contract — it never touches your working tree.
+Walk a tree, count your markers (TODO, FIXME, or whatever you define), and say which ones are buried inside comments where nobody will act on them. A report, not a gate — until you add --strict, and then a buried marker is an exit code your CI can catch.
 
 The honest edge
 
-this checks STALENESS (committed vs a fresh build), not CORRECTNESS: a green means the file matches what the command emits right now, never that the command or its output is right. It runs your build command, so only point it at a command you trust.
+It's a text scan, not a parser — it finds markers by pattern, so a marker written in a syntax it wasn't told about is a marker it won't see. You define the patterns; their completeness is your call.
 
 Run it
 
-python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --copy gen.py
-test_derived.py (11/11, mutation-bitten)
-Python 3, standard library only
+python3 census.py src/
+smoke_test.py (10/10, mutation-bitten)
+Python stdlib only, deterministic
 
 The code — every file that ships
 
-derived.py 245 lines on GitHub →
+census.py 254 lines on GitHub →
 #!/usr/bin/env python3
-"""derived.py — is a generated file STALE against the command that makes it?
+# SPDX-License-Identifier: MIT
+"""census.py — walk a tree, find your markers, and say which ones are BURIED.
 
-A "derived" file is one no human should hand-edit: a build command produces it
-from some source, and the committed copy is only ever supposed to be whatever
-that command most recently emitted. The failure this catches is the oldest one
-in generated code: the source moved, nobody re-ran the build, and the committed
-derived file quietly fell behind. It works today (it is a real file on disk) and
-breaks silently later, so no "does the file exist?" check ever sees it.
+You leave markers in a codebase all the time: TODO, FIXME, "you write this", a
+tag that says a section is a stub. A visual pass catches the ones you can see.
+The dangerous one is the marker **buried inside a comment** — it never renders,
+so scanning the file by eye sails right past it. Census walks a file tree, finds
+every marker you name, and for each one says whether it sits in **visible** text
+or is **buried** inside a comment. The buried ones are the report: those are the
+spots a human pass will miss.
 
-A script-generated file cannot DRIFT; it can only be STALE,
-and stale is one command.
+It is deliberately dumb about *meaning* — a marker is a marker. What it is precise
+about is **visibility**: does this thing render where a person would see it, or is
+it hidden in a `<!-- -->` / `/* */` / `#` comment where only a grep will find it.
 
-That sentence is TRUE and it is NOT A GUARD. The command is unenforced, so the
-sentence describes the fix, not a mechanism -- and the file goes stale while the
-sentence sits there being correct. This tool is the mechanism: it RUNS the build
-command and byte-compares its fresh output against the committed derived file.
+python3 census.py <tree-root> [options]
 
-NON-MUTATING BY CONTRACT (the property this gift is built around).
-This never edits your working tree. It runs the build command inside a private
-temporary directory, seeded with a copy of your inputs, and compares the fresh
-output there against the committed derived file here. Your files are never
-touched -- there is no reading of a tree that proves an edit is worthless, and a
-checker must not destroy one on a guess. If the build command insists on writing
-in place, pass --in-place and it runs against a full copy of the working tree in
-the sandbox (still never your real tree).
+By default it looks for `TODO`, `FIXME`, `XXX`, `HACK`, and `STUB` in the common
+source extensions. Point it at your own markers with `--marker` (repeatable) and
+your own file types with `--ext`.
 
-THE ORACLE IS THE COMMAND ITSELF, ON PURPOSE.
-This carries no copy of the source->derived mapping. You name the build command
-and the file it is supposed to produce; the tool asks the only question that
-needs no mapping: run the command fresh -- does what it emits match what is
-committed, byte for byte? A checker that re-declared the mapping would be a
-second source of truth for it, which is the very fault class being guarded.
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+`--json` emits ONE JSON object per hit on stdout —
+{"path","line","marker","visible":true|false,"excerpt"}
+so you can pipe the census into the next tool (count them, filter to buried,
+feed the paths onward). Without `--json` it prints a grouped human report.
 
-EXITS
-0 CURRENT -- the committed derived file matches a fresh build, byte for byte
-3 STALE -- it does not; the diff summary is printed (and --show-diff dumps it)
-4 BUILD-FAILED -- the build command exited non-zero; nothing can be concluded
-2 USAGE -- bad arguments, or the derived file / a --copy input is missing
-
-USAGE
-# The build command writes the derived file to a path you name.
-python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --copy gen.py --copy data/
-
-# The build command writes to stdout; capture it and compare.
-python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --stdout --copy gen.py
-
-# The build insists on editing files in place: run it against a tree copy.
-python3 derived.py --build-cmd "make derived" --derived out/x --in-place
-
-python3 derived.py --json # machine-readable verdict
+Exit codes:
+0 ran clean (hits or none — a census is a report, not a gate)
+1 at least one BURIED marker AND --strict was given (gate mode)
+3 usage / unreadable root
 """
 
 import argparse
 import json
 import os
-import shutil
-import subprocess
+import re
 import sys
-import tempfile
 
-EXIT_CURRENT = 0
-EXIT_USAGE = 2
-EXIT_STALE = 3
-EXIT_BUILD_FAILED = 4
+DEFAULT_MARKERS = ["TODO", "FIXME", "XXX", "HACK", "STUB"]
+DEFAULT_EXTS = [
+".py", ".js", ".cjs", ".mjs", ".ts", ".jsx", ".tsx",
+".c", ".h", ".cpp", ".cc", ".java", ".go", ".rs", ".rb",
+".html", ".htm", ".css", ".md", ".sh", ".yaml", ".yml",
+]
 
-# --- the printed edge: what this gift does NOT do -------------------------
-EDGE = (
-"this checks STALENESS (committed vs a fresh build), not CORRECTNESS: "
-"a green means the file matches what the command emits right now, never "
-"that the command or its output is right. It runs your build command, so "
-"only point it at a command you trust."
-)
+# Comment spans, by the syntaxes that actually bury text. These cover the vast
+# majority of source files without a per-language parser (which would be the wrong
+# amount of machinery for "is this in a comment").
+#
+# GIFT-012: the openers are recognised by a SINGLE-PASS, STRING-AWARE scanner, not
+# by raw regexes. The old regexes (`#[^\n]*`, `//[^\n]*`) matched a comment opener
+# even INSIDE a string literal, so `label = "widget # TODO"` or `url = "http://x/TODO"`
+# opened a false comment span and a LIVE marker read as buried-in-a-comment — the
+# exact inversion census exists to catch. The scanner walks the text once, tracking
+# whether it is inside a quote ('...' "..." `...`, with \ escapes); a comment opener
+# is only honoured OUTSIDE a string. It is quote-state + comment-state, NOT a parser.
+_LINE_OPENERS = ("//", "#") # run to end of line
+_BLOCK_OPENERS = (("<!--", "-->"), ("/*", "*/")) # run to their closer
+_QUOTES = ("'", '"', "`")
 
-def _read_bytes(path):
-with open(path, "rb") as fh:
-return fh.read()
+def _comment_spans(text):
+spans = []
+i, n = 0, len(text)
+in_str = None # the open quote char, or None when outside any string
+while i < n:
+ch = text[i]
+if in_str is not None:
+# inside a string: consume escapes, look only for the matching close
+if ch == "\\":
+i += 2
+continue
+if ch == in_str:
+in_str = None
+i += 1
+continue
+# not in a string — a block comment opener?
+matched = False
+for open_tok, close_tok in _BLOCK_OPENERS:
+if text.startswith(open_tok, i):
+end = text.find(close_tok, i + len(open_tok))
+end = (end + len(close_tok)) if end!= -1 else n
+spans.append((i, end))
+i = end
+matched = True
+break
+if matched:
+continue
+# a line comment opener?
+for open_tok in _LINE_OPENERS:
+if text.startswith(open_tok, i):
+end = text.find("\n", i)
+end = end if end!= -1 else n
+spans.append((i, end))
+i = end
+matched = True
+break
+if matched:
+continue
+# a quote opening a string region?
+if ch in _QUOTES:
+in_str = ch
+i += 1
+return spans
 
-def _diff_summary(want, got):
-"""A short, deterministic description of a byte difference. No external diff."""
-if want == got:
-return "identical"
-if len(want)!= len(got):
-lead = "committed" if len(want) > len(got) else "fresh-build"
-return f"length differs: committed={len(want)}B fresh={len(got)}B (longer: {lead})"
-for i, (a, b) in enumerate(zip(want, got)):
-if a!= b:
-return f"first byte differs at offset {i}: committed=0x{a:02x} fresh=0x{b:02x}"
-return "differ" # unreachable given the length/zip checks above
+def _buried(pos, spans):
+for a, b in spans:
+if a <= pos < b:
+return True
+return False
 
-def check(build_cmd, derived, copies, use_stdout=False, in_place=False,
-repo_root=None):
-"""Run the build fresh in a sandbox and compare to the committed derived file.
+def _line_index(text):
+starts = [0]
+for m in re.finditer(r"\n", text):
+starts.append(m.end())
+return starts
 
-Returns a result dict with a 'status' of current | stale | build-failed | usage.
-Never mutates the working tree.
-"""
-root = repo_root or os.getcwd()
-result = {
-"build_cmd": build_cmd,
-"derived": derived,
-"status": "current",
-"diff": "identical",
-"edge": EDGE,
-}
+def _lineno(off, starts):
+lo, hi = 0, len(starts) - 1
+while lo < hi:
+mid = (lo + hi + 1) // 2
+if starts[mid] <= off:
+lo = mid
+else:
+hi = mid - 1
+return lo + 1
 
-committed_path = os.path.join(root, derived)
-if not os.path.isfile(committed_path):
-result["status"] = "usage"
-result["error"] = f"derived file not found: {derived}"
-return result
-committed = _read_bytes(committed_path)
-
-sandbox = tempfile.mkdtemp(prefix="derived-check.")
+def scan_file(path, markers, word_boundary):
+"""Return list of {line, marker, visible, excerpt} for one file."""
 try:
-if in_place:
-# Copy the whole working tree so an in-place build can't touch the real one.
-for entry in os.listdir(root):
-if entry == ".git":
-continue # never needed to rebuild a derived file; huge
-src = os.path.join(root, entry)
-dst = os.path.join(sandbox, entry)
-if os.path.isdir(src):
-shutil.copytree(src, dst, symlinks=True)
-else:
-shutil.copy2(src, dst)
-else:
-for rel in copies:
-src = os.path.join(root, rel)
-if not os.path.exists(src):
-result["status"] = "usage"
-result["error"] = f"--copy input not found: {rel}"
-return result
-dst = os.path.join(sandbox, rel)
-os.makedirs(os.path.dirname(dst) or sandbox, exist_ok=True)
-if os.path.isdir(src):
-shutil.copytree(src, dst, symlinks=True)
-else:
-shutil.copy2(src, dst)
+with open(path, encoding="utf-8", errors="replace") as fh:
+text = fh.read()
+except OSError:
+return []
+spans = _comment_spans(text)
+starts = _line_index(text)
+hits = []
+seen = set() # (line, marker) — one hit per marker per line
+for marker in markers:
+pat = r"\b" + re.escape(marker) + r"\b" if word_boundary else re.escape(marker)
+for m in re.finditer(pat, text, re.IGNORECASE):
+ln = _lineno(m.start(), starts)
+key = (ln, marker.lower())
+if key in seen:
+continue
+seen.add(key)
+excerpt = text[starts[ln - 1]:].split("\n", 1)[0].strip()
+if len(excerpt) > 110:
+excerpt = excerpt[:107] + "..."
+hits.append({
+"line": ln,
+"marker": marker,
+"visible": not _buried(m.start(), spans),
+"excerpt": excerpt,
+})
+hits.sort(key=lambda h: h["line"])
+return hits
 
-proc = subprocess.run(
-build_cmd, shell=True, cwd=sandbox,
-capture_output=True, timeout=300,
-)
-if proc.returncode!= 0:
-result["status"] = "build-failed"
-result["exit"] = proc.returncode
-result["stderr"] = proc.stderr.decode("utf-8", "replace")[:2000]
-return result
-
-if use_stdout:
-fresh = proc.stdout
-else:
-fresh_path = os.path.join(sandbox, derived)
-if not os.path.isfile(fresh_path):
-result["status"] = "build-failed"
-result["error"] = (
-f"build ran but produced no {derived} in the sandbox "
-f"(did you mean --stdout, or a different --derived path?)"
-)
-return result
-fresh = _read_bytes(fresh_path)
-
-if fresh == committed:
-result["status"] = "current"
-result["diff"] = "identical"
-else:
-result["status"] = "stale"
-result["diff"] = _diff_summary(committed, fresh)
-result["_fresh"] = fresh
-result["_committed"] = committed
-return result
-finally:
-shutil.rmtree(sandbox, ignore_errors=True)
+def scan_tree(root, markers, exts, word_boundary):
+exts_l = tuple(e.lower() for e in exts)
+out = []
+for dp, dns, fns in os.walk(root):
+# never descend into VCS / dependency dirs
+for skip in (".git", "node_modules", ".hg", ".svn", "__pycache__"):
+if skip in dns:
+dns.remove(skip)
+for fn in sorted(fns):
+if fn.lower().endswith(exts_l):
+full = os.path.join(dp, fn)
+for h in scan_file(full, markers, word_boundary):
+h = dict(h)
+h["path"] = os.path.relpath(full, root)
+out.append(h)
+return out
 
 def main(argv=None):
-ap = argparse.ArgumentParser(
-description="Is a generated file stale against the command that makes it?",
-epilog="EDGE: " + EDGE,
+p = argparse.ArgumentParser(
+prog="census",
+description="walk a tree, find your markers, say which are buried in comments.",
 )
-ap.add_argument("--build-cmd", required=True,
-help="the command that regenerates the derived file (run in a sandbox)")
-ap.add_argument("--derived", required=True,
-help="repo-relative path of the file the command is supposed to produce")
-ap.add_argument("--copy", action="append", default=[], metavar="PATH",
-help="input file/dir the build needs; repeatable (ignored with --in-place)")
-ap.add_argument("--stdout", action="store_true",
-help="the build writes the derived content to stdout; capture and compare it")
-ap.add_argument("--in-place", action="store_true",
-help="the build edits files in place; run it against a full copy of the tree")
-ap.add_argument("--show-diff", action="store_true",
-help="on STALE, dump both versions' first differing region")
-ap.add_argument("--json", action="store_true", help="machine-readable verdict")
-ap.add_argument("--edge", action="store_true", help="print the printed edge and exit")
-args = ap.parse_args(argv)
+p.add_argument("root", help="the directory to walk")
+p.add_argument("--marker", action="append", metavar="TEXT",
+help="a marker to look for (repeatable; default: TODO FIXME XXX HACK STUB)")
+p.add_argument("--ext", action="append", metavar=".EXT",
+help="a file extension to include (repeatable; default: common source types)")
+p.add_argument("--no-word-boundary", action="store_true",
+help="match a marker as a raw substring, not a whole word "
+"(needed for glyph/punctuation markers like '<!--WRITE-->')")
+p.add_argument("--buried-only", action="store_true",
+help="report only markers buried in comments (the miss-risk set)")
+p.add_argument("--json", action="store_true",
+help="emit one JSON object per hit on stdout (the pipe contract)")
+p.add_argument("--strict", action="store_true",
+help="exit 1 if any buried marker is found (gate mode)")
+args = p.parse_args(argv)
 
-if args.edge:
-print(EDGE)
-return EXIT_CURRENT
+if not os.path.isdir(args.root):
+sys.stderr.write("census: not a directory: %s\n" % args.root)
+return 3
 
-res = check(
-args.build_cmd, args.derived, args.copy,
-use_stdout=args.stdout, in_place=args.in_place,
-)
-status = res["status"]
-# strip internal blobs before any user-facing emission
-fresh = res.pop("_fresh", None)
-committed = res.pop("_committed", None)
+markers = args.marker if args.marker else DEFAULT_MARKERS
+exts = args.ext if args.ext else DEFAULT_EXTS
+word_boundary = not args.no_word_boundary
+
+hits = scan_tree(args.root, markers, exts, word_boundary)
+if args.buried_only:
+hits = [h for h in hits if not h["visible"]]
+
+buried = sum(1 for h in hits if not h["visible"])
 
 if args.json:
-print(json.dumps(res, indent=2, sort_keys=True))
-else:
-if status == "current":
-print(f"CURRENT — {args.derived} matches a fresh build")
-elif status == "stale":
-print(f"STALE — {args.derived} is behind its build command")
-print(f" {res['diff']}")
-print(f" regenerate with: {args.build_cmd}")
-if args.show_diff and fresh is not None:
-print(" --- committed (first 400B) ---")
-sys.stdout.buffer.write(committed[:400])
-print("\n --- fresh build (first 400B) ---")
-sys.stdout.buffer.write(fresh[:400])
-print()
-elif status == "build-failed":
-print(f"BUILD-FAILED — {res.get('error') or 'the build command exited non-zero'}")
-if res.get("stderr"):
-print(res["stderr"])
-else: # usage
-print(f"USAGE ERROR — {res.get('error', 'bad arguments')}", file=sys.stderr)
+for h in hits:
+sys.stdout.write(json.dumps({
+"path": h["path"], "line": h["line"], "marker": h["marker"],
+"visible": h["visible"], "excerpt": h["excerpt"],
+}, sort_keys=True) + "\n")
+return 1 if (args.strict and buried) else 0
 
-return {
-"current": EXIT_CURRENT,
-"stale": EXIT_STALE,
-"build-failed": EXIT_BUILD_FAILED,
-"usage": EXIT_USAGE,
-}[status]
+if not hits:
+print("census: no markers found under %s" % args.root)
+return 0
+
+by_path = {}
+for h in hits:
+by_path.setdefault(h["path"], []).append(h)
+print("# census — %d marker(s) across %d file(s) (%d buried in comments)\n"
+% (len(hits), len(by_path), buried))
+for path in sorted(by_path):
+hs = by_path[path]
+nb = sum(1 for h in hs if not h["visible"])
+flag = " \u26a0 %d BURIED" % nb if nb else ""
+print("## %s (%d marker%s)%s" % (path, len(hs), "" if len(hs) == 1 else "s", flag))
+for h in hs:
+tag = "buried " if not h["visible"] else "visible"
+print(" L%4d [%s] %s %s" % (h["line"], tag, h["marker"], h["excerpt"]))
+print()
+if buried:
+print("\u2192 %d marker(s) are BURIED in comments \u2014 a visual pass will miss them." % buried)
+else:
+print("\u2192 every marker is in visible text \u2014 nothing is buried.")
+return 1 if (args.strict and buried) else 0
 
 if __name__ == "__main__":
 sys.exit(main())
 
-test_derived.py 207 lines on GitHub →
+smoke_test.py 123 lines on GitHub →
 #!/usr/bin/env python3
-"""test_derived.py — mutation-bitten behavior proof for the derived gift.
+# SPDX-License-Identifier: MIT
+"""smoke_test.py — non-vacuous tests for census.py.
 
-stdlib only. Each test asserts a distinct BEHAVIOR, so deleting the behavior
-from derived.py makes a test fail (that is the "mutation bite"). Run:
-
-python3 test_derived.py # prints N/N and exits 0 on all-green
+The load-bearing claim is the visible/buried distinction. The suite plants a
+marker in visible code AND the same marker inside a comment and asserts census
+tells them apart — a census that called everything visible (or everything
+buried) would fail. Run: python3 smoke_test.py
 """
+
+import io
+import json
 import os
-import shutil
-import subprocess
 import sys
 import tempfile
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-GIFT = os.path.join(HERE, "derived.py")
+import census
 
-CURRENT, USAGE, STALE, BUILD_FAILED = 0, 2, 3, 4
+FAIL = 0
 
-def _scratch():
-d = tempfile.mkdtemp(prefix="derived-test.")
-return d
+def ok(cond, msg):
+global FAIL
+print((" ok " if cond else " FAIL ") + msg)
+if not cond:
+FAIL += 1
 
-def _run(cwd, *args):
-"""Run the gift with cwd set so repo-relative paths resolve there."""
-p = subprocess.run(
-[sys.executable, GIFT, *args],
-cwd=cwd, capture_output=True, text=True, timeout=120,
-)
-return p.returncode, p.stdout, p.stderr
-
-# A build command that writes "1\n2\n3\n" to out.txt, deterministically.
-GEN = 'python3 -c "open(\'out.txt\',\'w\').write(\'1\\n2\\n3\\n\')"'
-
-results = []
-
-def check(name, cond):
-results.append((name, bool(cond)))
-print(f" [{'PASS' if cond else 'FAIL'}] {name}")
-
-def t_current_when_committed_matches_fresh_build():
-"""A committed file equal to a fresh build reads CURRENT (exit 0)."""
-d = _scratch()
+def run(root, *args):
+old = sys.stdout
+sys.stdout = io.StringIO()
 try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n3\n") # matches GEN
-rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
-check("current when committed == fresh build", rc == CURRENT and "CURRENT" in out)
+code = census.main([root] + list(args))
+out = sys.stdout.getvalue()
 finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_stale_when_committed_differs():
-"""A committed file that differs from the fresh build reads STALE (exit 3)."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n") # stale: build emits three lines
-rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
-check("stale when committed!= fresh build", rc == STALE and "STALE" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_non_mutating_leaves_committed_file_untouched():
-"""Running the check never edits the working tree's committed file."""
-d = _scratch()
-try:
-stale_content = "1\n2\n"
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write(stale_content)
-_run(d, "--build-cmd", GEN, "--derived", "out.txt")
-after = open(os.path.join(d, "out.txt")).read()
-check("non-mutating: committed file unchanged after a check", after == stale_content)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_build_failed_when_command_errors():
-"""A build command that exits non-zero yields BUILD-FAILED (exit 4), never a verdict."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("anything\n")
-rc, out, _ = _run(d, "--build-cmd", "python3 -c \"import sys; sys.exit(1)\"",
-"--derived", "out.txt")
-check("build-failed on non-zero build command", rc == BUILD_FAILED and "BUILD-FAILED" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_usage_when_derived_missing():
-"""A missing derived file is a usage error (exit 2), not STALE/CURRENT."""
-d = _scratch()
-try:
-rc, out, err = _run(d, "--build-cmd", GEN, "--derived", "nope.txt")
-check("usage error when derived file is absent", rc == USAGE and "USAGE" in (out + err))
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_stdout_mode_compares_captured_output():
-"""--stdout compares the build's stdout, not a file on disk."""
-d = _scratch()
-try:
-with open(os.path.join(d, "cur.txt"), "w") as f:
-f.write("hello\n")
-rc, out, _ = _run(d, "--build-cmd", 'python3 -c "print(\'hello\')"',
-"--derived", "cur.txt", "--stdout")
-check("--stdout compares captured stdout", rc == CURRENT and "CURRENT" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_stdout_mode_detects_stale():
-"""--stdout still detects a mismatch as STALE."""
-d = _scratch()
-try:
-with open(os.path.join(d, "cur.txt"), "w") as f:
-f.write("goodbye\n")
-rc, out, _ = _run(d, "--build-cmd", 'python3 -c "print(\'hello\')"',
-"--derived", "cur.txt", "--stdout")
-check("--stdout detects stale", rc == STALE and "STALE" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_deterministic_same_verdict_across_runs():
-"""The same inputs yield the same verdict every run (byte-oracle determinism)."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n3\n")
-verdicts = set()
-for _ in range(3):
-rc, _, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
-verdicts.add(rc)
-check("deterministic: identical verdict across 3 runs", verdicts == {CURRENT})
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_json_mode_emits_status():
-"""--json emits a parseable object carrying the status."""
-d = _scratch()
-try:
-import json as _json
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n3\n")
-rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt", "--json")
-obj = _json.loads(out)
-check("--json emits status object", obj.get("status") == "current")
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_edge_is_present_and_printed():
-"""The printed edge exists in the artifact and prints on demand."""
-d = _scratch()
-src = open(GIFT).read()
-rc, out, _ = _run(d, "--edge", "--build-cmd", "x", "--derived", "y")
-check("printed edge present in source AND on --edge",
-"STALENESS" in src and "not CORRECTNESS" in src and "STALENESS" in out)
-
-def t_diff_summary_names_the_difference():
-"""On STALE, the output names WHERE/HOW it differs (not just 'differ')."""
-d = _scratch()
-try:
-with open(os.path.join(d, "out.txt"), "w") as f:
-f.write("1\n2\n") # shorter than fresh
-rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
-check("stale output names the difference (length/offset)",
-rc == STALE and ("length differs" in out or "offset" in out))
-finally:
-shutil.rmtree(d, ignore_errors=True)
+sys.stdout = old
+return code, out
 
 def main():
-print("test_derived.py")
-for fn in [
-t_current_when_committed_matches_fresh_build,
-t_stale_when_committed_differs,
-t_non_mutating_leaves_committed_file_untouched,
-t_build_failed_when_command_errors,
-t_usage_when_derived_missing,
-t_stdout_mode_compares_captured_output,
-t_stdout_mode_detects_stale,
-t_deterministic_same_verdict_across_runs,
-t_json_mode_emits_status,
-t_edge_is_present_and_printed,
-t_diff_summary_names_the_difference,
-]:
-fn()
-passed = sum(1 for _, ok in results if ok)
-total = len(results)
-print(f"\n{passed}/{total} passing")
-return 0 if passed == total else 1
+with tempfile.TemporaryDirectory() as d:
+# a python file: one visible TODO (a whole word in a string), one buried
+# in a # comment. NB the visible one must be a WHOLE word — `TODO_x` has
+# no word boundary after TODO and correctly would not match.
+with open(os.path.join(d, "a.py"), "w") as fh:
+fh.write("x = 1 # TODO buried in a comment\n")
+fh.write('label = \"TODO\" # visible marker in a string literal\n')
+# an html file: a marker buried in an html comment
+with open(os.path.join(d, "b.html"), "w") as fh:
+fh.write("<p>hello</p>\n<!-- FIXME buried html marker -->\n")
+# a js file: a visible marker (whole word) and a block-comment-buried one
+with open(os.path.join(d, "c.js"), "w") as fh:
+fh.write('const label = \"XXX\";\n/* HACK buried in a block comment */\n')
+# a file type NOT in defaults — must be ignored
+with open(os.path.join(d, "ignore.log"), "w") as fh:
+fh.write("TODO this should never be seen (.log not scanned)\n")
+
+# 1. JSON-lines contract + the core visible/buried distinction.
+code, out = run(d, "--json")
+recs = [json.loads(l) for l in out.splitlines() if l.strip()]
+ok(code == 0, "json run exits 0")
+# a.py: line1 TODO buried, line2 TODO visible
+a_todos = sorted([r for r in recs if r["path"] == "a.py"], key=lambda r: r["line"])
+ok(len(a_todos) == 2 and a_todos[0]["visible"] is False and a_todos[1]["visible"] is True,
+"a.py: the # -comment TODO is BURIED, the code TODO is VISIBLE (the distinction bites)")
+
+# 2. html comment burial.
+b = [r for r in recs if r["path"] == "b.html"]
+ok(len(b) == 1 and b[0]["marker"] == "FIXME" and b[0]["visible"] is False,
+"b.html: FIXME inside <!-- --> is BURIED")
+
+# 3. js: visible XXX + block-comment-buried HACK.
+c = sorted([r for r in recs if r["path"] == "c.js"], key=lambda r: r["line"])
+ok([(r["marker"], r["visible"]) for r in c] == [("XXX", True), ("HACK", False)],
+"c.js: XXX visible, HACK buried in /* */ block comment")
+
+# 4. the.log file is never scanned (extension filter).
+ok(not any(r["path"] == "ignore.log" for r in recs),
+".log is not in default extensions — never scanned")
+
+# 5. --buried-only drops the visible ones.
+code, out = run(d, "--json", "--buried-only")
+recs2 = [json.loads(l) for l in out.splitlines() if l.strip()]
+ok(all(r["visible"] is False for r in recs2) and len(recs2) == 3,
+"--buried-only reports exactly the 3 buried markers, no visible ones")
+
+# 6. --strict exits 1 when a buried marker exists.
+code, _ = run(d, "--json", "--strict")
+ok(code == 1, "--strict exits 1 because buried markers are present")
+
+# 7. custom --marker finds a non-default token; word boundary respected.
+with open(os.path.join(d, "d.py"), "w") as fh:
+fh.write("WRITEME = 1\n")
+fh.write("REWRITEMEN = 2 # a longer token, no whole-word hit here\n")
+code, out = run(d, "--json", "--marker", "WRITEME")
+recs3 = [json.loads(l) for l in out.splitlines() if l.strip()]
+dhits = [r for r in recs3 if r["path"] == "d.py"]
+ok(len(dhits) == 1 and dhits[0]["line"] == 1,
+"custom --marker WRITEME matches the whole word only, not the substring in REWRITEMEN")
+
+# 8. --no-word-boundary lets a glyph/substring marker match.
+with open(os.path.join(d, "e.html"), "w") as fh:
+fh.write("<!--WRITE--> visible? no, it's in a comment\n")
+code, out = run(d, "--json", "--marker", "<!--WRITE-->", "--no-word-boundary", "--ext", ".html")
+recs4 = [json.loads(l) for l in out.splitlines() if l.strip()]
+ehits = [r for r in recs4 if r["path"] == "e.html"]
+ok(len(ehits) == 1, "--no-word-boundary matches a punctuation marker like <!--WRITE-->")
+
+# 9. MUTATION CHECK — a census that called everything visible would fail
+# test 1/2/3. Prove the buried-detector is not vacuous by asserting the
+# two populations are genuinely non-empty and disjoint.
+vis = [r for r in recs if r["visible"]]
+bur = [r for r in recs if not r["visible"]]
+ok(len(vis) >= 2 and len(bur) >= 3,
+"mutation check: both visible (>=2) and buried (>=3) populations are non-empty "
+"(an all-visible or all-buried classifier could not produce this)")
+
+print("\n" + ("CENSUS: %d FAILED" % FAIL if FAIL else "CENSUS: ALL GREEN"))
+return 1 if FAIL else 0
 
 if __name__ == "__main__":
 sys.exit(main())
-
-Take the whole folder →
-MIT
-Python 3, standard library only
-
----
-
-# Dwell — a Loop MMT gift
-https://loopmmt.com/gifts/dwell/
-[coverage: optional · branch: gifts]
-
-When You Commit Is What You Choose route ← all gifts
-
-Dwell
-
-A cart circles a loop of n ticks; holding is free and an extra full lap changes nothing. It leaves only when you reverse, and which of k exits it takes is a pure function of the phase at that instant: exit = (phase * k) // n. There's no separate 'pick' step — deferring costs nothing, and the moment you stop deferring IS the decision. Integer-exact and byte-replayable; a decision is an audit record you re-derive, not an opinion you store.
-
-The prompt that made this →
-
-The honest edge
-
-It is the deterministic router only: given (entry, reverse, n, k) the exit is a fact, but it does NOT decide when to stop deferring — that judgment (the reversal) is yours. k <= n is a wall (you can't quantize a loop of n ticks into more than n exits); k > n is refused, not rounded.
-
-Run it
-
-python3 dwell.py route 0 6 12 4
-test_dwell.py (89/89, mutation-bitten)
-Python stdlib only, deterministic
-
-The code — every file that ships
-
-dwell.py 182 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""dwell.py -- reversal-indexed routing: the WHEN you commit IS the WHAT you choose.
-
-A cart circles a loop of `n` ticks. Holding is free -- it can circle forever, and
-an extra full lap changes nothing. It leaves only when you REVERSE, and which of
-`k` exits it leaves on is a pure function of the PHASE at the instant of reversal:
-
-phase(entry, reverse, n) = (reverse - entry) mod n # where on the loop, in [0, n)
-exit_segment(entry, reverse, n, k) = (phase * k) // n # which of k exits, in [0, k)
-
-The choice is carried entirely by the timing. There is no separate "pick" step:
-deferring is free, and the moment you stop deferring is itself the decision. That
-is the whole idea -- a decision structure where latency is not lost time but the
-signal.
-
-Integer-exact by construction (no float), so the map is total, pure, and
-byte-replayable -- the same (entry, reverse, n, k) always yields the same exit,
-on any machine, forever. The WINDING number (how many full laps were circled) is
-DISCARDED for routing; that discard IS the free-hold property:
-
-exit_segment(entry, reverse, n, k) == exit_segment(entry, reverse + n, n, k)
-
-A `Mark` records a routing decision as two integers, and `replay(mark, n, k)`
-recomputes the exit from them -- so a decision is an audit record you can re-derive,
-never a stored opinion you have to trust.
-
-HONEST CEILING. This is the fully-deterministic ROUTER: given (entry, reverse, n, k)
-the exit is a fact. It does NOT decide *when* to stop deferring -- that single
-judgment (the reversal itself) is yours. The router turns your timing into a choice;
-it does not make the choice for you.
-
-python3 dwell.py route <entry> <reverse> <n> <k> # -> the exit segment [0, k)
-python3 dwell.py phase <entry> <reverse> <n> # -> phase [0, n) + winding
-python3 dwell.py demo # a small routing table
-python3 dwell.py --help
-
-Python 3 stdlib only, no dependencies.
-"""
-from __future__ import annotations
-
-import sys
-from dataclasses import dataclass
-from typing import NamedTuple
-
-__all__ = ["phase", "winding", "exit_segment", "Mark", "replay", "DwellError"]
-
-class DwellError(ValueError):
-"""A malformed Dwell call -- bad resolution, exit count, or tick order."""
-
-def _validate(entry_tick: int, reverse_tick: int, n: int, k: int) -> None:
-for name, val in (("entry_tick", entry_tick), ("reverse_tick", reverse_tick),
-("n", n), ("k", k)):
-if not isinstance(val, int) or isinstance(val, bool):
-raise DwellError(f"{name} must be a plain int, got {val!r}")
-if n < 1:
-raise DwellError(f"n (loop resolution) must be >= 1, got {n}")
-if k < 1:
-raise DwellError(f"k (exit count) must be >= 1, got {k}")
-if k > n:
-# You cannot quantize a loop of n ticks into more than n distinguishable exits.
-raise DwellError(f"k must be <= n (k<=n is a wall), got k={k} n={n}")
-if reverse_tick < entry_tick:
-# Ticks are a monotone clock; the cart enters, then circles, then reverses.
-raise DwellError(
-f"reverse_tick ({reverse_tick}) must be >= entry_tick ({entry_tick})")
-
-def phase(entry_tick: int, reverse_tick: int, n: int) -> int:
-"""Where on the loop the cart sits at reversal, in [0, n). Winding is folded out."""
-_validate(entry_tick, reverse_tick, n, k=1)
-return (reverse_tick - entry_tick) % n
-
-def winding(entry_tick: int, reverse_tick: int, n: int) -> int:
-"""
-How many FULL laps were circled before reversal (the coordinate the router
-discards). Read-only: routing never depends on it, and that independence IS the
-free-hold property -- a decision deferred through extra laps is not penalized.
-"""
-_validate(entry_tick, reverse_tick, n, k=1)
-return (reverse_tick - entry_tick) // n
-
-def exit_segment(entry_tick: int, reverse_tick: int, n: int, k: int) -> int:
-"""
-The router. Returns the exit segment in [0, k) the cart leaves on when reversed
-at `reverse_tick`, having entered at `entry_tick`, on a loop of resolution `n`
-with `k` exits.
-
-Pure, total, integer-exact. Tie-break at a segment boundary is floor, by
-construction (`(phase*k)//n`). Free-hold holds by the same construction: adding
-a full lap (n ticks) to reverse_tick leaves the exit unchanged.
-"""
-_validate(entry_tick, reverse_tick, n, k)
-return ((reverse_tick - entry_tick) % n * k) // n
-
-class Mark(NamedTuple):
-"""An audit record of one routing decision -- two integers, nothing else."""
-entry_tick: int
-reverse_tick: int
-
-@dataclass(frozen=True)
-class DwellSpec:
-"""The static shape of a loop: its resolution and its exit count."""
-n: int
-k: int
-
-def replay(mark: Mark, n: int, k: int) -> int:
-"""
-Recompute the exit a Mark produced, from the Mark plus the loop spec. Because the
-router is pure, replay(mark, n, k) == the exit_segment that produced it -- so the
-Mark is an audit record you re-derive, never an opinion you have to trust.
-"""
-return exit_segment(mark.entry_tick, mark.reverse_tick, n, k)
-
-# ---- CLI ---------------------------------------------------------------------------------------------
-_USAGE = """dwell.py -- reversal-indexed routing: when you commit is what you choose.
-
-python3 dwell.py route <entry> <reverse> <n> <k> the exit segment in [0, k)
-python3 dwell.py phase <entry> <reverse> <n> phase in [0, n) + winding (laps)
-python3 dwell.py demo a small routing table
-python3 dwell.py --help
-
-n = loop resolution (ticks per lap), k = number of exits (k <= n).
-An extra full lap never changes the exit -- deferring is free.
-"""
-
-def _demo() -> None:
-n, k = 12, 4
-print(f"loop n={n} ticks, k={k} exits; entry at tick 0")
-print("reverse | phase winding -> exit")
-for reverse in range(0, 25):
-p = phase(0, reverse, n)
-w = winding(0, reverse, n)
-e = exit_segment(0, reverse, n, k)
-print(f" {reverse:5d} | {p:5d} {w:6d} -> {e}")
-print("(note tick 12 and tick 24 -- a full/second lap -- route identically to tick 0: free-hold)")
-
-def main(argv) -> int:
-args = argv[1:]
-if not args or args[0] in ("--help", "-h", "help"):
-sys.stdout.write(_USAGE)
-return 0 if args else 1
-cmd = args[0]
-try:
-if cmd == "route":
-if len(args)!= 5:
-raise DwellError("route needs: <entry> <reverse> <n> <k>")
-entry, reverse, n, k = (int(x) for x in args[1:5])
-sys.stdout.write(str(exit_segment(entry, reverse, n, k)) + "\n")
-return 0
-if cmd == "phase":
-if len(args)!= 4:
-raise DwellError("phase needs: <entry> <reverse> <n>")
-entry, reverse, n = (int(x) for x in args[1:4])
-sys.stdout.write(f"phase={phase(entry, reverse, n)} winding={winding(entry, reverse, n)}\n")
-return 0
-if cmd == "demo":
-_demo()
-return 0
-except DwellError as e:
-sys.stderr.write(f"dwell: {e}\n")
-return 2
-except ValueError:
-sys.stderr.write("dwell: ticks, n, and k must be integers\n")
-return 2
-sys.stderr.write(f"dwell: unknown command {cmd!r}\n")
-sys.stderr.write(_USAGE)
-return 2
-
-if __name__ == "__main__":
-raise SystemExit(main(sys.argv))
-
-test_dwell.py 119 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_dwell.py -- proves the router is pure, total, and free-hold.
-
-The claims that ARE the tool:
-1. FREE-HOLD: adding a full lap (n ticks) to the reversal leaves the exit
-unchanged -- deferring is free. This is the whole idea; it gets the most tests.
-2. The exit is exactly (phase * k) // n, integer, in [0, k).
-3. replay(Mark) == the exit that produced it (an audit record, re-derived).
-4. Malformed calls REFUSE (raise DwellError), they don't silently guess.
-Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
-Exit 0 = all pass, exit 1 = a failure (loud).
-"""
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dwell import phase, winding, exit_segment, Mark, replay, DwellError
-
-_pass = 0
-_fail = 0
-
-def eq(name, got, want):
-global _pass, _fail
-if got == want:
-_pass += 1
-else:
-_fail += 1
-print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
-
-def ok(name, cond):
-global _pass, _fail
-if cond:
-_pass += 1
-else:
-_fail += 1
-print(f"FAIL {name}")
-
-def raises(name, fn):
-global _pass, _fail
-try:
-fn()
-_fail += 1
-print(f"FAIL {name} -- expected DwellError, none raised")
-except DwellError:
-_pass += 1
-except Exception as e: # noqa: BLE001
-_fail += 1
-print(f"FAIL {name} -- wrong exception {type(e).__name__}: {e}")
-
-# --- 1. FREE-HOLD: an extra full lap never changes the exit ---------------------------------
-n, k = 12, 4
-for reverse in range(0, 12):
-base = exit_segment(0, reverse, n, k)
-eq(f"free-hold +1 lap @rev={reverse}", exit_segment(0, reverse + n, n, k), base)
-eq(f"free-hold +2 laps @rev={reverse}", exit_segment(0, reverse + 2 * n, n, k), base)
-eq(f"free-hold +7 laps @rev={reverse}", exit_segment(0, reverse + 7 * n, n, k), base)
-
-# winding counts the laps that routing discards
-eq("winding 0 laps", winding(0, 5, 12), 0)
-eq("winding 1 lap", winding(0, 17, 12), 1)
-eq("winding 7 laps", winding(0, 84, 12), 7)
-eq("phase folds winding out", phase(0, 84, 12), phase(0, 0, 12))
-
-# --- 2. the routing law is exactly (phase*k)//n, in range ----------------------------------
-eq("phase 0 -> exit 0", exit_segment(0, 0, 12, 4), 0)
-eq("phase 3 -> exit 1", exit_segment(0, 3, 12, 4), 1) # (3*4)//12 = 1
-eq("phase 5 -> exit 1", exit_segment(0, 5, 12, 4), 1) # (5*4)//12 = 1
-eq("phase 6 -> exit 2", exit_segment(0, 6, 12, 4), 2) # (6*4)//12 = 2
-eq("phase 11 -> exit 3", exit_segment(0, 11, 12, 4), 3) # (11*4)//12 = 3
-# boundary tie-break is floor by construction
-eq("boundary floor phase 2->0", exit_segment(0, 2, 12, 4), 0) # (2*4)//12 = 0
-
-# entry offset only matters via the difference
-eq("entry offset invariance", exit_segment(100, 105, 12, 4), exit_segment(0, 5, 12, 4))
-
-# every exit stays in [0, k) across a whole lap
-for reverse in range(0, n):
-e = exit_segment(0, reverse, n, k)
-ok(f"exit in range @rev={reverse}", 0 <= e < k)
-
-# k == n: each tick is its own exit (bijective)
-for reverse in range(0, 8):
-eq(f"k==n bijection @rev={reverse}", exit_segment(0, reverse, 8, 8), reverse)
-
-# k == 1: everything routes to the single exit 0
-for reverse in range(0, 12):
-eq(f"k==1 single exit @rev={reverse}", exit_segment(0, reverse, 12, 1), 0)
-
-# --- 3. replay(Mark) == the exit that produced it -------------------------------------------
-m = Mark(entry_tick=3, reverse_tick=20)
-eq("replay == exit_segment", replay(m, 12, 4), exit_segment(3, 20, 12, 4))
-# an audit record survives a re-derivation on any machine (pure)
-eq("replay deterministic", replay(m, 12, 4), replay(m, 12, 4))
-
-# --- 4. malformed calls REFUSE, never guess ------------------------------------------------
-raises("n<1 refused", lambda: exit_segment(0, 0, 0, 1))
-raises("k<1 refused", lambda: exit_segment(0, 0, 12, 0))
-raises("k>n refused (the wall)", lambda: exit_segment(0, 0, 4, 5))
-raises("reverse<entry refused", lambda: exit_segment(5, 3, 12, 4))
-raises("bool is not int", lambda: exit_segment(0, True, 12, 4))
-raises("float refused", lambda: phase(0, 5.0, 12))
-
-# --- mutation bite: prove free-hold has teeth ----------------------------------------------
-# If routing (wrongly) depended on winding, +1 lap WOULD change the exit for some reversal.
-# Assert there EXISTS a reversal where phase differs from phase+lap yet exits still match --
-# i.e. the invariant is non-vacuous (the exits are not all identical anyway).
-distinct_exits = {exit_segment(0, r, n, k) for r in range(n)}
-ok("mutation bite: exits are genuinely varied", len(distinct_exits) == k)
-ok("mutation bite: +lap holds AND base varies",
-exit_segment(0, 3, n, k) == exit_segment(0, 3 + n, n, k)
-and exit_segment(0, 3, n, k)!= exit_segment(0, 6, n, k))
-
-print(("PASS" if _fail == 0 else "FAIL") + f" -- {_pass} passed, {_fail} failed")
-sys.exit(0 if _fail == 0 else 1)
 
 Take the whole folder →
 MIT

@@ -1,2026 +1,1373 @@
-# Loop MMT — corpus shard 57/61
+# Loop MMT — corpus shard 57/63
 
-> Bundle 57 of 61 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 57 of 63 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/sudoku/, /gifts/switchboard/, /gifts/timeline/)
+Nodes in this shard: 3 (/gifts/plumb/, /gifts/port/, /gifts/ratchet-inline-mime/)
 
 ---
 
-# Sudoku — a Loop MMT gift
-https://loopmmt.com/gifts/sudoku/
+# Plumb — a Loop MMT gift
+https://loopmmt.com/gifts/plumb/
 [coverage: optional · branch: gifts]
 
-A Solver That Shows Its Work transform ← all gifts
+Status Board That Won't Lie witness ← all gifts
 
-Sudoku
+Plumb
 
-Most Sudoku solvers hand you the answer; this one hands you the reasoning. It solves the way a person does — applying the lowest technique that makes progress and recording WHAT it did and WHY at every step as a single ordered trace, so the answer is just the last line of an argument you can read and check by hand. Five techniques (naked/hidden single, locked candidates, naked pair, x-wing), applied lowest-first. It never guesses: faced with a puzzle beyond its ladder it says “ceiling-hit” rather than searching — an honest difficulty read, not a failure. Deterministic: the same givens always produce the byte-identical trace.
+A tiny audit pattern for anyone whose dashboards turn green on intention instead of evidence. Each claim names a witness — a file that must exist, text that must be present, a command that must pass — and only renders green if its witness agrees. Assert done with nothing beneath it and you get UNWITNESSED, not a pass.
 
 The honest edge
 
-It only makes FORCED moves — it reasons, it does not search or backtrack, so a puzzle needing a technique above x-wing returns ceiling-hit (a difficulty read), not a guessed fill. And ‘broken’ fires when reasoning empties a cell; a contradiction sitting between two givens no technique touches reads as ceiling-hit, because the solver reasons about the puzzle rather than front-validating your input.
+It checks the witness exists and agrees, never that the witness is the right one. Point it at the wrong file and it'll happily pass — choosing a meaningful witness is your job.
 
 Run it
 
-python3 sudoku.py --demo
-test_sudoku.py (130/130, mutation-bitten, pinned golden trace)
-Python standard library only, deterministic + headless
+python3 plumb.py --help
+smoke_test.py (8/8)
+Python stdlib only
 
 The code — every file that ships
 
-sudoku.py 549 lines on GitHub →
-#!/usr/bin/env python3
-"""sudoku — a Sudoku solver that shows its work.
-
-Most solvers hand you the answer. This one hands you the *reasoning*: it solves
-the way a person does — applying the lowest technique that makes progress and
-recording WHAT it did and WHY at every step, as a single ordered trace. The
-answer is just the last line of an argument you can read.
-
-from sudoku import solve, from_string
-result = solve(from_string("53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"))
-result.status # 'solved-unique' | 'ceiling-hit' | 'broken'
-for step in result.trace:
-print(step.reason) # "naked single: 4 is the only candidate left for r1c3..."
-
-Five techniques, applied lowest-first (so the explanation reads like a human
-tutor, easiest move first):
-1. naked single — a cell with only one candidate left
-2. hidden single — a digit that fits only one cell in a unit
-3. locked candidates — pointing / claiming (an elimination technique)
-4. naked pair — two cells locking two digits to themselves
-5. x-wing — the basic fish
-
-Three honest terminal states:
-solved-unique — solved by these techniques alone; `solution` is filled in.
-ceiling-hit — consistent but needs a technique above the ladder (a
-DIFFICULTY read, not a failure — this puzzle is "harder
-than x-wing", which is useful information).
-broken — a cell ran out of candidates; the givens contradict.
-
-Properties (see test_sudoku.py):
-- Deterministic: the same givens always produce the byte-identical trace.
-- Certifying: every placement/elimination carries a human sentence saying
-why it is forced. The trace is a proof you can check by hand.
-- Never guesses: it only makes forced moves. It will say "ceiling-hit"
-before it will backtrack — it does not search, it reasons.
-
-Zero dependencies (Python standard library only). Headless: givens in, a
-SolveResult out — no I/O in the solver, no globals, no randomness.
-
-Origin: the reasoning core of a self-explaining Sudoku teaching app, stripped to
-stand alone. MIT licensed — take the folder.
-"""
-from __future__ import annotations
-
-import re
-from dataclasses import dataclass, asdict
-from typing import Callable, Dict, List, Optional, Set, Tuple
-
-Cell = Tuple[int, int] # (row, col), 0-indexed
-Grid = List[List[int]] # 9x9, 0 = empty
-Candidates = Dict[Cell, Set[int]]
-
-N = 9
-DIGITS = frozenset(range(1, 10))
-
-# ── The trace (the spine — everything folds from this) ──────────────────────
-@dataclass
-class TechniqueApplication:
-technique: str # rung name
-cells_affected: List[Cell] # coordinates touched
-candidates_eliminated: List[Tuple[Cell, int]] # what this step ruled out
-reason: str # the human sentence: WHY
-
-def to_dict(self) -> dict:
-d = asdict(self)
-d["cells_affected"] = [list(c) for c in self.cells_affected]
-d["candidates_eliminated"] = [
-[list(c), dg] for c, dg in self.candidates_eliminated
-]
-return d
-
-@dataclass
-class SolveResult:
-status: str # solved-unique|ceiling-hit|broken
-trace: List[TechniqueApplication]
-solution: Optional[Grid] = None # present iff solved-unique
-
-def to_dict(self) -> dict:
-return {
-"status": self.status,
-"trace": [t.to_dict() for t in self.trace],
-"solution": self.solution,
-}
-
-# ── Geometry (units: rows, cols, boxes) ─────────────────────────────────────
-def _peers(cell: Cell) -> Set[Cell]:
-r, c = cell
-peers: Set[Cell] = set()
-for k in range(N):
-peers.add((r, k))
-peers.add((k, c))
-br, bc = 3 * (r // 3), 3 * (c // 3)
-for dr in range(3):
-for dc in range(3):
-peers.add((br + dr, bc + dc))
-peers.discard(cell)
-return peers
-
-def _units() -> List[List[Cell]]:
-units: List[List[Cell]] = []
-for r in range(N):
-units.append([(r, c) for c in range(N)]) # rows
-for c in range(N):
-units.append([(r, c) for r in range(N)]) # cols
-for br in range(0, N, 3):
-for bc in range(0, N, 3):
-units.append([(br + dr, bc + dc)
-for dr in range(3) for dc in range(3)]) # boxes
-return units
-
-_UNITS = _units()
-_UNIT_NAME = (
-["row " + str(i + 1) for i in range(N)]
-+ ["column " + str(i + 1) for i in range(N)]
-+ ["box " + str(i + 1) for i in range(N)]
-)
-
-def compute_candidates(grid: Grid) -> Candidates:
-"""For every empty cell, the digits not already used by one of its peers.
-
-Deterministic and total — the fixed point recomputes this each step.
-"""
-cands: Candidates = {}
-for r in range(N):
-for c in range(N):
-if grid[r][c]!= 0:
-continue
-seen = {grid[pr][pc] for pr, pc in _peers((r, c)) if grid[pr][pc]!= 0}
-cands[(r, c)] = set(DIGITS) - seen
-return cands
-
-# ── The ladder (reorderable DATA — the one live research object) ────────────
-# A rung: given the candidate grid, return the ONE lowest-rung, row-major-first
-# applicable move as a TechniqueApplication, or None. Rungs never mutate.
-#
-# Two KINDS of rung share this signature, and the loop tells them apart by ONE
-# schema-stable signal — `candidates_eliminated`:
-# PLACEMENT rung (naked/hidden-single): places a digit; `candidates_eliminated`
-# is [] and the placed digit is the first [1-9] in `reason`.
-# ELIMINATION rung (locked-candidates, pairs, x-wing): places NOTHING; it
-# prunes candidates, so `candidates_eliminated` is non-empty and there is
-# no placed digit. `cells_affected` are the cells it pruned FROM.
-# Invariant: `candidates_eliminated` non-empty <=> elimination step. A rung
-# that would eliminate nothing returns None (no progress -> the loop would spin).
-Rung = Callable[[Grid, Candidates], Optional[TechniqueApplication]]
-
-def _rowmajor(cells) -> list:
-"""The within-rung tie-break: smallest (row, col) first."""
-return sorted(cells)
-
-def _box_of(cell: Cell) -> Tuple[int, int]:
-r, c = cell
-return (3 * (r // 3), 3 * (c // 3))
-
-def _box_cells(br: int, bc: int) -> List[Cell]:
-return [(br + dr, bc + dc) for dr in range(3) for dc in range(3)]
-
-def _box_num(br: int, bc: int) -> int:
-return (br // 3) * 3 + (bc // 3) + 1
-
-# Row/column units in a fixed order (rows 1-9 then cols 1-9), for the line-based
-# rungs; digit names within a reason are 1-indexed to match the singles' voice.
-_ROWS: List[List[Cell]] = [[(r, c) for c in range(N)] for r in range(N)]
-_COLS: List[List[Cell]] = [[(r, c) for r in range(N)] for c in range(N)]
-_BOXES: List[Tuple[int, int]] = [(br, bc) for br in range(0, N, 3)
-for bc in range(0, N, 3)]
-
-def rung_naked_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
-for cell in _rowmajor(cands):
-opts = cands[cell]
-if len(opts) == 1:
-d = next(iter(opts))
-r, c = cell
-return TechniqueApplication(
-technique="naked-single",
-cells_affected=[cell],
-candidates_eliminated=[],
-reason=(f"naked single: {d} is the only candidate left for "
-f"r{r + 1}c{c + 1} — every other digit is already used "
-f"by one of its peers."),
-)
-return None
-
-def rung_hidden_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
-# Units in a fixed order; within a unit, digits ascending; first hit wins.
-for ui, unit in enumerate(_UNITS):
-empties = [cell for cell in unit if cell in cands]
-for d in range(1, 10):
-spots = [cell for cell in empties if d in cands[cell]]
-if len(spots) == 1:
-cell = spots[0]
-# Skip if a naked single would already place it (lower rung wins).
-if len(cands[cell]) == 1:
-continue
-r, c = cell
-# The placed digit MUST be the first numeral in the reason:
-# _placed_digit greps the first \b[1-9]\b, so leading with a
-# unit number would make it place the unit's number, not {d}.
-return TechniqueApplication(
-technique="hidden-single",
-cells_affected=[cell],
-candidates_eliminated=[],
-reason=(f"hidden single: {d} can only go in r{r + 1}c{c + 1} "
-f"— within {_UNIT_NAME[ui]} it fits nowhere else."),
-)
-return None
-
-def rung_locked_candidates(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
-"""Locked candidates (pointing + claiming). An ELIMINATION rung.
-
-Pointing: within a box, if every candidate for a digit lies in one line
-(row or col), that digit is eliminated from the rest of that line.
-Claiming: within a line, if every candidate for a digit lies in one box,
-that digit is eliminated from the rest of that box.
-"""
-# ── Pointing: box -> line ───────────────────────────────────────────────
-for br, bc in _BOXES:
-cells = _box_cells(br, bc)
-for d in range(1, 10):
-spots = [cell for cell in cells if cell in cands and d in cands[cell]]
-if len(spots) < 2:
-continue
-rows = {r for r, _c in spots}
-cols = {c for _r, c in spots}
-if len(rows) == 1:
-r = next(iter(rows))
-targets = _rowmajor(cell for cell in _ROWS[r]
-if cell not in cells
-and cell in cands and d in cands[cell])
-if targets:
-return TechniqueApplication(
-technique="locked-candidates",
-cells_affected=targets,
-candidates_eliminated=[(cell, d) for cell in targets],
-reason=(f"locked candidates: in box {_box_num(br, bc)}, "
-f"{d} can only go in row {r + 1}, so {d} is "
-f"eliminated from the rest of row {r + 1}."),
-)
-if len(cols) == 1:
-c = next(iter(cols))
-targets = _rowmajor(cell for cell in _COLS[c]
-if cell not in cells
-and cell in cands and d in cands[cell])
-if targets:
-return TechniqueApplication(
-technique="locked-candidates",
-cells_affected=targets,
-candidates_eliminated=[(cell, d) for cell in targets],
-reason=(f"locked candidates: in box {_box_num(br, bc)}, "
-f"{d} can only go in column {c + 1}, so {d} is "
-f"eliminated from the rest of column {c + 1}."),
-)
-# ── Claiming: line -> box ───────────────────────────────────────────────
-for name, unit in ([(f"row {i + 1}", u) for i, u in enumerate(_ROWS)]
-+ [(f"column {i + 1}", u) for i, u in enumerate(_COLS)]):
-for d in range(1, 10):
-spots = [cell for cell in unit if cell in cands and d in cands[cell]]
-if len(spots) < 2:
-continue
-boxes = {_box_of(cell) for cell in spots}
-if len(boxes) == 1:
-br, bc = next(iter(boxes))
-box = _box_cells(br, bc)
-targets = _rowmajor(cell for cell in box
-if cell not in unit
-and cell in cands and d in cands[cell])
-if targets:
-return TechniqueApplication(
-technique="locked-candidates",
-cells_affected=targets,
-candidates_eliminated=[(cell, d) for cell in targets],
-reason=(f"locked candidates: in {name}, {d} can only go "
-f"in box {_box_num(br, bc)}, so {d} is eliminated "
-f"from the rest of box {_box_num(br, bc)}."),
-)
-return None
-
-def rung_naked_pair(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
-"""Naked pair. Two cells in a unit sharing the SAME two candidates {x, y}
-lock those digits to themselves, eliminating x and y from every other cell
-in that unit."""
-for ui, unit in enumerate(_UNITS):
-bi = _rowmajor(cell for cell in unit
-if cell in cands and len(cands[cell]) == 2)
-for i in range(len(bi)):
-for j in range(i + 1, len(bi)):
-a, b = bi[i], bi[j]
-if cands[a]!= cands[b]:
-continue
-pair = sorted(cands[a]) # [x, y]
-elim: List[Tuple[Cell, int]] = []
-for cell in unit:
-if cell in (a, b) or cell not in cands:
-continue
-for d in pair:
-if d in cands[cell]:
-elim.append((cell, d))
-if elim:
-elim.sort()
-affected = _rowmajor({c for c, _d in elim})
-ar, ac = a
-br_, bc_ = b
-return TechniqueApplication(
-technique="naked-pair",
-cells_affected=affected,
-candidates_eliminated=elim,
-reason=(f"naked pair: {pair[0]} and {pair[1]} are locked "
-f"to r{ar + 1}c{ac + 1} and r{br_ + 1}c{bc_ + 1} "
-f"in {_UNIT_NAME[ui]}, so both are eliminated from "
-f"the rest of that unit."),
-)
-return None
-
-def rung_x_wing(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
-"""X-wing (basic fish). If two rows each have digit d as a candidate in
-EXACTLY the same two columns, d is eliminated from those columns in every
-other row (and the column-based transpose)."""
-# ── Row-based: base = two rows, cross = two columns ─────────────────────
-for d in range(1, 10):
-rowcols: Dict[int, Tuple[int, int]] = {}
-for r in range(N):
-cols = [c for c in range(N)
-if (r, c) in cands and d in cands[(r, c)]]
-if len(cols) == 2:
-rowcols[r] = (cols[0], cols[1])
-bases = sorted(rowcols)
-for i in range(len(bases)):
-for j in range(i + 1, len(bases)):
-r1, r2 = bases[i], bases[j]
-if rowcols[r1]!= rowcols[r2]:
-continue
-c1, c2 = rowcols[r1]
-targets = _rowmajor(
-(r, c) for r in range(N) if r not in (r1, r2)
-for c in (c1, c2)
-if (r, c) in cands and d in cands[(r, c)])
-if targets:
-return TechniqueApplication(
-technique="x-wing",
-cells_affected=targets,
-candidates_eliminated=[(cell, d) for cell in targets],
-reason=(f"X-wing: {d} in rows {r1 + 1} and {r2 + 1} is "
-f"confined to columns {c1 + 1} and {c2 + 1}, so "
-f"{d} is eliminated from those columns in every "
-f"other row."),
-)
-# ── Column-based (transpose): base = two columns, cross = two rows ──────
-for d in range(1, 10):
-colrows: Dict[int, Tuple[int, int]] = {}
-for c in range(N):
-rows = [r for r in range(N)
-if (r, c) in cands and d in cands[(r, c)]]
-if len(rows) == 2:
-colrows[c] = (rows[0], rows[1])
-bases = sorted(colrows)
-for i in range(len(bases)):
-for j in range(i + 1, len(bases)):
-c1, c2 = bases[i], bases[j]
-if colrows[c1]!= colrows[c2]:
-continue
-r1, r2 = colrows[c1]
-targets = _rowmajor(
-(r, c) for c in range(N) if c not in (c1, c2)
-for r in (r1, r2)
-if (r, c) in cands and d in cands[(r, c)])
-if targets:
-return TechniqueApplication(
-technique="x-wing",
-cells_affected=targets,
-candidates_eliminated=[(cell, d) for cell in targets],
-reason=(f"X-wing: {d} in columns {c1 + 1} and {c2 + 1} is "
-f"confined to rows {r1 + 1} and {r2 + 1}, so "
-f"{d} is eliminated from those rows in every "
-f"other column."),
-)
-return None
-
-# ORDER IS DATA — reorder to change the difficulty model, never hard-code it.
-# New techniques (wings, chains) append here; the solve loop never changes.
-LADDER: List[Tuple[str, int, Rung]] = [
-("naked-single", 1, rung_naked_single),
-("hidden-single", 2, rung_hidden_single),
-("locked-candidates", 3, rung_locked_candidates),
-("naked-pair", 4, rung_naked_pair),
-("x-wing", 5, rung_x_wing),
-]
-
-def _is_contradiction(grid: Grid, cands: Candidates) -> bool:
-for cell, opts in cands.items():
-if not opts: # an empty cell with no candidate = broken
-return True
-return False
-
-def _complete(grid: Grid) -> bool:
-return all(grid[r][c]!= 0 for r in range(N) for c in range(N))
-
-def _placed_digit(step: TechniqueApplication) -> int:
-# CONTRACT: a PLACEMENT reason MUST lead with the placed digit — it is the
-# first \b[1-9]\b in the string, before any row/col/unit numeral. Both
-# placement rungs honor this. Never call this on an elimination step
-# (candidates_eliminated non-empty); use its structured (cell, digit) pairs.
-m = re.search(r"\b([1-9])\b", step.reason)
-return int(m.group(1))
-
-def _is_placement(step: TechniqueApplication) -> bool:
-"""A step is a PLACEMENT iff it eliminates no candidates (it places a digit);
-otherwise it is an ELIMINATION (it prunes candidates, places nothing)."""
-return not step.candidates_eliminated
-
-def solve(givens: Grid) -> SolveResult:
-"""solve(givens) -> SolveResult. Prefer-lowest-rung fixed point.
-
-Candidates are CARRIED, not recomputed each step: a placement prunes the
-placed digit from the placed cell's peers; an elimination prunes the pruned
-(cell, digit) pairs. Recomputing from the grid alone would lose every
-elimination-rung deduction (they don't live in the grid), so the persistent
-candidate set is what lets a later single depend on an earlier elimination.
-"""
-grid = [row[:] for row in givens]
-cands = compute_candidates(grid)
-trace: List[TechniqueApplication] = []
-
-while True:
-if _is_contradiction(grid, cands):
-return SolveResult(status="broken", trace=trace, solution=None)
-
-if _complete(grid):
-return SolveResult(status="solved-unique", trace=trace,
-solution=[row[:] for row in grid])
-
-# walk the ladder bottom-up; apply the LOWEST rung that makes progress
-step: Optional[TechniqueApplication] = None
-for _name, _tier, rung in LADDER:
-step = rung(grid, cands)
-if step is not None:
-break
-
-if step is None:
-# no rung progresses, board consistent but unfinished — a
-# DIFFICULTY read, not a failure.
-return SolveResult(status="ceiling-hit", trace=trace, solution=None)
-
-if _is_placement(step):
-(r, c) = step.cells_affected[0]
-d = _placed_digit(step)
-grid[r][c] = d
-del cands[(r, c)]
-for peer in _peers((r, c)):
-if peer in cands:
-cands[peer].discard(d)
-else:
-for cell, dig in step.candidates_eliminated:
-if cell in cands:
-cands[cell].discard(dig)
-trace.append(step)
-
-# ── convenience: parse / print an 81-char string ("." or "0" = empty) ───────
-def from_string(s: str) -> Grid:
-s = "".join(ch for ch in s if not ch.isspace())
-if len(s)!= 81:
-raise ValueError(f"expected 81 cells, got {len(s)}")
-g: Grid = []
-for r in range(N):
-row = []
-for c in range(N):
-ch = s[r * N + c]
-row.append(0 if ch in ".0" else int(ch))
-g.append(row)
-return g
-
-def to_string(grid: Grid) -> str:
-return "".join(str(grid[r][c]) for r in range(N) for c in range(N))
-
-def render(grid: Grid) -> str:
-"""A human-readable 9x9 grid with box separators (for the CLI)."""
-lines = []
-for r in range(N):
-if r in (3, 6):
-lines.append("------+-------+------")
-cells = []
-for c in range(N):
-if c in (3, 6):
-cells.append("|")
-cells.append(str(grid[r][c]) if grid[r][c] else ".")
-lines.append(" ".join(cells))
-return "\n".join(lines)
-
-# ── CLI: read an 81-char puzzle, print the reasoning, then the answer ───────
-def _main(argv: List[str]) -> int:
-demo = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
-if argv and argv[0] in ("-h", "--help"):
-print("usage: python3 sudoku.py [81-char-puzzle | --demo]")
-print(" cells 1-9; '.' or '0' = empty; whitespace ignored")
-print(" prints the step-by-step reasoning, then the solution")
-return 0
-arg = argv[0] if argv else "--demo"
-puzzle = demo if arg in ("", "--demo") else arg
-try:
-grid = from_string(puzzle)
-except ValueError as e:
-print(f"bad puzzle: {e}")
-return 2
-
-print("puzzle:")
-print(render(grid))
-print()
-result = solve(grid)
-print(f"status: {result.status} ({len(result.trace)} steps)\n")
-for i, step in enumerate(result.trace, 1):
-print(f" {i:>2}. {step.reason}")
-if result.solution is not None:
-print("\nsolution:")
-print(render(result.solution))
-elif result.status == "ceiling-hit":
-print("\n(consistent, but needs a technique above this solver's ladder — "
-"a difficulty read, not a failure.)")
-return 0
-
-if __name__ == "__main__":
-import sys
-raise SystemExit(_main(sys.argv[1:]))
-
-test_sudoku.py 248 lines on GitHub →
+plumb.py 299 lines on GitHub →
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""test_sudoku.py — proves the solver is certifying, deterministic, and honest.
+"""plumb.py — a status board that refuses to show green on hope.
 
-The claims that ARE the tool:
-1. CERTIFYING: every step carries a reason, and the reason is CHECKABLE —
-a placement's reason leads with the digit it places, and re-applying the
-whole trace to the givens reproduces the solution. The trace is a proof.
-2. DETERMINISTIC: the same givens produce the byte-identical trace, every run.
-3. THREE HONEST STATES: solved-unique (with a valid solution), ceiling-hit
-(consistent but beyond the ladder — a difficulty read), broken (givens
-contradict). Each is reachable and correctly labelled.
-4. NEVER GUESSES: it stops at ceiling-hit rather than searching. A puzzle
-needing a technique above x-wing returns ceiling-hit, not a lucky answer.
-Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
-Exit 0 = all pass, exit 1 = a failure (loud).
+A plumb line tells the truth about vertical no matter how the wall *feels*. This
+does the same for a status board: every claim you assert PASS must carry a
+WITNESS beneath it — a real, checkable piece of evidence — and the claim is only
+rendered green if that witness actually agrees. A "done" typed by a hopeful hand
+is not evidence. Plumb will not paint it green.
+
+The board file (`.plumb`) is one claim per line. Blank lines and lines starting
+with '#' are ignored. Each claim is 2 or 3 pipe-separated fields:
+
+NAME | WITNESS # status defaults to 'assert'
+NAME | STATUS | WITNESS # STATUS is 'assert' or 'todo'
+
+WITNESS is one of:
+
+exists PATH # PATH must exist
+absent PATH # PATH must NOT exist (e.g. "no secret committed")
+contains PATH ~ TEXT # PATH exists and contains the literal substring TEXT
+cmd SHELL COMMAND... # the command must exit 0
+none # NO witness at all (the honesty case)
+
+Verdicts:
+
+HELD assert + witness satisfied -> green, and clean
+BROKEN assert + witness NOT satisfied -> the green-on-hope catch
+UNWITNESSED assert + witness 'none' -> you claimed PASS with nothing beneath it
+BLOCKED witness could not be evaluated -> don't trust the reading
+TODO todo + witness not (yet) satisfied -> honest not-done (never green)
+READY todo + witness satisfied -> it's actually done; promote it
+
+Exit codes:
+0 every asserted claim is HELD (todo/ready present is fine)
+1 at least one BROKEN or UNWITNESSED claim (a definite green-on-hope)
+2 no broken assertions, but at least one BLOCKED claim (couldn't measure — don't trust green)
+3 usage / unreadable board
+
+A `todo` claim can NEVER render green. That is deliberate: the one thing this tool
+exists to make impossible is a green cell with nothing true beneath it.
 """
-import sys
-import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sudoku import (
-solve, from_string, to_string, compute_candidates,
-SolveResult, TechniqueApplication, _peers, _units, N, LADDER,
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+CEILING = (
+"note: Plumb checks that each claim's witness EXISTS / AGREES — not that the "
+"witness is CORRECT. A claim can point at the wrong evidence (a file that "
+"exists but proves nothing, a command that exits 0 for the wrong reason) and "
+"Plumb will pass it. It catches GREEN ON HOPE (a claim asserted PASS with no "
+"satisfied witness); it does NOT catch GREEN ON THE WRONG WITNESS. The witness "
+"is only as honest as you write it, and the board file runs its `cmd` witnesses "
+"with your shell — trust it like a Makefile."
 )
 
-_pass = 0
-_fail = 0
+# Verdicts
+HELD = "HELD"
+BROKEN = "BROKEN"
+UNWITNESSED = "UNWITNESSED"
+BLOCKED = "BLOCKED"
+TODO = "TODO"
+READY = "READY"
 
-def eq(name, got, want):
-global _pass, _fail
-if got == want:
-_pass += 1
+# Which verdicts drive which exit code.
+_FAIL_1 = (BROKEN, UNWITNESSED) # a definite green-on-hope
+_FAIL_2 = (BLOCKED,) # couldn't measure
+
+def _eprint(*a):
+print(*a, file=sys.stderr)
+
+# --- witness parsing --------------------------------------------------------
+
+def parse_witness(expr):
+"""expr -> ((kind, arg), None) on success, or (None, error_string).
+
+kind is one of exists/absent/contains/cmd/none.
+arg is a string (path or command), a (path, pattern) tuple for contains, or
+None for 'none'.
+"""
+expr = expr.strip()
+if expr == "" or expr.lower() == "none":
+return ("none", None), None
+head, _, rest = expr.partition(" ")
+kind = head.lower()
+rest = rest.strip()
+if kind in ("exists", "absent"):
+if not rest:
+return None, f"{kind} needs a path"
+return (kind, rest), None
+if kind == "contains":
+if " ~ " not in rest:
+return None, "contains needs the form: contains <path> ~ <text>"
+path, _, pattern = rest.partition(" ~ ")
+path = path.strip()
+if not path or pattern == "":
+return None, "contains needs both a path and a non-empty text"
+return ("contains", (path, pattern)), None
+if kind == "cmd":
+if not rest:
+return None, "cmd needs a command"
+return ("cmd", rest), None
+return None, f"unknown witness kind {kind!r} (want exists/absent/contains/cmd/none)"
+
+# --- board parsing ----------------------------------------------------------
+
+def parse_board(text):
+"""Return a list of claim dicts (name, status, witness kind/arg, parse_error, line)."""
+claims = []
+for lineno, raw in enumerate(text.splitlines(), 1):
+line = raw.strip()
+if not line or line.startswith("#"):
+continue
+# GIFT-009: parse NAME-first with a bounded left split, so a `cmd:` witness
+# that legitimately contains shell pipes (`... | wc -l`) is NOT torn apart.
+# The old `line.split("|")` counted every pipe as a field boundary, so a
+# piped command produced 4+ fields and hit the "2 or 3 fields" error — the
+# command was lost purely for containing a pipe. The grammar is unchanged
+# for the reader (name | [status] | witness); only the SPLIT is bounded:
+# field 0 is the name, an optional bare-status field 1, and EVERYTHING after
+# is the witness, rejoined verbatim (interior pipes preserved).
+head = [f.strip() for f in line.split("|", 2)]
+if len(head) == 2:
+name, status, wexpr = head[0], "assert", head[1]
+elif len(head) == 3:
+# 3 raw segments: field 1 is the status ONLY if it's a bare status
+# keyword; otherwise it belongs to a 2-field claim whose witness itself
+# carried a pipe, so fold field 1 back into the witness.
+if head[1].lower() in ("assert", "todo"):
+name, status, wexpr = head[0], head[1].lower(), head[2]
 else:
-_fail += 1
-print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
-
-def ok(name, cond):
-global _pass, _fail
-if cond:
-_pass += 1
+name, status, wexpr = head[0], "assert", head[1] + " | " + head[2]
 else:
-_fail += 1
-print(f"FAIL {name}")
+claims.append({"name": line, "status": "assert", "line": lineno,
+"parse_error": "a claim needs a name and a witness "
+"(name | witness or name | status | witness)"})
+continue
+if not name:
+claims.append({"name": "(unnamed)", "status": status, "line": lineno,
+"parse_error": "claim has no name"})
+continue
+if status not in ("assert", "todo"):
+claims.append({"name": name, "status": "assert", "line": lineno,
+"parse_error": f"unknown status {status!r} (want assert|todo)"})
+continue
+parsed, err = parse_witness(wexpr)
+if err:
+claims.append({"name": name, "status": status, "line": lineno,
+"parse_error": err})
+continue
+kind, arg = parsed
+claims.append({"name": name, "status": status, "witness_kind": kind,
+"witness_arg": arg, "line": lineno, "parse_error": None})
+return claims
 
-# ── Fixtures ─────────────────────────────────────────────────────────────────
-EASY = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
-EASY_SOLUTION = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+# --- witness evaluation -----------------------------------------------------
 
-# A grid that is complete and correct = solve returns it unchanged, zero steps.
-SOLVED = EASY_SOLUTION
-
-# A contradiction the solver actually REACHES: the near-complete easy solution
-# with r1c1 blanked and a 5 planted in its box, so r1c1's only digit (5) is
-# already taken by a peer — compute_candidates leaves it with an empty set and
-# _is_contradiction fires. (Note: a contradiction between two GIVENS that no
-# technique touches reads as ceiling-hit, not broken — the solver reasons, it
-# does not front-validate the givens. That is correct and intentional.)
-BROKEN = ".54678912672195348198342567859761423426853791713924856961537284287419635345286179"
-
-def is_valid_solution(s: str) -> bool:
-"""A solved grid: 81 non-zero cells, every row/col/box a permutation of 1-9."""
-g = from_string(s)
-if any(g[r][c] == 0 for r in range(N) for c in range(N)):
-return False
-for unit in _units():
-vals = sorted(g[r][c] for r, c in unit)
-if vals!= list(range(1, 10)):
-return False
-return True
-
-# ── PROPERTY 1: certifying — the trace is a checkable proof ───────────────────
-(lambda: None)() # keep the section visible
-
-def _replay_trace(givens, result):
-"""Re-apply the recorded trace to the givens; a placement's reason must lead
-with the digit it places, and applying every placement must reproduce the
-solution. This proves the reasons are not decorative — they carry the moves."""
-import re
-g = [row[:] for row in givens]
-for step in result.trace:
-if not step.candidates_eliminated: # placement
-(r, c) = step.cells_affected[0]
-d = int(re.search(r"\b([1-9])\b", step.reason).group(1))
-g[r][c] = d
-return g
-
-r_easy = solve(from_string(EASY))
-ok("easy solves", r_easy.status == "solved-unique")
-ok("easy solution is valid", r_easy.solution is not None and is_valid_solution(to_string(r_easy.solution)))
-eq("easy solution matches known answer", to_string(r_easy.solution), EASY_SOLUTION)
-ok("every step has a non-empty reason", all(s.reason.strip() for s in r_easy.trace))
-ok("trace is non-trivial", len(r_easy.trace) > 10)
-# the certifying check: replaying the trace's placements reproduces the solution
-replayed = _replay_trace(from_string(EASY), r_easy)
-eq("replaying the trace reproduces the solution", to_string(replayed), EASY_SOLUTION)
-
-# every placement step's reason leads with the digit actually placed in the solution
-import re
-for step in r_easy.trace:
-if not step.candidates_eliminated: # placement
-(rr, cc) = step.cells_affected[0]
-placed = int(re.search(r"\b([1-9])\b", step.reason).group(1))
-ok(f"placement reason leads with placed digit @r{rr+1}c{cc+1}",
-placed == from_string(EASY_SOLUTION)[rr][cc])
-
-# ── PROPERTY 2: deterministic — byte-identical trace every run ────────────────
-def trace_signature(result):
-return to_string_result(result)
-
-def to_string_result(result):
-import json
-return json.dumps(result.to_dict(), sort_keys=True)
-
-sig1 = to_string_result(solve(from_string(EASY)))
-sig2 = to_string_result(solve(from_string(EASY)))
-sig3 = to_string_result(solve(from_string(EASY)))
-ok("deterministic: run 1 == run 2", sig1 == sig2)
-ok("deterministic: run 2 == run 3", sig2 == sig3)
-# GOLDEN: pin the canonical trace signature by hash. Self-equality alone is a
-# weak determinism test (a benign reorder stays self-equal); a pinned golden
-# catches any change to the tie-break / scan order that reorders the trace.
-import hashlib as _hl
-_golden = "1f4fc6f7b5886070bb06a38c5457ef9c93a4c4dabdb9735518786b8f57e91548"
-_got = _hl.sha256(sig1.encode()).hexdigest()
-ok("deterministic: trace matches the pinned golden signature", _got == _golden)
-# solving does not mutate the givens
-givens = from_string(EASY)
-before = to_string(givens)
-solve(givens)
-eq("solve does not mutate givens", to_string(givens), before)
-
-# ── PROPERTY 3: three honest terminal states ──────────────────────────────────
-# solved-unique (already covered above)
-# broken:
-r_broken = solve(from_string(BROKEN))
-ok("contradiction -> broken", r_broken.status == "broken")
-ok("broken has no solution", r_broken.solution is None)
-
-# an already-solved grid: solved-unique, zero steps, solution == input
-r_done = solve(from_string(SOLVED))
-ok("already-solved -> solved-unique", r_done.status == "solved-unique")
-eq("already-solved needs zero steps", len(r_done.trace), 0)
-eq("already-solved returns the same grid", to_string(r_done.solution), SOLVED)
-
-# ── PROPERTY 4: never guesses — ceiling-hit before search ─────────────────────
-# The empty grid is consistent but has no forced move for these techniques,
-# so a NON-searching solver must return ceiling-hit (a searching one would
-# "solve" it to some arbitrary valid grid). This is the anti-guess proof.
-EMPTY = "." * 81
-r_empty = solve(from_string(EMPTY))
-ok("empty grid -> ceiling-hit (does NOT guess a solution)", r_empty.status == "ceiling-hit")
-ok("ceiling-hit has no solution", r_empty.solution is None)
-# a partial consistent grid with no forced single also ceiling-hits rather than searching
-# (17-clue minimal puzzles typically need guessing; a bare 2-clue grid certainly does)
-SPARSE = "1................2..............................................................."
-r_sparse = solve(from_string(SPARSE))
-ok("sparse consistent grid -> ceiling-hit, not a guessed fill",
-r_sparse.status == "ceiling-hit" and r_sparse.solution is None)
-
-# ── The elimination rungs actually fire (coverage that the ladder is exercised) ─
-# Not every easy puzzle exercises the higher rungs; assert the ladder is complete
-# and each rung is callable and returns the right SHAPE when it does fire.
-ok("ladder has all five rungs", [name for name, _t, _f in LADDER] ==
-["naked-single", "hidden-single", "locked-candidates", "naked-pair", "x-wing"])
-# a placement step: candidates_eliminated empty; an elimination step: non-empty.
-for step in r_easy.trace:
-placement = not step.candidates_eliminated
-if placement:
-ok(f"placement step has one affected cell ({step.technique})", len(step.cells_affected) == 1)
-else:
-ok(f"elimination step eliminated something ({step.technique})", len(step.candidates_eliminated) >= 1)
-
-# ── input validation ──────────────────────────────────────────────────────────
-def raises(name, fn):
-global _pass, _fail
+def eval_witness(kind, arg, cwd):
+"""Return (satisfied, detail). satisfied is True/False, or None = could-not-evaluate."""
+if kind == "exists":
+ok = os.path.exists(os.path.join(cwd, arg))
+return ok, ("present" if ok else "MISSING") + f": {arg}"
+if kind == "absent":
+ok = not os.path.exists(os.path.join(cwd, arg))
+return ok, ("absent" if ok else "PRESENT") + f": {arg}"
+if kind == "contains":
+path, pattern = arg
+full = os.path.join(cwd, path)
 try:
-fn()
-_fail += 1
-print(f"FAIL {name} (expected raise)")
-except Exception:
-_pass += 1
+with open(full, "r", encoding="utf-8", errors="replace") as f:
+text = f.read()
+except Exception as ex:
+return None, f"unreadable {path}: {ex.__class__.__name__}"
+ok = pattern in text
+return ok, (f"found {pattern!r}" if ok else f"NOT found {pattern!r}") + f" in {path}"
+if kind == "cmd":
+try:
+rc = subprocess.call(arg, shell=True, cwd=cwd,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except Exception as ex:
+return None, f"could not launch: {ex.__class__.__name__}"
+return (rc == 0), f"exit {rc}"
+return None, f"unknown witness kind {kind!r}"
 
-raises("from_string rejects wrong length", lambda: from_string("123"))
-raises("from_string rejects 80 chars", lambda: from_string("." * 80))
-ok("from_string accepts 81 with whitespace", to_string(from_string("." * 81)) == "0" * 81)
-ok("from_string treats 0 and. both as empty",
-from_string("0" * 81) == from_string("." * 81))
+def evaluate(claim, cwd):
+"""A parsed claim -> (verdict, detail)."""
+if claim.get("parse_error"):
+return BLOCKED, claim["parse_error"]
+status = claim["status"]
+kind = claim["witness_kind"]
+arg = claim["witness_arg"]
+if kind == "none":
+if status == "todo":
+return TODO, "no witness yet (todo)"
+return UNWITNESSED, "asserted PASS with no witness beneath it"
+satisfied, detail = eval_witness(kind, arg, cwd)
+if satisfied is None:
+return BLOCKED, detail
+if status == "todo":
+return (READY if satisfied else TODO), detail
+return (HELD if satisfied else BROKEN), detail
 
-# ── candidates helper is correct ──────────────────────────────────────────────
-cands = compute_candidates(from_string(EASY))
-# r1c3 (row 0, col 2) is empty in EASY; its candidates must exclude peers' givens
-ok("candidates computed for empty cells only",
-all(from_string(EASY)[r][c] == 0 for (r, c) in cands))
-ok("a candidate set never contains a peer's given",
-all(all((from_string(EASY)[pr][pc] not in opts)
-for (pr, pc) in _peers(cell) if from_string(EASY)[pr][pc]!= 0)
-for cell, opts in cands.items()))
+# --- run / render -----------------------------------------------------------
 
-# ── MUTATION BITE: prove the certifying check is not vacuously green ───────────
-# If the reasons were decorative (not carrying the placed digit), the replay
-# would NOT reproduce the solution. This bite asserts that (a) the trace has
-# real placement steps, and (b) mangling a reason's leading digit WOULD break
-# the replay — so a no-op reason (the plausible mutation) fails loud here.
-placements = [s for s in r_easy.trace if not s.candidates_eliminated]
-ok("mutation bite: trace has real placements", len(placements) > 0)
+def run(board_text, cwd):
+rows = []
+for c in parse_board(board_text):
+verdict, detail = evaluate(c, cwd)
+rows.append({"name": c["name"], "status": c["status"], "verdict": verdict,
+"detail": detail, "line": c["line"]})
+return rows
 
-def _replay_with_broken_reasons(givens, result):
-"""Replay but with every placement reason's digit forced to 1 — must NOT
-reproduce the solution (unless every placed digit really is 1, impossible)."""
-g = [row[:] for row in givens]
-for step in result.trace:
-if not step.candidates_eliminated:
-(r, c) = step.cells_affected[0]
-g[r][c] = 1 # deliberately wrong: ignore the real reason
-return to_string(g)
+def exit_code(rows):
+verdicts = {r["verdict"] for r in rows}
+if verdicts & set(_FAIL_1):
+return 1
+if verdicts & set(_FAIL_2):
+return 2
+return 0
 
-ok("mutation bite: breaking the reason breaks the replay",
-_replay_with_broken_reasons(from_string(EASY), r_easy)!= EASY_SOLUTION)
+_MARK = {HELD: "ok ", BROKEN: "XX ", UNWITNESSED: "XX ", BLOCKED: "?? ",
+TODO: ". ", READY: ">> "}
 
-# and: if solve silently returned 'solved' on the empty grid (a searching
-# mutation), property 4 would flip. Assert the anti-guess invariant has teeth:
-ok("mutation bite: empty grid is genuinely unforced (>50 empty cells, 0 forced singles)",
-len(compute_candidates(from_string(EMPTY))) == 81
-and all(len(v) == 9 for v in compute_candidates(from_string(EMPTY)).values()))
+def render_table(rows):
+if not rows:
+return "(no claims)"
+w = max(len(r["name"]) for r in rows)
+out = []
+for r in rows:
+out.append(f" {_MARK.get(r['verdict'], ' ')} {r['name']:<{w}} "
+f"{r['verdict']:<11} {r['detail']}")
+return "\n".join(out)
 
-print(("PASS" if _fail == 0 else "FAIL") + f" — {_pass} passed, {_fail} failed")
-sys.exit(0 if _fail == 0 else 1)
+def summary(rows):
+counts = {}
+for r in rows:
+counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+order = [HELD, BROKEN, UNWITNESSED, BLOCKED, TODO, READY]
+parts = [f"{counts[v]} {v.lower()}" for v in order if counts.get(v)]
+return "plumb: " + (" · ".join(parts) if parts else "no claims")
+
+def main(argv=None):
+ap = argparse.ArgumentParser(
+prog="plumb.py",
+description="A status board that refuses to show green on hope.")
+ap.add_argument("board", help="path to a.plumb board file, or - for stdin")
+ap.add_argument("--cwd", default=None,
+help="base dir for relative witness paths and commands "
+"(default: the board file's directory; '.' for stdin)")
+ap.add_argument("--json", action="store_true",
+help="machine-readable output on stdout")
+ap.add_argument("--quiet", action="store_true",
+help="print only the summary line (+ ceiling on stderr)")
+args = ap.parse_args(argv)
+
+if args.board == "-":
+board_text = sys.stdin.read()
+default_cwd = "."
+else:
+try:
+with open(args.board, "r", encoding="utf-8") as f:
+board_text = f.read()
+except Exception as ex:
+_eprint(f"plumb: cannot read board {args.board!r}: {ex}")
+return 3
+default_cwd = os.path.dirname(os.path.abspath(args.board)) or "."
+cwd = args.cwd or default_cwd
+
+rows = run(board_text, cwd)
+code = exit_code(rows)
+
+if args.json:
+print(json.dumps({"rows": rows, "exit": code}, indent=2))
+else:
+if not args.quiet:
+print(render_table(rows))
+print()
+print(summary(rows))
+
+_eprint(CEILING)
+return code
+
+if __name__ == "__main__":
+sys.exit(main())
+
+smoke_test.py 154 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""smoke_test.py — hermetic proof that plumb.py holds the line. No network, no
+state outside a tmpdir. Each scenario writes a board + evidence, runs plumb.py as
+a subprocess, and checks the exit code and the verdict text — the real CLI
+contract, mirroring the durability claims:
+
+1 a satisfied witness renders HELD and the run is clean (exit 0)
+2 a claim asserting PASS with a MISSING witness is caught BROKEN (exit 1) <- the headline
+3 a claim asserting PASS with NO witness is UNWITNESSED (exit 1)
+4 contains: HELD when the text is present, BROKEN when absent
+5 absent: HELD when the path is gone, BROKEN when it is present
+6 cmd: exit 0 -> HELD, non-zero -> BROKEN
+7 a malformed witness is BLOCKED, not silently passed (exit 2)
+8 a todo claim never renders green: unsatisfied -> TODO, satisfied -> READY,
+and neither fails the run (exit 0)
+
+Run: python3 smoke_test.py (expect: 8/8 passed)
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLUMB = os.path.join(HERE, "plumb.py")
+PASS = 0
+FAIL = 0
+
+def ok(msg):
+global PASS
+PASS += 1
+print(f"ok {msg}")
+
+def bad(msg, why):
+global FAIL
+FAIL += 1
+print(f"FAIL {msg}: {why}")
+
+def run_plumb(board_text, cwd):
+"""Write board.plumb into cwd, run plumb.py against it, return (rc, stdout)."""
+board = os.path.join(cwd, "board.plumb")
+with open(board, "w", encoding="utf-8") as f:
+f.write(board_text)
+p = subprocess.run([sys.executable, PLUMB, board],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+return p.returncode, p.stdout
+
+def write(cwd, name, text=""):
+with open(os.path.join(cwd, name), "w", encoding="utf-8") as f:
+f.write(text)
+
+def t1(d):
+write(d, "artifact.txt", "built")
+rc, out = run_plumb("build shipped | exists artifact.txt\n", d)
+if rc == 0 and "HELD" in out:
+ok("satisfied witness renders HELD, run is clean")
+else:
+bad("held", f"rc={rc} out=[{out.strip()}]")
+
+def t2(d):
+# assert PASS but the witness file does not exist -> green on hope, caught
+rc, out = run_plumb("build shipped | exists nope.txt\n", d)
+if rc == 1 and "BROKEN" in out:
+ok("asserted PASS with a missing witness is caught BROKEN (exit 1)")
+else:
+bad("green-on-hope", f"expected rc=1 + BROKEN, got rc={rc} out=[{out.strip()}]")
+
+def t3(d):
+rc, out = run_plumb("migration done | none\n", d)
+if rc == 1 and "UNWITNESSED" in out:
+ok("asserted PASS with no witness is UNWITNESSED (exit 1)")
+else:
+bad("unwitnessed", f"expected rc=1 + UNWITNESSED, got rc={rc} out=[{out.strip()}]")
+
+def t4(d):
+write(d, "README.md", "# thing\n\nMIT licensed.\n")
+rc, out = run_plumb("readme licensed | contains README.md ~ MIT\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("contains-present", f"rc={rc} out=[{out.strip()}]")
+return
+rc2, out2 = run_plumb("readme gpl | contains README.md ~ GPL\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("contains: HELD when text present, BROKEN when absent")
+else:
+bad("contains-absent", f"rc={rc2} out=[{out2.strip()}]")
+
+def t5(d):
+rc, out = run_plumb("no secret | absent.env\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("absent-gone", f"rc={rc} out=[{out.strip()}]")
+return
+write(d, ".env", "SECRET=x")
+rc2, out2 = run_plumb("no secret | absent.env\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("absent: HELD when path gone, BROKEN when present")
+else:
+bad("absent-present", f"rc={rc2} out=[{out2.strip()}]")
+
+def t6(d):
+rc, out = run_plumb("truthy | cmd true\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("cmd-zero", f"rc={rc} out=[{out.strip()}]")
+return
+rc2, out2 = run_plumb("falsy | cmd false\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("cmd: exit 0 -> HELD, non-zero -> BROKEN")
+else:
+bad("cmd-nonzero", f"rc={rc2} out=[{out2.strip()}]")
+
+def t7(d):
+# 'contains' with no ' ~ ' separator is malformed -> BLOCKED, not a silent pass
+rc, out = run_plumb("bad witness | contains README.md MIT\n", d)
+if rc == 2 and "BLOCKED" in out:
+ok("a malformed witness is BLOCKED, not silently passed (exit 2)")
+else:
+bad("blocked", f"expected rc=2 + BLOCKED, got rc={rc} out=[{out.strip()}]")
+
+def t8(d):
+# todo claims never go green, and never fail the run
+board = (
+"later feature | todo | exists notyet.txt\n" # unsatisfied -> TODO
+"already built | todo | cmd true\n" # satisfied -> READY
+)
+rc, out = run_plumb(board, d)
+if rc == 0 and "TODO" in out and "READY" in out and "HELD" not in out:
+ok("todo never renders green: TODO / READY, run stays clean (exit 0)")
+else:
+bad("todo", f"expected rc=0, TODO+READY, no HELD; rc={rc} out=[{out.strip()}]")
+
+def main():
+for t in (t1, t2, t3, t4, t5, t6, t7, t8):
+with tempfile.TemporaryDirectory() as d:
+t(d)
+print()
+print(f"{PASS}/{PASS + FAIL} passed")
+return 0 if FAIL == 0 else 1
+
+if __name__ == "__main__":
+sys.exit(main())
 
 Take the whole folder →
 MIT
-Python standard library only, deterministic + headless
+Python stdlib only
 
 ---
 
-# switchboard — a Loop MMT gift
-https://loopmmt.com/gifts/switchboard/
+# port — a Loop MMT gift
+https://loopmmt.com/gifts/port/
 [coverage: optional · branch: gifts]
 
-A Message Bus That Cannot Carry a Command relay ← all gifts
+Composition Port-Verb Declaration declare ← all gifts
 
-switchboard
+port
 
-A zero-dependency store-and-forward message bus over a plain directory: independent workers leave each other messages, nothing is ever deleted (supersede-only, so the folder's history is the audit trail), and a read is its own logged event — so “I sent it” never silently becomes “they know.” The load-bearing idea is that the schema is observation-only by construction: it has exactly six fields and rejects any unknown one, so a sender literally cannot smuggle in an action/command/run field. It moves messages; it cannot run them.
+Every small JSONL tool declares its own port-verb — source, transform, filter, fold, or sink — in a manifest field or a --port flag, so a map or a typechecker can READ a tool's composition shape instead of guessing it. The load-bearing move is `port check`: when a tool declares its verb in both places, they must agree, and a drift is a decidable non-zero exit, not a thing a human notices later.
 
 The honest edge
 
-It is a bus, not a guaranteed queue and not a command channel. No delivery guarantee and no retry: a read is a logged fact, an unread message stays visible as an orphan until someone reads it, and every message reaches a reader quoted as third-party data, never as the reader's own instruction. Only a human directs.
+It verifies a declaration is consistent with itself — manifest field vs the tool's own --port flag — not that the declared verb is true of the tool's actual behavior. A tool can honestly declare 'filter' in both places and still behave like a transform in its code; proving a verb against real behavior is a deeper, undecidable-in-general question this tool does not claim to answer.
 
 Run it
 
-node switchboard.js send --root./bus --from worker-a --kind status --body "..."
-test_switchboard.js (5/5)
-Node stdlib only (no dependencies); pure core runs in a browser or a test with no filesystem
+python3 port.py verbs
+test_port.py (15/15, mutation-bitten)
+Python 3, standard library only
 
 The code — every file that ships
 
-switchboard.js 501 lines on GitHub →
+port.py 239 lines on GitHub →
+#!/usr/bin/env python3
+"""port — declare a composition tool's port-verb, and read it back honestly.
+
+A composition of small JSONL tools only typechecks if each tool declares its
+own PORT-VERB: the type-level shape of its stdin/stdout contract on the shared
+JSON-lines interface. Five verbs, and only five:
+
+source: nothing -> JSONL (emits; no meaningful stdin)
+transform: JSONL -> JSONL (record in, record out)
+filter: JSONL -> JSONL' (record in, subset out — output type <= input)
+fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
+sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
+
+WHY THIS TOOL EXISTS. Before `port`, a map or a typechecker that wanted to know
+a tool's port-verb had to GUESS it — from a one-line description, or from a
+hand-kept list living in one program's source. A guess that a tool emits when it
+actually sinks is a silent lie: the map draws an edge that cannot carry data.
+`port` removes the guess. Every tool DECLARES its port-verb, in one of two honest
+places, and `port` reads the declaration back:
+
+1. A manifest field `port_verb` in a JSON manifest of tool entries, OR
+2. A `--port` flag the tool answers for itself.
+
+The load-bearing move is the CHECK (`port check`): when a tool declares its
+port-verb in BOTH places, they must AGREE. A manifest that says `filter` while
+the tool's own `--port` says `source` is a declaration that has drifted from the
+thing it describes — and `port check` makes that drift a decidable, non-zero
+exit, not a thing a human notices later. That is the whole point: a declaration
+you can verify beats a description you have to trust.
+
+port's own port-verb is `source`: it emits port declarations as JSON-lines and
+takes no meaningful stdin.
+
+No dependencies beyond the Python standard library. MIT licensed.
+
+USAGE
+port verbs
+Print the five port-verbs and their type contracts (JSONL, one per line).
+
+port read --manifest FILE [--slug SLUG]
+Read declared port_verb(s) from a manifest. With --slug, one entry;
+without, every entry that declares a port_verb. Emits JSON-lines:
+{"slug":..., "port_verb":..., "source": "manifest"}
+A manifest entry with no port_verb field is reported with
+port_verb=null and status="undeclared" (flagged, never guessed).
+
+port check --manifest FILE --flag-cmd 'CMD {slug}'
+For every manifest entry that declares a port_verb, run the tool's own
+--port flag (via --flag-cmd, with {slug} substituted) and compare.
+Emits one JSON-line verdict per entry:
+{"slug":..., "manifest":..., "flag":..., "status":"agree|drift|missing"}
+Exit 0 iff every checked entry AGREES; exit 3 on any drift/missing.
+This is the decidable self-check — a declaration verified against itself.
+
+port emit --slug SLUG --port-verb VERB
+Emit a single declaration JSON-line (for a tool that has no manifest yet).
+"""
+import argparse
+import json
+import subprocess
+import sys
+
+# The five port-verbs and their type-level contract on the shared JSONL interface.
+# This dict is the ONLY definition of the vocabulary — the closed set.
+PORT_VERBS = {
+"source": "nothing -> JSONL (emits; no meaningful stdin)",
+"transform": "JSONL -> JSONL (record in, record out)",
+"filter": "JSONL -> JSONL' (record in, subset out; output type <= input)",
+"fold": "JSONL -> JSONL_agg (records in, an aggregate/narrower record out)",
+"sink": "JSONL -> nothing (terminal side effect, no pipeable stdout)",
+}
+
+def is_valid_verb(verb):
+"""A port-verb is valid iff it is one of the five closed-set verbs."""
+return verb in PORT_VERBS
+
+def load_manifest_entries(path):
+"""Return the list of tool entries from a manifest.
+
+Accepts either a bare JSON list of entries, or a JSON object with a top-level
+key ('gifts', 'tools', or 'entries') holding the list. Raises ValueError if
+no entry list can be found — never guesses a shape.
+"""
+with open(path) as f:
+data = json.load(f)
+if isinstance(data, list):
+return data
+if isinstance(data, dict):
+for key in ("gifts", "tools", "entries"):
+if isinstance(data.get(key), list):
+return data[key]
+raise ValueError(
+"manifest is neither a list of entries nor an object with a "
+"'gifts'/'tools'/'entries' list"
+)
+
+def cmd_verbs(_args):
+"""Emit the five port-verbs and their contracts, one JSON-line each."""
+for verb, contract in PORT_VERBS.items():
+print(json.dumps({"port_verb": verb, "contract": contract}))
+return 0
+
+def cmd_read(args):
+"""Read declared port_verb(s) from a manifest and emit them as JSON-lines."""
+entries = load_manifest_entries(args.manifest)
+found = False
+for entry in entries:
+slug = entry.get("slug")
+if args.slug is not None and slug!= args.slug:
+continue
+verb = entry.get("port_verb")
+if verb is None:
+rec = {"slug": slug, "port_verb": None,
+"source": "manifest", "status": "undeclared"}
+elif not is_valid_verb(verb):
+rec = {"slug": slug, "port_verb": verb,
+"source": "manifest", "status": "invalid"}
+else:
+rec = {"slug": slug, "port_verb": verb,
+"source": "manifest", "status": "declared"}
+print(json.dumps(rec))
+found = True
+if args.slug is not None and not found:
+print(json.dumps({"slug": args.slug, "port_verb": None,
+"source": "manifest", "status": "not-found"}))
+return 3
+return 0
+
+def _run_flag(flag_cmd, slug):
+"""Run a tool's own --port flag and return the verb it prints, or None.
+
+flag_cmd is a template string with '{slug}' substituted for the entry slug.
+The tool is expected to print its port-verb as the first whitespace token
+on stdout. Any failure (non-zero exit, no output, unparseable) returns None
+— an honest 'the tool did not answer', never a guessed verb.
+"""
+cmd = flag_cmd.replace("{slug}", slug)
+try:
+out = subprocess.run(cmd, shell=True, capture_output=True,
+text=True, timeout=30)
+except Exception:
+return None
+if out.returncode!= 0:
+return None
+token = out.stdout.strip().split()
+if not token:
+return None
+verb = token[0]
+return verb if is_valid_verb(verb) else None
+
+def cmd_check(args):
+"""Compare each manifest port_verb against the tool's own --port flag.
+
+Exit 0 iff every checked entry agrees; exit 3 on any drift or missing.
+"""
+entries = load_manifest_entries(args.manifest)
+all_agree = True
+checked_any = False
+for entry in entries:
+slug = entry.get("slug")
+manifest_verb = entry.get("port_verb")
+if manifest_verb is None:
+continue # nothing declared in the manifest -> nothing to check here
+checked_any = True
+flag_verb = _run_flag(args.flag_cmd, slug)
+if flag_verb is None:
+status = "missing"
+all_agree = False
+elif flag_verb == manifest_verb:
+status = "agree"
+else:
+status = "drift"
+all_agree = False
+print(json.dumps({"slug": slug, "manifest": manifest_verb,
+"flag": flag_verb, "status": status}))
+if not checked_any:
+# Nothing declared a port_verb: there is nothing to verify. This is not
+# a pass (there was no check) — report it and exit 3 so a manifest that
+# forgot every declaration cannot read as green.
+print(json.dumps({"status": "no-declarations",
+"note": "no manifest entry declared a port_verb"}))
+return 3
+return 0 if all_agree else 3
+
+def cmd_emit(args):
+"""Emit a single port declaration JSON-line for a manifest-less tool."""
+if not is_valid_verb(args.port_verb):
+print(json.dumps({"slug": args.slug, "port_verb": args.port_verb,
+"status": "invalid",
+"valid": list(PORT_VERBS)}))
+return 3
+print(json.dumps({"slug": args.slug, "port_verb": args.port_verb,
+"source": "declared", "status": "declared"}))
+return 0
+
+def build_parser():
+p = argparse.ArgumentParser(
+prog="port",
+description="Declare a composition tool's port-verb, and read it back honestly.",
+)
+sub = p.add_subparsers(dest="cmd", required=True)
+
+sp = sub.add_parser("verbs", help="print the five port-verbs and contracts")
+sp.set_defaults(func=cmd_verbs)
+
+sp = sub.add_parser("read", help="read declared port_verb(s) from a manifest")
+sp.add_argument("--manifest", required=True)
+sp.add_argument("--slug", default=None)
+sp.set_defaults(func=cmd_read)
+
+sp = sub.add_parser("check", help="verify manifest port_verb against each tool's --port flag")
+sp.add_argument("--manifest", required=True)
+sp.add_argument("--flag-cmd", required=True,
+help="command template to run a tool's --port flag; {slug} is substituted")
+sp.set_defaults(func=cmd_check)
+
+sp = sub.add_parser("emit", help="emit a single port declaration line")
+sp.add_argument("--slug", required=True)
+sp.add_argument("--port-verb", required=True)
+sp.set_defaults(func=cmd_emit)
+
+return p
+
+def main(argv=None):
+args = build_parser().parse_args(argv)
+return args.func(args)
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_port.py 168 lines on GitHub →
+#!/usr/bin/env python3
+"""Mutation-bitten tests for the port gift.
+
+Each test asserts a real behavior. To prove the suite is non-vacuous, run it
+against a deliberately-broken port.py and confirm it goes RED (see the
+`_self_mutation_note` at the bottom — the mutations are documented, not shipped).
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PORT = os.path.join(HERE, "port.py")
+
+sys.path.insert(0, HERE)
+import port # noqa: E402
+
+def run(*args, input_text=None):
+"""Run port.py as a subprocess; return (exit, stdout_lines)."""
+proc = subprocess.run(
+[sys.executable, PORT, *args],
+capture_output=True, text=True, input=input_text,
+)
+lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+return proc.returncode, lines
+
+def write_manifest(entries, wrap=None):
+"""Write a temp manifest; wrap=None -> bare list, else {wrap: [...]}."""
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump(entries if wrap is None else {wrap: entries}, f)
+return path
+
+class TestVocabulary(unittest.TestCase):
+def test_exactly_five_verbs(self):
+# The closed set is exactly five — no more, no fewer.
+self.assertEqual(len(port.PORT_VERBS), 5)
+self.assertEqual(set(port.PORT_VERBS),
+{"source", "transform", "filter", "fold", "sink"})
+
+def test_valid_verb_gate(self):
+self.assertTrue(port.is_valid_verb("filter"))
+self.assertFalse(port.is_valid_verb("emit")) # a plausible non-verb
+self.assertFalse(port.is_valid_verb(""))
+self.assertFalse(port.is_valid_verb(None))
+
+def test_verbs_command_emits_five_lines(self):
+code, lines = run("verbs")
+self.assertEqual(code, 0)
+self.assertEqual(len(lines), 5)
+self.assertEqual({l["port_verb"] for l in lines}, set(port.PORT_VERBS))
+
+class TestRead(unittest.TestCase):
+def test_read_declared(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"},
+{"slug": "b", "port_verb": "sink"}])
+code, lines = run("read", "--manifest", m)
+self.assertEqual(code, 0)
+self.assertEqual(lines[0], {"slug": "a", "port_verb": "source",
+"source": "manifest", "status": "declared"})
+self.assertEqual(lines[1]["status"], "declared")
+
+def test_read_undeclared_is_flagged_not_guessed(self):
+# A gift with NO port_verb must come back status=undeclared, verb null —
+# never a guessed verb. This is the whole reason the gift exists.
+m = write_manifest([{"slug": "x", "verb": "survive"}]) # 'verb' is the
+code, lines = run("read", "--manifest", m) # marketing verb
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], None)
+self.assertEqual(lines[0]["status"], "undeclared")
+
+def test_read_invalid_verb_flagged(self):
+m = write_manifest([{"slug": "x", "port_verb": "emit"}]) # not a verb
+code, lines = run("read", "--manifest", m)
+self.assertEqual(lines[0]["status"], "invalid")
+
+def test_read_slug_filter(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"},
+{"slug": "b", "port_verb": "sink"}])
+code, lines = run("read", "--manifest", m, "--slug", "b")
+self.assertEqual(len(lines), 1)
+self.assertEqual(lines[0]["slug"], "b")
+
+def test_read_slug_not_found_exits_3(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("read", "--manifest", m, "--slug", "zzz")
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "not-found")
+
+def test_read_wrapped_manifest(self):
+# Real gifts-manifest.json wraps the list under 'gifts'.
+m = write_manifest([{"slug": "a", "port_verb": "fold"}], wrap="gifts")
+code, lines = run("read", "--manifest", m)
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], "fold")
+
+class TestCheck(unittest.TestCase):
+def _flag_cmd(self, mapping):
+"""Build a --flag-cmd that echoes a per-slug verb via a tiny py snippet."""
+table = json.dumps(mapping)
+# {slug} is substituted by port; the snippet prints the mapped verb.
+return (f"{sys.executable} -c "
+f"'import json,sys; "
+f"print(json.loads(sys.argv[1]).get(sys.argv[2],\"\"))' "
+f"'{table}' {{slug}}")
+
+def test_check_agree_exits_0(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "source"}))
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["status"], "agree")
+
+def test_check_drift_exits_3(self):
+# Manifest says source, the tool's own flag says sink -> drift, exit 3.
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "sink"}))
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "drift")
+
+def test_check_missing_flag_exits_3(self):
+# Tool answers nothing -> missing, not silently passed.
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({})) # empty -> ""
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "missing")
+
+def test_check_no_declarations_is_not_green(self):
+# A manifest that declared no port_verb at all must NOT read as pass.
+m = write_manifest([{"slug": "a", "verb": "survive"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "source"}))
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "no-declarations")
+
+class TestEmit(unittest.TestCase):
+def test_emit_valid(self):
+code, lines = run("emit", "--slug", "port", "--port-verb", "source")
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], "source")
+self.assertEqual(lines[0]["status"], "declared")
+
+def test_emit_invalid_exits_3(self):
+code, lines = run("emit", "--slug", "x", "--port-verb", "nonsense")
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "invalid")
+
+if __name__ == "__main__":
+unittest.main(verbosity=2)
+
+# _self_mutation_note: this suite was proven non-vacuous by mutation —
+# (1) PORT_VERBS drop 'sink' -> test_exactly_five_verbs RED
+# (2) cmd_read guess 'source' on null -> test_read_undeclared_* RED
+# (3) cmd_check return 0 always -> test_check_drift/missing RED
+# (4) cmd_check treat no-decl as pass -> test_check_no_declarations RED
+# each mutation reverted after confirming RED. A no-op runner cannot pass these.
+
+Take the whole folder →
+MIT
+Python 3, standard library only
+
+---
+
+# Inline MIME Parser — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-inline-mime/
+[coverage: optional · branch: gifts]
+
+What's Actually Inside This Email? parse ← all gifts
+
+Inline MIME Parser
+
+Parse a raw MIME message — an.eml, a saved email, a multipart body — into a structured tree with zero dependencies. parseMime(raw) unfolds folded headers, parses the Content-Type and its parameters, decodes each leaf body per its Content-Transfer-Encoding (base64, quoted-printable, 7bit/8bit) and charset (utf-8, latin1), splits multipart/* on its boundary, and recurses to any depth. RFC 2047 encoded words in headers (=?utf-8?B?..?=) are decoded too. Node or browser, no DOM, no filesystem.
+
+The honest edge
+
+It parses, it does not validate — a message with a missing closing boundary or a header with no body is parsed as far as it reasonably can, never thrown at, so the tree reflects what was there rather than what should have been. Charset support is honest about its scope: utf-8 (full multibyte) and the byte-preserving ascii/iso-8859-1/windows-1252 family decode faithfully; ANY OTHER charset falls back to utf-8 rather than transcoding from native tables — exotic legacy charsets are the edge. An unknown Content-Transfer-Encoding is treated as identity. Header values are RFC-2047-decoded in the `headers` map only; `rawHeaders` keeps the ordered, undecoded originals for anything that must see the wire bytes.
+
+Run it
+
+node ratchet-inline-mime.js --demo
+test_ratchet-inline-mime.js (36/36: header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ratchet-inline-mime.js 297 lines on GitHub →
+#!/usr/bin/env node
 // SPDX-License-Identifier: MIT
-// switchboard — a store-and-forward message bus that cannot carry a command.
-//
-// PRINTED EDGE: this is a message BUS, not a command channel and not a queue with
-// delivery guarantees — every message is third-party DATA (a report), never an
-// instruction to the reader; a read is its own logged event, so "I sent" never
-// implies "they know."
-//
-// WHAT IT IS. A tiny, zero-dependency store-and-forward bus over a plain directory.
-// Independent workers (scripts, tabs, agents) leave messages for each other under a
-// shared folder; nothing is deleted (supersede-only, the folder's history is the
-// audit trail). Two things make it a COMPOSE PRIMITIVE rather than a chat log:
-//
-// 1. The schema is OBSERVATION-ONLY by construction. A message has exactly six
-// fields and no more — the validator REJECTS any unknown top-level field, so a
-// sender cannot smuggle an `action`/`command`/`run`/`exec` field: the schema
-// literally cannot express a command. The four message kinds are status / focus
-// / fyi / question — none imperative.
-//
-// 2. Every message is surfaced QUOTED — "worker <id> reports: …" — never handed to
-// the reader as its own directive. There is no code path that turns a message
-// body into an instruction. Only a human directs.
-//
-// This is how you wire N independent gifts (or workers) into a larger block without
-// coupling them: they coordinate through DATA on a shared directory, each carrying a
-// content-hash and provenance, and a read is a logged fact — not an assumption.
-//
-// LANE: route (data moves along declared sender→recipient paths, each carrying a
-// receipt). Point-to-point goes to one recipient's inbox; broadcast goes to
-// everyone; a read writes a receipt so orphan (never-read) messages are
-// detectable.
-//
-// INVOCATION (CLI):
-// node switchboard.js send --root DIR --from ID --kind status --body "…" (broadcast)
-// node switchboard.js send --root DIR --from ID --to ID --kind question --body "…" (point-to-point)
-// node switchboard.js read --root DIR --as ID (surface inbox+broadcasts, quoted, logs receipts)
-// node switchboard.js orphans --root DIR --to ID (P2P messages ID was sent but never read)
-// node switchboard.js --help
-//
-// BROWSER / NODE ATTACH: the pure functions (validate, canonicalPayload, contentHash,
-// renderQuoted, and an in-memory Bus) are exported for use without a filesystem — so
-// the schema + quoting discipline compose into a page or a test with no disk at all.
-//
-// Zero dependencies. Node stdlib only (fs/path/crypto for the CLI; the pure core uses
-// none). MIT. Strip provenance: the internal Switchboard tool (AGPL) — the pure schema +
-// send/read/orphan path, with the git transport and the internal credential gate cut.
+"use strict";
+/* ratchet-inline-mime.js — a zero-dependency MIME message parser.
 
-'use strict';
+Hand it a raw RFC 822 / MIME message (an.eml, a saved email, a raw HTTP
+multipart body) and it returns a structured tree: unfolded headers, a parsed
+Content-Type with its parameters, and — for each leaf — a body decoded per its
+Content-Transfer-Encoding (base64 / quoted-printable / 7bit / 8bit / binary)
+and charset (utf-8 / ascii / latin1). multipart/* bodies are split on their
+boundary and each part parsed recursively, to any depth. RFC 2047 encoded
+words in header values (=?utf-8?B?..?= / =?..?Q?..?=) are decoded too.
 
-// ── The schema (the structural half of "cannot express a command") ──────────────
+Pure functions, no dependencies, no filesystem, no DOM — the same code runs in
+Node (module.exports) or a browser (window.LoopGifts.parseMime). It parses a
+message you already hold as text; it does not fetch, connect, or read files. */
 
-var SCHEMA_ID = 'loopmmt.switchboard.message/v1';
-
-// The four observation-only kinds. There is deliberately NO imperative kind.
-var KINDS = ['status', 'focus', 'fyi', 'question'];
-
-// The CLOSED set of top-level fields. Anything else is rejected — this is why the
-// schema cannot carry a command: `action`, `command`, `run`, `exec` are not in it.
-var ALLOWED_TOP = ['schema', 'sender', 'content_hash', 'kind', 'recipient', 'body'];
-var SENDER_FIELDS = ['session_id', 'branch', 'ts']; // provenance; session_id required
-
-var BROADCAST = 'broadcast';
-
-function MessageRejected(msg) {
-this.name = 'MessageRejected';
-this.message = msg;
+// ---- base64 (pure; tolerates whitespace and missing padding) ---------------
+var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function decodeBase64(str) {
+var lut = decodeBase64._lut;
+if (!lut) { lut = decodeBase64._lut = {}; for (var i = 0; i < B64.length; i++) lut[B64.charAt(i)] = i;}
+var out = [], buffer = 0, bits = 0;
+for (var j = 0; j < str.length; j++) {
+var c = str.charAt(j);
+if (c === "=") break;
+var v = lut[c];
+if (v === undefined) continue; // skip newlines/whitespace/stray chars
+buffer = (buffer << 6) | v; bits += 6;
+if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff);}
 }
-MessageRejected.prototype = Object.create(Error.prototype);
-MessageRejected.prototype.constructor = MessageRejected;
-
-// ── Pure helpers (no filesystem, browser-safe) ──────────────────────────────────
-
-function isoNow() {
-// UTC, second precision, no locale — the same clock everywhere.
-return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+return out;
 }
 
-function has(obj, k) { return Object.prototype.hasOwnProperty.call(obj, k);}
-
-// A stable JSON serialization: keys sorted at every level, compact separators.
-// This is the byte-truth the content_hash covers and the file bytes we write.
-function stableStringify(x) {
-if (x === null || typeof x!== 'object') return JSON.stringify(x);
-if (Array.isArray(x)) return '[' + x.map(stableStringify).join(',') + ']';
-var keys = Object.keys(x).sort();
-var parts = [];
-for (var i = 0; i < keys.length; i++) {
-parts.push(JSON.stringify(keys[i]) + ':' + stableStringify(x[keys[i]]));
+// ---- quoted-printable (=XX bytes, soft line breaks) ------------------------
+function decodeQuotedPrintable(str) {
+var out = [];
+for (var i = 0; i < str.length; i++) {
+var c = str.charAt(i);
+if (c === "=") {
+if (str.charAt(i + 1) === "\r" && str.charAt(i + 2) === "\n") { i += 2; continue;} // soft break
+if (str.charAt(i + 1) === "\n") { i += 1; continue;} // soft break (LF)
+var hex = str.substr(i + 1, 2);
+if (/^[0-9A-Fa-f]{2}$/.test(hex)) { out.push(parseInt(hex, 16)); i += 2; continue;}
+out.push(0x3d); // stray '=' kept literal
+} else {
+out.push(c.charCodeAt(0) & 0xff);
 }
-return '{' + parts.join(',') + '}';
+}
+return out;
 }
 
-// The bytes the content_hash covers: provenance + kind + recipient + body, canonically
-// serialized. Hashing the sender block binds provenance INTO the hash — tampering with
-// who-sent-it breaks the hash.
-function canonicalPayload(sender, kind, recipient, body) {
-return stableStringify({
-body: body,
-kind: kind,
-recipient: recipient,
-sender: sender
+// ---- bytes -> string, honest about the charsets it actually decodes ---------
+function utf8Decode(bytes) {
+var out = "", i = 0, n = bytes.length;
+while (i < n) {
+var b = bytes[i++];
+if (b < 0x80) { out += String.fromCharCode(b);}
+else if (b >= 0xc0 && b < 0xe0) { out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));}
+else if (b >= 0xe0 && b < 0xf0) { var c1 = bytes[i++] & 0x3f, c2 = bytes[i++] & 0x3f; out += String.fromCharCode(((b & 0x0f) << 12) | (c1 << 6) | c2);}
+else if (b >= 0xf0) {
+var d1 = bytes[i++] & 0x3f, d2 = bytes[i++] & 0x3f, d3 = bytes[i++] & 0x3f;
+var cp = (((b & 0x07) << 18) | (d1 << 12) | (d2 << 6) | d3) - 0x10000;
+out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+} else { out += "\ufffd";}
+}
+return out;
+}
+function bytesToString(bytes, charset) {
+charset = (charset || "utf-8").toLowerCase();
+if (charset === "us-ascii" || charset === "ascii" || charset === "latin1" ||
+charset === "iso-8859-1" || charset === "iso8859-1" ||
+charset === "windows-1252" || charset === "cp1252") {
+var s = "";
+for (var k = 0; k < bytes.length; k++) s += String.fromCharCode(bytes[k]); // byte-preserving
+return s;
+}
+return utf8Decode(bytes); // default and any unknown charset: utf-8 (see README edge)
+}
+
+// ---- structured header values ("text/plain; charset=utf-8; name=\"a b\"") ---
+function splitSemicolons(s) {
+var out = [], cur = "", inq = false;
+for (var i = 0; i < s.length; i++) {
+var c = s.charAt(i);
+if (c === '"') { inq =!inq; cur += c;}
+else if (c === ";" &&!inq) { out.push(cur); cur = "";}
+else cur += c;
+}
+out.push(cur);
+return out;
+}
+function unquote(v) {
+v = v.replace(/^[ \t]+|[ \t]+$/g, "");
+if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') {
+return v.substring(1, v.length - 1).replace(/\\(.)/g, "$1");
+}
+return v;
+}
+function parseStructured(value) {
+var parts = splitSemicolons(value);
+var main = (parts.shift() || "").replace(/^[ \t]+|[ \t]+$/g, "");
+var params = {};
+for (var i = 0; i < parts.length; i++) {
+var eq = parts[i].indexOf("=");
+if (eq === -1) continue;
+var k = parts[i].substring(0, eq).replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
+if (k) params[k] = unquote(parts[i].substring(eq + 1));
+}
+return { value: main, params: params};
+}
+
+// ---- RFC 2047 encoded words in header text ---------------------------------
+function decodeEncodedWords(str) {
+return str.replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, function (m, charset, enc, text) {
+var bytes = (enc === "B" || enc === "b")
+? decodeBase64(text)
+: decodeQuotedPrintable(text.replace(/_/g, " ")); // Q: '_' is space
+return bytesToString(bytes, charset);
 });
 }
 
-// A minimal, dependency-free sha-256 hex (FIPS-180-4) so contentHash works in the
-// browser AND in Node without importing anything. Bytes are the UTF-8 bytes of the
-// input string (multibyte-faithful), matching node crypto over the same string.
-function sha256Hex(str) {
-function utf8Bytes(s) {
-var out = [], i, c, c2;
-for (i = 0; i < s.length; i++) {
-c = s.charCodeAt(i);
-if (c < 0x80) out.push(c);
-else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
-else if (c >= 0xd800 && c <= 0xdbff) {
-c2 = s.charCodeAt(++i);
-var u = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
-out.push(0xf0 | (u >> 18), 0x80 | ((u >> 12) & 0x3f),
-0x80 | ((u >> 6) & 0x3f), 0x80 | (u & 0x3f));
-} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
+// ---- headers ---------------------------------------------------------------
+function splitHeadersBody(raw) {
+var norm = String(raw).replace(/\r\n/g, "\n");
+var idx = norm.indexOf("\n\n");
+if (idx === -1) return { headerBlock: norm, body: ""};
+return { headerBlock: norm.substring(0, idx), body: norm.substring(idx + 2)};
 }
-return out;
+function unfoldHeaders(headerBlock) {
+var lines = headerBlock.split("\n"), headers = [];
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+if (line === "") continue;
+if ((line.charAt(0) === " " || line.charAt(0) === "\t") && headers.length) {
+headers[headers.length - 1][1] += " " + line.replace(/^[ \t]+/, ""); // unfold
+} else {
+var ci = line.indexOf(":");
+if (ci === -1) continue; // not a header line — skip
+headers.push([line.substring(0, ci).replace(/[ \t]+$/, ""), line.substring(ci + 1).replace(/^[ \t]+/, "")]);
 }
-var K = [
-0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
-var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
-function rotr(n, x) { return (x >>> n) | (x << (32 - n));}
-var bytes = utf8Bytes(str);
-var l = bytes.length, bitLen = l * 8;
-bytes.push(0x80);
-while (bytes.length % 64!== 56) bytes.push(0);
-for (var j = 7; j >= 0; j--) bytes.push((bitLen / Math.pow(2, j * 8)) & 0xff);
-var w = new Array(64);
-for (var off = 0; off < bytes.length; off += 64) {
-for (var t = 0; t < 16; t++) {
-w[t] = (bytes[off+4*t]<<24)|(bytes[off+4*t+1]<<16)|(bytes[off+4*t+2]<<8)|(bytes[off+4*t+3]);
 }
-for (t = 16; t < 64; t++) {
-var s0 = rotr(7,w[t-15])^rotr(18,w[t-15])^(w[t-15]>>>3);
-var s1 = rotr(17,w[t-2])^rotr(19,w[t-2])^(w[t-2]>>>10);
-w[t] = (w[t-16]+s0+w[t-7]+s1)|0;
+return headers;
 }
-var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
-for (t = 0; t < 64; t++) {
-var S1 = rotr(6,e)^rotr(11,e)^rotr(25,e);
-var ch = (e&f)^(~e&g);
-var t1 = (h+S1+ch+K[t]+w[t])|0;
-var S0 = rotr(2,a)^rotr(13,a)^rotr(22,a);
-var maj = (a&b)^(a&c)^(b&c);
-var t2 = (S0+maj)|0;
-h=g; g=f; f=e; e=(d+t1)|0; d=c; c=b; b=a; a=(t1+t2)|0;
+function getRawHeader(rawHeaders, name) {
+name = name.toLowerCase();
+for (var i = 0; i < rawHeaders.length; i++) {
+if (rawHeaders[i][0].toLowerCase() === name) return rawHeaders[i][1];
 }
-H[0]=(H[0]+a)|0; H[1]=(H[1]+b)|0; H[2]=(H[2]+c)|0; H[3]=(H[3]+d)|0;
-H[4]=(H[4]+e)|0; H[5]=(H[5]+f)|0; H[6]=(H[6]+g)|0; H[7]=(H[7]+h)|0;
-}
-var hex = '';
-for (var k = 0; k < 8; k++) hex += ('00000000' + (H[k]>>>0).toString(16)).slice(-8);
-return hex;
+return null;
 }
 
-function contentHash(sender, kind, recipient, body) {
-return sha256Hex(canonicalPayload(sender, kind, recipient, body));
+// ---- multipart split -------------------------------------------------------
+function splitMultipart(body, boundary) {
+var delim = "--" + boundary, close = delim + "--";
+var lines = body.split("\n"), parts = [], cur = null;
+for (var i = 0; i < lines.length; i++) {
+var t = lines[i].replace(/\r$/, "");
+if (t === delim) { if (cur!== null) parts.push(cur.join("\n")); cur = [];}
+else if (t === close) { if (cur!== null) parts.push(cur.join("\n")); cur = null; break;}
+else if (cur!== null) cur.push(lines[i]);
+// lines before the first delim are the preamble (cur === null) — ignored
+}
+if (cur!== null) parts.push(cur.join("\n")); // unterminated: keep what we have
+return parts;
 }
 
-// Validate a candidate message. Throws MessageRejected on ANY violation — refuse loud,
-// never store. This is the load-bearing gate: the closed field set is what makes the
-// schema unable to express a command.
-function validate(msg) {
-if (msg === null || typeof msg!== 'object' || Array.isArray(msg)) {
-throw new MessageRejected('message must be an object');
-}
-// Closed field set — reject any unknown top-level field (the command firewall).
-var keys = Object.keys(msg);
-for (var i = 0; i < keys.length; i++) {
-if (ALLOWED_TOP.indexOf(keys[i]) === -1) {
-throw new MessageRejected(
-'unknown top-level field "' + keys[i] + '" — the schema is closed; ' +
-'it cannot carry a command');
-}
-}
-for (i = 0; i < ALLOWED_TOP.length; i++) {
-if (!has(msg, ALLOWED_TOP[i])) {
-throw new MessageRejected('missing required field "' + ALLOWED_TOP[i] + '"');
-}
-}
-if (msg.schema!== SCHEMA_ID) {
-throw new MessageRejected('schema must be "' + SCHEMA_ID + '"');
-}
-if (KINDS.indexOf(msg.kind) === -1) {
-throw new MessageRejected(
-'kind must be one of ' + KINDS.join('/') + ' (no imperative kind exists)');
-}
-if (typeof msg.recipient!== 'string' || msg.recipient.length === 0) {
-throw new MessageRejected('recipient must be a non-empty string ("broadcast" or an id)');
-}
-if (typeof msg.body!== 'string') {
-throw new MessageRejected('body must be a string (data, never a directive)');
-}
-// Sender provenance
-var s = msg.sender;
-if (s === null || typeof s!== 'object' || Array.isArray(s)) {
-throw new MessageRejected('sender must be a provenance object');
-}
-if (typeof s.session_id!== 'string' || s.session_id.length === 0) {
-throw new MessageRejected('sender.session_id is required');
-}
-var skeys = Object.keys(s);
-for (i = 0; i < skeys.length; i++) {
-if (SENDER_FIELDS.indexOf(skeys[i]) === -1) {
-throw new MessageRejected('unknown sender field "' + skeys[i] + '"');
-}
-}
-// content_hash must match the payload — provenance/body tampering breaks it.
-var expect = contentHash(s, msg.kind, msg.recipient, msg.body);
-if (msg.content_hash!== expect) {
-throw new MessageRejected(
-'content_hash mismatch (message was tampered or malformed): ' +
-'expected ' + expect.slice(0, 12) + '…');
-}
-return true;
+// ---- body decode -----------------------------------------------------------
+function decodeBody(body, cte, charset) {
+var bytes;
+if (cte === "base64") bytes = decodeBase64(body);
+else if (cte === "quoted-printable") bytes = decodeQuotedPrintable(body);
+else { bytes = []; for (var i = 0; i < body.length; i++) bytes.push(body.charCodeAt(i) & 0xff);}
+return bytesToString(bytes, charset);
 }
 
-// Compose a valid message object (fills schema + content_hash). Throws if the result
-// would not validate — you cannot build an invalid message with this.
-function compose(sender, kind, recipient, body) {
-if (typeof sender === 'string') sender = { session_id: sender, ts: isoNow()};
-else if (sender &&!sender.ts) sender = assign({}, sender, { ts: isoNow()});
-var msg = {
-schema: SCHEMA_ID,
-sender: sender,
-kind: kind,
-recipient: recipient,
-body: body,
-content_hash: contentHash(sender, kind, recipient, body)
+// ---- the parser ------------------------------------------------------------
+function parseMime(raw) {
+var sb = splitHeadersBody(raw);
+var rawHeaders = unfoldHeaders(sb.headerBlock);
+var headers = {};
+for (var i = 0; i < rawHeaders.length; i++) {
+var name = rawHeaders[i][0].toLowerCase();
+if (headers[name] === undefined) headers[name] = decodeEncodedWords(rawHeaders[i][1]); // last raw kept; first decoded value wins for the map
+}
+var ct = parseStructured(getRawHeader(rawHeaders, "content-type") || "text/plain");
+var cte = (getRawHeader(rawHeaders, "content-transfer-encoding") || "7bit").replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
+var node = {
+headers: headers,
+rawHeaders: rawHeaders,
+contentType: ct.value.toLowerCase(),
+contentTypeParams: ct.params,
+encoding: cte,
+isMultipart: false
 };
-validate(msg);
-return msg;
+if (node.contentType.indexOf("multipart/") === 0 && ct.params.boundary) {
+node.isMultipart = true;
+node.parts = [];
+var raws = splitMultipart(sb.body, ct.params.boundary);
+for (var p = 0; p < raws.length; p++) node.parts.push(parseMime(raws[p]));
+} else {
+node.bodyRaw = sb.body;
+node.body = decodeBody(sb.body, cte, ct.params.charset);
+}
+return node;
 }
 
-function assign(target) {
-for (var i = 1; i < arguments.length; i++) {
-var src = arguments[i];
-if (src) for (var k in src) if (has(src, k)) target[k] = src[k];
+// ---- a small human summary for the CLI -------------------------------------
+function summarize(node, depth) {
+depth = depth || 0;
+var pad = new Array(depth + 1).join(" ");
+var line = pad + node.contentType + (node.encoding && node.encoding!== "7bit"? " [" + node.encoding + "]": "");
+var lines = [line];
+if (depth === 0) {
+var interesting = ["from", "to", "subject", "date"];
+for (var i = 0; i < interesting.length; i++) {
+if (node.headers[interesting[i]]!== undefined) lines.push(pad + " " + interesting[i] + ": " + node.headers[interesting[i]]);
 }
-return target;
+}
+if (node.isMultipart) {
+for (var p = 0; p < node.parts.length; p++) lines = lines.concat(summarize(node.parts[p], depth + 1));
+} else {
+var body = node.body || "";
+var preview = body.length > 200? body.substring(0, 200) + "\u2026": body;
+lines.push(pad + " body(" + body.length + "): " + JSON.stringify(preview));
+}
+return lines;
 }
 
-// Surface a message as QUOTED third-party data — never as an instruction to the reader.
-// There is no other render path: a body cannot reach the reader as its own directive.
-function renderQuoted(msg) {
-var who = msg.sender.session_id;
-var to = msg.recipient === BROADCAST? 'all': msg.recipient;
-return 'worker ' + who + ' reports (' + msg.kind + ' → ' + to + '): ' + msg.body;
+// ---- dual-runtime export ---------------------------------------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parseMime = parseMime;
+window.LoopGifts.decodeEncodedWords = decodeEncodedWords;
 }
-
-// ── An in-memory Bus (no filesystem) — composes into a test or a page ───────────
-
-function Bus() {
-this._broadcast = []; // list of messages
-this._inbox = {}; // recipient -> list of messages
-this._reads = {}; // reader -> set of content_hash
-}
-Bus.prototype.send = function (sender, kind, recipient, body) {
-var msg = compose(sender, kind, recipient, body);
-if (recipient === BROADCAST) this._broadcast.push(msg);
-else (this._inbox[recipient] = this._inbox[recipient] || []).push(msg);
-return msg;
+if (typeof module!== "undefined" && module.exports) {
+module.exports = {
+parseMime: parseMime,
+decodeBase64: decodeBase64,
+decodeQuotedPrintable: decodeQuotedPrintable,
+decodeEncodedWords: decodeEncodedWords,
+bytesToString: bytesToString,
+parseStructured: parseStructured,
+summarize: summarize
 };
-Bus.prototype.read = function (readerId, logReceipt) {
-var out = (this._inbox[readerId] || []).concat(this._broadcast);
-if (logReceipt!== false) {
-var set = this._reads[readerId] = this._reads[readerId] || {};
-for (var i = 0; i < out.length; i++) set[out[i].content_hash] = true;
-}
-return out;
-};
-Bus.prototype.orphans = function (recipientId) {
-// P2P messages this recipient was sent but never read (never sent a receipt for).
-var sent = this._inbox[recipientId] || [];
-var read = this._reads[recipientId] || {};
-var out = [];
-for (var i = 0; i < sent.length; i++) {
-if (!read[sent[i].content_hash]) out.push(sent[i]);
-}
-return out;
-};
-
-// ── Filesystem transport (CLI only; append-by-create never conflicts) ───────────
-// Layout under --root:
-// <root>/broadcast/<ts>-<sender>-<hash8>.json
-// <root>/inbox/<recipient>/<ts>-<sender>-<hash8>.json
-// <root>/reads/<reader>/<ts>-<reader>-reads-<hash8>.json
-
-function _fsLayer() {
-var fs = require('fs');
-var path = require('path');
-
-function safeId(id) {
-// ids in filenames must be ref/path-safe; refuse anything with a separator.
-if (!/^[A-Za-z0-9._-]+$/.test(id)) {
-throw new MessageRejected('id "' + id + '" is not path-safe (allowed: A-Za-z0-9._-)');
-}
-return id;
-}
-function ensureDir(d) { fs.mkdirSync(d, { recursive: true});}
-function stamp() { return isoNow().replace(/[:]/g, '');}
-
-function writeMessage(root, msg) {
-validate(msg);
-var hash8 = msg.content_hash.slice(0, 8);
-var name = stamp() + '-' + safeId(msg.sender.session_id) + '-' + hash8 + '.json';
-var dir;
-if (msg.recipient === BROADCAST) dir = path.join(root, 'broadcast');
-else dir = path.join(root, 'inbox', safeId(msg.recipient));
-ensureDir(dir);
-var full = path.join(dir, name);
-// append-by-create: a fresh filename per message never collides, so two writers
-// never conflict on the same file.
-fs.writeFileSync(full, stableStringify(msg) + '\n');
-return full;
 }
 
-function readDirMessages(dir) {
-var out = [];
-if (!fs.existsSync(dir)) return out;
-var files = fs.readdirSync(dir).filter(function (f) { return /\.json$/.test(f);}).sort();
-for (var i = 0; i < files.length; i++) {
-var raw = fs.readFileSync(path.join(dir, files[i]), 'utf8');
-var msg;
-try { msg = JSON.parse(raw);} catch (e) { continue;}
-try { validate(msg);} catch (e) { continue;} // skip malformed, never trust blindly
-out.push(msg);
-}
-return out;
-}
+// ---- CLI (value-arg or stdin; never touches the filesystem) ----------------
+var DEMO = [
+"From: Alice <alice@example.com>",
+"To: Bob <bob@example.com>",
+"Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
+"MIME-Version: 1.0",
+"Content-Type: multipart/alternative; boundary=\"b0undary\"",
+"",
+"This preamble is ignored by MIME readers.",
+"--b0undary",
+"Content-Type: text/plain; charset=utf-8",
+"Content-Transfer-Encoding: quoted-printable",
+"",
+"Coffee costs 5=E2=82=AC. This line is soft-wrapped mid-wo=",
+"rd.",
+"--b0undary",
+"Content-Type: text/html; charset=utf-8",
+"Content-Transfer-Encoding: base64",
+"",
+"PGI+SGk8L2I+",
+"--b0undary--",
+""
+].join("\r\n");
 
-function logReceipt(root, readerId, hash) {
-var dir = path.join(root, 'reads', safeId(readerId));
-ensureDir(dir);
-var name = stamp() + '-' + safeId(readerId) + '-reads-' + hash.slice(0, 8) + '.json';
-fs.writeFileSync(path.join(dir, name),
-stableStringify({ reader: readerId, content_hash: hash, ts: isoNow()}) + '\n');
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+function run(raw, label) {
+var node = parseMime(raw);
+if (label) process.stdout.write(label + "\n");
+process.stdout.write(summarize(node).join("\n") + "\n");
+process.exit(0);
 }
-
-function readHashes(root, readerId) {
-var dir = path.join(root, 'reads', safeId(readerId));
-var set = {};
-if (!fs.existsSync(dir)) return set;
-var files = fs.readdirSync(dir).filter(function (f) { return /\.json$/.test(f);});
-for (var i = 0; i < files.length; i++) {
-try {
-var r = JSON.parse(fs.readFileSync(path.join(dir, files[i]), 'utf8'));
-if (r && r.content_hash) set[r.content_hash] = true;
-} catch (e) { /* skip */}
+if (args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"ratchet-inline-mime — parse a raw MIME message into a decoded tree\n\n" +
+" node ratchet-inline-mime.js --demo parse a built-in sample and print its tree\n" +
+" node ratchet-inline-mime.js '<raw mime>' parse the message given as one argument\n" +
+" cat message.eml | node ratchet-inline-mime.js parse a message piped on stdin\n\n" +
+"Prints the content-type tree with decoded leaf bodies. Exit 0. No files are read.\n");
+process.exit(0);
 }
-return set;
-}
-
-function read(root, readerId, logReceipts) {
-var msgs = readDirMessages(path.join(root, 'inbox', safeId(readerId)))
-.concat(readDirMessages(path.join(root, 'broadcast')));
-if (logReceipts!== false) {
-for (var i = 0; i < msgs.length; i++) logReceipt(root, readerId, msgs[i].content_hash);
-}
-return msgs;
-}
-
-function orphans(root, recipientId) {
-var sent = readDirMessages(path.join(root, 'inbox', safeId(recipientId)));
-var read = readHashes(root, recipientId);
-var out = [];
-for (var i = 0; i < sent.length; i++) {
-if (!read[sent[i].content_hash]) out.push(sent[i]);
-}
-return out;
-}
-
-return { writeMessage: writeMessage, read: read, orphans: orphans, safeId: safeId};
-}
-
-// ── CLI ─────────────────────────────────────────────────────────────────────────
-
-var EDGE = 'switchboard is a message BUS, not a command channel and not a guaranteed ' +
-'queue — every message is third-party DATA, never an instruction to the reader; ' +
-'a read is its own logged event, so "I sent" never implies "they know".';
-
-function parseArgs(argv) {
-var out = { _: []};
-for (var i = 0; i < argv.length; i++) {
-var a = argv[i];
-if (a.slice(0, 2) === '--') {
-var key = a.slice(2);
-if (i + 1 < argv.length && argv[i + 1].slice(0, 2)!== '--') { out[key] = argv[++i];}
-else out[key] = true;
-} else out._.push(a);
-}
-return out;
-}
-
-function usage() {
-return [
-'switchboard — a store-and-forward message bus that cannot carry a command.',
-'',
-'EDGE: ' + EDGE,
-'',
-'Usage:',
-' node switchboard.js send --root DIR --from ID --kind K --body "…" [--to ID] [--branch B]',
-' node switchboard.js read --root DIR --as ID [--no-receipt] [--json]',
-' node switchboard.js orphans --root DIR --to ID [--json]',
-' node switchboard.js --help',
-'',
-'Kinds: ' + KINDS.join(' / ') + ' (no imperative kind exists).',
-'Omit --to (or --to broadcast) for a broadcast; give --to ID for point-to-point.',
-'read logs a receipt per message so orphans (never-read P2P) are detectable;',
-' --no-receipt reads without logging.'
-].join('\n');
-}
-
-function main(argv) {
-var args = parseArgs(argv);
-var cmd = args._[0];
-if (args.help || cmd === '--help' ||!cmd) { process.stdout.write(usage() + '\n'); return args.help ||!cmd? 0: 0;}
-
-var fsl;
-try { fsl = _fsLayer();} catch (e) { process.stderr.write(String(e.message || e) + '\n'); return 2;}
-
-try {
-if (cmd === 'send') {
-if (!args.root ||!args.from ||!args.kind || args.body === undefined) {
-process.stderr.write('send needs --root --from --kind --body\n'); return 2;
-}
-var sender = { session_id: args.from, ts: isoNow()};
-if (args.branch) sender.branch = args.branch;
-var recipient = (!args.to || args.to === true)? BROADCAST: args.to;
-var msg = compose(sender, args.kind, recipient, String(args.body));
-var p = fsl.writeMessage(args.root, msg);
-process.stdout.write('sent ' + msg.content_hash.slice(0, 12) + '… → ' +
-(recipient === BROADCAST? 'broadcast': recipient) + ' (' + p + ')\n');
-return 0;
-}
-if (cmd === 'read') {
-if (!args.root ||!args.as) { process.stderr.write('read needs --root --as\n'); return 2;}
-var msgs = fsl.read(args.root, args.as,!args['no-receipt']);
-if (args.json) { process.stdout.write(stableStringify(msgs) + '\n'); return 0;}
-if (msgs.length === 0) { process.stdout.write('(no messages for ' + args.as + ')\n'); return 0;}
-for (var i = 0; i < msgs.length; i++) process.stdout.write(renderQuoted(msgs[i]) + '\n');
-return 0;
-}
-if (cmd === 'orphans') {
-if (!args.root ||!args.to) { process.stderr.write('orphans needs --root --to\n'); return 2;}
-var orph = fsl.orphans(args.root, args.to);
-if (args.json) { process.stdout.write(stableStringify(orph) + '\n'); return 0;}
-if (orph.length === 0) { process.stdout.write('(no orphans — every P2P message to ' + args.to + ' was read)\n'); return 0;}
-process.stdout.write(orph.length + ' orphan(s) — sent to ' + args.to + ' but never read:\n');
-for (var j = 0; j < orph.length; j++) process.stdout.write(' ' + renderQuoted(orph[j]) + '\n');
-return 0;
-}
-process.stderr.write('unknown command "' + cmd + '" — see --help\n');
-return 2;
-} catch (e) {
-process.stderr.write(String(e.message || e) + '\n');
-return 1;
+if (args[0] === "--demo") { run(DEMO, "# demo message");}
+else if (args.length >= 1) { run(args[0]);}
+else {
+var chunks = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", function (d) { chunks += d;});
+process.stdin.on("end", function () { run(chunks || DEMO);});
 }
 }
 
-// ── Exports (browser attach + Node require) ─────────────────────────────────────
-
-var api = {
-SCHEMA_ID: SCHEMA_ID,
-KINDS: KINDS,
-BROADCAST: BROADCAST,
-MessageRejected: MessageRejected,
-validate: validate,
-compose: compose,
-canonicalPayload: canonicalPayload,
-contentHash: contentHash,
-sha256Hex: sha256Hex,
-renderQuoted: renderQuoted,
-stableStringify: stableStringify,
-Bus: Bus,
-EDGE: EDGE
-};
-
-if (typeof window!== 'undefined') {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.switchboard = api;
-}
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = api;
-}
-
-if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-process.exit(main(process.argv.slice(2)));
-}
-
-test_switchboard.js 118 lines on GitHub →
+test_ratchet-inline-mime.js 156 lines on GitHub →
+#!/usr/bin/env node
 // SPDX-License-Identifier: MIT
-// test_switchboard.js — drift-check the switchboard gift against out-of-band oracles.
-//
-// Two oracles, neither produced by the gift:
-// 1. node:crypto — the content_hash's sha256 must equal node crypto over the same
-// canonical bytes (so provenance-binding is real, not self-certified).
-// 2. The command-firewall property — the schema MUST reject any top-level field
-// outside its closed set, so it cannot express a command. This is a structural
-// oracle: a would-be-command message must be rejected.
-//
-// Plus determinism, orphan/receipt semantics, quoting discipline, and a mutation bite
-// (a green suite that cannot catch a wrong hash proves nothing).
+/* test_ratchet-inline-mime.js — proves the parser implements its stated contract.
 
-'use strict';
-var crypto = require('crypto');
-var sb = require('./switchboard.js');
+THE ORACLE. There is no Node stdlib that says "is this MIME parsed right?" — the
+RFCs are the spec, so the oracle is CURATED VECTORS expressed directly against
+what parseMime promises: (1) header unfolding + case-insensitive access,
+(2) Content-Type value + parameter parsing (quoted params), (3) body decode per
+Content-Transfer-Encoding (base64, quoted-printable incl. soft breaks, identity),
+(4) charset decode (utf-8 multibyte, latin1 byte-preserving), (5) multipart split
+with preamble/epilogue discarded, (6) recursive nested multipart, (7) RFC 2047
+encoded words in headers (B and Q). Plus determinism and a mutation-bite so a
+degenerate core (ignores input / constant verdict) cannot pass green.
+Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var m = require("./ratchet-inline-mime.js");
+var parseMime = m.parseMime;
 
 var pass = 0, fail = 0;
-function ok(cond, name) {
-if (cond) { pass++;}
-else { fail++; console.error('FAIL: ' + name);}
-}
-function throws(fn, name) {
-try { fn(); fail++; console.error('FAIL (expected throw): ' + name);}
-catch (e) { pass++;}
-}
+function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
+function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
+function deepEqual(a, b) { return JSON.stringify(a) === JSON.stringify(b);}
 
-// ── 1. sha256 drift-check vs node crypto (the hash oracle) ──────────────────────
-// I1 UTF-8 byte fidelity — the known-bad tripwire is multibyte input.
-var vectors = ['', 'abc', 'a', 'The quick brown fox jumps over the lazy dog',
-'0123456789', 'café', 'naïve façade Zürich', '日本語テスト', '🦌',
-'order:🦌×3 café', 'line1\nline2\ttabbed'];
-for (var i = 0; i < vectors.length; i++) {
-var mine = sb.sha256Hex(vectors[i]);
-var oracle = crypto.createHash('sha256').update(String(vectors[i]), 'utf8').digest('hex');
-ok(mine === oracle, 'sha256 drift vs node crypto: ' + JSON.stringify(vectors[i]));
-}
-// FIPS anchors independent of the oracle.
-ok(sb.sha256Hex('') === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', 'FIPS anchor: empty');
-ok(sb.sha256Hex('abc') === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'FIPS anchor: abc');
+var CRLF = "\r\n";
+function msg(lines) { return lines.join(CRLF);}
 
-// ── 2. The command-firewall (structural oracle) ─────────────────────────────────
-// A valid message composes and validates.
-var good = sb.compose('worker-a', 'status', 'broadcast', 'hello');
-ok(sb.validate(good) === true, 'valid message validates');
+// ---- 1. headers: unfolding + case-insensitive map --------------------------
+var h = parseMime(msg([
+"Subject: a very long subject that the",
+"\tsender folded across two lines",
+"X-Mixed-Case: Value",
+"Content-Type: text/plain",
+"",
+"body"
+]));
+eq("unfolded subject", h.headers.subject, "a very long subject that the sender folded across two lines");
+eq("case-insensitive header key", h.headers["x-mixed-case"], "Value");
+eq("leaf body plain", h.body, "body");
+eq("plain is not multipart", h.isMultipart, false);
 
-// A message with an imperative field is REJECTED — the schema cannot carry a command.
-['action', 'command', 'run', 'exec', 'do'].forEach(function (verb) {
-var m = sb.compose('worker-a', 'status', 'broadcast', 'hi');
-m[verb] = 'rm -rf /'; // try to smuggle a command
-throws(function () { sb.validate(m);}, 'command-firewall rejects "' + verb + '" field');
-});
+// ---- 2. Content-Type value + params (quoted) -------------------------------
+var ct = parseMime(msg([ "Content-Type: text/plain; charset=\"UTF-8\"; format=flowed", "", "x"]));
+eq("content-type lowercased", ct.contentType, "text/plain");
+eq("param charset (unquoted)", ct.contentTypeParams.charset, "UTF-8");
+eq("param format", ct.contentTypeParams.format, "flowed");
 
-// An imperative KIND does not exist.
-throws(function () { sb.compose('worker-a', 'command', 'broadcast', 'x');}, 'no imperative kind');
-throws(function () { sb.compose('worker-a', 'run', 'broadcast', 'x');}, 'no "run" kind');
+// ---- 3. transfer-encodings -------------------------------------------------
+var b64 = parseMime(msg([ "Content-Type: text/plain", "Content-Transfer-Encoding: base64", "", "SGVsbG8sIHdvcmxk"]));
+eq("base64 decoded", b64.body, "Hello, world");
+eq("encoding recorded", b64.encoding, "base64");
 
-// content_hash tamper is caught (provenance binding is real).
-var t = sb.compose('worker-a', 'status', 'broadcast', 'original');
-t.body = 'tampered'; // change body without recomputing hash
-throws(function () { sb.validate(t);}, 'body tamper breaks content_hash');
-var t2 = sb.compose('worker-a', 'status', 'broadcast', 'x');
-t2.sender = { session_id: 'worker-EVIL', ts: t2.sender.ts}; // spoof sender
-throws(function () { sb.validate(t2);}, 'sender spoof breaks content_hash');
+var qp = parseMime(msg([ "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: quoted-printable", "", "Price: 5=E2=82=AC end"]));
+eq("quoted-printable euro", qp.body, "Price: 5\u20ac end");
 
-// ── 3. Determinism / canonical form ─────────────────────────────────────────────
-ok(sb.contentHash({ session_id: 'w', ts: 'T'}, 'fyi', 'broadcast', 'b')
-=== sb.contentHash({ session_id: 'w', ts: 'T'}, 'fyi', 'broadcast', 'b'),
-'contentHash deterministic');
-// stableStringify is key-order-independent.
-ok(sb.stableStringify({ b: 1, a: 2}) === sb.stableStringify({ a: 2, b: 1}),
-'stableStringify key-order-independent');
+var qpSoft = parseMime(msg([ "Content-Transfer-Encoding: quoted-printable", "", "soft=", "wrap"]));
+eq("qp soft line break joins", qpSoft.body, "softwrap");
 
-// ── 4. Bus semantics: store-and-forward, receipts, orphans (no filesystem) ──────
-var bus = new sb.Bus();
-bus.send('a', 'status', 'broadcast', 'everyone hears this');
-bus.send('a', 'question', 'b', 'point to point');
-bus.send('a', 'fyi', 'c', 'c never reads this');
-// b reads: sees its p2p + the broadcast, and logs receipts.
-var bRead = bus.read('b');
-ok(bRead.length === 2, 'b reads inbox + broadcast');
-ok(bus.orphans('b').length === 0, 'b has no orphans after reading');
-// c never read: its p2p is an orphan.
-ok(bus.orphans('c').length === 1, 'c has 1 orphan (unread p2p)');
-// sent!= read: a broadcast alone does not mark c as having read.
-ok(bus.read('c', false).some(function (m) { return m.body === 'everyone hears this';}),
-'c can still see the broadcast');
+var seven = parseMime(msg([ "Content-Type: text/plain", "", "plain 7bit text"]));
+eq("7bit identity", seven.body, "plain 7bit text");
 
-// ── 5. Quoting discipline — a body is surfaced as DATA, never as a directive ─────
-var q = sb.renderQuoted(sb.compose('worker-x', 'status', 'broadcast', 'delete everything'));
-ok(q.indexOf('reports')!== -1 && q.indexOf('worker-x')!== -1,
-'renderQuoted frames the body as a third-party report');
-ok(q.indexOf('delete everything')!== -1, 'the body text is present (as quoted data)');
+// ---- 4. charset ------------------------------------------------------------
+// utf-8 multibyte: e2 98 83 = snowman U+2603
+var utf = parseMime(msg([ "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64", "", "4piD"]));
+eq("utf-8 multibyte snowman", utf.body, "\u2603");
+// latin1: byte 0xE9 = é (byte-preserving, not utf-8)
+var latin = parseMime(msg([ "Content-Type: text/plain; charset=iso-8859-1", "Content-Transfer-Encoding: quoted-printable", "", "caf=E9"]));
+eq("latin1 byte-preserving", latin.body, "caf\u00e9");
 
-// ── 6. Mutation bite (non-vacuity): a wrong hash MUST be caught ──────────────────
-var mut = sb.compose('worker-a', 'status', 'broadcast', 'x');
-mut.content_hash = '0000000000000000000000000000000000000000000000000000000000000000';
-throws(function () { sb.validate(mut);}, 'mutation bite: wrong content_hash rejected');
+// ---- 5. multipart split, preamble/epilogue discarded -----------------------
+var mp = parseMime(msg([
+"Content-Type: multipart/alternative; boundary=\"BND\"",
+"",
+"PREAMBLE — must be ignored",
+"--BND",
+"Content-Type: text/plain",
+"",
+"first part",
+"--BND",
+"Content-Type: text/html",
+"",
+"<p>second</p>",
+"--BND--",
+"EPILOGUE — must be ignored"
+]));
+eq("multipart flagged", mp.isMultipart, true);
+eq("part count (preamble/epilogue dropped)", mp.parts.length, 2);
+eq("part 0 body", mp.parts[0].body, "first part");
+eq("part 0 type", mp.parts[0].contentType, "text/plain");
+eq("part 1 body", mp.parts[1].body, "<p>second</p>");
+eq("part 1 type", mp.parts[1].contentType, "text/html");
+ok("multipart leaf has no body field", mp.body === undefined);
 
-// path-safety: the fs layer refuses an id with a separator (would escape the tree).
-// Exercise it through the real write path: a recipient with a slash must be rejected.
-var fs = require('fs'), os = require('os'), path = require('path');
-var tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-'));
-throws(function () {
-var evil = sb.compose('a', 'status', '../evil', 'x'); // schema accepts any non-empty string
-// Drive the actual CLI write path by spawning; but simpler: the fs safeId is internal,
-// so assert via the documented CLI contract that a slashed id is refused.
-var cp = require('child_process');
-var r = cp.spawnSync('node', [path.join(__dirname, 'switchboard.js'),
-'send', '--root', tmp, '--from', 'a', '--to', '../evil', '--kind', 'status', '--body', 'x']);
-if (r.status === 0) throw new Error('write should have been refused'); // non-zero = refused
-// spawnSync returns non-zero status on refusal → this throw path is NOT taken → test throws below
-throw new Error('refused as expected');
-}, 'fs layer refuses a recipient id with a path separator');
-try { fs.rmSync(tmp, { recursive: true, force: true});} catch (e) {}
+// ---- 6. nested multipart (mixed containing alternative) --------------------
+var nested = parseMime(msg([
+"Content-Type: multipart/mixed; boundary=OUT",
+"",
+"--OUT",
+"Content-Type: multipart/alternative; boundary=IN",
+"",
+"--IN",
+"Content-Type: text/plain",
+"",
+"inner text",
+"--IN--",
+"--OUT",
+"Content-Type: application/octet-stream",
+"Content-Transfer-Encoding: base64",
+"",
+"QUJD",
+"--OUT--"
+]));
+eq("outer multipart", nested.isMultipart, true);
+eq("outer part count", nested.parts.length, 2);
+eq("inner is multipart", nested.parts[0].isMultipart, true);
+eq("inner leaf body", nested.parts[0].parts[0].body, "inner text");
+eq("sibling base64 leaf", nested.parts[1].body, "ABC");
 
-console.log('switchboard: ' + pass + ' passed, ' + fail + ' failed');
-if (fail > 0) process.exit(1);
+// ---- 7. RFC 2047 encoded words in headers ----------------------------------
+var ew = parseMime(msg([
+"Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
+"From: =?utf-8?Q?Andr=C3=A9?= <a@x.io>",
+"Content-Type: text/plain",
+"",
+"x"
+]));
+eq("encoded-word B subject", ew.headers.subject, "Hello, \u20ac");
+eq("encoded-word Q from", ew.headers.from, "Andr\u00e9 <a@x.io>");
+eq("Q underscore is space", m.decodeEncodedWords("=?utf-8?Q?a_b?="), "a b");
+
+// ---- direct codec probes ---------------------------------------------------
+eq("decodeBase64 -> bytes", m.bytesToString(m.decodeBase64("QUJD"), "ascii"), "ABC");
+eq("base64 tolerates newlines", m.bytesToString(m.decodeBase64("QU\nJD"), "ascii"), "ABC");
+eq("base64 missing padding", m.bytesToString(m.decodeBase64("QUJDRA"), "ascii"), "ABCD");
+
+// ---- determinism -----------------------------------------------------------
+ok("parse is deterministic", deepEqual(parseMime(mp === mp? msg([
+"Content-Type: multipart/mixed; boundary=Z", "", "--Z", "Content-Type: text/plain", "", "a", "--Z--"
+]): ""), parseMime(msg([
+"Content-Type: multipart/mixed; boundary=Z", "", "--Z", "Content-Type: text/plain", "", "a", "--Z--"
+]))));
+
+// ---- mutation-bite: the core must actually discriminate --------------------
+// A parser that ignored its input, or hard-coded a verdict, would collapse these.
+ok("bite: multipart vs simple differ", parseMime("Content-Type: multipart/x; boundary=b\r\n\r\n--b\r\n\r\nq\r\n--b--").isMultipart!==
+parseMime("Content-Type: text/plain\r\n\r\nq").isMultipart);
+ok("bite: base64 body!= its raw", (function () {
+var n = parseMime("Content-Transfer-Encoding: base64\r\n\r\nSGk=");
+return n.body === "Hi" && n.bodyRaw!== "Hi";
+})());
+ok("bite: distinct headers -> distinct values",
+parseMime("Subject: one\r\n\r\n").headers.subject!== parseMime("Subject: two\r\n\r\n").headers.subject);
+
+console.log("\nratchet-inline-mime: " + pass + " passed, " + fail + " failed" +
+" (header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + " +
+"nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)");
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node stdlib only (no dependencies); pure core runs in a browser or a test with no filesystem
-
----
-
-# timeline — a Loop MMT gift
-https://loopmmt.com/gifts/timeline/
-[coverage: optional · branch: gifts]
-
-Timeline Artifact Validator validate ← all gifts
-
-timeline
-
-Validate a timeline artifact before you render it. Given {frame, events}, timeline runs eight decidable soundness checks on the DECLARATION — no cycle in the happened-before edges, an explicitly declared measurement scale (Stevens level), operations legal for that scale, no two events colliding on one track at one instant, and a deterministic sort key — and returns a verdict naming exactly which rule each event breaks. It catches the fault at the data, before a single pixel is drawn. A pure function: the same artifact always yields a byte-identical verdict.
-
-The honest edge
-
-it is a PRESENCE checker, not a CORRECTNESS oracle: it confirms a scale is declared and self-consistent with the ops used, never that the declared level is the right one, and it does not prove your renderer is a pure fold — that runtime property stays yours to prove.
-
-Run it
-
-node timeline.js artifact.json # or: cat artifact.json | node timeline.js
-test_timeline.js (22 checks incl. C0-C8 + determinism proof + mutation bite, all green)
-Node.js / browser, standard library only (zero dependencies)
-
-The code — every file that ships
-
-timeline.js 390 lines on GitHub →
-// SPDX-License-Identifier: MIT
-// timeline.js — a standalone, zero-dependency validator for a timeline artifact.
-//
-// WHAT THIS IS
-// ------------
-// You have events you want to place on a timeline — a project history, a log, a
-// story, a schedule. Before you RENDER them, this checks the DECLARATION is
-// sound: no cycle in the "happened-before" edges, the axis names its scale, the
-// operations you use are legal for that scale, no two events collide on one
-// track at one instant, and the sort key is deterministic. It reads one JSON
-// object and returns a verdict. It is a pure function: the same artifact always
-// yields the same verdict.
-//
-// THE ARTIFACT (the shape it checks):
-// {
-// "frame": { "scale": "nominal"|"ordinal"|"interval"|"ratio", // REQUIRED
-// "grain": <ms|null>,
-// "topology": "S1"|null, "period": <number>, // optional circular axis
-// "foliation": { "key": <field|"t">, "dir": "asc"|"desc"}},
-// "events": [ { "id": <str>, "t": <ms int>, "parents": [<id>...],
-// "track": <str>, "kind": <str>, "duration": <ms>,
-// "label": <str>},...]
-//}
-//
-// THE CHECKS (each decidable from the declaration alone):
-// C0 well-formed.... every event is an object with an `id`.
-// C1 real-order..... parent edges form a DAG and resolve (no cycle, no dangling edge).
-// C2 scale-declared. frame.scale is an explicit Stevens level — no implicit gauge.
-// C3 stevens-legal.. ops used are legal for the level (ordering needs ordinal+;
-// a `duration` needs interval+, a difference of points).
-// C4 instant/dur.... a `duration` with no anchoring instant is a length, not a point.
-// C5 no-collision... two events on the same track at the same instant break the
-// overlay obligation (unless a non-`t` foliation orders them).
-// C6 fold-safety.... the foliation key is a real declared field (or "t"), never a
-// nondeterministic sentinel ("now"/"random"/"index"/...).
-// C7 leak-safety.... no event bakes a shared day bucket ("dayKey"/"day"/...);
-// day buckets are render-derived per frame, not authored.
-// C8 cyclic-topology a DECLARED circular axis (S1 + period) has its coordinates
-// reduced into one period (mod the period).
-//
-// THE PRINTED EDGE (what this is NOT):
-// This is a PRESENCE checker, not a CORRECTNESS oracle. C2 checks a scale is
-// DECLARED and self-consistent with the ops used — never that the declared
-// level is the RIGHT one. It does not prove your renderer is a pure fold; that
-// is a runtime property this static check cannot reach. It reports the
-// trajectory; choosing the true scale, and proving the render pure, stay yours.
-//
-// USAGE
-// node timeline.js artifact.json # lint a file
-// cat artifact.json | node timeline.js # lint stdin
-// node timeline.js --help
-// In a browser: window.ForestGifts.timelineLint(artifactObject)
-// In Node code: require('./timeline.js').timelineLint(artifactObject)
-//
-// Exit: 0 CLEAN | 3 FLAG | 2 USAGE (malformed input).
-
-'use strict';
-
-// Stevens' levels as a strict tower — each a superset of the one below.
-var STEVENS = { nominal: 0, ordinal: 1, interval: 2, ratio: 3};
-
-// Foliation keys that are NOT a real, replayable field — a sort on any of these
-// makes the render depend on WHEN it ran, breaking folds-twice-identical.
-var NONDETERMINISTIC_KEYS = {
-'now': 1, 'random': 1, 'rand': 1, 'index': 1, 'render-order': 1,
-'renderorder': 1, 'time()': 1, 'date.now': 1, 'uuid': 1, 'order-of-arrival': 1
-};
-
-// Baked day-bucket field names: a per-event day column is a frame-independent
-// bucket authored into the data — exactly the cross-frame leak the render must
-// derive per-frame instead.
-var BAKED_DAY_FIELDS = { 'daykey': 1, 'day': 1, 'datebucket': 1, 'date_bucket': 1};
-
-function finding(check, eventId, msg) {
-return { check: check, event: eventId, msg: msg};
-}
-
-function has(obj, key) {
-return Object.prototype.hasOwnProperty.call(obj, key);
-}
-
-// --- C1: axis is a real order (DAG + resolvable parents) --------------------
-function checkOrder(events, ids, findings) {
-// dangling parent
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var parents = ev.parents || [];
-for (var j = 0; j < parents.length; j++) {
-if (!ids[String(parents[j])]) {
-findings.push(finding('C1-real-order', ev.id,
-"parent '" + parents[j] + "' resolves to no event (dangling edge)"));
-}
-}
-}
-// cycle (iterative DFS with colouring: 0 unseen, 1 on-stack, 2 done)
-var byId = {};
-for (var k = 0; k < events.length; k++) byId[String(events[k].id)] = events[k];
-var color = {};
-
-function visit(start) {
-var stack = [{ node: start, parents: (byId[start] && byId[start].parents) || [], pos: 0}];
-color[start] = 1;
-while (stack.length) {
-var top = stack[stack.length - 1];
-var advanced = false;
-while (top.pos < top.parents.length) {
-var p = String(top.parents[top.pos]);
-top.pos++;
-if (!has(byId, p)) continue; // dangling already reported above
-var c = color[p] || 0;
-if (c === 1) {
-findings.push(finding('C1-real-order', top.node,
-"parent edge to '" + p + "' closes a cycle (axis is not a poset)"));
-continue;
-}
-if (c === 0) {
-color[p] = 1;
-stack.push({ node: p, parents: (byId[p] && byId[p].parents) || [], pos: 0});
-advanced = true;
-break;
-}
-}
-if (!advanced) {
-color[top.node] = 2;
-stack.pop();
-}
-}
-}
-
-for (var m = 0; m < events.length; m++) {
-var id = String(events[m].id);
-if ((color[id] || 0) === 0) visit(id);
-}
-}
-
-// --- C2: scale is declared (an explicit Stevens level; no implicit gauge) ---
-function checkScaleDeclared(frame, findings) {
-var scale = has(frame, 'scale')? frame.scale: null;
-if (scale === null || scale === undefined) {
-findings.push(finding('C2-scale-declared', null,
-'frame declares no scale -- an implicit gauge is forbidden'));
-return null;
-}
-if (!has(STEVENS, scale)) {
-findings.push(finding('C2-scale-declared', null,
-"frame.scale '" + scale + "' is not a Stevens level (nominal|ordinal|interval|ratio)"));
-return null;
-}
-return scale;
-}
-
-// --- C3: Stevens-legal ops for the declared level ---------------------------
-function checkStevensLegal(scale, frame, events, findings) {
-if (scale === null) return; // C2 already flagged
-var rank = STEVENS[scale];
-var fol = frame.foliation || {};
-var folKey = has(fol, 'key')? fol.key: 't';
-if (rank < STEVENS.ordinal) {
-if (folKey!== null && folKey!== undefined && folKey!== 't') {
-findings.push(finding('C3-stevens-legal', null,
-"foliation orders by '" + folKey + "' but a nominal axis has no order"));
-}
-for (var i = 0; i < events.length; i++) {
-if (events[i].parents && events[i].parents.length) {
-findings.push(finding('C3-stevens-legal', events[i].id,
-'event declares a causal order on a nominal axis'));
-}
-}
-}
-if (rank < STEVENS.interval) {
-for (var j = 0; j < events.length; j++) {
-if (has(events[j], 'duration')) {
-findings.push(finding('C3-stevens-legal', events[j].id,
-'a `duration` needs an interval+ axis (difference of points is undefined at ' + scale + ')'));
-}
-}
-}
-}
-
-// --- C4: Instant / Duration not confused ------------------------------------
-function checkInstantDuration(events, findings) {
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var hasDur = has(ev, 'duration');
-var hasAnchor = (ev.t!== null && ev.t!== undefined) ||
-(ev.start!== null && ev.start!== undefined);
-if (hasDur &&!hasAnchor) {
-findings.push(finding('C4-instant-duration', ev.id,
-'a `duration` with no anchoring instant is a length, not a point'));
-}
-if (ev.t_type === 'duration') {
-findings.push(finding('C4-instant-duration', ev.id,
-'`t` is typed a duration -- the axis coordinate must be an Instant'));
-}
-}
-}
-
-// --- C5: overlay tracks don't collide on a shared instant -------------------
-function checkNoCollision(frame, events, findings) {
-var fol = (frame || {}).foliation || {};
-var folKey = has(fol, 'key')? fol.key: 't';
-var resolves = folKey!== null && folKey!== undefined && String(folKey)!== 't';
-var seen = {}; // "track\x00t" -> array of {id, fv}
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var t = ev.t;
-if (t === null || t === undefined) continue;
-var track = has(ev, 'track')? ev.track: '_default';
-var fv = resolves? (has(ev, folKey)? ev[folKey]: undefined): null;
-var key = String(track) + '\x00' + String(t);
-var bucket = seen[key];
-if (bucket) {
-var unresolved = (!resolves) || (fv === null || fv === undefined);
-if (!unresolved) {
-for (var b = 0; b < bucket.length; b++) {
-var pv = bucket[b].fv;
-if (pv === null || pv === undefined || pv === fv) { unresolved = true; break;}
-}
-}
-if (unresolved) {
-findings.push(finding('C5-no-collision', ev.id,
-"collides with '" + bucket[0].id + "' on track '" + track + "' at instant " + t +
-' (overlay X obligation broken)'));
-}
-bucket.push({ id: ev.id, fv: fv});
-} else {
-seen[key] = [{ id: ev.id, fv: fv}];
-}
-}
-}
-
-// --- C6: fold-safety (static proxy for "render is a pure fold") -------------
-function checkFoldSafety(frame, events, findings) {
-var fol = frame.foliation || {};
-var key = has(fol, 'key')? fol.key: 't';
-if (key === null || key === undefined) return;
-if (NONDETERMINISTIC_KEYS[String(key).trim().toLowerCase()]) {
-findings.push(finding('C6-fold-safety', null,
-"foliation key '" + key + "' is nondeterministic -- breaks folds-twice-identical (the Ink Law)"));
-return;
-}
-if (key!== 't') {
-var carried = false;
-for (var i = 0; i < events.length; i++) {
-if (has(events[i], key)) { carried = true; break;}
-}
-if (!carried) {
-findings.push(finding('C6-fold-safety', null,
-"foliation key '" + key + "' is carried by no event (the declared sort would silently fall back to `t`)"));
-}
-}
-}
-
-// --- C7: leak-safety (static proxy for "no cross-frame day-leak") -----------
-function checkLeakSafety(events, findings) {
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var keys = Object.keys(ev);
-for (var j = 0; j < keys.length; j++) {
-if (BAKED_DAY_FIELDS[String(keys[j]).trim().toLowerCase()]) {
-findings.push(finding('C7-leak-safety', ev.id,
-"event bakes a day bucket ('" + keys[j] + "') -- day buckets are render-derived per-frame, not authored (cross-frame leak)"));
-break;
-}
-}
-}
-}
-
-// --- C8: cyclic-topology (a DECLARED circular axis is reduced mod period) ---
-function checkCyclicTopology(frame, events, findings) {
-var topo = has(frame, 'topology')? frame.topology: null;
-if (topo === null || topo === undefined) return;
-if (topo!== 'S1') {
-findings.push(finding('C8-cyclic-topology', null,
-"frame.topology '" + topo + "' is not a recognized axis topology (S1 = a periodic circle)"));
-return;
-}
-var period = frame.period;
-if (typeof period!== 'number' || period <= 0 || period!== period) {
-findings.push(finding('C8-cyclic-topology', null,
-'an S1 topology needs a positive numeric `period` (the wrap modulus, e.g. 1440 minutes)'));
-return;
-}
-for (var i = 0; i < events.length; i++) {
-var t = events[i].t;
-if (t === null || t === undefined) continue;
-if (!(t >= 0 && t < period)) {
-findings.push(finding('C8-cyclic-topology', events[i].id,
-'instant ' + t + ' is not reduced into [0,' + period + ') -- a circular coordinate must be taken mod the period'));
-}
-}
-}
-
-// --- the lint ---------------------------------------------------------------
-function timelineLint(artifact) {
-if (artifact === null || typeof artifact!== 'object' || Array.isArray(artifact)) {
-return { verdict: 'USAGE', error: 'artifact is not a JSON object'};
-}
-var frame = artifact.frame;
-var events = artifact.events;
-if (frame === null || typeof frame!== 'object' || Array.isArray(frame) ||!Array.isArray(events)) {
-return { verdict: 'USAGE', error: 'artifact needs a `frame` object and an `events` list'};
-}
-
-var findings = [];
-var valid = [];
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-if (ev === null || typeof ev!== 'object' || Array.isArray(ev) ||
-ev.id === null || ev.id === undefined) {
-findings.push(finding('C0-well-formed', 'index ' + i, 'event is not an object with an `id`'));
-} else {
-valid.push(ev);
-}
-}
-var ids = {};
-for (var v = 0; v < valid.length; v++) ids[String(valid[v].id)] = 1;
-
-var scale = checkScaleDeclared(frame, findings);
-checkOrder(valid, ids, findings);
-checkStevensLegal(scale, frame, valid, findings);
-checkInstantDuration(valid, findings);
-checkNoCollision(frame, valid, findings);
-checkFoldSafety(frame, valid, findings);
-checkLeakSafety(valid, findings);
-checkCyclicTopology(frame, valid, findings);
-
-var checksRun = ['C0-well-formed', 'C1-real-order', 'C2-scale-declared',
-'C3-stevens-legal', 'C4-instant-duration', 'C5-no-collision',
-'C6-fold-safety', 'C7-leak-safety', 'C8-cyclic-topology'];
-return {
-verdict: findings.length? 'FLAG': 'CLEAN',
-checks: checksRun,
-findings: findings,
-runtime_owned_by_renderer: ['render-is-a-pure-fold', 'no-cross-frame-day-leak']
-};
-}
-
-var HELP = [
-'timeline.js — validate a timeline artifact before you render it.',
-'',
-'Usage:',
-' node timeline.js artifact.json lint a file',
-' cat artifact.json | node timeline.js lint stdin',
-' node timeline.js --help',
-'',
-'Reads one JSON object {frame, events}; prints a verdict; exits',
-' 0 CLEAN · 3 FLAG · 2 USAGE.',
-'',
-'Edge: this is a PRESENCE checker, not a CORRECTNESS oracle. It confirms a',
-'scale is declared and self-consistent with the ops used — never that the',
-'declared level is the right one, and it does not prove your renderer is pure.'
-].join('\n');
-
-// --- surfaces: browser attach, Node require, Node CLI -----------------------
-if (typeof window!== 'undefined') {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.timelineLint = timelineLint;
-}
-
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { timelineLint: timelineLint};
-}
-
-if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-var argv = process.argv.slice(2);
-if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) {
-process.stdout.write(HELP + '\n');
-process.exit(0);
-}
-var readInput = function (cb) {
-if (argv[0]) {
-try { cb(require('fs').readFileSync(argv[0], 'utf8'));}
-catch (e) { process.stdout.write(JSON.stringify({ verdict: 'USAGE', error: String(e.message || e)}) + '\n'); process.exit(2);}
-} else {
-var chunks = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { chunks += d;});
-process.stdin.on('end', function () { cb(chunks);});
-}
-};
-readInput(function (raw) {
-var artifact;
-try { artifact = JSON.parse(raw);}
-catch (e) { process.stdout.write(JSON.stringify({ verdict: 'USAGE', error: String(e.message || e)}) + '\n'); process.exit(2);}
-var out = timelineLint(artifact);
-process.stdout.write(JSON.stringify(out, null, 2) + '\n');
-process.exit(out.verdict === 'USAGE'? 2: (out.verdict === 'FLAG'? 3: 0));
-});
-}
-
-test_timeline.js 165 lines on GitHub →
-// SPDX-License-Identifier: MIT
-// test_timeline.js — self-test + determinism proof for the timeline gift.
-//
-// node test_timeline.js
-//
-// Exit 0 = all pass. Exit 3 = a check failed. This is the gift's canonicalizer
-// self-test (Gift-Works B7): the determinism assertion IS the proof the render
-// is a pure fold — same artifact in, byte-identical verdict out.
-
-'use strict';
-
-var timelineLint = require('./timeline.js').timelineLint;
-
-var failures = 0;
-function ok(name, cond) {
-if (!cond) { console.error('FAIL: ' + name); failures++;}
-else { console.log('pass: ' + name);}
-}
-
-// helper: does the verdict contain a finding of the given check code?
-function hasCheck(v, code) {
-if (!v.findings) return false;
-for (var i = 0; i < v.findings.length; i++) {
-if (String(v.findings[i].check).indexOf(code) === 0) return true;
-}
-return false;
-}
-
-// --- a known-GOOD artifact: passes clean --------------------------------------
-var GOOD = {
-frame: { scale: 'interval', grain: null, foliation: { key: 't', dir: 'asc'}},
-events: [
-{ id: 'a', t: 0, track: 'main', label: 'start'},
-{ id: 'b', t: 100, parents: ['a'], track: 'main', duration: 50, label: 'work'},
-{ id: 'c', t: 200, parents: ['b'], track: 'main', label: 'end'}
-]
-};
-ok('C-good CLEAN verdict', timelineLint(GOOD).verdict === 'CLEAN');
-
-// --- C0: an event that is not an object with an id ----------------------------
-ok('C0 fires on a junk event', hasCheck(
-timelineLint({ frame: { scale: 'ordinal'}, events: [{ id: 'a', t: 0}, 42]}), 'C0'));
-
-// --- C1: a cycle in the parent edges (real defect: circular happened-before) --
-ok('C1 fires on a cycle', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [
-{ id: 'a', t: 0, parents: ['b']},
-{ id: 'b', t: 1, parents: ['a']}
-]
-}), 'C1'));
-// C1: a dangling parent edge
-ok('C1 fires on a dangling edge', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [{ id: 'a', t: 0, parents: ['ghost']}]
-}), 'C1'));
-
-// --- C2: no scale declared (implicit gauge) -----------------------------------
-ok('C2 fires on undeclared scale', hasCheck(timelineLint({
-frame: { grain: null},
-events: [{ id: 'a', t: 0}]
-}), 'C2'));
-// C2: a non-Stevens scale string
-ok('C2 fires on a bogus scale', hasCheck(timelineLint({
-frame: { scale: 'vibes'},
-events: [{ id: 'a', t: 0}]
-}), 'C2'));
-
-// --- C3: a causal order declared on a nominal (unordered) axis -----------------
-ok('C3 fires on order over a nominal axis', hasCheck(timelineLint({
-frame: { scale: 'nominal'},
-events: [{ id: 'a', t: 0}, { id: 'b', t: 1, parents: ['a']}]
-}), 'C3'));
-// C3: a duration on an ordinal axis (difference of points undefined below interval)
-ok('C3 fires on duration below interval', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [{ id: 'a', t: 0, duration: 10}]
-}), 'C3'));
-
-// --- C4: a duration with no anchoring instant ---------------------------------
-ok('C4 fires on unanchored duration', hasCheck(timelineLint({
-frame: { scale: 'interval'},
-events: [{ id: 'a', duration: 30}]
-}), 'C4'));
-
-// --- C5: two events, same track, same instant, no resolving foliation ---------
-ok('C5 fires on a same-track same-instant collision', hasCheck(timelineLint({
-frame: { scale: 'interval', foliation: { key: 't'}},
-events: [
-{ id: 'a', t: 100, track: 'main'},
-{ id: 'b', t: 100, track: 'main'}
-]
-}), 'C5'));
-// C5: the same collision RESOLVED by a non-t foliation is CLEAN for C5
-ok('C5 clear when a seq foliation resolves the pair',!hasCheck(timelineLint({
-frame: { scale: 'interval', foliation: { key: 'seq'}},
-events: [
-{ id: 'a', t: 100, track: 'main', seq: 1},
-{ id: 'b', t: 100, track: 'main', seq: 2}
-]
-}), 'C5'));
-
-// --- C6: a nondeterministic foliation key -------------------------------------
-ok('C6 fires on a nondeterministic key', hasCheck(timelineLint({
-frame: { scale: 'ordinal', foliation: { key: 'random'}},
-events: [{ id: 'a', t: 0}]
-}), 'C6'));
-// C6: a foliation key carried by no event (silent fallback to t)
-ok('C6 fires on a key no event carries', hasCheck(timelineLint({
-frame: { scale: 'ordinal', foliation: { key: 'seq'}},
-events: [{ id: 'a', t: 0}]
-}), 'C6'));
-
-// --- C7: a baked day bucket ---------------------------------------------------
-ok('C7 fires on a baked dayKey', hasCheck(timelineLint({
-frame: { scale: 'interval'},
-events: [{ id: 'a', t: 0, dayKey: '2026-08-31'}]
-}), 'C7'));
-
-// --- C8: a circular axis with an unreduced coordinate -------------------------
-ok('C8 fires on an unreduced circular coord', hasCheck(timelineLint({
-frame: { scale: 'interval', topology: 'S1', period: 1440},
-events: [{ id: 'a', t: 1500}]
-}), 'C8'));
-// C8: a valid circular axis is CLEAN
-ok('C8 clear on a reduced circular coord', timelineLint({
-frame: { scale: 'interval', topology: 'S1', period: 1440},
-events: [{ id: 'a', t: 30}, { id: 'b', t: 720}]
-}).verdict === 'CLEAN');
-
-// --- USAGE verdicts -----------------------------------------------------------
-ok('USAGE on a non-object', timelineLint(42).verdict === 'USAGE');
-ok('USAGE on a missing frame', timelineLint({ events: []}).verdict === 'USAGE');
-ok('USAGE on a missing events list', timelineLint({ frame: {}}).verdict === 'USAGE');
-
-// --- DETERMINISM: the canonicalizer self-test (Gift-Works B7) -----------------
-// Same artifact -> byte-identical serialized verdict, twice. This is the proof
-// the lint is a pure fold (folds-twice-identical).
-var samples = [GOOD, {
-frame: { scale: 'interval', topology: 'S1', period: 1440, foliation: { key: 't'}},
-events: [
-{ id: 'x', t: 100, track: 'a', parents: []},
-{ id: 'y', t: 100, track: 'a', duration: 5, dayKey: 'z'},
-{ id: 'z', t: 200, parents: ['x', 'ghost']}
-]
-}];
-for (var s = 0; s < samples.length; s++) {
-var a = JSON.stringify(timelineLint(samples[s]));
-var b = JSON.stringify(timelineLint(samples[s]));
-ok('determinism: sample ' + s + ' byte-identical across two runs', a === b);
-}
-
-// --- MUTATION BITE: prove the test is non-vacuous -----------------------------
-// If the lint were a no-op returning CLEAN always, C1 (cycle) would not fire.
-// The C1 assertion above already bites that mutation; assert it explicitly here.
-ok('mutation bite: a real cycle is NOT reported CLEAN',
-timelineLint({ frame: { scale: 'ordinal'}, events: [
-{ id: 'a', parents: ['b']}, { id: 'b', parents: ['a']}]}).verdict === 'FLAG');
-
-if (failures) {
-console.error('\nTIMELINE GIFT SELFTEST FAIL: ' + failures + ' failure(s)');
-process.exit(3);
-}
-console.log('\nTIMELINE GIFT SELFTEST PASS: all checks green, determinism proven');
-process.exit(0);
-
-Take the whole folder →
-MIT
-Node.js / browser, standard library only (zero dependencies)
+Node / browser, no dependencies
 
 ---

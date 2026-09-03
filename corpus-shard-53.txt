@@ -1,1424 +1,1673 @@
-# Loop MMT — corpus shard 53/61
+# Loop MMT — corpus shard 53/63
 
-> Bundle 53 of 61 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 53 of 63 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/loop21-l21x-snapshot/, /gifts/loop21-verifyskin/, /gifts/map/)
-
----
-
-# loop21:l21x-snapshot — a Loop MMT gift
-https://loopmmt.com/gifts/loop21-l21x-snapshot/
-[coverage: optional · branch: gifts]
-
-Portable Browser Document Persistence persist ← all gifts
-
-loop21:l21x-snapshot
-
-A dependency-free layer for the three things every small browser app ends up needing: turn a document into a portable snapshot string, keep a named catalog of them in the browser, and export or import the whole catalog as one file. Snapshots are deterministic — the encoder sorts keys at every level, so the same document always makes the same base64 string, which means a snapshot is diffable, hashable, and cache-keyable, and two snapshots are equal iff the documents are. Round-trips are exact, including multibyte text (accented names, emoji, non-Latin scripts), because the encoder goes through the UTF-8 byte stream and never char codes. The catalog store is injected, so the logic is pure and testable off-browser; the archive export/import validates its envelope and every entry name and rejects a malformed or foreign archive loudly rather than half-restoring.
-
-The honest edge
-
-It persists and moves documents — it does not encrypt them and it does not resolve merge conflicts. A snapshot is plaintext base64: anyone who has the string has the document. And if two devices edit the same catalog entry independently, the last save wins; this layer has no notion of a conflict, only of the most recent write.
-
-Run it
-
-node l21x-snapshot.js --help
-test_l21x-snapshot.js (29/29)
-Zero-dependency JavaScript (browser or Node)
-
-The code — every file that ships
-
-l21x-snapshot.js 315 lines on GitHub →
-#!/usr/bin/env node
-/* l21x-snapshot.js — a dependency-free browser document-persistence layer:
-turn any JSON-able document into a portable snapshot string, keep a named
-catalog of them in the browser, and export/import the whole catalog as one
-file. Same code runs in a browser (attach L21X to your namespace) or on Node
-(this CLI / require()).
-
-WHY THIS EXISTS. Every small browser app eventually needs the same three
-things and rewrites them badly each time: (1) serialize the current document
-to a string you can put in a URL, a text field, or a file; (2) keep a few of
-them around under names the user picked; (3) get all of that OUT — a backup,
-a transfer to another machine, a copy to a friend — as one portable blob.
-Done casually this is a pile of localStorage calls with no validation, no
-determinism, and no way to move the data. This is that layer, done once,
-zero-dependency, and honest about its edges.
-
-THE THREE VERBS.
-SNAPSHOT — encodeSnapshot(doc) -> base64 string; decodeSnapshot(b64) -> doc.
-A snapshot is a self-contained, portable string. It round-trips exactly:
-decodeSnapshot(encodeSnapshot(x)) deep-equals x, including multibyte text
-(accented names, emoji, non-Latin scripts) — the encoder goes through the
-UTF-8 byte stream, never char codes, so nothing corrupts silently.
-CATALOG — a named store of documents in the browser (localStorage), with
-save / load / remove / list / sortBy and name validation. The store is
-INJECTED (a tiny {getItem,setItem,removeItem} object), so the logic is
-pure and testable off-browser; in a browser you pass window.localStorage.
-ARCHIVE — archiveExport(catalog) -> one string; archiveImport(str) -> catalog.
-The whole catalog as a single portable file: back it up, move it, restore
-it. Import validates every entry name and rejects a malformed archive
-loudly rather than half-restoring.
-
-THE ONE FIDELITY RULE (the whole reason to trust it). A snapshot is
-DETERMINISTIC: encodeSnapshot sorts object keys at every level before
-encoding, so the same document always produces the same base64 string — which
-means two snapshots are equal iff the documents are equal, and a snapshot is
-diffable, hashable, and cache-keyable. Break the key-sort and equal documents
-would encode differently; the test battery carries a key-order vector
-precisely to catch that.
-
-USAGE (CLI — operates on snapshot strings via stdin/args)
-echo '{"b":2,"a":1}' | node l21x-snapshot.js encode # doc (JSON) -> snapshot
-node l21x-snapshot.js decode <base64> # snapshot -> doc (JSON)
-node l21x-snapshot.js roundtrip '{"a":1}' # prove decode(encode(x)) == x
-node l21x-snapshot.js --help
-
-Released under MIT. Its edge is printed in the README: this PERSISTS and MOVES
-documents; it does not encrypt them and it does not resolve merge conflicts.
-A snapshot is plaintext base64 — anyone who has the string has the document.
-*/
-"use strict";
-
-/* ---------- UTF-8-safe base64 (browser btoa/atob choke on multibyte) -------- */
-
-function _utf8ToBytes(str) {
-// Deterministic UTF-8 encoding, no dependencies.
-if (typeof TextEncoder!== "undefined") return new TextEncoder().encode(str);
-// Node / older-runtime fallback.
-if (typeof Buffer!== "undefined") return new Uint8Array(Buffer.from(str, "utf8"));
-// Minimal hand-rolled UTF-8 (last resort).
-var out = [];
-for (var i = 0; i < str.length; i++) {
-var c = str.charCodeAt(i);
-if (c < 0x80) out.push(c);
-else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
-else if (c >= 0xd800 && c <= 0xdbff) {
-var c2 = str.charCodeAt(++i);
-var cp = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
-out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
-0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
-} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
-}
-return new Uint8Array(out);
-}
-
-function _bytesToUtf8(bytes) {
-if (typeof TextDecoder!== "undefined") return new TextDecoder("utf-8").decode(bytes);
-if (typeof Buffer!== "undefined") return Buffer.from(bytes).toString("utf8");
-var s = "", i = 0;
-while (i < bytes.length) {
-var b = bytes[i++];
-if (b < 0x80) s += String.fromCharCode(b);
-else if (b < 0xe0) s += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));
-else if (b < 0xf0) s += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f));
-else {
-var cp = ((b & 0x07) << 18) | ((bytes[i++] & 0x3f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f);
-cp -= 0x10000;
-s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-}
-}
-return s;
-}
-
-var _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-function _bytesToB64(bytes) {
-if (typeof Buffer!== "undefined") return Buffer.from(bytes).toString("base64");
-var out = "", i;
-for (i = 0; i + 2 < bytes.length; i += 3) {
-var n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
-out += _B64[(n >> 18) & 63] + _B64[(n >> 12) & 63] + _B64[(n >> 6) & 63] + _B64[n & 63];
-}
-var rem = bytes.length - i;
-if (rem === 1) {
-var n1 = bytes[i] << 16;
-out += _B64[(n1 >> 18) & 63] + _B64[(n1 >> 12) & 63] + "==";
-} else if (rem === 2) {
-var n2 = (bytes[i] << 16) | (bytes[i + 1] << 8);
-out += _B64[(n2 >> 18) & 63] + _B64[(n2 >> 12) & 63] + _B64[(n2 >> 6) & 63] + "=";
-}
-return out;
-}
-
-function _b64ToBytes(b64) {
-if (typeof Buffer!== "undefined") return new Uint8Array(Buffer.from(b64, "base64"));
-var lookup = {}; for (var k = 0; k < _B64.length; k++) lookup[_B64[k]] = k;
-var clean = b64.replace(/[^A-Za-z0-9+/]/g, "");
-var bytes = [], i;
-for (i = 0; i + 3 < clean.length; i += 4) {
-var n = (lookup[clean[i]] << 18) | (lookup[clean[i + 1]] << 12) |
-(lookup[clean[i + 2]] << 6) | lookup[clean[i + 3]];
-bytes.push((n >> 16) & 255, (n >> 8) & 255, n & 255);
-}
-var rem = clean.length - i;
-if (rem === 2) { var a = (lookup[clean[i]] << 18) | (lookup[clean[i + 1]] << 12); bytes.push((a >> 16) & 255);}
-else if (rem === 3) { var b = (lookup[clean[i]] << 18) | (lookup[clean[i + 1]] << 12) | (lookup[clean[i + 2]] << 6); bytes.push((b >> 16) & 255, (b >> 8) & 255);}
-return new Uint8Array(bytes);
-}
-
-/* ---------- deterministic canonical JSON (sorted keys, every level) --------- */
-
-function _canonical(value) {
-if (value === null || typeof value!== "object") return JSON.stringify(value);
-if (Array.isArray(value)) return "[" + value.map(_canonical).join(",") + "]";
-var keys = Object.keys(value).sort();
-var parts = [];
-for (var i = 0; i < keys.length; i++) {
-parts.push(JSON.stringify(keys[i]) + ":" + _canonical(value[keys[i]]));
-}
-return "{" + parts.join(",") + "}";
-}
-
-/* ---------- SNAPSHOT --------------------------------------------------------- */
-
-// Encode a JSON-able document as a deterministic, portable base64 snapshot.
-function encodeSnapshot(doc) {
-var json = _canonical(doc); // sorted keys -> same doc, same string
-return _bytesToB64(_utf8ToBytes(json));
-}
-
-// Decode a base64 snapshot back into the document. Throws on a malformed string.
-function decodeSnapshot(b64) {
-if (typeof b64!== "string" || b64.length === 0) {
-throw new Error("decodeSnapshot: expected a non-empty base64 string");
-}
-var json = _bytesToUtf8(_b64ToBytes(b64));
-return JSON.parse(json);
-}
-
-/* ---------- CATALOG (store is injected: {getItem,setItem,removeItem}) -------- */
-
-var NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
-
-// Validate a catalog entry name (allowed chars, length). Returns {valid,error}.
-function validateName(name) {
-if (typeof name!== "string" ||!NAME_RE.test(name)) {
-return { valid: false, error: "Invalid name — A-Z a-z 0-9 - _ only, 1-64 chars"};
-}
-return { valid: true, error: null};
-}
-
-function _readCatalog(store, key) {
-try { var raw = store.getItem(key); return raw? JSON.parse(raw): {};}
-catch (e) { return {};}
-}
-function _writeCatalog(store, key, catalog) {
-store.setItem(key, JSON.stringify(catalog));
-}
-
-// Save a document under a name. Stores {snapshot, savedAt}. Throws on bad name.
-function catalogSave(store, key, name, doc, now) {
-var v = validateName(name);
-if (!v.valid) throw new Error(v.error);
-var catalog = _readCatalog(store, key);
-catalog[name] = { snapshot: encodeSnapshot(doc), savedAt: (now == null? 0: now)};
-_writeCatalog(store, key, catalog);
-return catalog[name];
-}
-
-// Load a document by name, or null if absent.
-function catalogLoad(store, key, name) {
-var catalog = _readCatalog(store, key);
-var entry = catalog[name];
-return entry? decodeSnapshot(entry.snapshot): null;
-}
-
-// Remove a document by name. Returns true if it existed.
-function catalogRemove(store, key, name) {
-var catalog = _readCatalog(store, key);
-if (!(name in catalog)) return false;
-delete catalog[name];
-_writeCatalog(store, key, catalog);
-return true;
-}
-
-// List entry names, sorted by "name" (default) or "time" (savedAt), asc/desc.
-function catalogList(store, key, sortKey, ascending) {
-var catalog = _readCatalog(store, key);
-var names = Object.keys(catalog);
-var asc = ascending!== false;
-names.sort(function (a, b) {
-var av, bv;
-if (sortKey === "time") { av = catalog[a].savedAt || 0; bv = catalog[b].savedAt || 0;}
-else { av = a; bv = b;}
-if (av < bv) return asc? -1: 1;
-if (av > bv) return asc? 1: -1;
-// stable tiebreak by name so the order is fully deterministic
-return a < b? -1: a > b? 1: 0;
-});
-return names;
-}
-
-/* ---------- ARCHIVE (the whole catalog as one portable string) -------------- */
-
-var ARCHIVE_MAGIC = "L21X-ARCHIVE-1";
-
-// Export a whole catalog object as one portable, deterministic string.
-function archiveExport(catalog) {
-return encodeSnapshot({ magic: ARCHIVE_MAGIC, entries: catalog || {}});
-}
-
-// Import an archive string back into a catalog object. Validates the envelope
-// and every entry name; throws loudly on a malformed or foreign archive.
-function archiveImport(str) {
-var obj;
-try { obj = decodeSnapshot(str);}
-catch (e) { throw new Error("archiveImport: not a valid archive (decode failed)");}
-if (!obj || obj.magic!== ARCHIVE_MAGIC || typeof obj.entries!== "object" || obj.entries === null) {
-throw new Error("archiveImport: not an l21x archive (bad envelope)");
-}
-var names = Object.keys(obj.entries);
-for (var i = 0; i < names.length; i++) {
-if (!validateName(names[i]).valid) {
-throw new Error("archiveImport: archive contains an invalid entry name: " + names[i]);
-}
-}
-return obj.entries;
-}
-
-/* ---------- exports (browser namespace OR node require) ---------------------- */
-
-var L21X = {
-encodeSnapshot: encodeSnapshot,
-decodeSnapshot: decodeSnapshot,
-validateName: validateName,
-catalogSave: catalogSave,
-catalogLoad: catalogLoad,
-catalogRemove: catalogRemove,
-catalogList: catalogList,
-archiveExport: archiveExport,
-archiveImport: archiveImport,
-ARCHIVE_MAGIC: ARCHIVE_MAGIC
-};
-
-if (typeof module!== "undefined" && module.exports) module.exports = L21X;
-if (typeof window!== "undefined") window.L21X = L21X;
-
-/* ---------- CLI ------------------------------------------------------------- */
-
-function _cli(argv) {
-var args = argv.slice(2);
-var cmd = args[0];
-if (!cmd || cmd === "--help" || cmd === "-h") {
-process.stdout.write(
-"l21x-snapshot — portable browser document persistence\n\n" +
-" echo '<json>' | node l21x-snapshot.js encode doc (JSON) -> snapshot (base64)\n" +
-" node l21x-snapshot.js decode <base64> snapshot -> doc (JSON)\n" +
-" node l21x-snapshot.js roundtrip '<json>' prove decode(encode(x)) deep-equals x\n" +
-" node l21x-snapshot.js --help\n"
-);
-return 0;
-}
-function readStdin(cb) {
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () { cb(Buffer.concat(chunks).toString("utf8"));});
-}
-if (cmd === "encode") {
-readStdin(function (input) {
-try { process.stdout.write(encodeSnapshot(JSON.parse(input)) + "\n");}
-catch (e) { process.stderr.write("encode: invalid JSON on stdin\n"); process.exitCode = 1;}
-});
-return 0;
-}
-if (cmd === "decode") {
-if (!args[1]) { process.stderr.write("decode: need a base64 argument\n"); return 1;}
-try { process.stdout.write(JSON.stringify(decodeSnapshot(args[1])) + "\n"); return 0;}
-catch (e) { process.stderr.write("decode: " + e.message + "\n"); return 1;}
-}
-if (cmd === "roundtrip") {
-if (!args[1]) { process.stderr.write("roundtrip: need a JSON argument\n"); return 1;}
-try {
-var doc = JSON.parse(args[1]);
-var back = decodeSnapshot(encodeSnapshot(doc));
-var ok = _canonical(doc) === _canonical(back);
-process.stdout.write((ok? "OK round-trip: ": "FAIL round-trip: ") + JSON.stringify(back) + "\n");
-return ok? 0: 1;
-} catch (e) { process.stderr.write("roundtrip: " + e.message + "\n"); return 1;}
-}
-process.stderr.write("unknown command: " + cmd + " (try --help)\n");
-return 1;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = _cli(process.argv);
-}
-
-test_l21x-snapshot.js 190 lines on GitHub →
-#!/usr/bin/env node
-/* test_l21x-snapshot.js — proves the three verbs hold their contracts.
-
-THE ORACLES (honest proofs, not "matches a string I typed"):
-1. ROUND-TRIP: decodeSnapshot(encodeSnapshot(x)) deep-equals x, for a
-battery that includes multibyte text, nesting, arrays, and edge values.
-2. DETERMINISM: two documents that are equal-but-key-reordered encode to the
-SAME base64 string (the fidelity rule). This is what makes a snapshot
-diffable/hashable; break the key-sort and this vector fails.
-3. CATALOG: save/load/remove/list over an injected in-memory store behave,
-and list is deterministically ordered by name and by time.
-4. ARCHIVE: export then import round-trips a whole catalog, and a foreign or
-malformed archive is rejected loudly.
-
-Also mutation-bites the core so a no-op test can't pass green. Exit 0 = all
-pass; exit 1 = a failure (loud). stdlib only. */
-"use strict";
-var assert = require("assert");
-var L = require("./l21x-snapshot.js");
-
-var pass = 0, fail = 0;
-function check(name, fn) {
-try { fn(); pass++;}
-catch (e) { fail++; console.error("FAIL " + name + "\n " + (e && e.message));}
-}
-// Deep, ORDER-INDEPENDENT equality. The encoder is deterministic (it sorts
-// keys), so a round-tripped object is content-equal but may be key-reordered
-// relative to the input — which is correct. Compare by content, not by the
-// insertion order JSON.stringify happens to preserve.
-function eq(a, b) {
-if (a === b) return true;
-if (a === null || b === null || typeof a!== "object" || typeof b!== "object") return a === b;
-if (Array.isArray(a)!== Array.isArray(b)) return false;
-if (Array.isArray(a)) {
-if (a.length!== b.length) return false;
-for (var i = 0; i < a.length; i++) if (!eq(a[i], b[i])) return false;
-return true;
-}
-var ka = Object.keys(a).sort(), kb = Object.keys(b).sort();
-if (ka.length!== kb.length) return false;
-for (var j = 0; j < ka.length; j++) { if (ka[j]!== kb[j]) return false; if (!eq(a[ka[j]], b[ka[j]])) return false;}
-return true;
-}
-
-/* 1. ROUND-TRIP battery -------------------------------------------------------*/
-var vectors = [
-{},
-{ a: 1},
-{ a: 1, b: [1, 2, 3], c: { d: true, e: null}},
-[1, "two", 3.5, false, null],
-"a bare string",
-42,
-true,
-null,
-{ name: "café", emoji: "🌲🔧", cyrillic: "Привет", cjk: "日本語"}, // multibyte
-{ nested: { deep: { deeper: { x: [ { y: 1}]}}}},
-{ "keys-with-dashes_and_1": "ok", "unicode-key-café": 1}
-];
-vectors.forEach(function (v, i) {
-check("roundtrip[" + i + "]", function () {
-var back = L.decodeSnapshot(L.encodeSnapshot(v));
-assert.ok(eq(v, back), "round-trip changed the document: " + JSON.stringify(back));
-});
-});
-
-/* 1b. PINNED GOLDEN — a fixed doc must encode to this exact string, forever.
-Content round-trip alone would miss an encoding drift that still decodes
-(e.g. a base64-alphabet swap). This pins the wire format. */
-check("pinned golden snapshot is byte-stable", function () {
-var doc = { a: 1, b: "café", c: [3, 2, 1], d: { z: true, y: null}};
-var GOLDEN = "eyJhIjoxLCJiIjoiY2Fmw6kiLCJjIjpbMywyLDFdLCJkIjp7InkiOm51bGwsInoiOnRydWV9fQ==";
-assert.strictEqual(L.encodeSnapshot(doc), GOLDEN, "wire format drifted from the pinned golden");
-assert.ok(eq(L.decodeSnapshot(GOLDEN), doc), "golden does not decode back to the doc");
-});
-
-/* 2. DETERMINISM (the fidelity rule) -----------------------------------------*/
-check("determinism: key order does not change the snapshot", function () {
-var s1 = L.encodeSnapshot({ a: 1, b: 2, c: 3});
-var s2 = L.encodeSnapshot({ c: 3, b: 2, a: 1});
-assert.strictEqual(s1, s2, "equal docs with different key order encoded differently");
-});
-check("determinism: nested key order too", function () {
-var s1 = L.encodeSnapshot({ outer: { z: 1, a: 2}, arr: [ { q: 1, p: 2}]});
-var s2 = L.encodeSnapshot({ arr: [ { p: 2, q: 1}], outer: { a: 2, z: 1}});
-assert.strictEqual(s1, s2, "nested key order leaked into the snapshot");
-});
-check("determinism: same doc encodes identically twice", function () {
-var d = { x: [1, 2, { y: "café"}]};
-assert.strictEqual(L.encodeSnapshot(d), L.encodeSnapshot(d));
-});
-check("decode rejects garbage loudly", function () {
-assert.throws(function () { L.decodeSnapshot("");});
-});
-
-/* 3. CATALOG (injected in-memory store) --------------------------------------*/
-function memStore() {
-var m = {};
-return {
-getItem: function (k) { return k in m? m[k]: null;},
-setItem: function (k, v) { m[k] = v;},
-removeItem: function (k) { delete m[k];}
-};
-}
-var KEY = "cat";
-
-check("catalog save/load round-trips a document", function () {
-var s = memStore();
-L.catalogSave(s, KEY, "draft", { title: "hello", body: "café ☕"}, 100);
-var got = L.catalogLoad(s, KEY, "draft");
-assert.ok(eq(got, { title: "hello", body: "café ☕"}), "catalog changed the doc");
-});
-check("catalog load of absent name is null", function () {
-var s = memStore();
-assert.strictEqual(L.catalogLoad(s, KEY, "nope"), null);
-});
-check("catalog remove reports existence", function () {
-var s = memStore();
-L.catalogSave(s, KEY, "a", { v: 1}, 1);
-assert.strictEqual(L.catalogRemove(s, KEY, "a"), true);
-assert.strictEqual(L.catalogRemove(s, KEY, "a"), false);
-assert.strictEqual(L.catalogLoad(s, KEY, "a"), null);
-});
-check("catalog list sorts by name asc/desc deterministically", function () {
-var s = memStore();
-L.catalogSave(s, KEY, "banana", { v: 1}, 3);
-L.catalogSave(s, KEY, "apple", { v: 1}, 1);
-L.catalogSave(s, KEY, "cherry", { v: 1}, 2);
-assert.ok(eq(L.catalogList(s, KEY, "name", true), ["apple", "banana", "cherry"]));
-assert.ok(eq(L.catalogList(s, KEY, "name", false), ["cherry", "banana", "apple"]));
-});
-check("catalog list sorts by time", function () {
-var s = memStore();
-L.catalogSave(s, KEY, "banana", { v: 1}, 3);
-L.catalogSave(s, KEY, "apple", { v: 1}, 1);
-L.catalogSave(s, KEY, "cherry", { v: 1}, 2);
-assert.ok(eq(L.catalogList(s, KEY, "time", true), ["apple", "cherry", "banana"]));
-});
-check("catalog rejects invalid names", function () {
-var s = memStore();
-assert.throws(function () { L.catalogSave(s, KEY, "has space", {}, 0);});
-assert.throws(function () { L.catalogSave(s, KEY, "", {}, 0);});
-assert.throws(function () { L.catalogSave(s, KEY, "x".repeat(65), {}, 0);});
-});
-check("validateName accepts good, rejects bad", function () {
-assert.strictEqual(L.validateName("good_Name-1").valid, true);
-assert.strictEqual(L.validateName("bad name").valid, false);
-});
-
-/* 4. ARCHIVE (whole catalog as one portable string) --------------------------*/
-check("archive export/import round-trips a catalog", function () {
-var s = memStore();
-L.catalogSave(s, KEY, "one", { a: 1}, 1);
-L.catalogSave(s, KEY, "two", { b: 2, deep: { x: "café"}}, 2);
-var raw = JSON.parse(s.getItem(KEY));
-var archive = L.archiveExport(raw);
-var back = L.archiveImport(archive);
-assert.ok(eq(back, raw), "archive changed the catalog");
-});
-check("archive of empty catalog round-trips", function () {
-assert.ok(eq(L.archiveImport(L.archiveExport({})), {}));
-});
-check("archive import rejects a foreign envelope", function () {
-var foreign = L.encodeSnapshot({ magic: "SOMETHING-ELSE", entries: {}});
-assert.throws(function () { L.archiveImport(foreign);});
-});
-check("archive import rejects garbage", function () {
-assert.throws(function () { L.archiveImport("not base64 @#$");});
-});
-check("archive import rejects an invalid entry name", function () {
-var bad = L.encodeSnapshot({ magic: L.ARCHIVE_MAGIC, entries: { "bad name": { snapshot: "x", savedAt: 0}}});
-assert.throws(function () { L.archiveImport(bad);});
-});
-
-/* 5. MUTATION BITE — a no-op test cannot pass green --------------------------*/
-/* If the encoder stopped being deterministic (key-sort removed), test 2 fails.
-We ALSO directly assert the bite: prove the oracle has teeth by confirming a
-known non-deterministic encode WOULD be caught. Encode a doc, then encode a
-key-shuffled twin; require equality. If someone deletes _canonical's sort,
-these differ and the suite goes red — demonstrated here as a live guard. */
-check("mutation-bite: determinism guard has teeth", function () {
-var a = L.encodeSnapshot({ m: 1, z: 2, a: 3, k: 4});
-var b = L.encodeSnapshot({ z: 2, k: 4, a: 3, m: 1});
-assert.strictEqual(a, b, "determinism guard would not catch a key-sort regression");
-// and a genuinely different doc MUST encode differently (no trivial-pass):
-assert.notStrictEqual(a, L.encodeSnapshot({ m: 1, z: 2, a: 3, k: 5}));
-});
-
-/* ---------------------------------------------------------------------------*/
-console.log((fail === 0? "PASS": "FAIL") + " — " + pass + " passed, " + fail + " failed");
-process.exitCode = fail === 0? 0: 1;
-
-Take the whole folder →
-MIT
-Zero-dependency JavaScript (browser or Node)
+Nodes in this shard: 4 (/gifts/gauntlet/, /gifts/gitlog/, /gifts/grain/, /gifts/hunkhole/)
 
 ---
 
-# Skin Config Validator — a Loop MMT gift
-https://loopmmt.com/gifts/loop21-verifyskin/
+# gauntlet — a Loop MMT gift
+https://loopmmt.com/gifts/gauntlet/
 [coverage: optional · branch: gifts]
 
-Is This User Config Safe To Apply? filter ← all gifts
+Fault-Injection Check-Tester break ← all gifts
 
-Skin Config Validator
+gauntlet
 
-Validate a user-submitted skin/theme config object — colors, fonts, numbers, CSS custom properties — against a schema you declare, BEFORE you splice it into a stylesheet. verifySkin(config, schema) type-checks every field, allowlists CSS colors and cssvar values (rejecting url(), @import, javascript:, and; {} breakouts), and returns { ok, value, errors, warnings} — value carries only the fields that passed, safe to apply. It does not mutate or coerce; it reports. No dependencies, Node or browser.
+Does your check actually catch a fault? A linter or validator can silently stop catching what it was written to catch, and nothing tells you until bad input reaches production. gauntlet copies your file into a disposable sandbox, injects ONE typed fault (truncate a tail, flip a byte, or apply a find/replace regression you name), runs YOUR check against the broken copy, and reports HELD (the check caught it) or ESCAPED (the check has a hole). The original file is never touched — only ever copied.
 
 The honest edge
 
-It keeps 'wrong' and 'unknown' apart: a bad type/range/injection is an ERROR, an unknown field is a dropped WARNING (forward-compat), a missing optional field is silent. The `string` type is NOT stylesheet-sanitized — it type-checks and length-caps only; use `cssvar` (the type with the injection allowlist) for anything headed into a style surface. The named-color allowlist is conservative (unknown names rejected, not guessed) and the cssvar check is a safe-character GRAMMAR, not a full CSS value parser — it proves the value can't break out of a declaration, not that it is meaningful CSS. The schema is YOURS: a malformed schema throws (programmer error); only the config is treated as untrusted and reported-not-thrown.
+gauntlet tests whether a check CATCHES the ONE fault you inject, not whether the check is correct in general: a HELD proves the check fired on this one broken input, never that it catches every fault. It runs your check command, so only point it at a command you trust. It only ever copies the target — it never modifies your original file.
 
 Run it
 
-node loop21-verifyskin.js config.json schema.json
-test_loop21-verifyskin.js (18/18: every type path, CSS-injection rejection, unknown-field drop+warn, required-missing error, non-object config reported-not-thrown, multi-error report, 2 ratchet-refusal cases)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-loop21-verifyskin.js 207 lines on GitHub →
-#!/usr/bin/env node
-/* loop21-verifyskin.js — a pure, dependency-free, STRICT validator for
-user-submitted "skin" config objects, before you apply them to a UI. Runs
-identically in a browser (window.LoopGifts.verifySkin) and in Node (require /
-this CLI). No DOM, no dependencies.
-
-WHY THIS EXISTS. A theming / skin feature lets a user hand you a small config
-object — colors, a font, a few numbers, some CSS custom properties — that you
-then splice into a stylesheet or inline style. That is untrusted input landing
-in your render surface. The usual answer is to trust it (and ship a CSS
-injection, or a broken layout from a typo'd number) or to hand-check a few
-fields and miss the rest. This validates the WHOLE object against a declared
-schema and tells you, honestly, what is wrong — before a single value is
-applied.
-
-WHAT "VERIFY" MEANS HERE. verifySkin does not mutate, coerce, or "fix" your
-config. It reads it against a schema and returns a verdict:
-{ ok, value, errors, warnings}
-`ok` is true only when there are zero errors. `value` is the subset of the
-input that passed (known, well-typed fields) — safe to apply. `errors` are
-hard failures (wrong type, out-of-range, a disallowed CSS value, a missing
-required field). `warnings` are soft (an unknown field that was dropped, a
-value clamped-in-spec-but-suspicious). A validator that silently drops the
-difference between "wrong" and "unknown" is lying about what it checked; this
-one keeps them apart.
-
-THE SCHEMA. A plain object mapping field name -> a small type spec:
-{ type: "color"} a CSS color: #rgb / #rrggbb / #rrggbbaa /
-rgb()/rgba()/hsl()/hsla() / a named-color from
-the allowlist. No url(), no expression, no;}
-{ type: "cssvar"} a CSS custom-property VALUE, allowlisted to a
-safe grammar (letters, digits, %, #, spaces,
-commas, dots, parens for the color fns above) —
-rejects; {} < > url( javascript: and @import.
-{ type: "number", min, max} a finite number, optionally range-checked.
-{ type: "integer", min, max} a number with no fractional part.
-{ type: "enum", values:[..]}one of a fixed set of strings.
-{ type: "boolean"} true / false.
-{ type: "string", maxLen} an arbitrary string, optionally length-capped
-(NOT applied to a stylesheet without your own
-escaping — see the README edge).
-Add `required: true` to make a missing field an error (default: optional).
-
-API
-verifySkin(config, schema) -> { ok, value, errors, warnings}
-`config` the untrusted object (anything; a non-object is one error).
-`schema` the field->spec map above (a non-object throws — the schema is
-YOURS, so a bad schema is a programmer error, not user input).
-`errors` / `warnings` are arrays of { field, message} (field null for
-whole-object problems). Never throws on bad `config` — that is the point;
-it reports. THROWS only on a malformed `schema`.
-
-Pure function of its inputs. Same code in a browser
-(window.LoopGifts.verifySkin) or Node (this CLI / require()).
-
-USAGE
-node loop21-verifyskin.js config.json schema.json # prints the verdict JSON
-node loop21-verifyskin.js --help
-*/
-(function (root, factory) {
-var api = factory();
-if (typeof module === "object" && module.exports) module.exports = api;
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.verifySkin = api.verifySkin;
-}
-root.__loop21VerifySkin = api;
-})(typeof globalThis!== "undefined"? globalThis: this, function () {
-"use strict";
-
-// A conservative named-color allowlist — the common CSS keywords. Not
-// exhaustive by design: an unknown name is rejected, not guessed.
-var NAMED_COLORS = {
-black:1, silver:1, gray:1, grey:1, white:1, maroon:1, red:1, purple:1,
-fuchsia:1, green:1, lime:1, olive:1, yellow:1, navy:1, blue:1, teal:1,
-aqua:1, cyan:1, magenta:1, orange:1, pink:1, brown:1, gold:1, coral:1,
-salmon:1, khaki:1, violet:1, indigo:1, turquoise:1, tan:1, beige:1,
-ivory:1, crimson:1, chocolate:1, transparent:1
-};
-
-var HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
-// rgb/rgba/hsl/hsla with only numbers, %, commas, spaces, dots inside.
-var COLOR_FN = /^(?:rgb|rgba|hsl|hsla)\(\s*[-0-9.%,\s\/]+\)$/;
-// A safe cssvar value: letters, digits, whitespace, and a small punctuation set.
-// Explicitly excludes; {} < > and the url(/@import/expression/javascript vectors.
-var SAFE_CSSVAR = /^[A-Za-z0-9#%.,()\-_ \/]*$/;
-var DANGER = /(url\s*\(|@import|expression\s*\(|javascript:|[;{}<>])/i;
-
-function isColor(v) {
-if (typeof v!== "string") return false;
-var s = v.trim();
-if (HEX.test(s)) return true;
-if (COLOR_FN.test(s)) return true;
-if (Object.prototype.hasOwnProperty.call(NAMED_COLORS, s.toLowerCase())) return true;
-return false;
-}
-function isSafeCssVar(v) {
-if (typeof v!== "string") return false;
-if (DANGER.test(v)) return false;
-return SAFE_CSSVAR.test(v);
-}
-
-function verifySkin(config, schema) {
-if (schema === null || typeof schema!== "object" || Array.isArray(schema))
-throw new Error("loop21-verifyskin: schema must be a plain object of field specs");
-
-var errors = [], warnings = [], value = {};
-
-if (config === null || typeof config!== "object" || Array.isArray(config)) {
-errors.push({ field: null, message: "config must be a plain object"});
-return { ok: false, value: {}, errors: errors, warnings: warnings};
-}
-
-var schemaFields = Object.keys(schema);
-
-// 1. unknown fields -> dropped, warned (not an error: forward-compat)
-Object.keys(config).forEach(function (k) {
-if (schemaFields.indexOf(k) === -1)
-warnings.push({ field: k, message: "unknown field dropped (not in schema)"});
-});
-
-// 2. each schema field
-schemaFields.forEach(function (field) {
-var spec = schema[field];
-if (spec === null || typeof spec!== "object")
-throw new Error("loop21-verifyskin: schema field '" + field + "' has a non-object spec");
-var present = Object.prototype.hasOwnProperty.call(config, field);
-var v = config[field];
-
-if (!present) {
-if (spec.required) errors.push({ field: field, message: "required field missing"});
-return;
-}
-
-switch (spec.type) {
-case "color":
-if (isColor(v)) value[field] = v;
-else errors.push({ field: field, message: "not a valid/allowlisted CSS color"});
-break;
-case "cssvar":
-if (isSafeCssVar(v)) value[field] = v;
-else errors.push({ field: field, message: "cssvar value contains a disallowed character or vector"});
-break;
-case "number":
-if (typeof v!== "number" ||!isFinite(v)) { errors.push({ field: field, message: "not a finite number"}); break;}
-if (typeof spec.min === "number" && v < spec.min) { errors.push({ field: field, message: "below min " + spec.min}); break;}
-if (typeof spec.max === "number" && v > spec.max) { errors.push({ field: field, message: "above max " + spec.max}); break;}
-value[field] = v;
-break;
-case "integer":
-if (typeof v!== "number" ||!isFinite(v) || Math.floor(v)!== v) { errors.push({ field: field, message: "not an integer"}); break;}
-if (typeof spec.min === "number" && v < spec.min) { errors.push({ field: field, message: "below min " + spec.min}); break;}
-if (typeof spec.max === "number" && v > spec.max) { errors.push({ field: field, message: "above max " + spec.max}); break;}
-value[field] = v;
-break;
-case "enum":
-if (!Array.isArray(spec.values)) throw new Error("loop21-verifyskin: enum field '" + field + "' needs a values array");
-if (spec.values.indexOf(v)!== -1) value[field] = v;
-else errors.push({ field: field, message: "not one of the allowed values"});
-break;
-case "boolean":
-if (typeof v === "boolean") value[field] = v;
-else errors.push({ field: field, message: "not a boolean"});
-break;
-case "string":
-if (typeof v!== "string") { errors.push({ field: field, message: "not a string"}); break;}
-if (typeof spec.maxLen === "number" && v.length > spec.maxLen) { errors.push({ field: field, message: "exceeds maxLen " + spec.maxLen}); break;}
-value[field] = v;
-break;
-default:
-throw new Error("loop21-verifyskin: unknown spec type '" + spec.type + "' for field '" + field + "'");
-}
-});
-
-return { ok: errors.length === 0, value: value, errors: errors, warnings: warnings};
-}
-
-return { verifySkin: verifySkin, isColor: isColor, isSafeCssVar: isSafeCssVar};
-});
-
-// ---- CLI (Node only) ------------------------------------------------------
-if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
-var api = (typeof globalThis!== "undefined"? globalThis: this).__loop21VerifySkin;
-var args = process.argv.slice(2);
-if (!args.length || args.indexOf("--help")!== -1) {
-process.stdout.write(
-"loop21-verifyskin — strict, zero-dep validator for user skin config\n" +
-" node loop21-verifyskin.js config.json schema.json print the verdict JSON\n" +
-" node loop21-verifyskin.js --help\n"
-);
-process.exit(0);
-}
-try {
-var fs = require("fs");
-if (args.length < 2) throw new Error("need a config.json and a schema.json");
-var config = JSON.parse(fs.readFileSync(args[0], "utf8"));
-var schema = JSON.parse(fs.readFileSync(args[1], "utf8"));
-var res = api.verifySkin(config, schema);
-process.stdout.write(JSON.stringify(res, null, 2) + "\n");
-process.exit(res.ok? 0: 2); // nonzero when the config is rejected
-} catch (e) {
-var msg = e && e.message? e.message: String(e);
-if (msg.indexOf("loop21-verifyskin:")!== 0) msg = "loop21-verifyskin: " + msg;
-process.stderr.write(msg + "\n");
-process.exit(1);
-}
-}
-
-test_loop21-verifyskin.js 174 lines on GitHub →
-#!/usr/bin/env node
-/* test_loop21-verifyskin.js — known-answer battery for loop21-verifyskin.
-
-The oracle is OUT OF BAND: every expected verdict below is a literal fact
-written by hand, never the output of a second validator. Each case constructs
-a config + schema whose correct { ok, value, errors, warnings} is known by
-construction.
-
-Run: node test_loop21-verifyskin.js (exit 0 = all pass)
-*/
-"use strict";
-var assert = require("assert");
-var { verifySkin, isColor, isSafeCssVar} = require("./loop21-verifyskin.js");
-
-var pass = 0, fail = 0;
-function ok(name, fn) {
-try { fn(); pass++; console.log(" ok " + name);}
-catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
-}
-
-// ---- 1. a fully-valid config passes, value echoes the typed fields --------
-ok("1 valid config -> ok:true, value carries typed fields", function () {
-var schema = {
-bg: { type: "color"},
-accent: { type: "color"},
-radius: { type: "integer", min: 0, max: 32},
-opacity: { type: "number", min: 0, max: 1},
-theme: { type: "enum", values: ["light", "dark"]},
-dense: { type: "boolean"}
-};
-var config = { bg: "#101820", accent: "gold", radius: 8, opacity: 0.9, theme: "dark", dense: true};
-var r = verifySkin(config, schema);
-assert.strictEqual(r.ok, true); // ORACLE
-assert.strictEqual(r.errors.length, 0);
-assert.deepStrictEqual(r.value, config); // all fields passed
-});
-
-// ---- 2. hex-color forms all accepted ------------------------------------
-ok("2 #rgb / #rrggbb / #rrggbbaa colors accepted", function () {
-["#fff", "#ffffff", "#ffffffff", "#1A2b3C"].forEach(function (c) {
-assert.strictEqual(isColor(c), true, c); // ORACLE
-});
-});
-
-// ---- 3. rgb()/rgba()/hsl() color functions accepted ---------------------
-ok("3 rgb/rgba/hsl functions accepted", function () {
-["rgb(10, 20, 30)", "rgba(0,0,0,0.5)", "hsl(210, 50%, 40%)"].forEach(function (c) {
-assert.strictEqual(isColor(c), true, c); // ORACLE
-});
-});
-
-// ---- 4. CSS injection in a color is rejected ----------------------------
-ok("4 injection color 'red;} body{...' rejected", function () {
-assert.strictEqual(isColor("red;} body{display:none}"), false); // ORACLE
-var r = verifySkin({ bg: "red;} body{}"}, { bg: { type: "color"}});
-assert.strictEqual(r.ok, false);
-assert.strictEqual(r.errors[0].field, "bg");
-});
-
-// ---- 5. url() and javascript: rejected as cssvar ------------------------
-ok("5 cssvar url()/javascript:/@import rejected", function () {
-assert.strictEqual(isSafeCssVar("url(evil.png)"), false); // ORACLE
-assert.strictEqual(isSafeCssVar("javascript:alert(1)"), false);
-assert.strictEqual(isSafeCssVar("@import 'x'"), false);
-assert.strictEqual(isSafeCssVar("a; color: red"), false); // semicolon
-});
-
-// ---- 6. a benign cssvar value accepted ----------------------------------
-ok("6 benign cssvar 'clamp(1rem, 2vw, 2rem)'-ish accepted", function () {
-assert.strictEqual(isSafeCssVar("1.5 2px 10%"), true); // ORACLE
-assert.strictEqual(isSafeCssVar("rgba(0,0,0,0.2)"), true);
-var r = verifySkin({ shadow: "0 1px 3px"}, { shadow: { type: "cssvar"}});
-assert.strictEqual(r.ok, true);
-assert.strictEqual(r.value.shadow, "0 1px 3px");
-});
-
-// ---- 7. number range enforced -------------------------------------------
-ok("7 number out of range is an error", function () {
-var schema = { opacity: { type: "number", min: 0, max: 1}};
-assert.strictEqual(verifySkin({ opacity: 1.5}, schema).ok, false); // ORACLE above max
-assert.strictEqual(verifySkin({ opacity: -0.1}, schema).ok, false); // below min
-assert.strictEqual(verifySkin({ opacity: 0.4}, schema).ok, true); // in range
-});
-
-// ---- 8. integer rejects a fractional value ------------------------------
-ok("8 integer field rejects 8.5", function () {
-var schema = { radius: { type: "integer"}};
-assert.strictEqual(verifySkin({ radius: 8.5}, schema).ok, false); // ORACLE
-assert.strictEqual(verifySkin({ radius: 8}, schema).ok, true);
-});
-
-// ---- 9. enum enforces the allowed set -----------------------------------
-ok("9 enum rejects an off-list value", function () {
-var schema = { theme: { type: "enum", values: ["light", "dark"]}};
-assert.strictEqual(verifySkin({ theme: "neon"}, schema).ok, false); // ORACLE
-assert.strictEqual(verifySkin({ theme: "light"}, schema).ok, true);
-});
-
-// ---- 10. boolean type-checked -------------------------------------------
-ok("10 boolean field rejects the string 'true'", function () {
-var schema = { dense: { type: "boolean"}};
-assert.strictEqual(verifySkin({ dense: "true"}, schema).ok, false); // ORACLE: string!= bool
-assert.strictEqual(verifySkin({ dense: false}, schema).ok, true);
-});
-
-// ---- 11. unknown field -> dropped + warned, NOT an error ----------------
-ok("11 unknown field dropped with a warning, ok stays true", function () {
-var schema = { bg: { type: "color"}};
-var r = verifySkin({ bg: "#000", evilField: "x"}, schema);
-assert.strictEqual(r.ok, true); // ORACLE: unknown!= error
-assert.strictEqual(r.warnings.length, 1);
-assert.strictEqual(r.warnings[0].field, "evilField");
-assert.strictEqual("evilField" in r.value, false); // dropped from safe value
-});
-
-// ---- 12. required field missing -> error --------------------------------
-ok("12 required-but-missing field is an error", function () {
-var schema = { bg: { type: "color", required: true}};
-var r = verifySkin({}, schema);
-assert.strictEqual(r.ok, false); // ORACLE
-assert.strictEqual(r.errors[0].message, "required field missing");
-});
-
-// ---- 13. optional missing field is silent -------------------------------
-ok("13 optional missing field is neither error nor warning", function () {
-var schema = { bg: { type: "color"}};
-var r = verifySkin({}, schema);
-assert.strictEqual(r.ok, true); // ORACLE
-assert.strictEqual(r.errors.length, 0);
-assert.strictEqual(r.warnings.length, 0);
-});
-
-// ---- 14. non-object config -> one whole-object error, never throws ------
-ok("14 non-object config reported, not thrown", function () {
-["a string", 42, null, [1, 2]].forEach(function (bad) {
-var r = verifySkin(bad, { bg: { type: "color"}});
-assert.strictEqual(r.ok, false); // ORACLE
-assert.strictEqual(r.errors[0].field, null);
-});
-});
-
-// ---- 15. multiple errors all reported (not just the first) --------------
-ok("15 several bad fields all reported", function () {
-var schema = {
-bg: { type: "color"},
-radius: { type: "integer"},
-theme: { type: "enum", values: ["a"]}
-};
-var r = verifySkin({ bg: "not-a-color", radius: 1.2, theme: "z"}, schema);
-assert.strictEqual(r.ok, false);
-assert.strictEqual(r.errors.length, 3); // ORACLE: all three
-});
-
-// ---- 16. RATCHET: bad schema (non-object) throws ------------------------
-ok("16 ratchet: non-object schema throws", function () {
-assert.throws(function () { verifySkin({}, "not a schema");}, /schema must be/); // ORACLE
-});
-
-// ---- 17. RATCHET: unknown spec type throws ------------------------------
-ok("17 ratchet: unknown spec type throws (programmer error)", function () {
-assert.throws(function () { verifySkin({ x: 1}, { x: { type: "widget"}});}, /unknown spec type/);
-});
-
-// ---- 18. value carries ONLY passing fields (a rejected field is absent) --
-ok("18 rejected field absent from value, valid sibling present", function () {
-var schema = { good: { type: "color"}, bad: { type: "integer"}};
-var r = verifySkin({ good: "#abc", bad: 1.5}, schema);
-assert.strictEqual(r.ok, false);
-assert.strictEqual(r.value.good, "#abc"); // ORACLE: good survives
-assert.strictEqual("bad" in r.value, false); // bad excluded
-});
-
-console.log("\nloop21-verifyskin: " + pass + " passed, " + fail + " failed");
-process.exit(fail? 1: 0);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# map — a Loop MMT gift
-https://loopmmt.com/gifts/map/
-[coverage: optional · branch: gifts]
-
-Composition Map show ← all gifts
-
-map
-
-Point it at a folder of small JSONL tools that each declare a port-verb, and map folds the whole set into a composition map — who can feed whom, how densely the set composes, and which tools light up the most pipelines. It reads each tool's declared port-verb (never guesses one) and reports any undeclared tool by name, excluded from the map.
-
-The honest edge
-
-It renders the TYPE-level map — whether the ports agree so the pipe can carry data at all — not whether the RECORDS fit. A transform emitting {event} records maps clean into a filter expecting {file} records and fails at runtime; map flags that semantic layer as unproven and never asserts it.
-
-Run it
-
-python3 map.py text --manifest gifts-manifest.json
-test_map.py (16/16, mutation-bitten)
+python3 gauntlet.py --target data.json --fault truncate --check "python3 validate.py {}"
+test_gauntlet.py (12/12, mutation-bitten)
 Python 3, standard library only
 
 The code — every file that ships
 
-map.py 283 lines on GitHub →
+gauntlet.py 230 lines on GitHub →
 #!/usr/bin/env python3
-"""map — show what-composes-with-what across a set of small JSONL tools.
+"""gauntlet.py — does your check actually catch a fault?
 
-You have a folder of little tools that each read JSON-lines on stdin and write
-JSON-lines on stdout. Which ones can you pipe together? `map` answers that. Point
-it at a manifest where each tool DECLARES its port-verb (the type-level shape of
-its stdin/stdout contract), and `map` folds the whole set into a composition map:
-who can feed whom, how densely the set composes, and which tools light up the most
-pipelines.
+A check (a linter, a validator, a test, a verifier) is only worth what it
+catches. The quiet failure is a check that passes on input it was supposed to
+reject — a green that means nothing. The way you find that out is to break the
+input ON PURPOSE, run the check, and see whether it fires. If you damage the
+file and the check still says PASS, the check has a hole.
 
-THE MODEL. Five port-verbs on the shared JSON-lines interface, and only five:
+gauntlet automates exactly that, safely:
 
-source: nothing -> JSONL (emits; no meaningful stdin)
-transform: JSONL -> JSONL (record in, record out)
-filter: JSONL -> JSONL' (record in, subset out; output type <= input)
-fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
-sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
+1. Copy the target file into a private, disposable sandbox. The original is
+NEVER touched.
+2. Inject ONE typed fault into the sandbox copy (truncate its tail, flip a
+byte, or apply a find/replace regression you name).
+3. Run YOUR check command against the mutated copy.
+4. Report the verdict:
+HELD -- the check FAILED on the broken input (good: it caught the fault)
+ESCAPED -- the check PASSED on the broken input (bad: your check has a hole)
 
-THE TYPE GATE (mechanical, decidable):
+ONE FAULT PER SHOT, SANDBOX ONLY (the safety rails, kept from the tool this was
+stripped from). Never buckshot: one typed fault per run, so a HELD/ESCAPED
+verdict names exactly what got through. The sandbox is deleted when the run
+ends -- abort is just "delete the temp dir," and the original file is read-only
+to this tool by construction (it is only ever copied, never written).
 
-A can feed B iff A EMITS jsonl (A.verb!= sink) AND B ACCEPTS jsonl (B.verb!= source)
+THE VERDICT IS INVERTED ON PURPOSE.
+A check that FAILS on broken input is doing its job -- so a non-zero exit from
+your check is a gauntlet PASS (HELD). A check that PASSES on broken input has a
+hole -- so a zero exit from your check is a gauntlet FAIL (ESCAPED). Read the
+exit codes below with that inversion in mind.
 
-That is the whole composition rule at the type level. `map` counts every ordered
-pair (A, B), A!= B, that passes it, and reports the density.
-
-WHY IT READS DECLARATIONS, NOT GUESSES. Before the `port` gift, a map like this
-kept its own hardcoded roster of which tool had which verb — a list inside one
-program's source that drifts the moment a tool changes or a new one ships. `map`
-does not guess and does not keep a private roster: it READS each tool's declared
-`port_verb` from the manifest (the same field `port` reads and checks). A tool that
-declares no port-verb is reported as UNDECLARED and excluded from the map with a
-count, never silently assigned a verb. The map is only ever as honest as the
-declarations under it — and it says so.
-
-HONEST CEILING (carried, not hidden). `map` renders the TYPE-level answer: can the
-pipe carry data at all. It does NOT assert that the RECORDS fit — a `transform`
-that emits `{event}` records typechecks clean into a `filter` that expects `{file}`
-records and fails at runtime. That finer, record-shape question the uniform JSONL
-type cannot settle, and `map` never claims it can. The map shows what the ports
-permit; it flags the semantic layer as unproven.
-
-map's own port-verb is `fold`: a set of gift declarations in, one aggregate
-composition-map record out.
-
-No dependencies beyond the Python standard library. MIT licensed.
+EXITS
+0 HELD -- the check caught the fault (your check FAILED on broken input)
+3 ESCAPED -- the check missed the fault (your check PASSED on broken input)
+4 NO-FAULT -- the chosen fault could not be injected (e.g. --replace found no
+match, or the file was too small to truncate); nothing tested
+2 USAGE -- bad arguments, or the target file is missing
 
 USAGE
-map read --manifest FILE
-Read the composition map from a manifest of tools that declare port_verb.
-Emits JSON-lines: one {"kind":"pair",...} per composable ordered pair,
-then one {"kind":"summary",...} record with density, census, fan-out/fan-in,
-the closed-form check, and the undeclared count. Its port-verb is fold.
+# Truncate the tail 10% and see whether your validator catches it:
+python3 gauntlet.py --target data.json --fault truncate --check "python3 validate.py {}"
 
-map summary --manifest FILE
-Emit only the single summary record (the aggregate), no per-pair lines.
+# Flip one byte in the middle:
+python3 gauntlet.py --target data.json --fault bitflip --check "python3 validate.py {}"
 
-map text --manifest FILE
-Human-readable rendering of the same map (density, census, top fan-out/in,
-the semantic-unproven flag). Not JSONL — for reading, not piping.
+# Apply a well-formed-wrong regression (the file still parses, it just lies):
+python3 gauntlet.py --target config.yaml --fault replace \\
+--from "version: 3" --to "version: 2" --check "python3 validate.py {}"
 
-map --port
-Print map's own port-verb (fold) as one JSON-line and exit.
+The check command runs against the mutated SANDBOX copy: `{}` in --check is
+replaced with the sandbox path. If your check reads stdin instead, use
+`--stdin` and gauntlet pipes the mutated bytes to it.
+
+python3 gauntlet.py --json # machine-readable verdict
+python3 gauntlet.py --edge # print the edge and exit
 """
+
 import argparse
-import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 
-VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
+EXIT_HELD = 0
+EXIT_USAGE = 2
+EXIT_ESCAPED = 3
+EXIT_NO_FAULT = 4
 
-def EMITS(v):
-"""A tool produces pipeable stdout iff it is not a sink."""
-return v!= "sink"
+EDGE = (
+"gauntlet tests whether a check CATCHES the ONE fault you inject, not "
+"whether the check is correct in general: a HELD proves the check fired on "
+"this one broken input, never that it catches every fault. It runs your "
+"check command, so only point it at a command you trust. It only ever "
+"copies the target -- it never modifies your original file."
+)
 
-def ACCEPTS(v):
-"""A tool consumes stdin iff it is not a source."""
-return v!= "source"
+# --- the fault catalog: each returns (mutated_bytes, note) or (None, why) -----
 
-def load_declared(path):
-"""Return (declared, undeclared) from a manifest.
+def _truncate(data):
+"""Tail-truncate 10% (byte loss). Well-formed-wrong on top-heavy files."""
+if len(data) < 10:
+return None, "file too small to truncate meaningfully"
+cut = int(len(data) * 0.9) or (len(data) - 1)
+return data[:cut], f"tail truncated: {len(data)}B -> {cut}B"
 
-declared: list of (slug, port_verb) for every entry with a valid port_verb
-undeclared: list of slugs with no (or invalid) port_verb — flagged, never guessed
+def _bitflip(data):
+"""Flip one byte in the middle. Deterministic (always the midpoint byte)."""
+if not data:
+return None, "file is empty; nothing to flip"
+i = len(data) // 2
+b = bytearray(data)
+b[i] ^= 0xFF
+return bytes(b), f"byte flipped at offset {i}: 0x{data[i]:02x} -> 0x{b[i]:02x}"
 
-Accepts a bare JSON list of entries or an object with a 'gifts'/'tools'/'entries'
-list. Raises ValueError if no entry list can be found — never guesses the shape.
+def _replace(data, frm, to):
+"""A find/replace regression: the file still parses, it just lies."""
+if frm is None or to is None:
+return None, "--replace requires --from and --to"
+fb, tb = frm.encode("utf-8"), to.encode("utf-8")
+if fb not in data:
+return None, f"--from string not found in target: {frm!r}"
+return data.replace(fb, tb, 1), f"replaced {frm!r} -> {to!r} (first match)"
+
+def inject(data, fault, frm=None, to=None):
+if fault == "truncate":
+return _truncate(data)
+if fault == "bitflip":
+return _bitflip(data)
+if fault == "replace":
+return _replace(data, frm, to)
+return None, f"unknown fault: {fault}"
+
+def run(target, fault, check_cmd, use_stdin=False, frm=None, to=None):
+"""Copy target to a sandbox, inject one fault, run the check, report verdict.
+
+Never touches the original target. Returns a result dict.
 """
-with open(path) as f:
-data = json.load(f)
-if isinstance(data, list):
-entries = data
-elif isinstance(data, dict):
-entries = None
-for k in ("gifts", "tools", "entries"):
-if isinstance(data.get(k), list):
-entries = data[k]
-break
-if entries is None:
-raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
-else:
-raise ValueError(f"{path}: not a JSON list or object")
-
-declared, undeclared = [], []
-for e in entries:
-slug = e.get("slug")
-pv = e.get("port_verb")
-if pv in VALID_VERBS:
-declared.append((slug, pv))
-else:
-undeclared.append(slug)
-return declared, undeclared
-
-def compose_map(declared):
-"""The fold: (slug, verb) list -> composition-map dict.
-
-Preserves the ancestor's compute core exactly (the byte-checked math):
-ordered-pair count over emitters x acceptors, closed-form
-|E|*|A| - |E∩A|, plus fan-out / fan-in per tool.
-"""
-gifts = sorted(declared)
-n = len(gifts)
-pairs = []
-by_first, by_second = {}, {}
-for i, (sa, va) in enumerate(gifts):
-for j, (sb, vb) in enumerate(gifts):
-if i == j:
-continue
-if EMITS(va) and ACCEPTS(vb):
-pairs.append((sa, sb))
-by_first[sa] = by_first.get(sa, 0) + 1
-by_second[sb] = by_second.get(sb, 0) + 1
-
-total_ordered = n * (n - 1)
-emitters = [g for g in gifts if EMITS(g[1])]
-acceptors = [g for g in gifts if ACCEPTS(g[1])]
-both = [g for g in gifts if EMITS(g[1]) and ACCEPTS(g[1])]
-closed_form = len(emitters) * len(acceptors) - len(both)
-
-from collections import Counter
-census = dict(Counter(v for _, v in gifts))
-
-return {
-"gifts": gifts,
-"n": n,
-"pairs": pairs,
-"total_ordered": total_ordered,
-"density": (len(pairs) / total_ordered) if total_ordered else 0.0,
-"census": census,
-"emitters": len(emitters),
-"acceptors": len(acceptors),
-"both_ports": len(both),
-"closed_form": closed_form,
-"closed_form_matches": closed_form == len(pairs),
-"fan_out": by_first,
-"fan_in": by_second,
+result = {
+"target": target, "fault": fault, "status": "held",
+"note": "", "check_exit": None, "edge": EDGE,
 }
+if not os.path.isfile(target):
+result["status"] = "usage"
+result["error"] = f"target file not found: {target}"
+return result
 
-def summary_record(cm, undeclared):
-"""The single aggregate record — map's fold output."""
-return {
-"kind": "summary",
-"n": cm["n"],
-"composable_pairs": len(cm["pairs"]),
-"total_ordered": cm["total_ordered"],
-"density": round(cm["density"], 4),
-"census": cm["census"],
-"emitters": cm["emitters"],
-"acceptors": cm["acceptors"],
-"closed_form_check": cm["closed_form_matches"],
-"undeclared": undeclared,
-"undeclared_count": len(undeclared),
-"semantic_layer": "UNPROVEN — map shows the TYPE gate (can the pipe carry "
-"data); it does not assert the RECORDS fit. That is a finer "
-"question the uniform JSONL type cannot settle.",
-}
+with open(target, "rb") as fh:
+original = fh.read()
 
-def emit_read(cm, undeclared, out):
-for sa, sb in cm["pairs"]:
-out.write(json.dumps({"kind": "pair", "from": sa, "to": sb}) + "\n")
-out.write(json.dumps(summary_record(cm, undeclared)) + "\n")
+mutated, note = inject(original, fault, frm, to)
+result["note"] = note
+if mutated is None:
+result["status"] = "no-fault"
+return result
+if mutated == original:
+result["status"] = "no-fault"
+result["note"] = note + " (no change to bytes)"
+return result
 
-def emit_text(cm, undeclared, out):
-out.write(f"Composition map — {cm['n']} tool(s) with a declared port-verb\n")
-out.write("=" * 56 + "\n")
-out.write(f"composable ordered pairs (A can feed B): {len(cm['pairs'])} / {cm['total_ordered']}\n")
-out.write(f"composition density: {cm['density']:.1%}\n")
-out.write(f"closed-form check |E|*|A|-|E∩A| = {cm['closed_form']} (matches: {cm['closed_form_matches']})\n")
-out.write(f"verb census: {cm['census']}\n")
-out.write(f"emitters (not sink): {cm['emitters']} acceptors (not source): {cm['acceptors']}\n\n")
-fo = sorted(cm["fan_out"].items(), key=lambda kv: -kv[1])[:8]
-out.write("top fan-out (feeds the most tools):\n")
-for s, c in fo:
-out.write(f" {s:32s} feeds {c}\n")
-fi = sorted(cm["fan_in"].items(), key=lambda kv: -kv[1])[:8]
-out.write("\ntop fan-in (fed by the most tools):\n")
-for s, c in fi:
-out.write(f" {s:32s} fed-by {c}\n")
-if undeclared:
-out.write(f"\nUNDECLARED ({len(undeclared)}) — excluded from the map, not guessed:\n")
-out.write(" " + ", ".join(str(s) for s in undeclared) + "\n")
-out.write("\nNOTE: this is the TYPE-level map. Semantic record-shape fit is UNPROVEN —\n")
-out.write("a composable pair means the ports agree, not that the records fit.\n")
+sandbox = tempfile.mkdtemp(prefix="gauntlet.")
+try:
+sandbox_file = os.path.join(sandbox, os.path.basename(target))
+with open(sandbox_file, "wb") as fh:
+fh.write(mutated)
+
+if use_stdin:
+proc = subprocess.run(
+check_cmd, shell=True, input=mutated,
+capture_output=True, timeout=300,
+)
+else:
+cmd = check_cmd.replace("{}", sandbox_file)
+if cmd == check_cmd and "{}" not in check_cmd:
+# no placeholder given: append the path
+cmd = f"{check_cmd} {sandbox_file}"
+proc = subprocess.run(
+cmd, shell=True, capture_output=True, timeout=300,
+)
+
+result["check_exit"] = proc.returncode
+# INVERSION: check FAILED (non-zero) on broken input => HELD (good).
+# check PASSED (zero) on broken input => ESCAPED (bad).
+result["status"] = "held" if proc.returncode!= 0 else "escaped"
+return result
+finally:
+shutil.rmtree(sandbox, ignore_errors=True)
 
 def main(argv=None):
-ap = argparse.ArgumentParser(description="Fold a set of port-declared tools into a composition map.")
-ap.add_argument("--port", action="store_true", help="print map's own port-verb (fold) and exit")
-sub = ap.add_subparsers(dest="cmd")
-for name in ("read", "summary", "text"):
-p = sub.add_parser(name)
-p.add_argument("--manifest", required=True)
-ap.add_argument("--selftest", action="store_true")
+ap = argparse.ArgumentParser(
+description="Does your check actually catch a fault you inject?",
+epilog="EDGE: " + EDGE,
+)
+ap.add_argument("--target", help="the file to inject a fault into (copied, never modified)")
+ap.add_argument("--fault", choices=["truncate", "bitflip", "replace"],
+help="the single typed fault to inject")
+ap.add_argument("--check", help="the check command to run; {} is replaced with the sandbox path")
+ap.add_argument("--from", dest="frm", help="(--fault replace) the string to find")
+ap.add_argument("--to", dest="to", help="(--fault replace) the string to substitute")
+ap.add_argument("--stdin", action="store_true",
+help="pipe the mutated bytes to the check on stdin instead of a path")
+ap.add_argument("--json", action="store_true", help="machine-readable verdict")
+ap.add_argument("--edge", action="store_true", help="print the edge and exit")
 args = ap.parse_args(argv)
 
-if args.port:
-print(json.dumps({"slug": "map", "port_verb": "fold"}))
+if args.edge:
+print(EDGE)
+return EXIT_HELD
+
+if not (args.target and args.fault and args.check):
+print("USAGE ERROR — --target, --fault and --check are all required",
+file=sys.stderr)
+return EXIT_USAGE
+
+res = run(args.target, args.fault, args.check,
+use_stdin=args.stdin, frm=args.frm, to=args.to)
+status = res["status"]
+
+if args.json:
+import json
+print(json.dumps(res, indent=2, sort_keys=True))
+else:
+if status == "held":
+print(f"HELD — the check caught the {args.fault} fault "
+f"(check exited {res['check_exit']} on broken input)")
+print(f" fault: {res['note']}")
+elif status == "escaped":
+print(f"ESCAPED — the check MISSED the {args.fault} fault "
+f"(check exited 0 on broken input — it has a hole)")
+print(f" fault: {res['note']}")
+elif status == "no-fault":
+print(f"NO-FAULT — could not inject: {res['note']}")
+else:
+print(f"USAGE ERROR — {res.get('error', 'bad arguments')}", file=sys.stderr)
+
+return {
+"held": EXIT_HELD, "escaped": EXIT_ESCAPED,
+"no-fault": EXIT_NO_FAULT, "usage": EXIT_USAGE,
+}[status]
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_gauntlet.py 206 lines on GitHub →
+#!/usr/bin/env python3
+"""test_gauntlet.py — mutation-bitten behavior proof for the gauntlet gift.
+
+stdlib only. Each test asserts a distinct BEHAVIOR so deleting the behavior
+makes a test fail. Run: python3 test_gauntlet.py
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GIFT = os.path.join(HERE, "gauntlet.py")
+
+HELD, USAGE, ESCAPED, NO_FAULT = 0, 2, 3, 4
+
+# A check that PASSES (exit 0) only if the file is exactly the 200-byte original.
+# Deterministic, stdlib-only, written per-test into the sandbox.
+STRICT_CHECK = (
+"python3 -c \"import sys; d=open(sys.argv[1],'rb').read(); "
+"sys.exit(0 if len(d)==200 and d==b'A'*200 else 1)\" {}"
+)
+# A weak check that ALWAYS passes — used to prove ESCAPED detection.
+WEAK_CHECK = "python3 -c \"import sys; sys.exit(0)\" {}"
+
+results = []
+
+def check(name, cond):
+results.append((name, bool(cond)))
+print(f" [{'PASS' if cond else 'FAIL'}] {name}")
+
+def _scratch_target(content=b"A" * 200):
+d = tempfile.mkdtemp(prefix="gauntlet-test.")
+p = os.path.join(d, "data.bin")
+with open(p, "wb") as f:
+f.write(content)
+return d, p
+
+def _run(*args):
+p = subprocess.run([sys.executable, GIFT, *args],
+capture_output=True, text=True, timeout=120)
+return p.returncode, p.stdout, p.stderr
+
+def t_held_when_strict_check_catches_truncation():
+"""A strict check that rejects a truncated file => HELD (exit 0)."""
+d, p = _scratch_target()
+try:
+rc, out, _ = _run("--target", p, "--fault", "truncate", "--check", STRICT_CHECK)
+check("HELD when strict check catches truncation", rc == HELD and "HELD" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_escaped_when_weak_check_misses():
+"""A check that always passes => ESCAPED (exit 3): the hole is detected."""
+d, p = _scratch_target()
+try:
+rc, out, _ = _run("--target", p, "--fault", "truncate", "--check", WEAK_CHECK)
+check("ESCAPED when weak check misses the fault", rc == ESCAPED and "ESCAPED" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_original_never_modified():
+"""The original target file is byte-identical after a run (sandbox only)."""
+d, p = _scratch_target()
+try:
+before = open(p, "rb").read()
+_run("--target", p, "--fault", "bitflip", "--check", WEAK_CHECK)
+after = open(p, "rb").read()
+check("original file untouched after a run", before == after)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_bitflip_held_by_strict_check():
+"""A single-byte flip is caught by the strict check => HELD."""
+d, p = _scratch_target()
+try:
+rc, out, _ = _run("--target", p, "--fault", "bitflip", "--check", STRICT_CHECK)
+check("HELD on bitflip caught by strict check", rc == HELD and "byte flipped" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_replace_regression_held():
+"""A find/replace regression the check rejects => HELD; note names the swap."""
+d = tempfile.mkdtemp(prefix="gauntlet-test.")
+p = os.path.join(d, "cfg.txt")
+open(p, "w").write("version: 3\n")
+# check passes only if it still says 'version: 3'
+chk = "python3 -c \"import sys; sys.exit(0 if 'version: 3' in open(sys.argv[1]).read() else 1)\" {}"
+try:
+rc, out, _ = _run("--target", p, "--fault", "replace",
+"--from", "version: 3", "--to", "version: 2", "--check", chk)
+check("HELD on replace regression + note names swap",
+rc == HELD and "version: 3" in out and "version: 2" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_no_fault_when_replace_string_absent():
+"""--replace with a --from that isn't present => NO-FAULT (exit 4), not a verdict."""
+d = tempfile.mkdtemp(prefix="gauntlet-test.")
+p = os.path.join(d, "cfg.txt")
+open(p, "w").write("hello\n")
+try:
+rc, out, _ = _run("--target", p, "--fault", "replace",
+"--from", "not-here", "--to", "x", "--check", WEAK_CHECK)
+check("NO-FAULT when --from absent", rc == NO_FAULT and "NO-FAULT" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_usage_when_target_missing():
+"""A missing target file is a usage error (exit 2)."""
+rc, out, err = _run("--target", "/no/such/file", "--fault", "truncate", "--check", WEAK_CHECK)
+check("USAGE when target file missing", rc == USAGE and "USAGE" in (out + err))
+
+def t_usage_when_required_arg_missing():
+"""Missing --check is a usage error, not a crash."""
+d, p = _scratch_target()
+try:
+rc, out, err = _run("--target", p, "--fault", "truncate")
+check("USAGE when --check missing", rc == USAGE and "USAGE" in (out + err))
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_verdict_inversion_is_correct():
+"""The inversion holds: check-fails => HELD, check-passes => ESCAPED, same fault."""
+d, p = _scratch_target()
+try:
+rc_strict, _, _ = _run("--target", p, "--fault", "truncate", "--check", STRICT_CHECK)
+rc_weak, _, _ = _run("--target", p, "--fault", "truncate", "--check", WEAK_CHECK)
+check("inversion: strict->HELD(0), weak->ESCAPED(3)",
+rc_strict == HELD and rc_weak == ESCAPED)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_deterministic_verdict():
+"""Same target+fault+check => same verdict every run."""
+d, p = _scratch_target()
+try:
+verdicts = set()
+for _ in range(3):
+rc, _, _ = _run("--target", p, "--fault", "bitflip", "--check", STRICT_CHECK)
+verdicts.add(rc)
+check("deterministic: identical verdict across 3 runs", verdicts == {HELD})
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_json_mode_emits_status():
+"""--json emits a parseable object with the status and check_exit."""
+import json as _json
+d, p = _scratch_target()
+try:
+rc, out, _ = _run("--target", p, "--fault", "truncate", "--check", STRICT_CHECK, "--json")
+obj = _json.loads(out)
+check("--json emits status + check_exit",
+obj.get("status") == "held" and obj.get("check_exit") is not None)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_edge_present_and_printed():
+"""The printed edge is in the artifact and prints on --edge."""
+src = open(GIFT).read()
+rc, out, _ = _run("--edge")
+check("edge present in source AND on --edge",
+"never modifies your original" in src and "never modifies your original" in out)
+
+def main():
+print("test_gauntlet.py")
+for fn in [
+t_held_when_strict_check_catches_truncation,
+t_escaped_when_weak_check_misses,
+t_original_never_modified,
+t_bitflip_held_by_strict_check,
+t_replace_regression_held,
+t_no_fault_when_replace_string_absent,
+t_usage_when_target_missing,
+t_usage_when_required_arg_missing,
+t_verdict_inversion_is_correct,
+t_deterministic_verdict,
+t_json_mode_emits_status,
+t_edge_present_and_printed,
+]:
+fn()
+passed = sum(1 for _, ok in results if ok)
+total = len(results)
+print(f"\n{passed}/{total} passing")
+return 0 if passed == total else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python 3, standard library only
+
+---
+
+# Gitlog — a Loop MMT gift
+https://loopmmt.com/gifts/gitlog/
+[coverage: optional · branch: gifts]
+
+Git History On A Pipe read ← all gifts
+
+Gitlog
+
+Turn a git history into one JSON object per commit on stdout, so the questions you actually have — how many commits touched this file, who authored what last week, churn per day — become one pipe away instead of re-parsing git's text yourself. Field names match what git-log folds already read.
+
+The honest edge
+
+It reports exactly what git reports — it's only as complete as the history you point it at. A shallow clone gives you a shallow answer, faithfully.
+
+Run it
+
+python3 gitlog.py --repo.
+test_gitlog.py (19/19)
+Python stdlib only
+
+The code — every file that ships
+
+gitlog.py 269 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""gitlog.py — turn a git history into one JSON object per commit, on stdout.
+
+A git repository already holds the truth about what happened and when: every
+commit is a dated, authored, immutable record. But that truth is trapped behind
+`git log`'s human-facing format. This reads the log and emits it as **JSON
+lines** — one object per commit, newest first by default — so the next tool in a
+pipe can fold, filter, count, or chart it without re-parsing git's output itself.
+
+It is a *source*: it emits records and consumes no stdin. Point it at a repo, get
+a clean stream of commits you can reason about. The whole point is to stop
+eyeballing `git log` and start folding it: "how many commits touched this file",
+"who authored what in this range", "what was the churn per day" all become one
+pipe away once the history is on the rail as records.
+
+Each commit becomes one object with these fields (always present):
+hash full 40-char commit SHA (git %H)
+short abbreviated SHA (git %h)
+committed committer date, ISO-8601 strict (git %cI)
+authored author date, ISO-8601 strict (git %aI)
+author author name (git %an)
+email author email (git %ae)
+subject first line of the message (git %s)
+
+With --churn, three more fields are added per commit (one extra git call each):
+files number of files changed in the commit (int)
+added total inserted lines across those files (int, None if binary-only)
+deleted total deleted lines (int, None if binary-only)
+
+The field names match what the existing git-log folds already read (%H, %h, %cI,
+%aI, %s), so a fold written against those consumes this source's output directly.
+
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+- emits ONE JSON object per line on stdout — a commit record.
+- order is git's default (reverse-chronological) unless --reverse is given.
+- --path P restricts to commits that touched P (repeatable).
+- --since / --until / --author / --max-count are passed through to git log.
+- errors go to stderr; stdout stays clean JSON-lines.
+
+Exit codes:
+0 the log was read and emitted (including the empty-history case)
+2 git failed / not a repository / git not found (don't trust the reading)
+3 usage / bad input
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+# GIFT-013: field/record framing must use a byte that CANNOT occur in commit
+# text. The old 0x1f/0x1e (ASCII unit/record separators) were assumed "safe
+# inside commit text" but are not — git permits those control bytes inside a
+# subject or author name, so a crafted commit split one record into many
+# ("malformed log record: expected 7 fields, got 8"). NUL is the only byte git
+# guarantees absent from commit content (its objects are NUL-terminated
+# C-strings): fields are joined with %x00 and each record is terminated by
+# `git log -z`, so no field value can ever break the frame.
+NUL = "\x00"
+
+# The per-commit fields, in emit order. (placeholder, json_key) pairs.
+FIELDS = [
+("%H", "hash"),
+("%h", "short"),
+("%cI", "committed"),
+("%aI", "authored"),
+("%an", "author"),
+("%ae", "email"),
+("%s", "subject"),
+]
+
+class GitLogError(Exception):
+"""A git fault or usage error, carrying an exit code."""
+
+def __init__(self, message, code):
+super().__init__(message)
+self.code = code
+
+def _run_git(args, repo):
+"""Run a git command in repo, return stdout text. Raise GitLogError on failure."""
+try:
+proc = subprocess.run(
+["git", "-C", repo] + args,
+stdout=subprocess.PIPE,
+stderr=subprocess.PIPE,
+encoding="utf-8",
+)
+except FileNotFoundError:
+raise GitLogError("git executable not found on PATH", 2)
+if proc.returncode!= 0:
+detail = proc.stderr.strip() or "git exited %d" % proc.returncode
+raise GitLogError(detail, 2)
+return proc.stdout
+
+def read_commits(repo, ref="HEAD", paths=None, since=None, until=None,
+author=None, max_count=None, reverse=False):
+"""Read commits from repo and return a list of record dicts (no churn).
+
+The list is git's default order (reverse-chronological) unless reverse=True.
+An empty history returns [] and is NOT an error.
+"""
+# GIFT-014: an unborn repository (git init, zero commits) has no valid HEAD,
+# so `git log HEAD` fatals. The contract says an empty history returns [] and
+# is not an error. When the ref is the DEFAULT HEAD, detect the unborn case
+# with a quiet verify and honor that contract. An invalid EXPLICIT ref
+# (ref!= "HEAD") still errors, and stays distinguishable from an unborn HEAD.
+if ref == "HEAD":
+probe = subprocess.run(
+["git", "-C", repo, "rev-parse", "--verify", "--quiet", "HEAD"],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+)
+if probe.returncode!= 0:
+inside = subprocess.run(
+["git", "-C", repo, "rev-parse", "--git-dir"],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+)
+if inside.returncode == 0:
+return [] # unborn default HEAD -> empty history, per contract
+# not a git repo / unreadable -> fall through; _run_git raises properly.
+
+# Fields joined by a literal NUL (%x00); `-z` NUL-terminates each record.
+fmt = "%x00".join(p for p, _ in FIELDS)
+args = ["log", ref, "-z", "--format=%s" % fmt]
+if reverse:
+args.append("--reverse")
+if since:
+args.append("--since=%s" % since)
+if until:
+args.append("--until=%s" % until)
+if author:
+args.append("--author=%s" % author)
+if max_count is not None:
+args.append("--max-count=%d" % max_count)
+if paths:
+args.append("--")
+args.extend(paths)
+
+raw = _run_git(args, repo)
+# -z terminates every record (including the last) with a NUL, and fields are
+# NUL-joined, so the whole stream is NUL-separated tokens: every len(FIELDS)
+# tokens is one record. Drop the single trailing empty left by the final
+# terminator; interior empty tokens (e.g. an empty subject) are preserved.
+tokens = raw.split(NUL)
+if tokens and tokens[-1] == "":
+tokens.pop()
+if not tokens:
+return []
+n = len(FIELDS)
+if len(tokens) % n!= 0:
+# A malformed stream is a fault, not a silent drop.
+raise GitLogError(
+"malformed log stream: %d field tokens is not a multiple of %d"
+% (len(tokens), n),
+2,
+)
+records = []
+for i in range(0, len(tokens), n):
+group = tokens[i:i + n]
+rec = {key: group[j] for j, (_, key) in enumerate(FIELDS)}
+records.append(rec)
+return records
+
+def add_churn(repo, record):
+"""Add files/added/deleted to one record via `git show --numstat`.
+
+added/deleted are None when the commit is binary-only (git prints '-').
+Mutates and returns the record.
+"""
+out = _run_git(
+["show", "--numstat", "--format=", record["hash"]], repo
+)
+files = 0
+added = 0
+deleted = 0
+saw_binary = False
+for line in out.splitlines():
+line = line.strip()
+if not line:
+continue
+cols = line.split("\t")
+if len(cols) < 3:
+continue
+files += 1
+a, d = cols[0], cols[1]
+if a == "-" or d == "-":
+saw_binary = True
+continue
+try:
+added += int(a)
+deleted += int(d)
+except ValueError:
+saw_binary = True
+record["files"] = files
+# If every changed file was binary, added/deleted are not meaningful.
+if saw_binary and added == 0 and deleted == 0:
+record["added"] = None
+record["deleted"] = None
+else:
+record["added"] = added
+record["deleted"] = deleted
+return record
+
+def _emit(record, out=None):
+"""Write one JSON object as a single line to stdout (or the given stream)."""
+stream = out if out is not None else sys.stdout
+stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+def build_parser():
+p = argparse.ArgumentParser(
+prog="gitlog",
+description="Emit a git history as JSON lines, one object per commit.",
+)
+p.add_argument("--repo", default=".", help="path to the git repo (default:.)")
+p.add_argument("--ref", default="HEAD",
+help="ref/range to log (default: HEAD; e.g. main, v1..v2)")
+p.add_argument("--path", action="append", dest="paths", metavar="P",
+help="restrict to commits touching P (repeatable)")
+p.add_argument("--since", help="git --since passthrough (e.g. '2 weeks ago')")
+p.add_argument("--until", help="git --until passthrough")
+p.add_argument("--author", help="git --author filter passthrough")
+p.add_argument("-n", "--max-count", type=int, default=None,
+help="limit to the most recent N commits")
+p.add_argument("--reverse", action="store_true",
+help="oldest first (default is newest first)")
+p.add_argument("--churn", action="store_true",
+help="add files/added/deleted per commit (one extra git call each)")
+return p
+
+def main(argv=None):
+parser = build_parser()
+args = parser.parse_args(argv)
+
+if args.max_count is not None and args.max_count < 1:
+sys.stderr.write("gitlog: -n must be >= 1\n")
+return 3
+
+try:
+records = read_commits(
+args.repo,
+ref=args.ref,
+paths=args.paths,
+since=args.since,
+until=args.until,
+author=args.author,
+max_count=args.max_count,
+reverse=args.reverse,
+)
+for rec in records:
+if args.churn:
+add_churn(args.repo, rec)
+_emit(rec)
 return 0
-if args.selftest:
-return _selftest()
-if not args.cmd:
-ap.print_help()
+except GitLogError as exc:
+sys.stderr.write("gitlog: %s\n" % exc)
+return exc.code
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_gitlog.py 168 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Tests for gitlog.py — run against a REAL throwaway git repo, not a mock.
+
+The point of a source gift is that it reads a real git log correctly, so the
+tests build an actual repository in a temp dir and assert on the emitted records.
+Each test is written to BITE: it asserts specific values a broken implementation
+would get wrong (field mapping, ordering, churn arithmetic, path filtering),
+not merely that "some output appeared".
+
+Run: python3 test_gitlog.py (exits non-zero if any assertion fails)
+"""
+
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import gitlog
+
+def _git(repo, *args, env=None):
+subprocess.run(["git", "-C", repo] + list(args), check=True,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+def _commit(repo, path, content, message, when):
+"""Write a file and commit it with a fixed author/committer date."""
+full = os.path.join(repo, path)
+os.makedirs(os.path.dirname(full), exist_ok=True) if os.path.dirname(full) else None
+with open(full, "w", encoding="utf-8") as fh:
+fh.write(content)
+_git(repo, "add", path)
+env = dict(os.environ)
+env["GIT_AUTHOR_DATE"] = when
+env["GIT_COMMITTER_DATE"] = when
+env["GIT_AUTHOR_NAME"] = "Ada Lovelace"
+env["GIT_AUTHOR_EMAIL"] = "ada@example.com"
+env["GIT_COMMITTER_NAME"] = "Ada Lovelace"
+env["GIT_COMMITTER_EMAIL"] = "ada@example.com"
+subprocess.run(["git", "-C", repo, "commit", "-m", message],
+check=True, stdout=subprocess.DEVNULL,
+stderr=subprocess.DEVNULL, env=env)
+
+def _make_repo(tmp):
+repo = os.path.join(tmp, "r")
+os.makedirs(repo)
+_git(repo, "init")
+_git(repo, "config", "user.name", "Ada Lovelace")
+_git(repo, "config", "user.email", "ada@example.com")
+# three commits, oldest first
+_commit(repo, "a.txt", "one\ntwo\nthree\n", "first: add a.txt",
+"2026-01-01T09:00:00")
+_commit(repo, "b.txt", "x\n", "second: add b.txt",
+"2026-01-02T09:00:00")
+_commit(repo, "a.txt", "one\ntwo\nthree\nfour\n", "third: extend a.txt",
+"2026-01-03T09:00:00")
+return repo
+
+def _run(argv):
+"""Run main() capturing stdout; return (exit_code, [parsed records])."""
+buf = io.StringIO()
+old = sys.stdout
+sys.stdout = buf
+try:
+code = gitlog.main(argv)
+finally:
+sys.stdout = old
+records = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+return code, records
+
+RESULTS = []
+
+def check(name, cond):
+RESULTS.append((name, bool(cond)))
+print(("PASS" if cond else "FAIL") + " " + name)
+
+def main():
+tmp = tempfile.mkdtemp(prefix="gitlog-test-")
+repo = _make_repo(tmp)
+
+# 1. count: three commits in, three records out.
+code, recs = _run(["--repo", repo])
+check("emits one record per commit (3)", code == 0 and len(recs) == 3)
+
+# 2. default order is newest-first — the third commit leads.
+check("default order newest-first",
+recs[0]["subject"] == "third: extend a.txt"
+and recs[2]["subject"] == "first: add a.txt")
+
+# 3. --reverse flips to oldest-first. (Bites an ignored --reverse.)
+code, rrecs = _run(["--repo", repo, "--reverse"])
+check("--reverse gives oldest-first",
+rrecs[0]["subject"] == "first: add a.txt"
+and rrecs[2]["subject"] == "third: extend a.txt")
+
+# 4. field mapping: author/email/dates land in the right keys.
+# (Bites a transposed field map — the classic %an/%ae swap.)
+top = recs[0]
+check("author name mapped correctly", top["author"] == "Ada Lovelace")
+check("email mapped correctly", top["email"] == "ada@example.com")
+check("committed date is the fixed ISO date",
+top["committed"].startswith("2026-01-03T09:00:00"))
+check("hash is 40 hex chars", len(top["hash"]) == 40
+and all(c in "0123456789abcdef" for c in top["hash"]))
+check("short is a prefix of hash", top["hash"].startswith(top["short"]))
+
+# 5. no churn fields unless asked. (Bites churn leaking in by default.)
+check("no churn fields by default", "added" not in top and "files" not in top)
+
+# 6. --churn arithmetic: the first commit added 3 lines to a.txt, 0 deleted.
+code, crecs = _run(["--repo", repo, "--reverse", "--churn"])
+first = crecs[0]
+check("churn: files counted", first.get("files") == 1)
+check("churn: added lines correct (3)", first.get("added") == 3)
+check("churn: deleted lines correct (0)", first.get("deleted") == 0)
+# third commit: +1 line, -0 on a.txt
+third = crecs[2]
+check("churn: extend commit added 1", third.get("added") == 1
+and third.get("deleted") == 0)
+
+# 7. --path filters to commits touching that path.
+# a.txt was touched by commits 1 and 3 only (not 2). Bites a broken filter.
+code, precs = _run(["--repo", repo, "--path", "a.txt"])
+subjects = {r["subject"] for r in precs}
+check("--path a.txt selects only its 2 commits",
+len(precs) == 2 and "second: add b.txt" not in subjects)
+
+# 8. -n limits count. Bites an ignored max-count.
+code, nrecs = _run(["--repo", repo, "-n", "1"])
+check("-n 1 yields exactly one record", code == 0 and len(nrecs) == 1)
+
+# 9. not-a-repo is exit 2, not a crash and not exit 0.
+code, _ = _run(["--repo", tmp]) # tmp itself is not a git repo
+check("non-repo path exits 2", code == 2)
+
+# 10. -n 0 is a usage error (exit 3).
+code, _ = _run(["--repo", repo, "-n", "0"])
+check("-n 0 is usage error (exit 3)", code == 3)
+
+# 11. stdout is clean JSON-lines: every emitted line parses as a JSON object.
+code, recs = _run(["--repo", repo])
+check("every line is a JSON object",
+all(isinstance(r, dict) for r in recs) and len(recs) == 3)
+
+# 12. empty range is exit 0 with zero records (not an error).
+code, erecs = _run(["--repo", repo, "--since", "2030-01-01"])
+check("empty result is exit 0, zero records", code == 0 and erecs == [])
+
+# --- meta: the suite must not be vacuous ---
+ran = len(RESULTS)
+passed = sum(1 for _, ok in RESULTS if ok)
+print("\n%d/%d checks passed (%d ran)" % (passed, ran, ran))
+if ran < 12:
+print("VACUITY GUARD FAILED: too few checks ran")
+return 1
+return 0 if passed == ran else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only
+
+---
+
+# Grain — a Loop MMT gift
+https://loopmmt.com/gifts/grain/
+[coverage: optional · branch: gifts]
+
+Structure Smell Test smell ← all gifts
+
+Grain
+
+Compress your data, compare the ratio against a size-matched random null model drawn live, and get a self-calibrating reading of how much structure vs. noise — no hand-set threshold. Snapshot it over time and it becomes a cheap drift alarm.
+
+The honest edge
+
+It's a smell, not a proof — a smoke alarm, not an arson investigator. Great for staleness and homogenization drift; not a data-rot or dead-link checker.
+
+Run it
+
+python3 grain.py --help
+test_grain.py (5/5)
+Python stdlib only
+
+The code — every file that ships
+
+grain.py 315 lines on GitHub →
+#!/usr/bin/env python3
+"""
+grain.py — a self-calibrating structure & drift smell test for any corpus.
+
+Does this text/relation have *grain* — real structure — or is it slurry?
+
+WHAT IT DOES
+It compresses your data with zlib (a Kolmogorov UPPER bound: DEFLATE finds
+repeated substructure) and compares the compression ratio against a
+size-matched, deterministically-seeded RANDOM NULL MODEL built from your own
+data's own symbols. If your data compresses clearly *more* than random
+arrangements of the same symbols, it carries structure a random baseline does
+not — a rule, a template, a hub, a repetition. The threshold is drawn LIVE
+from the null model, so there is no magic number to hand-tune as your data
+grows. That self-calibration is the whole trick.
+
+WHAT IT IS GOOD FOR (graded honestly)
+* Corpus staleness / homogenization drift — its BEST fit. Snapshot the grain
+signature over time; a drift is a near-free staleness/homogenization alarm.
+No labels, no model, no training. (see: --drift)
+* "AI slop" smell — YES, as a SMELL, not a classifier.
+Machine-generated text trends more templated/redundant; rising structure
+against the null is a cheap smoke alarm. A smoke alarm, not an investigator.
+* Detecting a generating rule leaking into a published relation (hub / label
+reuse) — the original use this was extracted from. (see: --relation)
+
+WHAT IT IS *NOT* GOOD FOR
+* Data rot (dead links, broken references, bit-decay). Wrong tool — that is a
+reference-integrity problem; this measures structure, not reachability.
+* A proof of anything. It is a lower-bound SMELL. zlib is an upper bound on
+complexity, so a low ratio proves compressibility, not a specific cause; and
+it is WEAK on chain-shaped rules (a chain reuses each symbol ~twice, like a
+sparse random graph), so a clean reading is not a certificate of "no rule."
+
+Stdlib only. Deterministic (seeded). No dependencies. MIT licensed.
+
+Origin: extracted and generalized from the "non-compressibility gate" in the
+Loop MMT corpus-map builder. The specific application (generator-leak detection
+in a published edge graph) stayed home; this is the general kernel, given away.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import statistics
+import sys
+import zlib
+
+class GrainInputError(Exception):
+"""A clean, user-facing input error (bad path, unreadable baseline).
+
+Raised instead of letting an OSError traceback escape, so adversarial I/O
+fails with a one-line message and a nonzero exit (exit 2) rather than a
+stack trace."""
+
+# --- the one documented knob ------------------------------------------------
+Z_CUT = 2.0 # flag STRUCTURED when the real ratio is > Z sd below the
+# null MEAN — more compressible than random arrangements of
+# its own symbols, beyond normal variation. Self-calibrating
+# (mean+sd drawn live); no absolute number to drift.
+NULL_TRIALS = 64 # deterministic sample size of the random baseline
+NULL_SEED = 0xC0DE # fixed seed => folds-twice-identical (reproducible)
+MIN_SD = 1e-6 # sd-floor: below this the baseline is degenerate and the
+# z-cut is meaningless, so fall back to a coarse fraction.
+DEGENERATE_FRACTION = 0.5 # backstop only when the null baseline has ~no spread
+
+def _zlib_ratio(raw: bytes) -> float:
+"""rho = compressed_len / raw_len at max level. LOW rho => compressible => structure."""
+if not raw:
+return 1.0
+return len(zlib.compress(raw, 9)) / len(raw)
+
+def _serialize(tokens) -> bytes:
+"""
+Canonical bytes for a token sequence: newline-joined, real symbols kept.
+We keep the REAL tokens (never remap to a dense integer alphabet): structure
+manifests as repeated real tokens, and that reuse is exactly the compressible
+signal to catch. The null is serialized identically, so any per-token length
+effect cancels between actual and null.
+"""
+return "\n".join(tokens).encode("utf-8")
+
+def _null_stats(n_tokens, null_draw):
+"""
+zlib-ratio DISTRIBUTION of `NULL_TRIALS` size-matched RANDOM draws from the
+data's own alphabet — NOT a permutation of the same multiset. Drawing fresh
+from the alphabet is what lets a real rule stand out: the actual reuses a hub
+label (`x -> glossary` many times) far more than a uniform draw over the
+alphabet does, so the actual compresses more and its z_score drops. (A
+same-multiset permutation would hold that reuse INSIDE the null and detect
+nothing — the exact bug this replaced.) Deterministic (seeded). Returns
+(mean, population_sd) over the draws.
+
+`null_draw(rng, n)` returns one random size-n token list from the alphabet.
+"""
+if n_tokens < 2:
+return 1.0, 0.0
+rng = random.Random(NULL_SEED)
+ratios = [_zlib_ratio(_serialize(null_draw(rng, n_tokens)))
+for _ in range(NULL_TRIALS)]
+return statistics.mean(ratios), statistics.pstdev(ratios)
+
+def _alphabet_draw(alphabet):
+"""Default null: draw n symbols uniformly (with replacement) from `alphabet`.
+
+The pool is `sorted`, not a bare `list(alphabet)`: a set's iteration order is
+randomized per process (PYTHONHASHSEED), so an unsorted pool made the fixed
+PRNG seed index a differently-ordered pool in every process — same input, two
+processes, different z-score (GIFT-006). Determinism is a whole-pipeline
+property; the seed alone is not enough if upstream ordering is not canonical.
+The relation path already sorts its node pool; this brings the token path to
+the same footing.
+"""
+pool = sorted(alphabet)
+return lambda rng, n: [rng.choice(pool) for _ in range(n)]
+
+def signature(tokens, null_draw=None):
+"""
+The grain signature of a token sequence, self-calibrated against a size-matched
+uniform draw from its own alphabet. `z_score` is sigma below (negative) / above
+the null mean: strongly negative => structured (compresses more than a random
+draw of its size does). Pass `null_draw` to supply a domain-specific null (see
+the relation path); default is a uniform draw over the distinct tokens.
+"""
+tokens = list(tokens)
+if null_draw is None:
+null_draw = _alphabet_draw(set(tokens) or {""})
+rho_actual = _zlib_ratio(_serialize(tokens))
+mean_null, sd_null = _null_stats(len(tokens), null_draw)
+rel = (rho_actual / mean_null) if mean_null else 1.0
+z = ((rho_actual - mean_null) / sd_null) if sd_null > MIN_SD else 0.0
+degenerate = sd_null <= MIN_SD
+if not tokens:
+structured = False
+elif degenerate:
+structured = rho_actual < DEGENERATE_FRACTION * mean_null
+else:
+structured = z < -Z_CUT
+return {
+"tokens": len(tokens),
+"rho_actual": round(rho_actual, 4),
+"mean_null": round(mean_null, 4),
+"sd_null": round(sd_null, 4),
+"rel_to_null": round(rel, 4),
+"z_score": round(z, 3),
+"z_cut": Z_CUT,
+"null_trials": NULL_TRIALS,
+"degenerate_baseline": degenerate,
+"verdict": "STRUCTURED" if structured else "IDIOSYNCRATIC",
+}
+
+# --- input modes ------------------------------------------------------------
+
+def tokens_from_text(text, mode="lines"):
+if mode == "lines":
+return [ln for ln in text.splitlines() if ln.strip()]
+if mode == "words":
+return text.split()
+raise ValueError(f"unknown text mode: {mode}")
+
+def tokens_from_relation(text):
+"""Each non-empty line is an edge `a->b` or `a<TAB>b`; kept as a real token."""
+out = []
+for ln in text.splitlines():
+ln = ln.strip()
+if not ln:
+continue
+if "->" in ln:
+a, b = ln.split("->", 1)
+elif "\t" in ln:
+a, b = ln.split("\t", 1)
+else:
+a, b = ln, ""
+out.append(f"{a.strip()}->{b.strip()}")
+return sorted(out) # canonical order, like the original relation serializer
+
+def relation_null_draw(edge_tokens):
+"""
+Faithful relation null (from the original gate): the alphabet is the NODE set,
+and each null draw is `n` random DISTINCT directed pairs from it. A rule-leak
+(a hub reusing one target node across many edges) sits far below this uniform-
+pair baseline; a genuinely idiosyncratic dependency graph sits inside it.
+"""
+nodes = set()
+for tok in edge_tokens:
+if "->" in tok:
+a, b = tok.split("->", 1)
+nodes.add(a.strip())
+nodes.add(b.strip())
+nodes = sorted(nodes)
+all_pairs = [(a, b) for a in nodes for b in nodes if a!= b]
+
+def draw(rng, n):
+k = min(n, len(all_pairs))
+return [f"{a}->{b}" for a, b in sorted(rng.sample(all_pairs, k))] if k > 0 else []
+
+return draw
+
+def _read(path):
+if path == "-":
+return sys.stdin.read()
+try:
+with open(path, "r", encoding="utf-8", errors="replace") as fh:
+return fh.read()
+except (OSError, IOError) as exc:
+# A clean one-line refusal instead of a traceback: missing file,
+# a directory given as a file, permission denied, etc.
+raise GrainInputError("cannot read %r: %s" % (path, exc.strerror or exc))
+
+HONEST_CEILING = (
+"note: a lower-bound SMELL, never a proof. zlib is an upper bound on "
+"complexity, so a low ratio proves compressibility, not a specific cause; "
+"it is weak on chain-shaped rules; and it says nothing about data rot "
+"(broken references) — that is a different tool."
+)
+
+def main(argv=None):
+p = argparse.ArgumentParser(
+description="Self-calibrating structure & drift smell test for any corpus.",
+epilog=HONEST_CEILING,
+)
+p.add_argument("path", help="file to read, or '-' for stdin")
+p.add_argument("--relation", action="store_true",
+help="treat each line as an edge (a->b) instead of prose")
+p.add_argument("--words", action="store_true",
+help="tokenize prose by words instead of lines")
+p.add_argument("--drift", metavar="BASELINE.json",
+help="compare this input's signature against a saved baseline "
+"and report the change (the staleness alarm)")
+p.add_argument("--save", metavar="OUT.json",
+help="write this input's signature to OUT.json as a baseline")
+p.add_argument("--json", action="store_true", help="machine-readable output")
+args = p.parse_args(argv)
+
+try:
+return _run(args)
+except GrainInputError as exc:
+sys.stderr.write("grain: %s\n" % exc)
 return 2
 
-declared, undeclared = load_declared(args.manifest)
-cm = compose_map(declared)
+def _run(args):
+text = _read(args.path)
+if args.relation:
+toks = tokens_from_relation(text)
+sig = signature(toks, null_draw=relation_null_draw(toks))
+else:
+toks = tokens_from_text(text, "words" if args.words else "lines")
+sig = signature(toks)
 
-if args.cmd == "read":
-emit_read(cm, undeclared, sys.stdout)
-elif args.cmd == "summary":
-sys.stdout.write(json.dumps(summary_record(cm, undeclared)) + "\n")
-elif args.cmd == "text":
-emit_text(cm, undeclared, sys.stdout)
+if args.save:
+try:
+with open(args.save, "w", encoding="utf-8") as fh:
+json.dump(sig, fh, indent=2, sort_keys=True)
+except (OSError, IOError) as exc:
+raise GrainInputError("cannot write %r: %s"
+% (args.save, exc.strerror or exc))
+
+if args.drift:
+try:
+with open(args.drift, "r", encoding="utf-8") as fh:
+base = json.load(fh)
+except (OSError, IOError) as exc:
+raise GrainInputError("cannot read baseline %r: %s"
+% (args.drift, exc.strerror or exc))
+except ValueError as exc:
+raise GrainInputError("baseline %r is not valid JSON: %s"
+% (args.drift, exc))
+delta_z = round(sig["z_score"] - base.get("z_score", 0.0), 3)
+delta_rel = round(sig["rel_to_null"] - base.get("rel_to_null", 1.0), 4)
+drift = {
+"baseline_z": base.get("z_score"),
+"current_z": sig["z_score"],
+"delta_z": delta_z,
+"delta_rel_to_null": delta_rel,
+# more structure than before => drift toward homogenization/staleness
+"reading": ("MORE STRUCTURED than baseline (homogenizing/staling)"
+if delta_z < -0.5 else
+"LESS STRUCTURED than baseline (diversifying)"
+if delta_z > 0.5 else
+"stable (within noise)"),
+}
+if args.json:
+print(json.dumps({"signature": sig, "drift": drift}, indent=2, sort_keys=True))
+else:
+print(f"grain drift: {drift['reading']} (delta_z={delta_z})")
+print(HONEST_CEILING)
 return 0
 
-def _selftest():
-"""Mutation-honest selftest over a tiny known set with a hand-computed answer."""
-# 4 tools: 1 source, 1 transform, 1 filter, 1 sink.
-# emitters = {source, transform, filter} (3) (not sink)
-# acceptors = {transform, filter, sink} (3) (not source)
-# both = {transform, filter} (2)
-# composable pairs = |E|*|A| - |E∩A| = 3*3 - 2 = 7
-decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
-cm = compose_map(decl)
-assert cm["n"] == 4, cm["n"]
-assert len(cm["pairs"]) == 7, f"expected 7 pairs, got {len(cm['pairs'])}"
-assert cm["closed_form"] == 7 and cm["closed_form_matches"], "closed form wrong"
-assert cm["emitters"] == 3 and cm["acceptors"] == 3, "emit/accept wrong"
-# source feeds all 3 acceptors, is fed by nobody
-assert cm["fan_out"].get("s") == 3, cm["fan_out"]
-assert "s" not in cm["fan_in"], "source should have 0 fan-in"
-# sink fed by all 3 emitters, feeds nobody
-assert cm["fan_in"].get("k") == 3, cm["fan_in"]
-assert "k" not in cm["fan_out"], "sink should have 0 fan-out"
-# MUTATION BITE 1: if EMITS wrongly included sink, pairs would jump.
-# With EMITS==(always True): emitters=4, pairs = 4*3 - 2 = 10!= 7
-def _bad_emits(v):
-return True
-saved = globals()["EMITS"]
-try:
-globals()["EMITS"] = _bad_emits
-bad = compose_map(decl)
-assert len(bad["pairs"])!= 7, "mutation not detected — EMITS bite failed"
-finally:
-globals()["EMITS"] = saved
-# re-run clean to confirm restoration
-assert len(compose_map(decl)["pairs"]) == 7, "restore failed"
-# undeclared handling: an invalid verb is excluded + flagged, not guessed
-decl2 = decl + [("bad", "nonsense")]
-d2, u2 = [x for x in decl2 if x[1] in VALID_VERBS], [x[0] for x in decl2 if x[1] not in VALID_VERBS]
-assert u2 == ["bad"] and len(d2) == 4, "undeclared not isolated"
-print("selftest: 6/6 OK (n, pairs=7, closed-form, fan-out/in endpoints, EMITS mutation bite, undeclared-excluded)")
+if args.json:
+print(json.dumps(sig, indent=2, sort_keys=True))
+else:
+print(f"grain: {sig['verdict']} "
+f"(z={sig['z_score']} vs cut -{sig['z_cut']}; "
+f"{sig['tokens']} tokens; rho={sig['rho_actual']} vs null {sig['mean_null']})")
+print(HONEST_CEILING)
 return 0
 
 if __name__ == "__main__":
 sys.exit(main())
 
-test_map.py 170 lines on GitHub →
+test_grain.py 71 lines on GitHub →
 #!/usr/bin/env python3
-"""Mutation-bitten tests for map.py.
-
-Each test asserts a specific behavior; the suite is proven to go RED under a
-planted mutation (see test_mutation_is_detected) so a no-op test can't pass green.
-Run: python3 test_map.py
-"""
-import io
+"""Tests for grain.py — the discrimination must be real, not a no-op."""
 import json
-import os
+import subprocess
 import sys
 import tempfile
-import unittest
+import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import map as M # noqa: E402
+import grain
 
-def _manifest(entries):
-fd, path = tempfile.mkstemp(suffix=".json")
-with os.fdopen(fd, "w") as f:
-json.dump({"gifts": entries}, f)
-return path
+def test_structured_vs_idiosyncratic():
+# A hub/template: every line reuses the same target token — a generator leak.
+structured = [f"class_{i}->glossary" for i in range(60)]
+# Idiosyncratic: distinct random-ish pairs, little reuse.
+import random
+rng = random.Random(1)
+nodes = [f"n{i}" for i in range(60)]
+idio = sorted({f"{rng.choice(nodes)}->{rng.choice(nodes)}" for _ in range(60)})
+s_struct = grain.signature(structured, null_draw=grain.relation_null_draw(structured))
+s_idio = grain.signature(idio, null_draw=grain.relation_null_draw(idio))
+# The structured set must read more compressible (lower z) than the idiosyncratic.
+assert s_struct["z_score"] < s_idio["z_score"], (s_struct, s_idio)
+assert s_struct["verdict"] == "STRUCTURED", s_struct
 
-class TestPortGate(unittest.TestCase):
-def test_emits_gate(self):
-# everything but sink emits
-self.assertTrue(M.EMITS("source"))
-self.assertTrue(M.EMITS("transform"))
-self.assertTrue(M.EMITS("filter"))
-self.assertTrue(M.EMITS("fold"))
-self.assertFalse(M.EMITS("sink"))
+def test_determinism():
+toks = [f"a{i}->b{i%7}" for i in range(50)]
+a = grain.signature(toks)
+b = grain.signature(toks)
+assert a == b, "signature must fold-twice-identical (seeded)"
 
-def test_accepts_gate(self):
-# everything but source accepts
-self.assertFalse(M.ACCEPTS("source"))
-self.assertTrue(M.ACCEPTS("transform"))
-self.assertTrue(M.ACCEPTS("filter"))
-self.assertTrue(M.ACCEPTS("fold"))
-self.assertTrue(M.ACCEPTS("sink"))
+def test_empty_is_not_structured():
+s = grain.signature([])
+assert s["verdict"] == "IDIOSYNCRATIC", s
 
-class TestComposeMap(unittest.TestCase):
-def setUp(self):
-# 1 of each of 4 verbs; hand-computed answer = 7 composable ordered pairs
-self.decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
+def test_drift_detects_homogenization():
+diverse = [f"n{i}->m{i}" for i in range(60)] # low structure
+homogd = [f"n{i}->glossary" for i in range(60)] # high structure (hub)
+base = grain.signature(diverse, null_draw=grain.relation_null_draw(diverse))
+now = grain.signature(homogd, null_draw=grain.relation_null_draw(homogd))
+# Homogenized corpus is MORE structured => z drops.
+assert now["z_score"] < base["z_score"]
 
-def test_pair_count_hand_computed(self):
-cm = M.compose_map(self.decl)
-self.assertEqual(len(cm["pairs"]), 7)
-
-def test_closed_form_matches_enumeration(self):
-cm = M.compose_map(self.decl)
-self.assertEqual(cm["closed_form"], len(cm["pairs"]))
-self.assertTrue(cm["closed_form_matches"])
-
-def test_source_feeds_all_acceptors_no_fan_in(self):
-cm = M.compose_map(self.decl)
-self.assertEqual(cm["fan_out"]["s"], 3) # feeds t, f, k
-self.assertNotIn("s", cm["fan_in"]) # source is fed by nobody
-
-def test_sink_fed_by_all_emitters_no_fan_out(self):
-cm = M.compose_map(self.decl)
-self.assertEqual(cm["fan_in"]["k"], 3) # fed by s, t, f
-self.assertNotIn("k", cm["fan_out"]) # sink feeds nobody
-
-def test_no_self_pairs(self):
-cm = M.compose_map(self.decl)
-for a, b in cm["pairs"]:
-self.assertNotEqual(a, b)
-
-def test_density(self):
-cm = M.compose_map(self.decl)
-# 7 composable / 12 ordered = 0.5833...
-self.assertAlmostEqual(cm["density"], 7 / 12, places=4)
-
-class TestDeclarationHonesty(unittest.TestCase):
-def test_undeclared_excluded_not_guessed(self):
-path = _manifest([
-{"slug": "a", "port_verb": "source"},
-{"slug": "b"}, # no port_verb
-{"slug": "c", "port_verb": "bogus"}, # invalid
-])
-declared, undeclared = M.load_declared(path)
-os.unlink(path)
-self.assertEqual([d[0] for d in declared], ["a"])
-self.assertEqual(set(undeclared), {"b", "c"})
-
-def test_summary_reports_undeclared_count(self):
-path = _manifest([
-{"slug": "a", "port_verb": "source"},
-{"slug": "b"},
-])
-declared, undeclared = M.load_declared(path)
-os.unlink(path)
-cm = M.compose_map(declared)
-rec = M.summary_record(cm, undeclared)
-self.assertEqual(rec["undeclared_count"], 1)
-self.assertIn("b", rec["undeclared"])
-
-def test_summary_carries_semantic_unproven_flag(self):
-cm = M.compose_map([("a", "source"), ("b", "sink")])
-rec = M.summary_record(cm, [])
-self.assertIn("UNPROVEN", rec["semantic_layer"])
-
-class TestReadEmitsJSONL(unittest.TestCase):
-def test_read_emits_pairs_then_summary(self):
-cm = M.compose_map([("s", "source"), ("k", "sink")])
-buf = io.StringIO()
-M.emit_read(cm, [], buf)
-lines = [json.loads(x) for x in buf.getvalue().strip().split("\n")]
-self.assertEqual(lines[0]["kind"], "pair")
-self.assertEqual(lines[0]["from"], "s")
-self.assertEqual(lines[0]["to"], "k")
-self.assertEqual(lines[-1]["kind"], "summary")
-
-def test_own_port_is_fold(self):
-out = io.StringIO()
-saved = sys.stdout
+def test_cli_json_and_honest_ceiling():
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+fh.write("\n".join(f"class_{i}->glossary" for i in range(40)))
+path = fh.name
 try:
-sys.stdout = out
-M.main(["--port"])
+out = subprocess.run(
+[sys.executable, "grain.py", path, "--relation", "--json"],
+capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+)
+assert out.returncode == 0, out.stderr
+data = json.loads(out.stdout)
+assert "verdict" in data and "z_score" in data
 finally:
-sys.stdout = saved
-self.assertEqual(json.loads(out.getvalue())["port_verb"], "fold")
-
-class TestManifestShapes(unittest.TestCase):
-def test_bare_list_manifest(self):
-fd, path = tempfile.mkstemp(suffix=".json")
-with os.fdopen(fd, "w") as f:
-json.dump([{"slug": "a", "port_verb": "source"}], f)
-declared, _ = M.load_declared(path)
 os.unlink(path)
-self.assertEqual(declared, [("a", "source")])
-
-def test_no_entry_list_raises(self):
-fd, path = tempfile.mkstemp(suffix=".json")
-with os.fdopen(fd, "w") as f:
-json.dump({"nope": 1}, f)
-with self.assertRaises(ValueError):
-M.load_declared(path)
-os.unlink(path)
-
-class TestMutationIsDetected(unittest.TestCase):
-"""Prove the suite is not a no-op: a planted mutation must break a test."""
-def test_mutation_is_detected(self):
-decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
-# Mutate EMITS to always-True (sink wrongly counted as an emitter).
-saved = M.EMITS
-try:
-M.EMITS = lambda v: True
-cm = M.compose_map(decl)
-# Under always-True EMITS: emitters=4, acceptors=3, both={t,f,k}=3,
-# so pairs = |E|*|A| - |E∩A| = 4*3 - 3 = 9, NOT the correct 7.
-self.assertNotEqual(len(cm["pairs"]), 7,
-"mutation did not change the result — suite is a no-op")
-self.assertEqual(len(cm["pairs"]), 9)
-finally:
-M.EMITS = saved
-# Confirm restoration: the real function gives 7 again.
-self.assertEqual(len(M.compose_map(decl)["pairs"]), 7)
 
 if __name__ == "__main__":
-unittest.main(verbosity=2)
+n = 0
+for name, fn in sorted(globals().items()):
+if name.startswith("test_") and callable(fn):
+fn()
+print(f"ok {name}")
+n += 1
+print(f"\n{n}/{n} passed")
 
 Take the whole folder →
 MIT
-Python 3, standard library only
+Python stdlib only
+
+---
+
+# Hunkhole — a Loop MMT gift
+https://loopmmt.com/gifts/hunkhole/
+[coverage: optional · branch: gifts]
+
+The Change Git Hides filter ← all gifts
+
+Hunkhole
+
+Git tells you which FILES changed. It does not tell you when a stale working tree, a bad merge, or a clumsy restore quietly REVERTED part of a file while leaving the file itself in place — a file-presence check reads that as a clean recovery. Hunkhole is the one command that catches it: it diffs the set of named top-level definitions (function / const / exports / def) between two git revisions and reports the ones that vanished. A symbol present before and gone after, with nothing renamed to take its place, is the reverted-hunk shape. Read-only, deterministic, stdlib-only.
+
+The honest edge
+
+Every hit is a QUESTION, not a verdict — a symbol you renamed or retired reads exactly like one that was reverted away, so hunkhole hands you the finite list and you rule on each. And a clean run is NOT a clean bill: it sees NAMED TOP-LEVEL definitions only, so a hunk reverted inside a surviving function body is invisible to it. Visibility, not immunity.
+
+Run it
+
+python3 hunkhole.py --help
+test_hunkhole.py (30 checks / 8 tests, mutation-bitten, pinned golden vanished-set + throwaway-repo end-to-end)
+Python standard library only, read-only, deterministic
+
+The code — every file that ships
+
+hunkhole.py 177 lines on GitHub →
+#!/usr/bin/env python3
+"""hunkhole — find the change that git's own tools hide: a reverted hunk.
+
+THE HOLE THIS FILLS
+
+Git tells you which *files* changed. It does not tell you when a stale working
+tree, a bad merge, or a clumsy restore quietly *reverted* part of a file while
+leaving the file itself in place. A file-presence check reads that as a clean
+recovery — the file is there, so nothing looks wrong — while a load-bearing
+definition that used to live inside it is simply gone.
+
+That failure is real and it hides well: a stale tree can revert tens of
+thousands of lines across dozens of files, a later restore returns every *file*,
+and because every file is present, no one notices the definitions that never
+came back. hunkhole is the one command that would have found it.
+
+THE PROBE
+
+Not "did this file change" (forward work changes files constantly) but "is a
+named, top-level definition that existed at BEFORE absent at AFTER." A symbol
+present in the old revision and gone in the new one, with nothing renamed to
+take its place, is the reverted-hunk shape. hunkhole diffs the *set of defined
+names* between two git revisions and reports the ones that vanished.
+
+WHY IT'S HONEST — read this before trusting a clean run
+
+- **Every hit is a QUESTION, not a verdict.** A symbol you deliberately renamed
+or retired reads exactly like one that was reverted away. hunkhole hands you
+the finite list of vanished names; you rule on each. It never claims a symbol
+"should" still be there.
+
+- **A clean run is NOT a clean bill.** hunkhole sees *named top-level*
+definitions (function / const / exports / def). A hunk reverted *inside* a
+surviving function body is invisible to it — the function name is still there.
+Absence of a finding is not proof of a clean restore, and the tool says so in
+its own output.
+
+- **It is read-only.** It writes nothing, changes nothing, fixes nothing. It
+reads two revisions out of git and compares symbol sets.
+
+Visibility, not immunity. You are the witness.
+
+USAGE
+python3 hunkhole.py <BEFORE> [AFTER]
+BEFORE a git revision (sha, tag, branch) — the "known-good" side
+AFTER a git revision to compare against (default: HEAD)
+
+python3 hunkhole.py <BEFORE> <AFTER> --against <CLOBBER>
+--against limit the sweep to files touched by one suspect commit,
+instead of every file that differs between BEFORE and AFTER
+
+EXIT 0 = no vanished symbols · 3 = findings (the alarm) · 2 = error/usage
+
+MIT licensed. Python standard library only. Read-only. Deterministic.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+
+# Named top-level definitions across the common scripting languages.
+# JS: function foo / const foo = / foo: function / exports.foo · Python: def foo
+_DEF_PATTERN = re.compile(
+r"^\s*(?:"
+r"function\s+(\w+)"
+r"|const\s+(\w+)\s*="
+r"|(\w+)\s*:\s*function"
+r"|exports\.(\w+)"
+r"|def\s+(\w+)"
+r")",
+re.M,
+)
+_CODE_SUFFIXES = (".js", ".py", ".sh", ".mjs", ".cjs")
+
+def git(*args: str) -> str | None:
+"""Run a git command; return stdout on success, None on failure."""
+r = subprocess.run(["git", *args], capture_output=True, text=True)
+return r.stdout if r.returncode == 0 else None
+
+def symbols(text: str) -> set[str]:
+"""The set of named top-level definitions found in a blob of source text."""
+return {name for groups in _DEF_PATTERN.findall(text) for name in groups if name}
+
+def vanished_symbols(before_text: str, after_text: str) -> list[str]:
+"""Names defined in `before_text` but not in `after_text`, sorted."""
+return sorted(symbols(before_text) - symbols(after_text))
+
+def is_code(path: str) -> bool:
+"""True iff the path has a suffix hunkhole probes for symbols."""
+return path.endswith(_CODE_SUFFIXES)
+
+def scan(before: str, after: str = "HEAD", against: str | None = None):
+"""Compare two revisions; return (files_swept, holes, absent).
+
+holes — list of (path, [vanished names]) for surviving code files.
+absent — list of paths present at `before` and absent at `after`
+(a whole-file drop; reported alongside hunk holes).
+Returns (None, None, None) if the underlying diff can't be produced.
+"""
+listing = git("diff", "--name-only", before, against or after)
+if listing is None:
+return None, None, None
+files = sorted(listing.split())
+
+holes: list[tuple[str, list[str]]] = []
+absent: list[str] = []
+for f in files:
+a = git("show", f"{before}:{f}")
+if a is None:
+continue # born after BEFORE — not hunkhole's business
+b = git("show", f"{after}:{f}")
+if b is None:
+absent.append(f) # whole-file drop — reported, not hunkhole's core probe
+continue
+if not is_code(f):
+continue # symbols are a code probe; data files need a different lens
+gone = vanished_symbols(a, b)
+if gone:
+holes.append((f, gone))
+return files, holes, absent
+
+def render(before: str, after: str, against: str | None, files, holes, absent) -> str:
+"""Render a scan result as the human-readable report text."""
+header = f"hunkhole: {before[:9]} -> {after}"
+if against:
+header += f" (files touched by {against[:9]})"
+header += f" · {len(files)} file(s) swept"
+lines = [header, "-" * 78]
+for f in absent:
+lines.append(f"FILE ABSENT {f}")
+for f, gone in holes:
+lines.append(f"HOLE {f}")
+for s in gone:
+lines.append(f" gone: {s}()")
+if not holes and not absent:
+lines.append("no named definition present at BEFORE is missing at AFTER.")
+lines.append("(NOT a clean bill — a hunk inside a surviving function body is invisible here.)")
+lines.append("-" * 78)
+n = len(holes) + len(absent)
+lines.append(
+f"{n} finding(s). Each is a QUESTION, not a verdict — a rename reads the same as a revert."
+)
+return "\n".join(lines)
+
+def main(argv: list[str]) -> int:
+if not argv or argv[0] in ("-h", "--help"):
+sys.stdout.write(__doc__)
+return 2
+before = argv[0]
+after = argv[1] if len(argv) > 1 and not argv[1].startswith("--") else "HEAD"
+against = None
+if "--against" in argv:
+i = argv.index("--against")
+if i + 1 >= len(argv):
+sys.stderr.write("hunkhole: --against needs a revision\n")
+return 2
+against = argv[i + 1]
+
+files, holes, absent = scan(before, after, against)
+if files is None:
+sys.stderr.write(f"hunkhole: cannot diff {before}..{against or after}\n")
+return 2
+
+sys.stdout.write(render(before, after, against, files, holes, absent) + "\n")
+return 3 if (holes or absent) else 0
+
+if __name__ == "__main__":
+raise SystemExit(main(sys.argv[1:]))
+
+test_hunkhole.py 185 lines on GitHub →
+#!/usr/bin/env python3
+"""test_hunkhole.py — the certifying properties of the hunkhole gift.
+
+Run: python3 test_hunkhole.py (exit 0 = all pass, 1 = a failure)
+
+hunkhole's git-facing shell is exercised end-to-end in a throwaway repo; its
+symbol-diff CORE (symbols / vanished_symbols / is_code / render) is pure and is
+tested directly on fixtures. Each test is MUTATION-BITTEN: it is here because a
+plausible mutation of hunkhole.py makes it fail loud. The core-diff test pins a
+GOLDEN sorted vanished-set — a rename reading identically to a revert is the
+exact property that must hold, and a golden proves the set, not just its size.
+"""
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+
+import hunkhole as h
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+# ---- fixtures: before/after source blobs -----------------------------------
+BEFORE_JS = """\
+function alpha() { return 1;}
+const beta = () => 2;
+gamma: function () { return 3;}
+exports.delta = function () {};
+function survivor() {
+let innerReverted = 9; // a hunk inside a surviving body (not def-shaped)
+return innerReverted;
+}
+"""
+AFTER_JS = """\
+const beta = () => 2;
+exports.delta = function () {};
+function survivor() {
+return 0; // innerReverted hunk reverted, name survives
+}
+"""
+
+BEFORE_PY = """\
+def one(): pass
+def two(): pass
+def three(): pass
+"""
+AFTER_PY = """\
+def one(): pass
+def three(): pass
+"""
+
+# ---- 1. the core diff: vanished top-level names, pinned golden --------------
+def test_vanished_golden():
+gone_js = h.vanished_symbols(BEFORE_JS, AFTER_JS)
+# alpha (function) and gamma (obj-method) vanished; beta/delta/survivor stayed.
+check(gone_js == ["alpha", "gamma"], f"JS vanished set wrong: {gone_js}")
+# the hunk INSIDE survivor() is invisible — survivor is not reported gone
+check("survivor" not in gone_js, "survivor should NOT be flagged (in-body hunk is invisible)")
+# pin a golden signature over a combined fixture run
+gone_py = h.vanished_symbols(BEFORE_PY, AFTER_PY)
+check(gone_py == ["two"], f"PY vanished set wrong: {gone_py}")
+sig = hashlib.sha256(("|".join(gone_js) + "#" + "|".join(gone_py)).encode()).hexdigest()
+golden = "72e9237f911294dc57a66b67e296fb888a0d43373cbb485118d4f73a4df09f8b"
+check(sig == golden, f"golden vanished-set signature drifted: got {sig[:16]}...")
+
+# ---- 2. a rename reads the same as a revert (the honest-edge property) ------
+def test_rename_reads_as_revert():
+before = "def compute(): pass\n"
+after = "def calculate(): pass\n" # renamed
+gone = h.vanished_symbols(before, after)
+check(gone == ["compute"], f"rename should surface old name as gone: {gone}")
+# kills a mutation that tried to be 'smart' and suppress renames
+
+# ---- 3. no false hole when nothing vanished --------------------------------
+def test_no_false_hole():
+same = "def a(): pass\ndef b(): pass\n"
+check(h.vanished_symbols(same, same) == [], "identical source must yield no vanished names")
+# a purely ADDED symbol is not a hole
+added = "def a(): pass\ndef b(): pass\ndef c(): pass\n"
+check(h.vanished_symbols(same, added) == [], "an added symbol must not read as vanished")
+
+# ---- 4. symbols() sees each definition form; kills a dropped alternative ----
+def test_symbol_forms():
+src = "function f(){}\nconst g=1\nh: function(){}\nexports.i=1\ndef j(): pass\n"
+got = h.symbols(src)
+for name in ("f", "g", "h", "i", "j"):
+check(name in got, f"symbol form not detected: {name} (pattern lost an alternative)")
+
+# ---- 5. is_code gate: symbols probed only on code suffixes -----------------
+def test_is_code():
+for ok in ("x.js", "y.py", "z.sh", "a.mjs", "b.cjs"):
+check(h.is_code(ok), f"{ok} should be code")
+for no in ("data.json", "notes.md", "image.png", "LICENSE"):
+check(not h.is_code(no), f"{no} should NOT be treated as code")
+
+# ---- 6. render marks a clean run as NOT a clean bill ------------------------
+def test_render_clean_caveat():
+out = h.render("abc123def", "HEAD", None, files=["a.py"], holes=[], absent=[])
+check("NOT a clean bill" in out, "clean render must carry the not-a-clean-bill caveat")
+check("0 finding(s)" in out, "clean render must report 0 findings")
+
+# ---- 7. render shows holes and absent files distinctly ---------------------
+def test_render_findings():
+out = h.render(
+"abc123def", "HEAD", None,
+files=["a.py", "b.py"],
+holes=[("a.py", ["gone_one", "gone_two"])],
+absent=["b.py"],
+)
+check("HOLE a.py" in out, "hole line missing")
+check("gone: gone_one()" in out, "vanished symbol not rendered")
+check("FILE ABSENT b.py" in out, "absent-file line missing")
+check("2 finding(s)" in out, "finding count wrong (1 hole + 1 absent = 2)")
+check("QUESTION, not a verdict" in out, "the question-not-verdict disclaimer must render")
+
+# ---- 8. END-TO-END against a real throwaway git repo -----------------------
+def _run_git(cwd, *args):
+subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+
+def test_end_to_end_reverted_hunk():
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+p = os.path.join(repo, "mod.py")
+with open(p, "w") as fh:
+fh.write("def keeper(): pass\ndef doomed(): pass\n")
+_run_git(repo, "add", "mod.py")
+_run_git(repo, "commit", "-qm", "before")
+before_sha = subprocess.run(
+["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+).stdout.strip()
+# revert the 'doomed' definition, keep the file
+with open(p, "w") as fh:
+fh.write("def keeper(): pass\n")
+_run_git(repo, "commit", "-aqm", "after (doomed reverted)")
+
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+files, holes, absent = h.scan(before_sha, "HEAD")
+finally:
+os.chdir(cwd0)
+check(holes == [("mod.py", ["doomed"])], f"end-to-end hole not found: {holes}")
+check(absent == [], f"nothing should be absent: {absent}")
+
+def run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+try:
+t()
+except Exception as exc:
+_FAILURES.append(f"{t.__name__} raised: {exc!r}")
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
+return 0
+
+if __name__ == "__main__":
+sys.exit(run())
+
+Take the whole folder →
+MIT
+Python standard library only, read-only, deterministic
 
 ---

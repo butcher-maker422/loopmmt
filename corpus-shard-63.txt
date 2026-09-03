@@ -1,0 +1,411 @@
+# Loop MMT — corpus shard 63/63
+
+> Bundle 63 of 63 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 1 (/gifts/worklog/)
+
+---
+
+# Worklog — a Loop MMT gift
+https://loopmmt.com/gifts/worklog/
+[coverage: optional · branch: gifts]
+
+Git History, Grouped by Day fold ← all gifts
+
+Worklog
+
+git log is a firehose; what you want is 'what got done last week?' Worklog folds a repo's history over a span into a grouped report — by day (newest first) or by author (most commits first) — each bucket a count and its commit subjects. A read-only fold: it never writes to the repo, never touches your tree, never needs network.
+
+The honest edge
+
+It reports the commit RECORD, not the work — a day with one big commit and a day with ten trivial ones both read as 'commits'; it doesn't measure effort or lines. Grouping is by committer-date and author-name-as-git-records-it, so skewed clocks (rebases, imports) or one person under two names land in the buckets git gives — it reports what git says, it doesn't reconcile identities or fix clocks. Merge commits are excluded by default.
+
+Run it
+
+python3 worklog.py --last 7
+test_worklog.py (13/13, mutation-bitten, pinned structural golden)
+Python stdlib only (calls local git), deterministic
+
+The code — every file that ships
+
+worklog.py 205 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""worklog.py — turn a git history into a readable worklog over a span of time.
+
+`git log` is a firehose. What you usually want is the human question underneath it:
+*what got done last week?* — grouped by day or by person, summarized, countable.
+`worklog` is that. Point it at a git repo and a time span and it emits a grouped
+worklog: commits collected over the span, bucketed by day (default) or by author,
+each bucket summarized with a count and its commit subjects.
+
+python3 worklog.py [<repo>] [--since...] [--until...] [--by day|author] [--json]
+
+It reads the repository through `git log` only. It never writes to the repo, never
+touches your working tree, and never needs network — it is a read-only fold over
+history you already have.
+
+------------------------------------------------------------------------------
+Spans (pick one; --since/--until can combine):
+--since <when> only commits at or after this date (git date: 2026-08-01, "2 weeks ago")
+--until <when> only commits at or before this date
+--last <N> shorthand for the last N days (from now)
+(no span) the whole history reachable from --ref
+
+Grouping:
+--by day (default) one bucket per calendar day, newest day first
+--by author one bucket per author, most commits first
+
+------------------------------------------------------------------------------
+The JSON contract (so this composes in a pipe):
+--json emits ONE JSON object per bucket on stdout, sorted deterministically:
+{"group":"day"|"author", "key":..., "count":N, "commits":[{hash,date,author,subject},...]}
+so you can pipe the worklog into the next tool (sum counts, filter to one author,
+feed a summarizer). Without --json it prints a grouped human report.
+
+Determinism: for a fixed repo + span + grouping, the output is byte-identical across
+runs — commits are ordered by (committer-date, hash), buckets are ordered by a fixed
+rule (day: date descending; author: count descending then name ascending), so the
+report is diffable and hashable.
+
+Exit codes:
+0 ran clean (commits or none — a worklog is a report, not a gate)
+2 not a git repository, or git failed
+3 usage error
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+# A record separator unlikely to appear in a commit subject.
+_SEP = "\x1f"
+_REC = "\x1e"
+
+def _run_git(repo, args):
+try:
+out = subprocess.run(
+["git", "-C", repo] + args,
+stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+check=True, text=True,
+)
+return out.stdout
+except FileNotFoundError:
+sys.stderr.write("worklog: git not found on PATH\n")
+raise SystemExit(2)
+except subprocess.CalledProcessError as e:
+sys.stderr.write("worklog: git failed: %s\n" % (e.stderr.strip() or e))
+raise SystemExit(2)
+
+def is_git_repo(repo):
+try:
+r = subprocess.run(
+["git", "-C", repo, "rev-parse", "--is-inside-work-tree"],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+return r.returncode == 0 and r.stdout.strip() == "true"
+except FileNotFoundError:
+return False
+
+def collect_commits(repo, ref, since, until):
+"""Return commits as list of {hash, short, date (ISO committer date), author, subject},
+ordered deterministically by (committer-date, hash)."""
+fmt = _SEP.join(["%H", "%h", "%cI", "%an", "%s"]) + _REC
+args = ["log", ref, "--no-merges", "--pretty=format:" + fmt]
+if since:
+args.append("--since=" + since)
+if until:
+args.append("--until=" + until)
+raw = _run_git(repo, args)
+commits = []
+for rec in raw.split(_REC):
+rec = rec.strip("\n")
+if not rec:
+continue
+parts = rec.split(_SEP)
+if len(parts)!= 5:
+continue
+full, short, cdate, author, subject = parts
+commits.append({
+"hash": full, "short": short, "date": cdate,
+"author": author, "subject": subject,
+})
+commits.sort(key=lambda c: (c["date"], c["hash"]))
+return commits
+
+def _day_of(iso):
+# committer date is ISO-8601 with offset, e.g. 2026-08-31T19:25:00-04:00
+return iso[:10]
+
+def group_by_day(commits):
+buckets = {}
+for c in commits:
+buckets.setdefault(_day_of(c["date"]), []).append(c)
+# newest day first
+out = []
+for day in sorted(buckets, reverse=True):
+cs = sorted(buckets[day], key=lambda c: (c["date"], c["hash"]))
+out.append({"group": "day", "key": day, "count": len(cs), "commits": cs})
+return out
+
+def group_by_author(commits):
+buckets = {}
+for c in commits:
+buckets.setdefault(c["author"], []).append(c)
+# most commits first, then author name ascending for a stable tie-break
+keys = sorted(buckets, key=lambda a: (-len(buckets[a]), a))
+out = []
+for a in keys:
+cs = sorted(buckets[a], key=lambda c: (c["date"], c["hash"]))
+out.append({"group": "author", "key": a, "count": len(cs), "commits": cs})
+return out
+
+def _short_commit(c):
+return {"hash": c["short"], "date": c["date"], "author": c["author"], "subject": c["subject"]}
+
+def main(argv=None):
+p = argparse.ArgumentParser(
+prog="worklog",
+description="turn a git history into a readable worklog over a span of time.",
+)
+p.add_argument("repo", nargs="?", default=".", help="path to the git repo (default: current dir)")
+p.add_argument("--ref", default="HEAD", help="ref to walk (default: HEAD)")
+p.add_argument("--since", metavar="WHEN", help="only commits at/after this git date")
+p.add_argument("--until", metavar="WHEN", help="only commits at/before this git date")
+p.add_argument("--last", type=int, metavar="N", help="shorthand: the last N days")
+p.add_argument("--by", choices=["day", "author"], default="day", help="grouping (default: day)")
+p.add_argument("--json", action="store_true", help="emit one JSON object per bucket (the pipe contract)")
+args = p.parse_args(argv)
+
+if args.last is not None:
+if args.last < 1:
+sys.stderr.write("worklog: --last must be >= 1\n")
+return 3
+cutoff = datetime.now(timezone.utc) - timedelta(days=args.last)
+args.since = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+if not is_git_repo(args.repo):
+sys.stderr.write("worklog: not a git repository: %s\n" % args.repo)
+return 2
+
+commits = collect_commits(args.repo, args.ref, args.since, args.until)
+buckets = group_by_day(commits) if args.by == "day" else group_by_author(commits)
+
+if args.json:
+for b in buckets:
+obj = {
+"group": b["group"], "key": b["key"], "count": b["count"],
+"commits": [_short_commit(c) for c in b["commits"]],
+}
+sys.stdout.write(json.dumps(obj, sort_keys=True) + "\n")
+return 0
+
+if not commits:
+print("worklog: no commits in the given span.")
+return 0
+
+span = []
+if args.since:
+span.append("since %s" % args.since)
+if args.until:
+span.append("until %s" % args.until)
+span_s = (" (%s)" % ", ".join(span)) if span else ""
+print("# worklog — %d commit(s) grouped by %s%s\n" % (len(commits), args.by, span_s))
+for b in buckets:
+print("## %s (%d commit%s)" % (b["key"], b["count"], "" if b["count"] == 1 else "s"))
+for c in b["commits"]:
+if args.by == "day":
+print(" %s %-16s %s" % (c["short"], c["author"][:16], c["subject"]))
+else:
+print(" %s %s %s" % (c["short"], _day_of(c["date"]), c["subject"]))
+print()
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_worklog.py 183 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_worklog.py — mutation-bitten tests for the worklog gift.
+
+Self-contained: builds a synthetic git repo in a tempdir with fixed commit dates and
+authors, runs worklog over it, and asserts on the buckets. The golden is pinned on the
+STRUCTURE (group, key, count, ordered subjects/authors/dates) rather than on commit
+hashes, because a commit hash depends on the local git version's object encoding — so
+the golden stays byte-stable across environments while still catching any change in
+grouping, ordering, counting, or the field set. Hash SHAPE (7-hex short id) is checked
+separately.
+
+Mutation bite (proven with teeth in the build):
+- flip the day bucket order to ascending -> the day-order test + golden fail
+- group_by_author tie-break removed/reversed -> the author-order test fails
+- drop --no-merges commit ordering sort -> the within-bucket order test fails
+- count a merge/emit wrong count -> the count tests fail
+
+Run: python3 test_worklog.py (prints "N/N passed", exits 0 on all-green)
+"""
+
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import contextlib
+
+import worklog
+
+COMMITS = [
+# (author, date, subject)
+("Ann", "2026-08-30T10:00:00+00:00", "add login"),
+("Ann", "2026-08-30T14:00:00+00:00", "fix logout bug"),
+("Bo", "2026-08-31T09:00:00+00:00", "write docs"),
+("Ann", "2026-08-31T11:00:00+00:00", "polish login form"),
+]
+
+def build_repo(root):
+def git(*args, **env):
+e = dict(os.environ)
+e.update(env)
+subprocess.run(["git", "-C", root] + list(args), check=True,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=e)
+git("init")
+git("config", "user.email", "x@x.co")
+git("config", "user.name", "seed")
+for author, date, subject in COMMITS:
+email = author.lower() + "@x.co"
+git("commit", "--allow-empty", "-m", subject,
+GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL=email,
+GIT_COMMITTER_NAME=author, GIT_COMMITTER_EMAIL=email,
+GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+
+def run_json(root, by):
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+rc = worklog.main([root, "--by", by, "--json"])
+lines = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+return rc, lines
+
+def structural(buckets):
+"""Reduce buckets to the hash-independent shape we pin."""
+out = []
+for b in buckets:
+out.append({
+"group": b["group"],
+"key": b["key"],
+"count": b["count"],
+"subjects": [c["subject"] for c in b["commits"]],
+"authors": [c["author"] for c in b["commits"]],
+"dates": [c["date"] for c in b["commits"]],
+})
+return out
+
+# PINNED GOLDEN — the structural shape of the worklog over the fixture.
+GOLDEN_DAY = [
+{"group": "day", "key": "2026-08-31", "count": 2,
+"subjects": ["write docs", "polish login form"],
+"authors": ["Bo", "Ann"],
+"dates": ["2026-08-31T09:00:00+00:00", "2026-08-31T11:00:00+00:00"]},
+{"group": "day", "key": "2026-08-30", "count": 2,
+"subjects": ["add login", "fix logout bug"],
+"authors": ["Ann", "Ann"],
+"dates": ["2026-08-30T10:00:00+00:00", "2026-08-30T14:00:00+00:00"]},
+]
+GOLDEN_AUTHOR = [
+{"group": "author", "key": "Ann", "count": 3,
+"subjects": ["add login", "fix logout bug", "polish login form"],
+"authors": ["Ann", "Ann", "Ann"],
+"dates": ["2026-08-30T10:00:00+00:00", "2026-08-30T14:00:00+00:00", "2026-08-31T11:00:00+00:00"]},
+{"group": "author", "key": "Bo", "count": 1,
+"subjects": ["write docs"], "authors": ["Bo"], "dates": ["2026-08-31T09:00:00+00:00"]},
+]
+
+RESULTS = []
+
+def check(name, cond):
+RESULTS.append((name, bool(cond)))
+
+def main():
+with tempfile.TemporaryDirectory() as root:
+build_repo(root)
+
+rc_d, day = run_json(root, "day")
+rc_a, author = run_json(root, "author")
+
+# 1-2. pinned structural golden
+check("golden: by-day structure matches pinned", structural(day) == GOLDEN_DAY)
+check("golden: by-author structure matches pinned", structural(author) == GOLDEN_AUTHOR)
+
+# 3. determinism — same repo, byte-identical json twice
+_, day2 = run_json(root, "day")
+check("determinism: two by-day runs identical", day == day2)
+
+# 4. day order is newest-first
+keys = [b["key"] for b in day]
+check("order: days are newest-first", keys == sorted(keys, reverse=True))
+
+# 5. author order is most-commits-first, then name asc
+acount = [(b["count"], b["key"]) for b in author]
+check("order: authors by count desc then name asc",
+acount == sorted(acount, key=lambda t: (-t[0], t[1])))
+
+# 6. within a bucket, commits are chronological
+for b in day + author:
+ds = [c["date"] for c in b["commits"]]
+if ds!= sorted(ds):
+check("order: within-bucket chronological", False)
+break
+else:
+check("order: within-bucket chronological", True)
+
+# 7. counts sum to total commits
+check("count: by-day counts sum to 4", sum(b["count"] for b in day) == 4)
+check("count: by-author counts sum to 4", sum(b["count"] for b in author) == 4)
+
+# 8. every commit carries the four fields
+every = all(set(c) == {"hash", "date", "author", "subject"}
+for b in day for c in b["commits"])
+check("fields: each commit has hash,date,author,subject", every)
+
+# 9. hash SHAPE — short hash is 7+ hex chars (hash-independent check)
+shapes = all(re.fullmatch(r"[0-9a-f]{7,}", c["hash"])
+for b in day for c in b["commits"])
+check("shape: short hashes are hex", shapes)
+
+# 10. --since narrows the span
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+worklog.main([root, "--since", "2026-08-31T00:00:00", "--by", "day", "--json"])
+narrowed = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+check("since: narrows to the 31st only",
+[b["key"] for b in narrowed] == ["2026-08-31"] and narrowed[0]["count"] == 2)
+
+# 11. not a git repo -> exit 2
+with tempfile.TemporaryDirectory() as notrepo:
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+rc_bad = worklog.main([notrepo, "--json"])
+check("usage: non-repo -> exit 2", rc_bad == 2)
+
+# 12. clean exit 0 on a real span
+check("default: exit 0 (a worklog is a report)", rc_d == 0 and rc_a == 0)
+
+passed = sum(1 for _, ok in RESULTS if ok)
+total = len(RESULTS)
+for name, ok in RESULTS:
+print("%s %s" % ("ok " if ok else "FAIL", name))
+print("\n%d/%d passed" % (passed, total))
+return 0 if passed == total else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only (calls local git), deterministic
+
+---

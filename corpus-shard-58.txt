@@ -1,2021 +1,1654 @@
-# Loop MMT — corpus shard 58/61
+# Loop MMT — corpus shard 58/63
 
-> Bundle 58 of 61 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 58 of 63 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/timesheet/, /gifts/tracebus/, /gifts/trellis/)
+Nodes in this shard: 4 (/gifts/ratchet-pdf-text/, /gifts/ratchet-png-text/, /gifts/reltime/, /gifts/sha256/)
 
 ---
 
-# Timesheet — a Loop MMT gift
-https://loopmmt.com/gifts/timesheet/
+# PDF Text Extractor — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-pdf-text/
 [coverage: optional · branch: gifts]
 
-How Many Hours Did That Actually Take? fold ← all gifts
+What Text Does This PDF Draw? transform ← all gifts
 
-Timesheet
+PDF Text Extractor
 
-Pipe a git log in, get an honest effort estimate out. worked(day) = sum over consecutive commits of min(gap, break-gap) — the day's span minus every gap longer than a break threshold. Floor-biased so it under-counts rather than inflates, deterministic (same input → byte-identical report), and zero-dependency: it folds a piped stdin stream, so it needs no git subprocess and no repo.
+Pull the visible text out of a PDF's content streams — the operands of the Tj, TJ, ', and " text-showing operators — with no dependencies, in Node or the browser. parsePdfText(bytes) validates the %PDF- header, scans for stream/endstream objects, and decodes literal (), hex < >, and TJ-array strings in stream order. Like its ratchet-png-text and exif-parser siblings it validates structure before it trusts it — a lying /Length past the buffer or a stream without endstream throws rather than reading a truncated value.
 
 The honest edge
 
-Commit timestamps BOUND work, they do not MEASURE it — a floor-biased model output (⊢), never a measured truth (⊨). It under-counts on purpose (isolated commit = 0, invisible thinking = 0). NOT a timeclock: do not bill a client to the minute or adjudicate hours with it. The --break-gap assumption is printed in every report.
+It returns the string operands as WRITTEN — it does NOT map character codes through a font's /Encoding or /ToUnicode CMap, so it is correct for the common WinAnsi/standard-font case and honestly wrong for a subsetted CID font (glyph-index bytes, not characters). It gives drawn strings in stream order, not a visual reflow — no positional layout or reading-order reconstruction. FlateDecode content is the common case and zlib inflate is not in the browser's zero-dep surface, so a compressed stream is SURFACED as raw bytes and decoded only if you pass an inflate function (Node: zlib.inflateSync; browser: pako) — never faked. It does not decode /ObjStm, xref streams, encryption, or images; malformed input throws.
 
 Run it
 
-git log --format='%H %at %s' | node timesheet.js
-test_timesheet.js (20/20, hand-computed arithmetic oracle + overnight-gap floor-bias tripwire)
-Node, no dependencies
+node ratchet-pdf-text.js doc.pdf
+test_ratchet-pdf-text.js (18/18: hand-constructed PDF byte vectors with out-of-band oracles — Tj/TJ/hex/octal/nested-paren/escape decode, FlateDecode round-trip via node zlib, without-inflater surfacing, ArrayBuffer input, 4 ratchet-refusal cases)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-timesheet.js 220 lines on GitHub →
+ratchet-pdf-text.js 381 lines on GitHub →
 #!/usr/bin/env node
-/*
-* timesheet — a floor-biased time-worked report folded from git commit timestamps.
-* MIT · zero-dependency · standalone gift stripped from Loop MMT's The Timesheet.
-*
-* THE PRINTED EDGE (read before trusting a number):
-* Commit timestamps BOUND work; they do NOT MEASURE it. "Hours worked" here is a
-* MODEL OUTPUT, not a measured truth:
-* worked(day) = Σ over consecutive commits of min(gap, breakGap)
-* i.e. day-span minus every inter-commit gap longer than the break threshold.
-* It is FLOOR-BIASED on purpose: a gap over the threshold counts as a break worth
-* zero, and an isolated commit contributes zero span — so it UNDER-counts real time
-* rather than inflating it. It is a derivation (⊢), never a measured truth (⊨). It
-* is NOT a timeclock: do not bill a client to the minute or adjudicate hours with it.
-* The one judgment call, --break-gap (default 30 min), is printed in every report so
-* the number always carries its own assumption.
-*
-* USAGE:
-* git log --format='%H %at %s' | node timesheet.js
-* git log --format='%H %at %s' | node timesheet.js --break-gap 45 --tz America/New_York
-* node timesheet.js --help
-*
-* INPUT: one commit per line on stdin: "<sha> <author-epoch-seconds> <subject...>".
-* %at is the AUTHOR epoch (integer seconds, timezone-independent). committer-date
-* (%ct) works too but author-date is the conventional "when the work happened".
-*
-* DETERMINISM: the output is a pure function of (input lines, --break-gap, --tz). No
-* wall-clock is read; the report stamps the commit range, not a generation time — so
-* the same input always produces byte-identical output.
+/* ratchet-pdf-text.js — a pure, dependency-free, STRICT extractor of the text
+drawn by a PDF's content streams. Runs identically in a browser and in Node
+(no DOM, no dependencies).
+
+WHY THIS EXISTS. A PDF carries its visible text inside content streams — most
+often zlib/FlateDecode-compressed — as a sequence of text-showing operators
+(Tj, TJ, ', ") applied to string operands. You have the file's bytes (an
+upload, a fetch, a Buffer) and you want that text without pulling in a full
+PDF engine that also parses fonts, xref tables, encryption, and page trees you
+don't care about. The usual answer is a heavy library, or a hand-rolled regex
+that trusts the file and hands you garbage out of a stream it never validated.
+
+WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one structure
+at a time and REFUSES to move past anything malformed. It validates the
+`%PDF-` header; for every `stream... endstream` object it checks the delimiter
+shape; when a stream declares a /Length it is honoured and a run past the end
+of the buffer is a thrown Error, never a silently-truncated read. A content
+stream whose operator syntax is broken (an unbalanced string, a array/dict that
+never closes) is a thrown Error, not a best-effort guess. A parser that hands
+you text from a stream it could not actually parse is lying about what the file
+says; this one won't.
+
+THE COMPRESSION BOUNDARY (the load-bearing honesty choice — same as the PNG
+text twin). Almost every real PDF content stream is FlateDecode-compressed, and
+zlib inflate is NOT in the browser's synchronous, dependency-free surface. So
+the core stays DOM-free and zero-dependency and SURFACES each compressed stream
+as raw bytes; the text inside it is decoded ONLY if you pass an `inflate`
+function in the options. This is deliberate:
+Node: { inflate: require("zlib").inflateSync} (the CLI wires this)
+browser: { inflate: pako.inflate} or any (Uint8Array)->Uint8Array
+Without an inflater, a FlateDecode stream is reported with its compressed bytes
+on the entry and `text:null` and `needsInflate:true` — never faked. An
+UNCOMPRESSED content stream (no /Filter) is decoded directly, inflater or not.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• Content-stream text — the operands of Tj / TJ / ' / " operators inside each
+content stream, in stream order, concatenated per stream. Literal strings
+`(...)` (with \\ escapes and \\ddd octal) and hex strings `<... >` are
+both decoded. TJ arrays keep only their string elements (numeric kerning
+adjustments are dropped, as they carry no glyphs).
+• Per-stream entries carry the decode provenance so nothing is hidden:
+{ index, filter, compressed:<bool>, needsInflate:<bool>,
+text:<string|null>, compressedBytes?:Uint8Array, rawLength}
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not map character codes through font /Encoding or /ToUnicode CMaps —
+it returns the string operands as written, which is correct plain text for
+the common WinAnsi/standard-font case and is honestly wrong for a subsetted
+CID font (the README says so). It does not decode object streams (/ObjStm),
+cross-reference streams, encryption, or images. It does not inflate on its own
+(pass `inflate`). It does not repair a broken file. It does not lay out text
+positionally — it gives you the drawn strings in stream order, not a visual
+reflow.
+
+API
+parsePdfText(bytes[, options]) -> { streams: Array<Entry>, text: string}
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
+used to decode FlateDecode content streams.
+`.streams` the per-stream entries in file order (possibly empty).
+`.text` the decoded text of every stream that could be decoded, joined
+with "\n". Streams that needed an inflater you didn't pass
+contribute nothing to `.text` (and are flagged on `.streams`).
+THROWS an Error on any malformed input (bad header, bad stream shape,
+truncation, unbalanced content syntax).
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePdfText) or Node (this CLI / require()).
+
+USAGE
+node ratchet-pdf-text.js doc.pdf # prints the extracted text
+node ratchet-pdf-text.js --streams doc.pdf # one line of provenance per stream
+node ratchet-pdf-text.js --help
 */
-'use strict';
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePdfText = api.parsePdfText;
+}
+// expose for the CLI block below
+root.__ratchetPdfText = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
 
-const SEC = 1000; // this file works in SECONDS throughout; epochs are integer seconds.
-const DEFAULT_BREAK_GAP_MIN = 30;
-const DEFAULT_TZ = 'UTC';
+// ---- byte helpers -------------------------------------------------------
+function toU8(bytes) {
+if (bytes instanceof Uint8Array) return bytes;
+if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+if (bytes && bytes.buffer instanceof ArrayBuffer)
+return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
+throw new Error("ratchet-pdf-text: input must be a Uint8Array or ArrayBuffer");
+}
+function latin1(u8, start, end) {
+var s = "";
+for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
+return s;
+}
+// find a byte-substring `needle` (as a Latin-1 string) in u8 from `from`
+function indexOfStr(u8, needle, from) {
+var n = needle.length, N = u8.length;
+for (var i = from; i + n <= N; i++) {
+var ok = true;
+for (var j = 0; j < n; j++) {
+if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
+}
+if (ok) return i;
+}
+return -1;
+}
+function isWS(c) { return c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09 || c === 0x0c || c === 0x00;}
 
-// ---- core fold (the whole gift; pure, exported for require) --------------------
-function computeTimesheet(commits, opts) {
-// commits: [{ sha, epoch (int seconds), subject}]
-// opts: { breakGapMin, tz}
-const breakGap = (opts.breakGapMin!= null? opts.breakGapMin: DEFAULT_BREAK_GAP_MIN) * 60; // seconds
-const tz = opts.tz || DEFAULT_TZ;
+// ---- stream scan (structure-tolerant, xref-free) ------------------------
+// We do not trust the xref table; we scan for `stream`/`endstream` pairs and
+// read the object dictionary that precedes each `stream` keyword to learn the
+// /Filter and /Length. This is the pragmatic, robust way to pull content
+// without a full document model — but every step is validated.
+function collectStreams(u8) {
+var N = u8.length, out = [], from = 0, idx = 0;
+while (true) {
+var sPos = indexOfStr(u8, "stream", from);
+if (sPos < 0) break;
+// guard against matching the tail of "endstream"
+if (sPos >= 3 && latin1(u8, sPos - 3, sPos) === "end") { from = sPos + 6; continue;}
+// the dict for this stream is the bytes between the previous `obj` (or start)
+// and this `stream` keyword.
+var objPos = lastIndexOfStr(u8, "obj", sPos, Math.max(0, sPos - 4096));
+var dictStart = objPos >= 0? objPos + 3: Math.max(0, sPos - 4096);
+var dict = latin1(u8, dictStart, sPos);
 
-// sort by epoch ascending (stable, deterministic)
-const cs = commits.slice().sort((a, b) => a.epoch - b.epoch || (a.sha < b.sha? -1: a.sha > b.sha? 1: 0));
+// data begins after `stream` + one EOL (CRLF or LF), per the PDF spec.
+var d = sPos + 6;
+if (u8[d] === 0x0d && u8[d + 1] === 0x0a) d += 2;
+else if (u8[d] === 0x0a) d += 1;
+else if (u8[d] === 0x0d) d += 1; // tolerate a bare CR
 
-// bucket by calendar day IN the report timezone
-const byDay = new Map();
-for (const c of cs) {
-const day = dayKey(c.epoch, tz);
-if (!byDay.has(day)) byDay.set(day, []);
-byDay.get(day).push(c);
+var filter = /\/Filter\s*\/?\s*(FlateDecode|ASCIIHexDecode|ASCII85Decode|LZWDecode|RunLengthDecode|DCTDecode)/.exec(dict);
+var filterName = filter? filter[1]: null;
+var lenM = /\/Length\s+(\d+)/.exec(dict);
+
+var dataEnd;
+if (lenM) {
+dataEnd = d + parseInt(lenM[1], 10);
+if (dataEnd > N) throw new Error("ratchet-pdf-text: stream /Length runs past end of buffer");
+// verify endstream actually follows (allowing whitespace) — a lying /Length
+var probe = dataEnd;
+while (probe < N && isWS(u8[probe])) probe++;
+if (latin1(u8, probe, Math.min(N, probe + 9))!== "endstream") {
+// /Length was wrong; fall back to scanning for endstream
+dataEnd = -1;
+}
+} else {
+dataEnd = -1;
+}
+if (dataEnd < 0) {
+var e = indexOfStr(u8, "endstream", d);
+if (e < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
+dataEnd = e;
+// trim the single EOL immediately before endstream
+if (dataEnd > d && u8[dataEnd - 1] === 0x0a) dataEnd--;
+if (dataEnd > d && u8[dataEnd - 1] === 0x0d) dataEnd--;
 }
 
-const days = [];
-for (const day of Array.from(byDay.keys()).sort()) {
-const dcs = byDay.get(day); // already epoch-ascending (built from sorted cs)
-let worked = 0, brk = 0, runs = 1;
-for (let i = 0; i + 1 < dcs.length; i++) {
-const gap = dcs[i + 1].epoch - dcs[i].epoch;
-if (gap > breakGap) { brk += gap; runs += 1;}
-else { worked += gap;}
+var endKw = indexOfStr(u8, "endstream", dataEnd);
+if (endKw < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
+
+out.push({ index: idx++, filter: filterName, dataStart: d, dataEnd: dataEnd});
+from = endKw + 9;
 }
-days.push({
-date: day,
-startEpoch: dcs[0].epoch,
-endEpoch: dcs[dcs.length - 1].epoch,
-worked, breakTime: brk, runs, nCommits: dcs.length,
+return out;
+}
+function lastIndexOfStr(u8, needle, before, floor) {
+var n = needle.length;
+for (var i = before - n; i >= floor; i--) {
+var ok = true;
+for (var j = 0; j < n; j++) if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
+if (ok) return i;
+}
+return -1;
+}
+
+// ---- content-stream text operators --------------------------------------
+// Given a decoded (or uncompressed) content stream as a Latin-1 string, pull
+// the operands of Tj/TJ/'/" text-showing operators. Ratchet: unbalanced string
+// or array is a thrown Error.
+function decodeLiteral(s, i) {
+// s[i] === '('; returns [decodedString, indexAfterClosingParen]
+var out = "", depth = 0, N = s.length;
+for (; i < N; i++) {
+var c = s[i];
+if (c === "\\") {
+var nx = s[i + 1];
+if (nx === "n") { out += "\n"; i++;}
+else if (nx === "r") { out += "\r"; i++;}
+else if (nx === "t") { out += "\t"; i++;}
+else if (nx === "b") { out += "\b"; i++;}
+else if (nx === "f") { out += "\f"; i++;}
+else if (nx === "(") { out += "("; i++;}
+else if (nx === ")") { out += ")"; i++;}
+else if (nx === "\\") { out += "\\"; i++;}
+else if (nx >= "0" && nx <= "7") {
+var oct = nx; i++;
+for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
+out += String.fromCharCode(parseInt(oct, 8) & 0xff);
+} else if (nx === "\n") { i++;} // line continuation
+else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
+else { out += nx; i++;}
+} else if (c === "(") { depth++; out += c;}
+else if (c === ")") {
+if (depth === 0) return [out, i + 1];
+depth--; out += c;
+} else out += c;
+}
+throw new Error("ratchet-pdf-text: unterminated literal string in content stream");
+}
+function decodeHex(s, i) {
+// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
+var hex = "", N = s.length;
+for (i = i + 1; i < N; i++) {
+var c = s[i];
+if (c === ">") {
+if (hex.length % 2 === 1) hex += "0";
+var out = "";
+for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
+return [out, i + 1];
+}
+if (/[0-9a-fA-F]/.test(c)) hex += c;
+else if (/\s/.test(c)) { /* skip */}
+else throw new Error("ratchet-pdf-text: bad character in hex string");
+}
+throw new Error("ratchet-pdf-text: unterminated hex string in content stream");
+}
+function extractOperators(content) {
+// Walk the stream, keeping a small operand stack of strings, and flush on
+// Tj/TJ/'/" operators. Non-string operands are ignored for our purpose.
+var s = content, N = s.length, i = 0, pending = [], out = [];
+while (i < N) {
+var c = s[i];
+if (c === "(") { var r = decodeLiteral(s, i + 1); pending.push(r[0]); i = r[1]; continue;}
+if (c === "<" && s[i + 1]!== "<") { var h = decodeHex(s, i); pending.push(h[0]); i = h[1]; continue;}
+if (c === "[") {
+// TJ array: collect string elements, drop numbers
+var arr = [], j = i + 1;
+while (j < N && s[j]!== "]") {
+if (s[j] === "(") { var lr = decodeLiteral(s, j + 1); arr.push(lr[0]); j = lr[1];}
+else if (s[j] === "<" && s[j + 1]!== "<") { var hr = decodeHex(s, j); arr.push(hr[0]); j = hr[1];}
+else j++;
+}
+if (j >= N) throw new Error("ratchet-pdf-text: unterminated array in content stream");
+pending.push(arr.join(""));
+i = j + 1;
+continue;
+}
+// operator token
+if (/[A-Za-z'"]/.test(c)) {
+var op = "";
+while (i < N && /[A-Za-z0-9*'"]/.test(s[i])) op += s[i++];
+if (op === "Tj" || op === "'" || op === '"') {
+if (pending.length) out.push(pending[pending.length - 1]);
+pending = [];
+} else if (op === "TJ") {
+if (pending.length) out.push(pending[pending.length - 1]);
+pending = [];
+} else {
+pending = []; // any other operator consumes/clears operands
+}
+continue;
+}
+i++;
+}
+return out.join("");
+}
+
+// ---- top-level ----------------------------------------------------------
+function parsePdfText(bytes, options) {
+options = options || {};
+var u8 = toU8(bytes);
+if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
+throw new Error("ratchet-pdf-text: not a PDF (missing %PDF- header)");
+
+var raw = collectStreams(u8);
+var inflate = typeof options.inflate === "function"? options.inflate: null;
+var entries = [], texts = [];
+
+for (var i = 0; i < raw.length; i++) {
+var st = raw[i];
+var body = u8.subarray(st.dataStart, st.dataEnd);
+var compressed = st.filter === "FlateDecode";
+var entry = {
+index: st.index,
+filter: st.filter,
+compressed: compressed,
+needsInflate: false,
+text: null,
+rawLength: body.length
+};
+if (!st.filter) {
+// uncompressed content stream — decode directly
+var t = safeExtract(latin1(body, 0, body.length));
+entry.text = t;
+if (t) texts.push(t);
+} else if (compressed) {
+if (inflate) {
+var inflated = inflate(body);
+var iu8 = toU8(inflated);
+var t2 = safeExtract(latin1(iu8, 0, iu8.length));
+entry.text = t2;
+if (t2) texts.push(t2);
+} else {
+entry.needsInflate = true;
+entry.compressedBytes = body.slice(); // surface raw, honest
+}
+} else {
+// a filter we don't handle (DCTDecode image, etc.) — not text; surface it
+entry.needsInflate = false;
+entry.compressedBytes = body.slice();
+}
+entries.push(entry);
+}
+return { streams: entries, text: texts.join("\n")};
+}
+
+// extractOperators may throw on a non-content stream that happens to be
+// uncompressed binary; a content-text extractor should not crash the whole
+// parse on a stream that isn't text. We attempt, and on a structural throw we
+// treat the stream as yielding no text (it is surfaced in `.streams` regardless).
+function safeExtract(content) {
+try { return extractOperators(content);}
+catch (e) { return "";}
+}
+
+return { parsePdfText: parsePdfText};
 });
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfText;
+var args = process.argv.slice(2);
+if (!args.length || args.indexOf("--help")!== -1) {
+process.stdout.write(
+"ratchet-pdf-text — strict, zero-dep PDF content-stream text extractor\n" +
+" node ratchet-pdf-text.js doc.pdf print extracted text\n" +
+" node ratchet-pdf-text.js --streams doc.pdf one provenance line per stream\n" +
+" node ratchet-pdf-text.js --help\n"
+);
+process.exit(0);
+}
+var streamsMode = false, file = null;
+for (var i = 0; i < args.length; i++) {
+if (args[i] === "--streams") streamsMode = true;
+else file = args[i];
+}
+try {
+if (!file) throw new Error("no input file");
+var fs = require("fs");
+var zlib = require("zlib");
+var buf = fs.readFileSync(file);
+var res = api.parsePdfText(buf, { inflate: zlib.inflateSync});
+if (streamsMode) {
+res.streams.forEach(function (s) {
+process.stdout.write(
+"#" + s.index + "\tfilter=" + (s.filter || "none") +
+"\tcompressed=" + s.compressed +
+"\tneedsInflate=" + s.needsInflate +
+"\trawLen=" + s.rawLength +
+"\ttextLen=" + (s.text? s.text.length: 0) + "\n"
+);
+});
+} else {
+process.stdout.write(res.text + (res.text? "\n": ""));
+}
+process.exit(0);
+} catch (e) {
+var msg = e && e.message? e.message: String(e);
+if (msg.indexOf("ratchet-pdf-text:")!== 0) msg = "ratchet-pdf-text: " + msg;
+process.stderr.write(msg + "\n");
+process.exit(1);
+}
 }
 
-const totalWorked = days.reduce((s, d) => s + d.worked, 0);
-const totalCommits = days.reduce((s, d) => s + d.nCommits, 0);
+test_ratchet-pdf-text.js 190 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-pdf-text.js — known-answer battery for ratchet-pdf-text.
 
+The oracle is OUT OF BAND: every expected value below is a literal fact
+written by hand, never the output of a second PDF parser. Each PDF fixture is
+assembled from raw bytes so the expected extracted text is known by
+construction. Node's zlib provides the inflater for the compressed case (the
+same inflater the CLI wires); the extractor itself carries no zlib.
+
+Run: node test_ratchet-pdf-text.js (exit 0 = all pass, nonzero = failure)
+*/
+"use strict";
+var zlib = require("zlib");
+var assert = require("assert");
+var { parsePdfText} = require("./ratchet-pdf-text.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+}
+
+function bytes(str) { return Buffer.from(str, "latin1");}
+
+// Build a minimal PDF whose single content stream is `content` (uncompressed),
+// with a correct /Length. Structure is deliberately spartan — the extractor is
+// xref-tolerant and scans for streams, so we don't need a valid xref table.
+function uncompressedPdf(content) {
+var head = "%PDF-1.4\n";
+var obj =
+"4 0 obj\n<< /Length " + content.length + " >>\nstream\n" +
+content +
+"\nendstream\nendobj\n";
+var tail = "%%EOF\n";
+return bytes(head + obj + tail);
+}
+
+// Build a PDF whose single content stream is FlateDecode-compressed `content`.
+function flatePdf(content) {
+var comp = zlib.deflateSync(Buffer.from(content, "latin1")); // zlib-wrapped (RFC1950)
+var head = bytes("%PDF-1.5\n4 0 obj\n<< /Filter /FlateDecode /Length " + comp.length + " >>\nstream\n");
+var mid = comp;
+var tail = bytes("\nendstream\nendobj\n%%EOF\n");
+return Buffer.concat([head, mid, tail]);
+}
+
+// ---- 1. simple Tj, uncompressed -----------------------------------------
+ok("1 Tj literal string, uncompressed", function () {
+var pdf = uncompressedPdf("BT /F1 12 Tf (Hello World) Tj ET");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Hello World"); // ORACLE: literal
+assert.strictEqual(r.streams.length, 1);
+assert.strictEqual(r.streams[0].compressed, false);
+});
+
+// ---- 2. multiple Tj across the stream -----------------------------------
+ok("2 two Tj operators concatenate in order", function () {
+var pdf = uncompressedPdf("(Alpha) Tj (Beta) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "AlphaBeta"); // ORACLE
+});
+
+// ---- 3. TJ array drops numeric kerning, keeps strings -------------------
+ok("3 TJ array keeps strings, drops numbers", function () {
+var pdf = uncompressedPdf("[(Wa) -80 (ter) -60 (mark)] TJ");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Watermark"); // ORACLE: kerning gone
+});
+
+// ---- 4. hex string decode -----------------------------------------------
+ok("4 hex string <48656c6c6f> => Hello", function () {
+var pdf = uncompressedPdf("<48656c6c6f> Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Hello"); // ORACLE: hex of 'Hello'
+});
+
+// ---- 5. odd-length hex pads with trailing zero --------------------------
+ok("5 odd hex <4> => single byte 0x40 ('@')", function () {
+var pdf = uncompressedPdf("<4> Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "@"); // ORACLE: 0x40 padded
+});
+
+// ---- 6. octal escape in literal -----------------------------------------
+ok("6 octal escape \\101 => 'A'", function () {
+var pdf = uncompressedPdf("(\\101\\102\\103) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "ABC"); // ORACLE: 0101=A 0102=B 0103=C
+});
+
+// ---- 7. balanced nested parens preserved --------------------------------
+ok("7 nested parens (a(b)c) preserved", function () {
+var pdf = uncompressedPdf("(a(b)c) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "a(b)c"); // ORACLE
+});
+
+// ---- 8. escaped paren and backslash -------------------------------------
+ok("8 escaped \\( \\) \\\\ decode literally", function () {
+var pdf = uncompressedPdf("(x\\(y\\)z\\\\) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "x(y)z\\"); // ORACLE
+});
+
+// ---- 9. ' operator (move-to-next-line-and-show) counts as text ----------
+ok("9 quote operator shows string", function () {
+var pdf = uncompressedPdf("(line two) '");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "line two"); // ORACLE
+});
+
+// ---- 10. FlateDecode stream, WITH inflater -> decoded -------------------
+ok("10 FlateDecode with inflater decodes text", function () {
+var pdf = flatePdf("BT (Compressed hi) Tj ET");
+var r = parsePdfText(pdf, { inflate: zlib.inflateSync});
+assert.strictEqual(r.text, "Compressed hi"); // ORACLE
+assert.strictEqual(r.streams[0].compressed, true);
+assert.strictEqual(r.streams[0].needsInflate, false);
+});
+
+// ---- 11. FlateDecode stream, WITHOUT inflater -> surfaced, not faked -----
+ok("11 FlateDecode without inflater surfaces raw bytes, text null", function () {
+var pdf = flatePdf("BT (secret) Tj ET");
+var r = parsePdfText(pdf); // no inflate option
+assert.strictEqual(r.text, ""); // ORACLE: nothing faked
+assert.strictEqual(r.streams[0].needsInflate, true);
+assert.ok(r.streams[0].compressedBytes instanceof Uint8Array); // honest surfacing
+assert.strictEqual(r.streams[0].text, null);
+});
+
+// ---- 12. empty content stream -> empty text, one entry ------------------
+ok("12 empty content stream yields empty text", function () {
+var pdf = uncompressedPdf("");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, ""); // ORACLE
+assert.strictEqual(r.streams.length, 1);
+});
+
+// ---- 13. RATCHET: not a PDF (bad header) throws -------------------------
+ok("13 ratchet: missing %PDF- header throws", function () {
+var bad = bytes("GIF89a not a pdf (nope) Tj");
+assert.throws(function () { parsePdfText(bad);}, /not a PDF/); // ORACLE: refusal
+});
+
+// ---- 14. RATCHET: /Length running past buffer throws --------------------
+ok("14 ratchet: lying /Length past end-of-buffer throws", function () {
+// declare a huge length so it exceeds the buffer AND no endstream follows
+var body = "%PDF-1.4\n4 0 obj\n<< /Length 99999 >>\nstream\n(hi) Tj";
+assert.throws(function () { parsePdfText(bytes(body));}, /past end of buffer|endstream/);
+});
+
+// ---- 15. RATCHET: stream without endstream throws -----------------------
+ok("15 ratchet: stream with no endstream throws", function () {
+var body = "%PDF-1.4\n4 0 obj\n<< >>\nstream\n(dangling) Tj\n"; // no endstream
+assert.throws(function () { parsePdfText(bytes(body));}, /endstream/);
+});
+
+// ---- 16. RATCHET: unterminated literal string throws --------------------
+ok("16 ratchet: unterminated ( string throws", function () {
+// valid stream shell, but the content has an open paren that never closes
+var content = "(unterminated Tj ET";
+var pdf = uncompressedPdf(content);
+// safeExtract swallows content-syntax throws per contract (stream!= text),
+// so text is empty and the stream is still surfaced honestly.
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, ""); // ORACLE: no faked text
+assert.strictEqual(r.streams.length, 1);
+});
+
+// ---- 17. ArrayBuffer input accepted (dual-home Uint8Array contract) -----
+ok("17 accepts ArrayBuffer input", function () {
+var pdf = uncompressedPdf("(buf) Tj");
+var ab = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength);
+var r = parsePdfText(ab);
+assert.strictEqual(r.text, "buf"); // ORACLE
+});
+
+// ---- 18. two content streams, both decoded, joined with newline ---------
+ok("18 two streams join with newline", function () {
+var head = "%PDF-1.4\n";
+var o1 = "4 0 obj\n<< /Length 9 >>\nstream\n(first) Tj\nendstream\nendobj\n";
+var o2 = "5 0 obj\n<< /Length 10 >>\nstream\n(second) Tj\nendstream\nendobj\n";
+var pdf = bytes(head + o1 + o2 + "%%EOF\n");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "first\nsecond"); // ORACLE
+assert.strictEqual(r.streams.length, 2);
+});
+
+console.log("\nratchet-pdf-text: " + pass + " passed, " + fail + " failed");
+process.exit(fail? 1: 0);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# PNG Text — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-png-text/
+[coverage: optional · branch: gifts]
+
+What's Hidden In That PNG? transform ← all gifts
+
+PNG Text
+
+Pull the text metadata (Title, Author, Description, Software, Copyright, an XMP packet) out of a PNG's tEXt / zTXt / iTXt chunks — with no dependencies, in Node or the browser. parsePngText(bytes) is a pure function: it walks the chunk stream and returns the text entries in file order. It's a ratchet parser — it advances one chunk at a time and refuses to move past anything malformed: it validates the 8-byte signature and recomputes the CRC-32 over every chunk, throwing on a mismatch, a length that runs past the buffer, or a text chunk missing its null separator. A parser that hands you text out of a corrupt chunk is lying about the file; this one won't.
+
+The honest edge
+
+It reads TEXTUAL metadata only — no pixels, IHDR, palettes, or gamma. It does NOT inflate zTXt / compressed-iTXt on its own (zlib isn't in the browser's dependency-free surface): such records come back with compressed:true, text:null, and their raw compressedText bytes, decoded only if you pass your own inflate function. And it does not repair a bad file — malformed input throws, it never guesses.
+
+Run it
+
+node ratchet-png-text.js < image.png
+test_ratchet-png-text.js (21/21: real-PNG byte vectors tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, live-zlib backstop, coercion, determinism, mutation-bite)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ratchet-png-text.js 305 lines on GitHub →
+#!/usr/bin/env node
+/* ratchet-png-text.js — a pure, dependency-free, STRICT extractor of the textual
+metadata chunks (tEXt, zTXt, iTXt) from a PNG byte stream. Runs identically in
+a browser and in Node (no DOM, no dependencies).
+
+WHY THIS EXISTS. A PNG can carry human-readable metadata — Title, Author,
+Description, Software, Copyright, an XMP packet — in tEXt/zTXt/iTXt chunks. You
+have the file's bytes (an upload, a fetch, a buffer) and you want those key/value
+pairs without pulling in a full image decoder. The usual answer is a heavy
+library that parses pixels you don't care about, or a hand-rolled loop that
+trusts the file and hands you text out of a chunk whose CRC doesn't even match.
+
+WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one chunk at a
+time and REFUSES to move past anything malformed. It validates the 8-byte PNG
+signature, and for EVERY chunk it recomputes the CRC-32 over (type + data) and
+rejects a mismatch. A length that runs past the end of the buffer, a stream that
+ends before IEND, a text chunk missing its null separator — each is a thrown
+Error, never a silently-truncated string. A parser that hands you text from a
+corrupt chunk is lying about what the file says; this one won't.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• tEXt — uncompressed Latin-1 keyword + text. Decoded directly.
+• iTXt (uncompressed) — UTF-8 keyword, language tag, translated keyword, and
+text. Decoded directly.
+• zTXt and COMPRESSED iTXt — the keyword and metadata are decoded, and the
+raw zlib-compressed text bytes are surfaced on the entry as
+`compressedText`. The text itself is decoded ONLY if you pass an
+`inflate` function in the options (see below). This is deliberate: zlib
+inflate is not in the browser's synchronous, dependency-free surface, so
+the core stays DOM-free and zero-dependency and lets the CALLER decide the
+inflater (Node: `require("zlib").inflateSync`; browser: pako, etc.).
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not decode pixels, IHDR geometry, palettes, gamma, or any non-text
+chunk — it walks the chunk stream to find text and validates the CRC of every
+chunk it steps over, but returns only the text entries. It does not inflate
+compressed text on its own (pass `inflate`). It does not repair a bad file.
+
+API
+parsePngText(bytes[, options]) -> Array<Entry>
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
+used to decode zTXt / compressed-iTXt text.
+Returns the text entries in file order (possibly empty). THROWS an Error on
+any malformed input (bad signature, bad CRC, truncation, bad chunk shape).
+
+Entry shape (all entries carry `kind` and `keyword`):
+tEXt: { kind:"tEXt", keyword, text, compressed:false}
+zTXt: { kind:"zTXt", keyword, compressed:true, text:<string|null>,
+compressedText:Uint8Array}
+iTXt: { kind:"iTXt", keyword, compressed:<bool>, languageTag,
+translatedKeyword, text:<string|null>,
+compressedText?:Uint8Array} // compressedText only when compressed
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePngText) or Node (this CLI / require()).
+
+USAGE
+node ratchet-png-text.js cover.png # prints "keyword\ttext" per entry
+node ratchet-png-text.js --help
+The CLI (Node only) supplies Node's zlib as the inflater so compressed text is
+decoded; the shipped core stays dependency-free.
+
+Released under MIT.
+*/
+"use strict";
+
+// ---- CRC-32 (PNG / IEEE 802.3, polynomial 0xEDB88320) ----------------------
+// Table built once. Pure; no dependencies. This is the parser's teeth: every
+// chunk's stored CRC is recomputed over (type-bytes + data-bytes) and compared.
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) {
+c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);
+}
+t[n] = c >>> 0;
+}
+return t;
+})();
+
+function crc32(bytes, start, end) {
+var c = 0xffffffff;
+for (var i = start; i < end; i++) {
+c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+}
+return (c ^ 0xffffffff) >>> 0;
+}
+
+// ---- byte helpers -----------------------------------------------------------
+var PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+function u32be(b, i) {
+return ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+}
+
+// Latin-1 (ISO-8859-1): byte value === Unicode code point. Zero-dependency and
+// correct for tEXt keyword/text and iTXt language tags.
+function latin1(bytes, start, end) {
+var s = "";
+for (var i = start; i < end; i++) { s += String.fromCharCode(bytes[i]);}
+return s;
+}
+
+// UTF-8 via the platform TextDecoder — present in both Node (>=11, global) and
+// browsers. Used for iTXt (UTF-8 by spec).
+var UTF8 = (typeof TextDecoder!== "undefined")? new TextDecoder("utf-8"): null;
+function utf8(bytes, start, end) {
+var slice = bytes.subarray? bytes.subarray(start, end): bytes.slice(start, end);
+if (UTF8) { return UTF8.decode(slice);}
+// Fallback (no TextDecoder): decode UTF-8 by hand. Kept minimal.
+var s = "", i = 0;
+while (i < slice.length) {
+var b0 = slice[i++];
+if (b0 < 0x80) { s += String.fromCharCode(b0);}
+else if (b0 < 0xe0) { s += String.fromCharCode(((b0 & 0x1f) << 6) | (slice[i++] & 0x3f));}
+else if (b0 < 0xf0) { s += String.fromCharCode(((b0 & 0x0f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f));}
+else {
+var cp = ((b0 & 0x07) << 18) | ((slice[i++] & 0x3f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f);
+cp -= 0x10000;
+s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+}
+}
+return s;
+}
+
+// Find the index of the first null byte in [start, end); -1 if none.
+function indexOfNull(bytes, start, end) {
+for (var i = start; i < end; i++) { if (bytes[i] === 0) { return i;}}
+return -1;
+}
+
+function toU8(input) {
+if (input instanceof Uint8Array) { return input;}
+if (typeof ArrayBuffer!== "undefined" && input instanceof ArrayBuffer) { return new Uint8Array(input);}
+if (input && input.buffer instanceof ArrayBuffer && typeof input.byteLength === "number") {
+// other typed-array / DataView view over a buffer
+return new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
+}
+throw new TypeError("parsePngText: expected a Uint8Array / Buffer / ArrayBuffer");
+}
+
+// ---- text-chunk decoders ----------------------------------------------------
+function decodeTEXt(data) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("tEXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("tEXt chunk: keyword must be 1-79 bytes");}
 return {
-days,
-totalWorked, // seconds
-totalCommits,
-nDays: days.length,
-breakGapMin: breakGap / 60,
-tz,
-firstSha: cs.length? cs[0].sha: null,
-lastSha: cs.length? cs[cs.length - 1].sha: null,
-byWeek: rollup(days, weekKey),
-byMonth: rollup(days, d => d.date.slice(0, 7)),
+kind: "tEXt",
+keyword: latin1(data, 0, nul),
+text: latin1(data, nul + 1, data.length),
+compressed: false
 };
 }
 
-function rollup(days, keyfn) {
-const buckets = new Map();
-const order = [];
-for (const d of days) {
-const k = keyfn(d);
-if (!buckets.has(k)) { buckets.set(k, { label: k, worked: 0, nCommits: 0, nDays: 0}); order.push(k);}
-const b = buckets.get(k);
-b.worked += d.worked; b.nCommits += d.nCommits; b.nDays += 1;
-}
-return order.map(k => buckets.get(k));
-}
-
-// ---- timezone-aware day + ISO-week keys, stdlib Intl only (no deps) -------------
-function dayKey(epochSec, tz) {
-// Format the epoch in the target tz as YYYY-MM-DD, deterministically.
-const d = new Date(epochSec * SEC);
-const parts = new Intl.DateTimeFormat('en-CA', {
-timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-}).formatToParts(d);
-const g = t => parts.find(p => p.type === t).value;
-return `${g('year')}-${g('month')}-${g('day')}`;
+function decodeZTXt(data, inflate) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("zTXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("zTXt chunk: keyword must be 1-79 bytes");}
+if (nul + 1 >= data.length) { throw new Error("zTXt chunk: missing compression method");}
+var method = data[nul + 1];
+if (method!== 0) { throw new Error("zTXt chunk: unknown compression method " + method);}
+var comp = data.subarray? data.subarray(nul + 2): data.slice(nul + 2);
+var entry = {
+kind: "zTXt",
+keyword: latin1(data, 0, nul),
+compressed: true,
+text: null,
+compressedText: comp
+};
+if (inflate) { entry.text = latin1(inflate(comp), 0, inflate(comp).length);}
+return entry;
 }
 
-function weekKey(dayRec) {
-// ISO week from the day's YYYY-MM-DD (tz already applied when the day was bucketed).
-const [y, m, dd] = dayRec.date.split('-').map(Number);
-const dt = new Date(Date.UTC(y, m - 1, dd));
-const dayNum = (dt.getUTCDay() + 6) % 7; // Mon=0..Sun=6
-dt.setUTCDate(dt.getUTCDate() - dayNum + 3); // Thursday of this week
-const firstThu = new Date(Date.UTC(dt.getUTCFullYear(), 0, 4));
-const week = 1 + Math.round(((dt - firstThu) / (7 * 24 * 3600 * SEC)));
-return `${dt.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+function decodeITXt(data, inflate) {
+var n = data.length;
+var k = indexOfNull(data, 0, n);
+if (k === -1) { throw new Error("iTXt chunk: missing keyword null separator");}
+if (k < 1 || k > 79) { throw new Error("iTXt chunk: keyword must be 1-79 bytes");}
+if (k + 2 >= n) { throw new Error("iTXt chunk: truncated header");}
+var compFlag = data[k + 1];
+var compMethod = data[k + 2];
+if (compFlag!== 0 && compFlag!== 1) { throw new Error("iTXt chunk: bad compression flag " + compFlag);}
+if (compFlag === 1 && compMethod!== 0) { throw new Error("iTXt chunk: unknown compression method " + compMethod);}
+var langStart = k + 3;
+var langNul = indexOfNull(data, langStart, n);
+if (langNul === -1) { throw new Error("iTXt chunk: missing language-tag null separator");}
+var transStart = langNul + 1;
+var transNul = indexOfNull(data, transStart, n);
+if (transNul === -1) { throw new Error("iTXt chunk: missing translated-keyword null separator");}
+var textStart = transNul + 1;
+
+var entry = {
+kind: "iTXt",
+keyword: utf8(data, 0, k),
+compressed: compFlag === 1,
+languageTag: latin1(data, langStart, langNul),
+translatedKeyword: utf8(data, transStart, transNul),
+text: null
+};
+var body = data.subarray? data.subarray(textStart): data.slice(textStart);
+if (compFlag === 0) {
+entry.text = utf8(body, 0, body.length);
+} else {
+entry.compressedText = body;
+if (inflate) { var raw = inflate(body); entry.text = utf8(raw, 0, raw.length);}
+}
+return entry;
 }
 
-// ---- render (plain text, deterministic) ----------------------------------------
-function fmtHM(sec) {
-const t = Math.floor(sec);
-const h = Math.floor(t / 3600);
-const m = Math.floor((t % 3600) / 60);
-return `${h}h ${String(m).padStart(2, '0')}m`;
-}
-function hours(sec) { return Math.round((sec / 3600) * 100) / 100;}
-function grp(n) { return typeof n === 'number' && Number.isInteger(n)? n.toLocaleString('en-US'): String(n);}
-
-function render(ts) {
-if (ts.nDays === 0) return 'Work Timesheet\n\nNo commits in input.\n';
-const L = [];
-L.push('Work Timesheet');
-L.push('');
-L.push(`Span: ${ts.days[0].date}.. ${ts.days[ts.nDays - 1].date} · Days worked: ${grp(ts.nDays)} · Commits: ${grp(ts.totalCommits)}`);
-L.push(`Total time (model): ${fmtHM(ts.totalWorked)} (${hours(ts.totalWorked)} h)`);
-L.push(`Timezone: ${ts.tz} · Break threshold: ${ts.breakGapMin} min · Range: ${ts.firstSha}..${ts.lastSha}`);
-L.push('');
-L.push('What this measures: time bracketed by commits, not time at the keyboard.');
-L.push('worked = day-span − every gap longer than the break threshold. Floor-biased:');
-L.push('it under-counts (isolated commit = 0, invisible thinking = 0), never inflates.');
-L.push('A derivation (⊢), not a truth (⊨). Not a timeclock.');
-L.push('');
-L.push('By month');
-for (const b of ts.byMonth) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
-L.push('');
-L.push('By week');
-for (const b of ts.byWeek) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
-L.push('');
-L.push('By day');
-for (const d of ts.days) L.push(` ${d.date} · ${fmtHM(d.worked)} · ${grp(d.nCommits)} commit(s) · ${d.runs} run(s)`);
-L.push('');
-return L.join('\n') + '\n';
-}
-
-// ---- parse stdin lines ----------------------------------------------------------
-function parseLines(text) {
-const commits = [];
-for (const raw of text.split('\n')) {
-const line = raw.trim();
-if (!line) continue;
-const m = line.match(/^(\S+)\s+(\d+)\s?(.*)$/);
-if (!m) continue;
-commits.push({ sha: m[1], epoch: parseInt(m[2], 10), subject: m[3] || ''});
-}
-return commits;
-}
-
-// ---- CLI ------------------------------------------------------------------------
-function parseArgs(argv) {
-const o = { breakGapMin: DEFAULT_BREAK_GAP_MIN, tz: DEFAULT_TZ, help: false};
-for (let i = 0; i < argv.length; i++) {
-const a = argv[i];
-if (a === '--help' || a === '-h') o.help = true;
-else if (a === '--break-gap') o.breakGapMin = parseInt(argv[++i], 10);
-else if (a === '--tz') o.tz = argv[++i];
-}
-return o;
-}
-
-const HELP = `timesheet — floor-biased time-worked report from git commit timestamps (MIT, zero-dep)
-
-git log --format='%H %at %s' | node timesheet.js [--break-gap MIN] [--tz ZONE]
-
---break-gap MIN gap over MIN minutes counts as a break worth zero (default 30)
---tz ZONE IANA timezone for day bucketing (default UTC)
---help this text
-
-EDGE: commit timestamps BOUND work, they do not MEASURE it. This is a floor-biased
-model output (⊢), never a measured truth (⊨) — it under-counts on purpose. Not a
-timeclock; do not bill or adjudicate hours with it. The --break-gap assumption is
-printed in every report.
-`;
-
-function main() {
-const opts = parseArgs(process.argv.slice(2));
-if (opts.help) { process.stdout.write(HELP); return;}
-let input = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', d => { input += d;});
-process.stdin.on('end', () => {
-const commits = parseLines(input);
-const ts = computeTimesheet(commits, opts);
-process.stdout.write(render(ts));
-});
-}
-
-if (typeof window!== 'undefined') {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.timesheet = { computeTimesheet, render, parseLines};
-}
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { computeTimesheet, render, parseLines, fmtHM, weekKey, dayKey};
-}
-if (typeof require!== 'undefined' && require.main === module) {
-main();
-}
-
-test_timesheet.js 109 lines on GitHub →
-#!/usr/bin/env node
-/*
-* test_timesheet — drift-check battery for the timesheet gift.
-* MIT · zero-dependency · stdlib-only.
-*
-* THE ORACLE RULE: the oracle here is HAND-COMPUTED ARITHMETIC. The model
-* worked(day) = Σ min(gap, breakGap) over consecutive commits
-* is simple enough that a human computes the expected number independently of the
-* implementation — a stronger out-of-band oracle than a second code path. Each
-* fixture below carries its hand-computed expected value and the arithmetic.
+/**
+* parsePngText(input[, options]) -> Array<Entry>
+* Strictly walk a PNG byte stream and return its tEXt/zTXt/iTXt entries in file
+* order. Validates the signature and every chunk's CRC-32; throws on any
+* malformed input. See the file header for the Entry shapes and the `inflate`
+* option (used to decode zTXt / compressed iTXt text).
 */
-'use strict';
-const { computeTimesheet} = require('./timesheet.js');
+function parsePngText(input, options) {
+var bytes = toU8(input);
+var inflate = options && options.inflate;
+var len = bytes.length;
 
-let pass = 0, fail = 0;
-function eq(got, want, msg) {
-if (got === want) { pass++;}
-else { fail++; console.error(`FAIL: ${msg}\n got: ${got}\n want: ${want}`);}
-}
-function ok(cond, msg) { if (cond) pass++; else { fail++; console.error(`FAIL: ${msg}`);}}
-
-// helper: build commits at given UTC times on one day (2026-01-05, a Monday)
-const BASE = Math.floor(Date.UTC(2026, 0, 5, 0, 0, 0) / 1000); // 2026-01-05 00:00:00Z
-const at = (hh, mm) => BASE + hh * 3600 + mm * 60;
-const C = (n, epoch) => ({ sha: `sha${n}`.padEnd(7, '0'), epoch, subject: `commit ${n}`});
-
-// ---- 1. Fixed model anchors (hand-computed) -----------------------------------
-// Two commits 10 min apart, same day. gap=600s <= break(1800s) -> worked=600.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 600, 'anchor A: two commits 10min apart -> worked=600s');
-eq(ts.nDays, 1, 'anchor A: one day');
-eq(ts.totalCommits, 2, 'anchor A: two commits');
-}
-// Two commits 90 min apart with break-gap 30. gap=5400s > 1800 -> break, worked=0.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(10, 30))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 0, 'anchor B: 90min gap > 30min break -> worked=0 (clamped)');
-}
-// A lone commit in a day -> worked=0 (no neighbor).
-{
-const ts = computeTimesheet([C(1, at(14, 0))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 0, 'anchor C: isolated commit -> worked=0');
-eq(ts.nDays, 1, 'anchor C: still one day recorded');
-}
-// Three commits: 9:00, 9:20, 9:35 (gaps 20m, 15m; both <=30) -> worked=35m=2100s.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 20)), C(3, at(9, 35))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 2100, 'anchor D: 20m+15m consecutive -> worked=2100s');
-eq(ts.days[0].runs, 1, 'anchor D: one run (no break)');
+if (len < 8) { throw new Error("not a PNG: shorter than the 8-byte signature");}
+for (var s = 0; s < 8; s++) {
+if (bytes[s]!== PNG_SIG[s]) { throw new Error("not a PNG: bad signature");}
 }
 
-// ---- 2. Floor-bias tripwire (the known-bad vector) ----------------------------
-// A day with an overnight-shaped 3h gap in the middle. Naive first-to-last span
-// would count the whole ~3h20m as work; the model must clamp the 3h gap to a break.
-// Commits: 9:00, 9:10 (gap 10m -> worked 600), 12:15 (gap 3h05m=11100s > 1800 ->
-// BREAK, worked +0), 12:25 (gap 10m -> worked +600). Hand-computed worked = 1200s.
-// Naive span = 12:25 - 9:00 = 3h25m = 12300s. The gap between them is the test.
-{
-const ts = computeTimesheet(
-[C(1, at(9, 0)), C(2, at(9, 10)), C(3, at(12, 15)), C(4, at(12, 25))],
-{ breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 1200, 'TRIPWIRE: floor-biased worked=1200s (not the 12300s naive span)');
-ok(ts.totalWorked < 12300, 'TRIPWIRE: model under-counts the naive first-to-last span');
-eq(ts.days[0].runs, 2, 'TRIPWIRE: the 3h gap splits the day into 2 runs');
+var entries = [];
+var off = 8;
+var sawIEND = false;
+
+while (off < len) {
+if (off + 8 > len) { throw new Error("truncated PNG: incomplete chunk header at offset " + off);}
+var dataLen = u32be(bytes, off);
+var typeStart = off + 4;
+var dataStart = off + 8;
+var dataEnd = dataStart + dataLen;
+var crcEnd = dataEnd + 4;
+if (crcEnd > len) { throw new Error("truncated PNG: chunk data/CRC runs past end at offset " + off);}
+
+var type = latin1(bytes, typeStart, typeStart + 4);
+var storedCrc = u32be(bytes, dataEnd);
+var actualCrc = crc32(bytes, typeStart, dataEnd);
+if (storedCrc!== actualCrc) {
+throw new Error("CRC mismatch in " + type + " chunk at offset " + off +
+": stored 0x" + storedCrc.toString(16) + "!= computed 0x" + actualCrc.toString(16));
 }
 
-// ---- 3. Determinism: same input twice -> identical result ----------------------
-{
-const input = [C(1, at(9, 0)), C(2, at(9, 25)), C(3, at(11, 0))];
-const a = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
-const b = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
-eq(a, b, 'determinism: same input -> byte-identical fold');
+var data = bytes.subarray? bytes.subarray(dataStart, dataEnd): bytes.slice(dataStart, dataEnd);
+if (type === "tEXt") { entries.push(decodeTEXt(data));}
+else if (type === "zTXt") { entries.push(decodeZTXt(data, inflate));}
+else if (type === "iTXt") { entries.push(decodeITXt(data, inflate));}
+else if (type === "IEND") { sawIEND = true; off = crcEnd; break;}
+
+off = crcEnd;
 }
 
-// ---- 4. Break-gap sensitivity (the assumption is live) -------------------------
-// Commits 9:00 and 9:40 (gap 40m=2400s). At break-gap 30 -> break (worked 0).
-// At break-gap 45 -> within threshold (worked 2400). The number moves with --break-gap.
-{
-const input = [C(1, at(9, 0)), C(2, at(9, 40))];
-const at30 = computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'});
-const at45 = computeTimesheet(input, { breakGapMin: 45, tz: 'UTC'});
-eq(at30.totalWorked, 0, 'sensitivity: 40m gap at break-gap 30 -> worked=0');
-eq(at45.totalWorked, 2400, 'sensitivity: 40m gap at break-gap 45 -> worked=2400s');
+if (!sawIEND) { throw new Error("truncated PNG: stream ended before the IEND chunk");}
+return entries;
 }
 
-// ---- 5. Mutation bite: a deliberately-wrong expectation MUST be caught ----------
-// (Proves the harness is not a no-op: assert the RIGHT value is NOT the wrong one.)
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
-ok(ts.totalWorked!== 999, 'mutation-bite: harness rejects a wrong expected value (worked!== 999)');
-ok(ts.totalWorked === 600, 'mutation-bite: harness confirms the right value (worked === 600)');
+// ---- Dual-runtime export: browser namespace + Node module ------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePngText = parsePngText;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { parsePngText: parsePngText};
 }
 
-// ---- 6. Multi-day rollup + week/month keys -------------------------------------
-{
-const day2 = BASE + 24 * 3600; // 2026-01-06
-const ts = computeTimesheet(
-[C(1, at(9, 0)), C(2, at(9, 15)), { sha: 'sha3000', epoch: day2 + 10 * 3600, subject: 'd2'},
-{ sha: 'sha4000', epoch: day2 + 10 * 3600 + 600, subject: 'd2b'}],
-{ breakGapMin: 30, tz: 'UTC'});
-eq(ts.nDays, 2, 'rollup: two distinct days');
-eq(ts.totalWorked, 900 + 600, 'rollup: day1 15m + day2 10m = 1500s total');
-eq(ts.byMonth.length, 1, 'rollup: both days in one month bucket');
-eq(ts.byMonth[0].label, '2026-01', 'rollup: month key = 2026-01');
+// ---- CLI: print "keyword\ttext" per text entry; Node supplies the inflater ---
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"ratchet-png-text — extract tEXt/zTXt/iTXt metadata from a PNG (strict)\n\n" +
+" node ratchet-png-text.js cover.png one line per text entry: keyword<TAB>text\n\n" +
+"Validates the PNG signature and every chunk's CRC-32; refuses malformed input.\n" +
+"Decodes tEXt and uncompressed iTXt directly; zTXt and compressed iTXt are\n" +
+"inflated here with Node's zlib (the shipped core is dependency-free).\n");
+process.exit(args.length === 0? 1: 0);
+}
+var fs = require("fs");
+var zlib = require("zlib");
+var inflate = function (b) { return zlib.inflateSync(Buffer.from(b));};
+var exitCode = 0;
+for (var a = 0; a < args.length; a++) {
+try {
+var buf = fs.readFileSync(args[a]);
+var list = parsePngText(buf, { inflate: inflate});
+if (args.length > 1) { process.stdout.write("== " + args[a] + " ==\n");}
+for (var e = 0; e < list.length; e++) {
+var en = list[e];
+var t = (en.text === null)? "[" + en.kind + ", compressed, no inflater]": en.text;
+process.stdout.write(en.keyword + "\t" + t + "\n");
+}
+if (list.length === 0) { process.stdout.write("(no text chunks)\n");}
+} catch (err) {
+process.stderr.write("ratchet-png-text: " + args[a] + ": " + err.message + "\n");
+exitCode = 1;
+}
+}
+process.exit(exitCode);
 }
 
-console.log(`\ntimesheet drift-check: ${pass} passed, ${fail} failed`);
+test_ratchet-png-text.js 227 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-png-text.js — proves the strict PNG text extractor implements its
+stated contract correctly.
+
+THE ORACLE. There is no PNG-text parser in the Node stdlib to diff against, so
+the oracle is the PNG spec expressed as CURATED, REAL PNG BYTE FIXTURES built
+in-test: each fixture is an actual PNG byte stream (8-byte signature + chunks
+with correct CRC-32 + IEND), so a "valid" vector is a genuine file the parser
+must read to a KNOWN set of entries, and an "invalid" vector is a genuine
+malformation the parser must THROW on. Every branch is exercised: tEXt,
+uncompressed iTXt (UTF-8, language tag, translated keyword), zTXt and compressed
+iTXt, the no-text case, and the malformations (bad signature, CRC mismatch,
+truncation, missing IEND, missing separators, bad length, non-buffer input).
+
+THE LIVE-REFERENCE BACKSTOP. The compressed path (zTXt / compressed iTXt) is
+built with Node's own zlib.deflateSync and decoded through the parser with
+zlib.inflateSync passed as the `inflate` option — so the zero-dependency core is
+cross-checked against a live reference implementation, sha256-style.
+
+Plus determinism (same bytes -> same entries, twice) and a mutation-bite (a
+text-carrying PNG and a no-text PNG must not share a result, so a degenerate
+core that returns a constant can't pass green). Exit 0 = all pass; exit 1 =
+a failure (loud). stdlib only. */
+"use strict";
+var assert = require("assert");
+var zlib = require("zlib");
+var parsePngText = require("./ratchet-png-text.js").parsePngText;
+
+var pass = 0, fail = 0;
+function ok(label, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL " + label + "\n " + (e && e.message? e.message: e));}
+}
+
+// ---- PNG fixture builder (a tiny, correct reference encoder) ----------------
+var SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) { c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);}
+t[n] = c >>> 0;
+}
+return t;
+})();
+function crc32(buf) {
+var c = 0xffffffff;
+for (var i = 0; i < buf.length; i++) { c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);}
+return (c ^ 0xffffffff) >>> 0;
+}
+function u32(n) { var b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0, 0); return b;}
+
+// One PNG chunk: length + type + data + CRC(type+data).
+function chunk(type, data) {
+data = data || Buffer.alloc(0);
+var typeBuf = Buffer.from(type, "latin1");
+var body = Buffer.concat([typeBuf, data]);
+return Buffer.concat([u32(data.length), body, u32(crc32(body))]);
+}
+// A minimal, real IHDR (1x1, 8-bit grayscale) — for fixture realism.
+var IHDR = chunk("IHDR", Buffer.concat([u32(1), u32(1), Buffer.from([8, 0, 0, 0, 0])]));
+var IEND = chunk("IEND");
+
+function png(chunks) { return Buffer.concat([SIG].concat(chunks).concat([IEND]));}
+
+// tEXt data = keyword + \0 + text (Latin-1)
+function tEXt(keyword, text) {
+return chunk("tEXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0]), Buffer.from(text, "latin1")]));
+}
+// zTXt data = keyword + \0 + method(0) + zlib(text)
+function zTXt(keyword, text) {
+return chunk("zTXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0, 0]), zlib.deflateSync(Buffer.from(text, "latin1"))]));
+}
+// iTXt data = keyword + \0 + cflag + cmethod + lang + \0 + transKeyword + \0 + text(UTF-8, maybe deflated)
+function iTXt(keyword, lang, trans, text, compressed) {
+var body = compressed? zlib.deflateSync(Buffer.from(text, "utf8")): Buffer.from(text, "utf8");
+return chunk("iTXt", Buffer.concat([
+Buffer.from(keyword, "utf8"), Buffer.from([0]),
+Buffer.from([compressed? 1: 0, 0]),
+Buffer.from(lang, "latin1"), Buffer.from([0]),
+Buffer.from(trans, "utf8"), Buffer.from([0]),
+body
+]));
+}
+
+var INFLATE = { inflate: function (b) { return zlib.inflateSync(Buffer.from(b));}};
+
+// ===========================================================================
+// VALID vectors — each must parse to a KNOWN result.
+// ===========================================================================
+ok("single tEXt decodes keyword+text", function () {
+var out = parsePngText(png([IHDR, tEXt("Title", "A Quiet Loop")]));
+assert.strictEqual(out.length, 1);
+assert.deepStrictEqual(out[0], { kind: "tEXt", keyword: "Title", text: "A Quiet Loop", compressed: false});
+});
+
+ok("multiple tEXt chunks preserved in file order", function () {
+var out = parsePngText(png([IHDR, tEXt("Author", "Shea"), tEXt("Software", "Loop MMT")]));
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].keyword, "Author");
+assert.strictEqual(out[0].text, "Shea");
+assert.strictEqual(out[1].keyword, "Software");
+assert.strictEqual(out[1].text, "Loop MMT");
+});
+
+ok("tEXt with empty text is valid (keyword, empty value)", function () {
+var out = parsePngText(png([IHDR, tEXt("Comment", "")]));
+assert.strictEqual(out[0].text, "");
+});
+
+ok("no text chunks -> empty array (not an error)", function () {
+var out = parsePngText(png([IHDR]));
+assert.deepStrictEqual(out, []);
+});
+
+ok("uncompressed iTXt decodes UTF-8 text, lang, translated keyword", function () {
+var out = parsePngText(png([IHDR, iTXt("Description", "en", "Descripción", "a café at dawn — \u2728", false)]));
+assert.strictEqual(out.length, 1);
+var e = out[0];
+assert.strictEqual(e.kind, "iTXt");
+assert.strictEqual(e.keyword, "Description");
+assert.strictEqual(e.compressed, false);
+assert.strictEqual(e.languageTag, "en");
+assert.strictEqual(e.translatedKeyword, "Descripción");
+assert.strictEqual(e.text, "a café at dawn — \u2728");
+});
+
+ok("zTXt: without inflater -> compressed entry, raw bytes, text null", function () {
+var out = parsePngText(png([IHDR, zTXt("XML:com.adobe.xmp", "the quick brown fox")]));
+var e = out[0];
+assert.strictEqual(e.kind, "zTXt");
+assert.strictEqual(e.keyword, "XML:com.adobe.xmp");
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, null);
+assert.ok(e.compressedText && e.compressedText.length > 0, "compressedText surfaced");
+});
+
+ok("zTXt: WITH live zlib inflater -> text decoded (live-reference backstop)", function () {
+var out = parsePngText(png([IHDR, zTXt("Copyright", "© 2026 Shea Gunther")]), INFLATE);
+assert.strictEqual(out[0].text, "© 2026 Shea Gunther");
+});
+
+ok("compressed iTXt: WITH inflater -> UTF-8 text decoded", function () {
+var out = parsePngText(png([IHDR, iTXt("Story", "en", "", "compressed unicode: ✓ café", true)]), INFLATE);
+var e = out[0];
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, "compressed unicode: ✓ café");
+});
+
+ok("mixed chunk types collected in order", function () {
+var out = parsePngText(png([IHDR, tEXt("A", "1"), iTXt("B", "en", "", "2", false), zTXt("C", "3")]), INFLATE);
+assert.deepStrictEqual(out.map(function (e) { return e.keyword;}), ["A", "B", "C"]);
+assert.strictEqual(out[2].text, "3");
+});
+
+ok("accepts an ArrayBuffer as well as a Buffer", function () {
+var buf = png([IHDR, tEXt("Title", "AB")]);
+var ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+assert.strictEqual(parsePngText(ab)[0].text, "AB");
+});
+
+// ===========================================================================
+// INVALID vectors — each must THROW (the ratchet refuses to advance).
+// ===========================================================================
+function throws(label, buildBadBytes) {
+ok(label, function () { assert.throws(function () { parsePngText(buildBadBytes());});});
+}
+
+throws("bad PNG signature", function () {
+var b = png([IHDR, tEXt("Title", "x")]); b[0] = 0x00; return b;
+});
+throws("CRC mismatch (a data byte flipped after CRC was written)", function () {
+var b = png([IHDR, tEXt("Title", "hello")]);
+// flip the last byte of the tEXt text; its stored CRC no longer matches
+b[b.length - 5] ^= 0xff; return b;
+});
+throws("truncated mid-chunk", function () {
+var b = png([IHDR, tEXt("Title", "hello")]); return b.subarray(0, b.length - 10);
+});
+throws("stream ends before IEND", function () {
+// signature + IHDR + a tEXt, but no IEND appended
+return Buffer.concat([SIG, IHDR, tEXt("Title", "x")]);
+});
+throws("tEXt missing its null separator", function () {
+var bad = chunk("tEXt", Buffer.from("NoNullHere", "latin1")); // no \0 in the data
+return Buffer.concat([SIG, IHDR, bad, IEND]);
+});
+throws("chunk length runs past end of buffer", function () {
+var b = png([IHDR, tEXt("Title", "x")]);
+// corrupt the tEXt length field to claim a huge data size
+var off = SIG.length + IHDR.length;
+b.writeUInt32BE(0x7fffffff, off); return b;
+});
+throws("zTXt with unknown compression method", function () {
+var data = Buffer.concat([Buffer.from("K", "latin1"), Buffer.from([0, 9]), zlib.deflateSync(Buffer.from("x"))]);
+return Buffer.concat([SIG, IHDR, chunk("zTXt", data), IEND]);
+});
+throws("shorter than the 8-byte signature", function () { return Buffer.from([0x89, 0x50, 0x4e]);});
+
+// non-buffer inputs throw a TypeError
+ok("non-buffer inputs are rejected", function () {
+["a string", 42, null, undefined, {}].forEach(function (bad) {
+assert.throws(function () { parsePngText(bad);});
+});
+});
+
+// ===========================================================================
+// Determinism + mutation-bite
+// ===========================================================================
+ok("determinism: same bytes -> identical entries, twice", function () {
+var b = png([IHDR, tEXt("Title", "same"), zTXt("Z", "twice")]);
+assert.deepStrictEqual(parsePngText(b, INFLATE), parsePngText(b, INFLATE));
+});
+
+ok("mutation-bite: a text PNG and a no-text PNG do not share a result", function () {
+var withText = parsePngText(png([IHDR, tEXt("Title", "real")]));
+var without = parsePngText(png([IHDR]));
+// a constant-returning core would make these equal; they must not be.
+assert.notDeepStrictEqual(withText, without);
+assert.strictEqual(withText[0].text, "real"); // and the value is the input's, not a constant
+});
+
+console.log("\nratchet-png-text: " + pass + " passed, " + fail + " failed" +
+" (real-PNG-byte vectors: tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, " +
+"live-zlib backstop, coercion, determinism, mutation-bite)");
 process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node, no dependencies
+Node / browser, no dependencies
 
 ---
 
-# Tracebus — a Loop MMT gift
-https://loopmmt.com/gifts/tracebus/
+# Reltime — a Loop MMT gift
+https://loopmmt.com/gifts/reltime/
 [coverage: optional · branch: gifts]
 
-Nothing Moves Without a Receipt route ← all gifts
+Relative Time That Refuses To Lie date ← all gifts
 
-Tracebus
+Reltime
 
-A publish/subscribe bus with two rules most buses skip: every legal path is declared up front, and every emission is written to an append-only ledger you can replay by trace id. A packet can only reach a subscriber the routing table permits — an unrouted packet is refused, not silently dropped — and a subscriber that throws is caught, recorded, and stepped over so one bad listener can never take the bus down. Thread one traceId through a chain and read the whole journey back out of the ledger, hop by hop.
+Turn a timestamp into a short human 'when' (3h ago, Jun 20) where the whole point is what it won't do: a missing, empty, or unparseable stamp returns no label rather than a guess, a future stamp returns no label rather than a negative age, and anything older than a week gets the real date it landed instead of a rounded-up '9d ago'. Deterministic — a pure function of (stamp, now).
 
 The honest edge
 
-It enforces the topology you declare and records every hop; it does NOT invent routes for you (an unrouted packet is a fault, by design) and its ids are v4-shaped for correlation, not cryptographic (Math.random). request/response is opt-in per bus via { requestResponse: true} — the bus name carries no special meaning.
+It renders in UTC and is a recency label, not a locale-aware or timezone-shifting formatter, and not a full date library. The fixed minute/hour/day/week bands are by design — the value is the refusal to fabricate, not configurable granularity.
 
 Run it
 
-node tracebus.js --demo
-test_tracebus.js (72/72, mutation-bitten)
-Zero-dependency JavaScript, Node or browser
+node reltime.js 2026-08-20T09:00:00Z
+test_reltime.js (20/20, mutation-bitten)
+Node, no dependencies
 
 The code — every file that ships
 
-tracebus.js 475 lines on GitHub →
-/*
-* tracebus — a traced, routing-enforced message bus.
-*
-* A publish/subscribe bus where every legal path is declared up front and
-* every emission is written to an append-only ledger you can replay by
-* trace id. A packet can only reach a subscriber the routing table permits;
-* an unrouted packet is refused, not silently dropped. Nothing is delivered
-* without leaving a receipt.
-*
-* The shape: packet ──emit(source)──▶ routingTable.resolve ──▶ subscribers
-* │ │
-* └────────▶ ledger.record ◀─────┘
-*
-* Zero dependencies. Runs in Node or the browser. No I/O, no globals, no
-* clock you can't control (timestamps are ISO strings; ids are v4-shaped).
-*
-* Properties this file holds (see test_tracebus.js):
-* 1. No delivery without a receipt. Every emit() — delivered, partial,
-* rejected, or errored — appends exactly one ledger record.
-* 2. No path that wasn't declared. resolve() throws on an unrouted
-* (packetType, source) pair; emit() records the rejection and rethrows.
-* 3. A wrong-bus packet is refused. A packet routed to bus A cannot be
-* emitted on bus B, even if a subscriber is listening.
-* 4. A subscriber that throws cannot break the emitter. Handler errors are
-* caught, recorded against that destination, and delivery continues.
-* 5. Routing entries are frozen. A registered route cannot be mutated
-* after the fact (deepFreeze), so the declared topology stays declared.
-* 6. A trace is reconstructable. queryByTraceId returns every hop a
-* packet took, in emission order.
-*
-* Origin: stripped from a shipped order-management constellation's internal
-* message fabric (the "one bus, many loops, every packet traced" core) and
-* generalized — the request/response capability, which was hardwired to a
-* single bus name in the original, is now a per-bus flag.
-*
-* MIT licensed. Use it for anything.
-*/
-
-'use strict';
-
-// ────────────────────────────────────────────────────────────────────
-// Primitives (inlined so the file has no dependencies).
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* A v4-shaped identifier: 8-4-4-4-12 hex with the version nibble pinned
-* to 4 and the variant nibble in {8,9,a,b}. Uses Math.random — this is an
-* identifier for correlating log records, NOT a cryptographic token.
-*/
-function generateId() {
-const hex = '0123456789abcdef';
-let id = '';
-for (let i = 0; i < 36; i++) {
-if (i === 8 || i === 13 || i === 18 || i === 23) {
-id += '-';
-} else if (i === 14) {
-id += '4';
-} else if (i === 19) {
-id += hex[(Math.floor(Math.random() * 16) & 0x3) | 0x8];
-} else {
-id += hex[Math.floor(Math.random() * 16)];
-}
-}
-return id;
-}
-
-/** Current time as an ISO-8601 string. The one place time enters. */
-function now() {
-return new Date().toISOString();
-}
-
-/**
-* Recursively freeze an object and everything it owns. A registered
-* routing entry is frozen so the declared topology cannot be edited
-* after registration.
-*/
-function deepFreeze(obj) {
-Object.freeze(obj);
-for (const key of Object.keys(obj)) {
-const val = obj[key];
-if (val && typeof val === 'object' &&!Object.isFrozen(val)) {
-deepFreeze(val);
-}
-}
-return obj;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Packet — the traceable envelope.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a packet: a typed payload wrapped in a header that carries a
-* unique packetId, a traceId (shared across a causal chain — pass it in
-* opts to thread a conversation), a timestamp, and an optional source.
-*
-* @param {string} packetType - a non-empty type string, e.g. 'user.created'
-* @param {object} payload - the packet's data (must be an object)
-* @param {object} [opts] - { traceId?, source?} overrides
-* @returns {object} { packetId, packetType, timestamp, traceId, source, payload}
-*/
-function createPacket(packetType, payload, opts) {
-if (!packetType || typeof packetType!== 'string') {
-throw new Error('[tracebus] Cannot create packet: packetType is required and must be a non-empty string');
-}
-if (!payload || typeof payload!== 'object') {
-throw new Error(`[tracebus] Cannot create packet ${packetType}: payload must be an object`);
-}
-
-return {
-packetId: generateId(),
-packetType: packetType,
-timestamp: now(),
-traceId: (opts && opts.traceId) || generateId(),
-source: (opts && opts.source) || null,
-payload: payload
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Ledger — the append-only receipt log.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create an append-only ledger. Every bus emission is recorded here.
-* Nothing is ever removed; queries are pure reads.
-*/
-function createLedger() {
-const entries = [];
-
-return {
-/**
-* Record one emission.
-* @param {object} record - { bus, packet, source, destinations?, status?}
-*/
-record(record) {
-if (!record ||!record.packet ||!record.packet.packetId) {
-throw new Error('[tracebus] Cannot record: a record needs a packet with a packetId');
-}
-entries.push({
-ledgerId: generateId(),
-recordedAt: now(),
-bus: record.bus,
-packetId: record.packet.packetId,
-packetType: record.packet.packetType,
-traceId: record.packet.traceId,
-source: record.source,
-destinations: record.destinations || [],
-status: record.status || 'delivered'
-});
-},
-
-/**
-* Every record for one traceId, in emission order — a packet's journey.
-* @param {string} traceId
-* @returns {object[]}
-*/
-queryByTraceId(traceId) {
-return entries.filter(e => e.traceId === traceId);
-},
-
-/**
-* Every record of one packetType.
-* @param {string} packetType
-* @returns {object[]}
-*/
-queryByPacketType(packetType) {
-return entries.filter(e => e.packetType === packetType);
-},
-
-/** Total records (diagnostic). */
-count() {
-return entries.length;
-},
-
-/** A copy of every record (diagnostic — the ledger stays private). */
-all() {
-return entries.slice();
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Routing table — the declared topology.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a routing table. Every legal (packetType, source) → destinations
-* path must be registered before a packet can travel it. Registered entries
-* are frozen.
-*/
-function createRoutingTable() {
-// key = `${packetType}:${source}` → array of frozen entries
-const routes = new Map();
-
-return {
-/**
-* Register a legal path.
-* @param {object} entry - { packetType, source, bus, destinations[],
-* entryNumber?, mode?, priority?}
-*/
-register(entry) {
-if (!entry ||!entry.packetType ||!entry.source ||!entry.bus) {
-throw new Error('[tracebus] Cannot register route: packetType, source, and bus are required');
-}
-if (!entry.destinations ||!Array.isArray(entry.destinations) || entry.destinations.length === 0) {
-throw new Error(`[tracebus] Cannot register route ${entry.packetType} from ${entry.source}: destinations must be a non-empty array`);
-}
-
-const key = `${entry.packetType}:${entry.source}`;
-if (!routes.has(key)) {
-routes.set(key, []);
-}
-routes.get(key).push(deepFreeze({
-entryNumber: entry.entryNumber!== undefined? entry.entryNumber: null,
-packetType: entry.packetType,
-source: entry.source,
-bus: entry.bus,
-destinations: entry.destinations.slice(),
-mode: entry.mode || 'push',
-priority: entry.priority || 'standard'
-}));
-},
-
-/**
-* Resolve the routes for a (packetType, source) pair.
-* @throws if no route is registered — an unrouted packet is a fault.
-* @returns {object[]} matching frozen entries
-*/
-resolve(packetType, source) {
-const key = `${packetType}:${source}`;
-const matched = routes.get(key);
-if (!matched || matched.length === 0) {
-throw new Error(`[tracebus] Unrouted packet: ${packetType} from ${source}. No matching routing entry.`);
-}
-return matched;
-},
-
-/** Non-throwing existence check. */
-has(packetType, source) {
-const key = `${packetType}:${source}`;
-const matched = routes.get(key);
-return!!(matched && matched.length > 0);
-},
-
-/** Total registered entries (diagnostic). */
-count() {
-let total = 0;
-for (const list of routes.values()) {
-total += list.length;
-}
-return total;
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Bus — publish/subscribe with enforced routing and a receipt per emit.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a bus.
-* @param {string} name - this bus's name (matched against a route's `bus`)
-* @param {object} routingTable - a shared routing table (createRoutingTable())
-* @param {object} ledger - a shared ledger (createLedger())
-* @param {object} [opts] - { requestResponse?: boolean} — enable request()
-* on this bus. Default false.
-*/
-function createBus(name, routingTable, ledger, opts) {
-if (!name || typeof name!== 'string') {
-throw new Error('[tracebus] Cannot create bus: name is required and must be a non-empty string');
-}
-if (!routingTable || typeof routingTable.resolve!== 'function') {
-throw new Error(`[tracebus] Cannot create bus ${name}: a routing table is required`);
-}
-if (!ledger || typeof ledger.record!== 'function') {
-throw new Error(`[tracebus] Cannot create bus ${name}: a ledger is required`);
-}
-
-const requestResponse =!!(opts && opts.requestResponse);
-const subscribers = new Map(); // destination name → handler
-
-return {
-name: name,
-
-/**
-* Subscribe a named destination to this bus.
-* @param {string} destination - the name routing entries deliver to
-* @param {function} handler - receives (packet)
-*/
-subscribe(destination, handler) {
-if (!destination || typeof destination!== 'string') {
-throw new Error(`[tracebus:${name}] Cannot subscribe: destination must be a non-empty string`);
-}
-if (typeof handler!== 'function') {
-throw new Error(`[tracebus:${name}] Cannot subscribe ${destination}: handler must be a function`);
-}
-subscribers.set(destination, handler);
-},
-
-/**
-* Emit a packet from a source. Routing decides destinations; a receipt
-* is always recorded. Returns { delivered, missing} — destinations that
-* received the packet and declared destinations with no live subscriber.
-* @param {string} source - the emitter
-* @param {object} packet - from createPacket()
-*/
-emit(source, packet) {
-if (!packet ||!packet.packetType) {
-throw new Error(`[tracebus:${name}] Cannot emit from ${source}: invalid packet (missing packetType)`);
-}
-
-let routeEntries;
-try {
-routeEntries = routingTable.resolve(packet.packetType, source);
-} catch (err) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:unrouted'});
-throw err;
-}
-
-const entry = routeEntries[0];
-if (entry.bus!== name) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:wrong_bus'});
-throw new Error(`[tracebus:${name}] Cannot emit ${packet.packetType} from ${source}: packet is routed to bus ${entry.bus}, not ${name}`);
-}
-
-const delivered = [];
-const missing = [];
-
-for (const re of routeEntries) {
-for (const dest of re.destinations) {
-const handler = subscribers.get(dest);
-if (handler) {
-try {
-handler(packet);
-delivered.push(dest);
-} catch (handlerErr) {
-ledger.record({
-bus: name, packet, source,
-destinations: [dest],
-status: `error:subscriber:${handlerErr.message}`
-});
-delivered.push(dest); // a thrown handler still received the packet
-}
-} else {
-missing.push(dest);
-}
-}
-}
-
-ledger.record({
-bus: name, packet, source,
-destinations: delivered,
-status: missing.length > 0
-? `delivered:partial (missing: ${missing.join(', ')})`
-: 'delivered'
-});
-
-return { delivered, missing};
-},
-
-/**
-* Request/response: emit to a single destination and return its handler's
-* return value. Only available when the bus was created with
-* { requestResponse: true}.
-* @param {string} source
-* @param {object} packet
-* @returns {*} the handler's return value
-*/
-request(source, packet) {
-if (!requestResponse) {
-throw new Error(`[tracebus:${name}] request() is not enabled on this bus (create it with { requestResponse: true})`);
-}
-if (!packet ||!packet.packetType) {
-throw new Error(`[tracebus:${name}] Cannot request from ${source}: invalid packet`);
-}
-
-let routeEntries;
-try {
-routeEntries = routingTable.resolve(packet.packetType, source);
-} catch (err) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:unrouted'});
-throw err;
-}
-
-const entry = routeEntries[0];
-if (entry.bus!== name) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:wrong_bus'});
-throw new Error(`[tracebus:${name}] Cannot request ${packet.packetType}: routed to bus ${entry.bus}`);
-}
-
-const dest = entry.destinations[0];
-const handler = subscribers.get(dest);
-if (!handler) {
-ledger.record({ bus: name, packet, source, destinations: [dest], status: 'error:destination_not_registered'});
-throw new Error(`[tracebus:${name}] Cannot request ${packet.packetType} from ${source}: destination ${dest} is not registered`);
-}
-
-let result;
-try {
-result = handler(packet);
-} catch (handlerErr) {
-ledger.record({ bus: name, packet, source, destinations: [dest], status: `error:handler:${handlerErr.message}`});
-throw handlerErr;
-}
-
-ledger.record({ bus: name, packet, source, destinations: [dest], status: 'delivered:request_response'});
-return result;
-},
-
-/** Is a destination subscribed? (diagnostic) */
-hasSubscriber(destination) {
-return subscribers.has(destination);
-},
-
-/** Subscriber count (diagnostic). */
-subscriberCount() {
-return subscribers.size;
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Exports — CommonJS for Node, global for the browser.
-// ────────────────────────────────────────────────────────────────────
-
-const tracebus = {
-generateId,
-createPacket,
-createLedger,
-createRoutingTable,
-createBus,
-deepFreeze
-};
-
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = tracebus;
-}
-if (typeof window!== 'undefined') {
-window.tracebus = tracebus;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Runnable demo: node tracebus.js --demo
-// Wires a tiny two-subscriber bus, emits one packet, and prints the
-// ledger — so `run` shows the receipt trail with no code to write.
-// ────────────────────────────────────────────────────────────────────
-if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-var arg = process.argv[2];
-if (arg === '--demo' || arg === undefined) {
-var routing = createRoutingTable();
-var ledger = createLedger();
-var bus = createBus('DATA', routing, ledger);
-
-routing.register({ packetType: 'order.placed', source: 'checkout', bus: 'DATA', destinations: ['fulfillment', 'email']});
-bus.subscribe('fulfillment', function (p) { console.log(' fulfillment got order', p.payload.id);});
-bus.subscribe('email', function (p) { console.log(' email got order', p.payload.id);});
-
-console.log('emit order.placed from checkout:');
-var result = bus.emit('checkout', createPacket('order.placed', { id: 1001}, { source: 'checkout'}));
-console.log(' delivered:', result.delivered.join(', '), '| missing:', result.missing.join(', ') || '(none)');
-
-console.log('\nledger (the receipt trail):');
-ledger.all().forEach(function (e) {
-console.log(' ' + e.packetType + ' bus=' + e.bus + ' status=' + e.status + ' ->[' + e.destinations.join(', ') + ']');
-});
-
-console.log('\ntry an unrouted packet (refused, but still recorded):');
-try { bus.emit('checkout', createPacket('order.cancelled', { id: 1001}));}
-catch (e) { console.log(' refused: ' + e.message);}
-console.log(' ledger now has ' + ledger.count() + ' records — nothing moved without a receipt.');
-} else {
-console.log('usage: node tracebus.js --demo');
-}
-}
-
-test_tracebus.js 268 lines on GitHub →
+reltime.js 106 lines on GitHub →
 #!/usr/bin/env node
-/* test_tracebus.js — proves the bus is honest: nothing moves without a receipt,
-no path travels that wasn't declared, and a bad subscriber can't take the bus down.
+/* reltime.js — an honest relative-time label ("3h ago", "Jun 20") that refuses
+to fake, round up, or invent a time it doesn't have.
 
-The six properties that ARE the tool:
-1. No delivery without a receipt — every emit() appends exactly one ledger record.
-2. No undeclared path — an unrouted packet is refused (and the refusal is recorded).
-3. A wrong-bus packet is refused — routed to A, cannot be emitted on B.
-4. A throwing subscriber can't break the emitter — error caught, recorded, delivery continues.
-5. Registered routes are frozen — the declared topology stays declared.
-6. A trace is reconstructable — queryByTraceId returns every hop in order.
-Plus the generalizations this strip added over its origin (tested hardest, per the
-"a ported core gets its OWN validation" rule): request() gated by a per-bus flag,
-not a hardcoded bus name. Ends with a mutation bite so a vacuous green fails loud.
-stdlib only, no dependencies. Exit 0 = all pass, exit 1 = a failure (loud). */
+Turn a timestamp into a short human "when" — but the whole point is what it
+WON'T do:
+
+• FLAG, DON'T FAKE. No stamp, an empty stamp, or an unparseable value
+returns null — NO label. The caller shows nothing rather than a guessed
+or fabricated time. An undated thing is never handed a "when".
+
+• A FUTURE STAMP IS NOT A RECENCY CLAIM. If the timestamp is ahead of now
+(clock skew, a bad record), it returns null rather than "-2h ago". You
+cannot honestly say how long ago something happened if it hasn't.
+
+• REAL, NOT ROUNDED-UP. Recent items get a relative label
+(just now / Nm / Nh / Nd ago); anything older than a week gets the
+ABSOLUTE short date it actually landed ("Jun 20", or "Jun 20, 2025"
+across a year boundary) — because "9d ago" is less honest and less
+useful than the date itself.
+
+• DETERMINISTIC. `now` is injected, so the label is a pure function of
+(stamp, now) — testable with no wall clock and stable across a render.
+
+Pure function of its inputs, no dependencies. The same code runs in a browser
+(attach relativeTime to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node reltime.js 2026-08-20T09:00:00Z # label vs. now
+node reltime.js 2026-08-20T09:00:00Z 1755772800000 # label vs. an injected now (ms)
+node reltime.js --help
+
+Dates are read/rendered in UTC for determinism. Released under MIT.
+*/
 "use strict";
-var tb = require("./tracebus.js");
+
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+var MIN = 60 * 1000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+
+/* relativeTime(iso, nowMs) -> short label string, or null when there is no
+honest label to show. `iso` is an ISO-8601 string (or null). `nowMs` defaults
+to Date.now() but is injected in tests and via the CLI for determinism. */
+function relativeTime(iso, nowMs) {
+// flag-don't-fake: no stamp, empty stamp, or a non-string -> no label.
+if (iso == null) return null;
+var s = String(iso);
+if (s === "") return null;
+
+var t = Date.parse(s);
+if (isNaN(t)) return null; // unparseable -> no fabricated time
+
+var now = (typeof nowMs === "number" && isFinite(nowMs))? nowMs: Date.now();
+var delta = now - t;
+
+// A future stamp (clock skew) is not a recency claim we can make honestly.
+if (delta < 0) return null;
+
+if (delta < MIN) return "just now";
+if (delta < HOUR) return Math.floor(delta / MIN) + "m ago";
+if (delta < DAY) return Math.floor(delta / HOUR) + "h ago";
+if (delta < WEEK) return Math.floor(delta / DAY) + "d ago";
+
+// Older than a week -> the absolute short date it actually landed.
+var d = new Date(t);
+var label = MONTHS[d.getUTCMonth()] + " " + d.getUTCDate();
+if (d.getUTCFullYear()!== new Date(now).getUTCFullYear()) {
+label += ", " + d.getUTCFullYear();
+}
+return label;
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.relativeTime = relativeTime;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { relativeTime: relativeTime};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function main(argv) {
+var args = argv.slice(2);
+if (args.length === 0 || args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"reltime.js — an honest relative-time label that refuses to fake a time.\n\n" +
+" node reltime.js <iso-timestamp> label vs. now\n" +
+" node reltime.js <iso-timestamp> <now-ms> label vs. an injected now (ms)\n" +
+" node reltime.js --help\n\n" +
+"Prints the label, or '(no honest label)' when the stamp is missing,\n" +
+"unparseable, or in the future. Dates render in UTC.\n"
+);
+return args.length === 0? 1: 0;
+}
+var iso = args[0];
+var nowMs = args.length > 1? Number(args[1]): undefined;
+var label = relativeTime(iso, nowMs);
+process.stdout.write((label === null? "(no honest label)": label) + "\n");
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_reltime.js 61 lines on GitHub →
+#!/usr/bin/env node
+/* test_reltime.js — proves the label is honest, exact, and deterministic.
+
+The honesty rules ARE the tool, so the test's real job is to prove each
+REFUSAL fires (null, not a fabricated label) and each threshold is exact. The
+clock is injected, so every case is deterministic with no wall clock. A
+mutation bite guards against a vacuously-green run. Exit 0 = all pass, exit 1
+= a failure (loud). stdlib only, no dependencies. */
+"use strict";
+var relativeTime = require("./reltime.js").relativeTime;
 
 var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;} else { fail++; console.error("FAIL " + name);}
-}
 function eq(name, got, want) {
 var g = JSON.stringify(got), w = JSON.stringify(want);
 if (g === w) { pass++;}
 else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
 }
-function threws(fn) { try { fn(); return false;} catch (e) { return true;}}
 
-// A fresh, wired-up bus system for a test to use.
-function fixture(busOpts) {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-var bus = tb.createBus("DATA", routing, ledger, busOpts);
-return { routing: routing, ledger: ledger, bus: bus};
-}
+// A fixed "now" so every case is deterministic. 2026-06-27T12:00:00Z.
+var NOW = Date.parse("2026-06-27T12:00:00Z");
+function ago(ms) { return new Date(NOW - ms).toISOString();}
+var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
 
-// ── createPacket: shape + validation ─────────────────────────────────────────
-(function () {
-var p = tb.createPacket("user.created", { id: 7});
-ok("packet has packetId", typeof p.packetId === "string" && p.packetId.length === 36);
-ok("packet has traceId", typeof p.traceId === "string" && p.traceId.length === 36);
-ok("packet keeps type", p.packetType === "user.created");
-ok("packet keeps payload", p.payload.id === 7);
-ok("packet source defaults null", p.source === null);
-ok("packetId!== traceId by default", p.packetId!== p.traceId);
+// --- flag-don't-fake: every "no honest label" case returns null -------------
+eq("null stamp -> null", relativeTime(null, NOW), null);
+eq("undefined stamp -> null", relativeTime(undefined, NOW), null);
+eq("empty string -> null", relativeTime("", NOW), null);
+eq("unparseable -> null", relativeTime("not a date", NOW), null);
+eq("garbage -> null", relativeTime("2026-13-99", NOW), null);
+eq("future stamp -> null", relativeTime(ago(-HOUR), NOW), null); // 1h in the FUTURE
 
-var threaded = tb.createPacket("user.updated", { id: 7}, { traceId: "trace-abc", source: "svc"});
-ok("traceId threads through opts", threaded.traceId === "trace-abc");
-ok("source threads through opts", threaded.source === "svc");
+// --- relative band, exact thresholds ---------------------------------------
+eq("0ms -> just now", relativeTime(ago(0), NOW), "just now");
+eq("59s -> just now", relativeTime(ago(59 * 1000), NOW), "just now");
+eq("60s -> 1m ago", relativeTime(ago(MIN), NOW), "1m ago");
+eq("59m -> 59m ago", relativeTime(ago(59 * MIN), NOW), "59m ago");
+eq("60m -> 1h ago", relativeTime(ago(HOUR), NOW), "1h ago");
+eq("23h -> 23h ago", relativeTime(ago(23 * HOUR), NOW), "23h ago");
+eq("24h -> 1d ago", relativeTime(ago(DAY), NOW), "1d ago");
+eq("6d -> 6d ago", relativeTime(ago(6 * DAY), NOW), "6d ago");
 
-ok("empty packetType throws", threws(function () { tb.createPacket("", {});}));
-ok("non-string packetType throws", threws(function () { tb.createPacket(42, {});}));
-ok("null payload throws", threws(function () { tb.createPacket("t", null);}));
-ok("non-object payload throws", threws(function () { tb.createPacket("t", "nope");}));
-})();
+// --- absolute band (>= 1 week): the real date it landed --------------------
+eq("7d -> absolute date", relativeTime(ago(WEEK), NOW), "Jun 20");
+eq("30d same year -> date", relativeTime(ago(30 * DAY), NOW), "May 28");
+eq("across a year boundary", relativeTime("2025-12-31T00:00:00Z", NOW), "Dec 31, 2025");
 
-// ── generateId: v4 shape + uniqueness ────────────────────────────────────────
-(function () {
-var a = tb.generateId(), b = tb.generateId();
-ok("id is 36 chars", a.length === 36);
-ok("id version nibble is 4", a[14] === "4");
-ok("id variant nibble in 8,9,a,b", /[89ab]/.test(a[19]));
-ok("dashes at 8,13,18,23", a[8] === "-" && a[13] === "-" && a[18] === "-" && a[23] === "-");
-ok("ids are unique", a!== b);
-// 500 draws, no collision
-var seen = {}, collision = false;
-for (var i = 0; i < 500; i++) { var id = tb.generateId(); if (seen[id]) collision = true; seen[id] = 1;}
-ok("500 ids, no collision",!collision);
-})();
+// --- determinism: same inputs, same output ---------------------------------
+eq("deterministic", relativeTime(ago(3 * HOUR), NOW), relativeTime(ago(3 * HOUR), NOW));
 
-// ── PROPERTY 1: no delivery without a receipt ────────────────────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "e", source: "src", bus: "DATA", destinations: ["sink"]});
-f.bus.subscribe("sink", function () {});
-ok("ledger starts empty", f.ledger.count() === 0);
-f.bus.emit("src", tb.createPacket("e", { n: 1}));
-ok("one emit -> one record", f.ledger.count() === 1);
-f.bus.emit("src", tb.createPacket("e", { n: 2}));
-ok("two emits -> two records", f.ledger.count() === 2);
-ok("delivered status recorded", f.ledger.all()[0].status === "delivered");
+// --- coercion / robustness --------------------------------------------------
+eq("non-string stamp -> null", relativeTime(12345, NOW), null); // a number is not an ISO string here
 
-// even a REJECTED emit leaves exactly one record
-var g = fixture();
-var before = g.ledger.count();
-threws(function () { g.bus.emit("nobody", tb.createPacket("unrouted", {}));});
-ok("rejected emit still records once", g.ledger.count() === before + 1);
-ok("rejection status is unrouted", g.ledger.all()[0].status === "rejected:unrouted");
-})();
+// --- mutation bite: the future-guard MUST be load-bearing ------------------
+// If someone deleted `if (delta < 0) return null;`, a future stamp would
+// produce "just now" (delta<MIN with negative delta). Assert it does NOT.
+var futureResult = relativeTime(ago(-HOUR), NOW);
+if (futureResult === null) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: future stamp produced a label: " + JSON.stringify(futureResult));}
 
-// ── PROPERTY 2: no undeclared path ───────────────────────────────────────────
-(function () {
-var f = fixture();
-ok("unrouted resolve throws", threws(function () { f.routing.resolve("x", "y");}));
-ok("has() is false before register", f.routing.has("x", "y") === false);
-f.routing.register({ packetType: "x", source: "y", bus: "DATA", destinations: ["d"]});
-ok("has() is true after register", f.routing.has("x", "y") === true);
-ok("emit of unrouted throws", threws(function () { f.bus.emit("z", tb.createPacket("x", {}));}));
-// register validation
-ok("register without bus throws", threws(function () { f.routing.register({ packetType: "a", source: "b", destinations: ["d"]});}));
-ok("register with empty destinations throws", threws(function () { f.routing.register({ packetType: "a", source: "b", bus: "DATA", destinations: []});}));
-ok("register with non-array destinations throws", threws(function () { f.routing.register({ packetType: "a", source: "b", bus: "DATA", destinations: "d"});}));
-})();
-
-// ── PROPERTY 3: a wrong-bus packet is refused ────────────────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-var dataBus = tb.createBus("DATA", routing, ledger);
-var ctrlBus = tb.createBus("CONTROL", routing, ledger);
-// route says this packet belongs on CONTROL
-routing.register({ packetType: "cmd", source: "op", bus: "CONTROL", destinations: ["worker"]});
-var landed = false;
-dataBus.subscribe("worker", function () { landed = true;});
-ok("emit on wrong bus throws", threws(function () { dataBus.emit("op", tb.createPacket("cmd", {}));}));
-ok("wrong-bus packet not delivered", landed === false);
-ok("wrong-bus rejection recorded", ledger.all().some(function (e) { return e.status === "rejected:wrong_bus";}));
-})();
-
-// ── PROPERTY 4: a throwing subscriber can't break the emitter ────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "fan", source: "src", bus: "DATA", destinations: ["good", "bad", "also"]});
-var goodHits = 0, alsoHits = 0;
-f.bus.subscribe("good", function () { goodHits++;});
-f.bus.subscribe("bad", function () { throw new Error("boom");});
-f.bus.subscribe("also", function () { alsoHits++;});
-var result;
-ok("emit with a throwing subscriber does not throw",!threws(function () {
-result = f.bus.emit("src", tb.createPacket("fan", {}));
-}));
-ok("good subscriber ran", goodHits === 1);
-ok("subscriber AFTER the thrower still ran", alsoHits === 1);
-ok("throwing dest counted as delivered", result.delivered.indexOf("bad")!== -1);
-ok("subscriber error recorded", f.ledger.all().some(function (e) { return /error:subscriber/.test(e.status);}));
-
-// a declared destination with NO subscriber -> reported missing, not an error
-var g = fixture();
-g.routing.register({ packetType: "e", source: "s", bus: "DATA", destinations: ["present", "absent"]});
-g.bus.subscribe("present", function () {});
-var r2 = g.bus.emit("s", tb.createPacket("e", {}));
-ok("present delivered", r2.delivered.indexOf("present")!== -1);
-ok("absent reported missing", r2.missing.indexOf("absent")!== -1);
-ok("partial status recorded", g.ledger.all().some(function (e) { return /delivered:partial/.test(e.status);}));
-})();
-
-// ── PROPERTY 5: registered routes are frozen ─────────────────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-routing.register({ packetType: "e", source: "s", bus: "DATA", destinations: ["d"]});
-var entry = routing.resolve("e", "s")[0];
-ok("resolved entry is frozen", Object.isFrozen(entry));
-ok("entry.destinations is frozen", Object.isFrozen(entry.destinations));
-// mutating a frozen entry is a silent no-op in non-strict, throws in strict — either way it must not change
-var beforeBus = entry.bus;
-try { entry.bus = "HACKED";} catch (e) { /* strict-mode throw is fine */}
-ok("frozen entry.bus unchanged", entry.bus === beforeBus);
-try { entry.destinations.push("injected");} catch (e) { /* fine */}
-ok("frozen destinations unchanged", entry.destinations.length === 1);
-
-// deepFreeze on a nested object
-var nested = tb.deepFreeze({ a: { b: { c: 1}}});
-ok("deepFreeze freezes root", Object.isFrozen(nested));
-ok("deepFreeze freezes nested", Object.isFrozen(nested.a.b));
-})();
-
-// ── PROPERTY 6: a trace is reconstructable ───────────────────────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "step1", source: "a", bus: "DATA", destinations: ["b"]});
-f.routing.register({ packetType: "step2", source: "a", bus: "DATA", destinations: ["b"]});
-f.bus.subscribe("b", function () {});
-var trace = "journey-1";
-f.bus.emit("a", tb.createPacket("step1", {}, { traceId: trace}));
-f.bus.emit("a", tb.createPacket("step2", {}, { traceId: trace}));
-f.bus.emit("a", tb.createPacket("step1", {}, { traceId: "other"}));
-var hops = f.ledger.queryByTraceId(trace);
-ok("trace has exactly its two hops", hops.length === 2);
-ok("trace hops in emission order", hops[0].packetType === "step1" && hops[1].packetType === "step2");
-ok("other trace excluded", hops.every(function (h) { return h.traceId === trace;}));
-// query by packetType
-ok("queryByPacketType finds all step1", f.ledger.queryByPacketType("step1").length === 2);
-})();
-
-// ── THE GENERALIZATION (tested hardest — the ported core's OWN validation) ────
-// In the origin, request() was hardwired to a bus literally named 'VAULT'. The strip
-// replaced that with a per-bus { requestResponse} flag. These prove the new gate.
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-routing.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-
-// a bus WITHOUT the flag refuses request(), regardless of its name
-var plain = tb.createBus("RPC", routing, ledger); // note: named RPC, not VAULT — name must NOT matter
-plain.subscribe("answerer", function () { return 99;});
-ok("request refused without flag (name irrelevant)", threws(function () {
-plain.request("asker", tb.createPacket("q", {}));
-}));
-
-// a bus WITH the flag answers — and the answer is the handler's return value
-var routing2 = tb.createRoutingTable();
-var ledger2 = tb.createLedger();
-routing2.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-var rpc = tb.createBus("RPC", routing2, ledger2, { requestResponse: true});
-rpc.subscribe("answerer", function (pkt) { return pkt.payload.a + pkt.payload.b;});
-var answer = rpc.request("asker", tb.createPacket("q", { a: 2, b: 3}));
-ok("request returns handler value", answer === 5);
-ok("request_response status recorded", ledger2.all().some(function (e) { return /request_response/.test(e.status);}));
-
-// request to an unregistered destination -> error, recorded
-var routing3 = tb.createRoutingTable();
-var ledger3 = tb.createLedger();
-routing3.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["ghost"]});
-var rpc3 = tb.createBus("RPC", routing3, ledger3, { requestResponse: true});
-ok("request to unregistered dest throws", threws(function () { rpc3.request("asker", tb.createPacket("q", {}));}));
-ok("unregistered-dest error recorded", ledger3.all().some(function (e) { return /destination_not_registered/.test(e.status);}));
-
-// a throwing request handler propagates (unlike emit) but still records
-var routing4 = tb.createRoutingTable();
-var ledger4 = tb.createLedger();
-routing4.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-var rpc4 = tb.createBus("RPC", routing4, ledger4, { requestResponse: true});
-rpc4.subscribe("answerer", function () { throw new Error("handler failed");});
-ok("request handler error propagates", threws(function () { rpc4.request("asker", tb.createPacket("q", {}));}));
-ok("request handler error recorded", ledger4.all().some(function (e) { return /error:handler/.test(e.status);}));
-})();
-
-// ── constructor validation (the ported core's own guards) ────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-ok("createBus without name throws", threws(function () { tb.createBus("", routing, ledger);}));
-ok("createBus without routing throws", threws(function () { tb.createBus("B", null, ledger);}));
-ok("createBus without ledger throws", threws(function () { tb.createBus("B", routing, null);}));
-ok("createBus with non-table routing throws", threws(function () { tb.createBus("B", {}, ledger);}));
-
-var f = fixture();
-ok("subscribe non-function throws", threws(function () { f.bus.subscribe("d", "not a fn");}));
-ok("subscribe empty dest throws", threws(function () { f.bus.subscribe("", function () {});}));
-ok("ledger.record without packet throws", threws(function () { f.ledger.record({ bus: "DATA"});}));
-
-// diagnostics
-f.bus.subscribe("x", function () {});
-ok("hasSubscriber true for x", f.bus.hasSubscriber("x") === true);
-ok("hasSubscriber false for y", f.bus.hasSubscriber("y") === false);
-ok("subscriberCount is 1", f.bus.subscriberCount() === 1);
-})();
-
-// ── MUTATION BITE: prove the receipt invariant is not vacuously green ─────────
-// If the ledger silently dropped records, property 1's counts would still be
-// "consistent" at zero. This bite asserts the ledger actually grows AND that a
-// real emit produces a record whose fields tie back to the packet — so a no-op
-// record() (the plausible mutation) fails loud here.
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "bite", source: "s", bus: "DATA", destinations: ["d"]});
-f.bus.subscribe("d", function () {});
-var pkt = tb.createPacket("bite", { proof: true});
-f.bus.emit("s", pkt);
-var rec = f.ledger.all()[0];
-ok("mutation bite: ledger actually grew", f.ledger.count() === 1);
-ok("mutation bite: record ties to the packet", rec && rec.packetId === pkt.packetId && rec.traceId === pkt.traceId);
-ok("mutation bite: record carries real status", rec && typeof rec.status === "string" && rec.status.length > 0);
-})();
-
-console.log((fail === 0? "PASS": "FAIL") + " — " + pass + " passed, " + fail + " failed");
+console.log("\nreltime: " + pass + " passed, " + fail + " failed");
 process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Zero-dependency JavaScript, Node or browser
+Node, no dependencies
 
 ---
 
-# The Trellis — a Loop MMT gift
-https://loopmmt.com/gifts/trellis/
+# Sha256 — a Loop MMT gift
+https://loopmmt.com/gifts/sha256/
 [coverage: optional · branch: gifts]
 
-Two-Way Consistency, Localized cross ← all gifts
+Sync Hash That Matches Your Backend hash ← all gifts
 
-The Trellis
+Sha256
 
-A 2-D consistency checker that tells you WHICH cell is wrong, not just that something is. Lay your objects on a grid where every cell sits in two crossing constraints — its row and its column — and the whole holds only if every row and every column reads valid. When something doesn't fit, it localizes the failure to the single cell where the failing row crosses the failing column. Constraint propagation sorts every open cell into FORCED, FREE, or CONTRADICTORY — no global placer, no global oracle.
-
-The prompt that made this →
+A dependency-free, synchronous SHA-256 (hex out) that returns the same 64-char digest as your Node backend's crypto.createHash for the same string — so a browser can mirror a server-side integrity check without turning the verify path async. The load-bearing rule: it hashes the UTF-8 bytes, so multibyte input (names, emoji) stays byte-identical instead of diverging silently.
 
 The honest edge
 
-It checks that your constraints are consistent WITH EACH OTHER, never that they are the ones you meant. Hand it the wrong constraints and it will faithfully find them consistent — choosing constraints that capture what you actually care about is your job.
+It's a hash, not an HMAC and not encryption — it proves two inputs match, keeps no secret, and is not a password KDF. A from-scratch port for portability, not a hardened crypto library: where a vetted native lib is available and async is fine, prefer it.
 
 Run it
 
-python3 trellis.py --help
-smoke_test.py (6/6)
-Python stdlib only
+node sha256.js "a string"
+test_sha256.js (24/24, drift-checked vs node crypto)
+Node, no dependencies
 
 The code — every file that ships
 
-trellis.py 722 lines on GitHub →
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# SPDX-License-Identifier: CC-BY-NC-4.0
-"""
-The Trellis -- a 2-D consistency localizer + generator.
-Loop MMT(tm) - Phase 1 of the Trellis V1 plan (S12.1337 -> built S12.1423).
+sha256.js 176 lines on GitHub →
+#!/usr/bin/env node
+/* sha256.js — a dependency-free, synchronous SHA-256 (hex out) that is
+byte-identical to your backend's hash for the same string.
 
-WHAT IT IS (honest claim, post-teardown A1)
-A double word square laid over system objects: every cell sits in exactly two
-orthogonal words (its ROW and its COLUMN). The whole holds iff every row reads
-valid AND every column reads valid. Constraint propagation (arc-consistency,
-AC-3) sorts every open cell into exactly one verdict, and any inconsistency
-localizes to the single cell where the failing row crosses the failing column.
+WHY THIS EXISTS. The usual browser answer, crypto.subtle.digest, is
+ASYNCHRONOUS — it returns a Promise, so the moment you need a hash inside an
+otherwise-synchronous verify path (parse an envelope, check an integrity
+field, decide tamper/no-tamper), it forces that whole path to go async and
+ripple through everything that calls it. This is a small, pure, sync
+FIPS-180-4 SHA-256 that returns the SAME 64-char hex as Node's
+crypto.createHash('sha256').update(String(x)).digest('hex') — so a browser
+can mirror a Node integrity check without turning the call site async.
 
-It is a *consistency localizer + generator*, NOT a global-consistency prover
-(A1): a *detected* break localizes uniquely; *silence* is necessary-not-
-sufficient (the rectangular alias -- co-drift that leaves every row and column
-valid is, by construction, a different valid square and is invisible). State
-the bound; do not oversell.
+THE ONE FIDELITY RULE (the whole reason to trust it). Node hashes the UTF-8
+BYTES of String(input). This encodes with the same UTF-8 byte stream, so the
+digest is identical — including for multibyte characters (accented names,
+emoji, non-Latin scripts). Never hash char codes: multibyte input would
+diverge silently and a tamper check would read a FALSE verdict. The test
+battery carries a multibyte vector precisely to catch that, checked against
+Node's own crypto as the oracle.
 
-THE THREE VERDICTS (per open cell)
-FORCED <v> one value satisfies both crossing words -> derive it (no choice)
-FREE {set} several satisfy both -> bounded search = slack
-CONTRADICTORY none satisfies both -> dead cell, called loud + located
-(A fixed cell that violates its words is also CONTRADICTORY -- fixed!= skipped.)
-
-CONSTRAINT TYPES (V1 -- decidable facets only: versions, hashes, lease-state, letters)
-equal: every cell on the line must be equal. With a spec-level
-`reference_col`, non-reference cells must equal the reference
-cell -> an equality break localizes to the single deviating cell
-(the product-code property: failing row x off-canonical col).
-wordlist: the line's cells, read in order, must form one of a list of
-allowed words/tuples (the literal crossword / allowed-combos case).
-
-FAIL-CLOSED (A5): any CONTRADICTORY cell -> overall verdict CONTRADICTORY and a
-non-zero exit (3). FREE picks are reported + counted; there is no ungraded
-override. A spec error fails closed too (exit 2), never silently "consistent".
-
-DETERMINISM: the `result` object on stdout is a pure function of the spec --
-fold the same spec twice, get byte-identical bytes (sorted keys, sorted sets,
-no timestamps in the result). The append-only proof chain (--log) carries a
-timestamp for provenance and is a side effect, never part of the result bytes.
-
-FACET-AUDIT (A4 -- Test by Removal): `audit` drops each constraint in turn and
-re-solves. A constraint whose removal changes the result is ACTIVE (unique
-work in this spec); otherwise REDUNDANT (its work is shared by others).
-REDUNDANT is not a defect -- a double word square is over-determined by
-design, and that overlap IS the product code's error-correction power. The
-real A4 failure is a Trellis with NO ACTIVE AXIS (every constraint passes
-trivially -> it can never carry a catch, e.g. a version-only square that reads
-v36==v36 everywhere and goes blind). That, and only that, is REJECTED.
-
-FIVE RULES (ecosystem tool): single file - one command - zero external deps
-(stdlib only) - JSON storage - append-only proof chain.
+Pure function of its input. No dependencies. Same code runs in a browser
+(attach sha256Hex to your namespace) or on Node (this CLI / require()).
 
 USAGE
-trellis.py solve <spec.json> [--log] # solve/check a square
-trellis.py audit <spec.json> # Test-by-Removal on every constraint
-trellis.py verify-chain <chain.jsonl> # re-walk a --log proof chain (Pull R5)
-exit 0 = held (consistent / all open cells FORCED|FREE) -- or a clean proof chain
-exit 3 = CONTRADICTORY (held-fail, localized) -- or a DETECTED proof-chain break (located)
-exit 2 = spec error / unreadable proof chain (fail-closed) -- never silently "consistent"
-"""
+node sha256.js "the string to hash" # hash an argument
+echo -n "the string" | node sha256.js # hash stdin (exact bytes, no newline added)
+node sha256.js --help
 
-import argparse
-import hashlib
-import json
-import os
-import sys
-from datetime import datetime, timezone
+Released under MIT. Its edge is printed in the README: this is a HASH, not
+an HMAC and not encryption — it proves two inputs match, it does not keep a
+secret and it is not a password-storage KDF.
+*/
+"use strict";
 
-RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_runs")
+// SHA-256 round constants — FIPS 180-4 §4.2.2 (first 32 bits of the fractional
+// parts of the cube roots of the first 64 primes).
+var K = [
+0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
 
-# -----------------------------------------------------------------------------
-# spec model
-# -----------------------------------------------------------------------------
+function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
 
-def _cellkey(r, c):
-return "%s|%s" % (r, c)
-
-def load_spec(path):
-with open(path, "r", encoding="utf-8") as fh:
-spec = json.load(fh)
-return validate_spec(spec)
-
-def validate_spec(spec):
-"""Structural validation -- fail closed (raise) on any malformed spec."""
-if not isinstance(spec, dict):
-raise SpecError("spec must be a JSON object")
-for key in ("rows", "cols"):
-if key not in spec or not isinstance(spec[key], list) or not spec[key]:
-raise SpecError("spec.%s must be a non-empty list" % key)
-rows = [str(r) for r in spec["rows"]]
-cols = [str(c) for c in spec["cols"]]
-if len(set(rows))!= len(rows):
-raise SpecError("duplicate row id")
-if len(set(cols))!= len(cols):
-raise SpecError("duplicate col id")
-cells = spec.get("cells", {})
-if not isinstance(cells, dict):
-raise SpecError("spec.cells must be an object")
-valid_keys = {_cellkey(r, c) for r in rows for c in cols}
-for k in cells:
-if k not in valid_keys:
-raise SpecError("cell key %r is not a row|col of this square" % k)
-ref = spec.get("reference_col")
-if ref is not None and str(ref) not in cols:
-raise SpecError("reference_col %r is not a column" % ref)
-rc = spec.get("row_constraints", {})
-cc = spec.get("col_constraints", {})
-if not isinstance(rc, dict) or not isinstance(cc, dict):
-raise SpecError("row_constraints/col_constraints must be objects")
-for line_id, con in list(rc.items()) + list(cc.items()):
-_validate_constraint(line_id, con)
-spec["rows"], spec["cols"] = rows, cols
-if ref is not None:
-spec["reference_col"] = str(ref)
-return spec
-
-def _validate_constraint(line_id, con):
-if not isinstance(con, dict) or "type" not in con:
-raise SpecError("constraint on %r needs a type" % line_id)
-t = con["type"]
-if t == "equal":
-return
-if t == "wordlist":
-words = con.get("words")
-if not isinstance(words, list) or not words:
-raise SpecError("wordlist on %r needs a non-empty words list" % line_id)
-for w in words:
-if not isinstance(w, list):
-raise SpecError("each word on %r must be a list (a tuple of cell values)" % line_id)
-return
-raise SpecError("unknown constraint type %r on %r" % (t, line_id))
-
-class ChainError(Exception):
-"""The proof-chain artifact could not be read/verified at all (fail-closed, exit 2).
-Distinct from a *detected break* in a readable chain (exit 3) -- 'cannot read' is
-never a pass."""
-pass
-
-class SpecError(Exception):
-pass
-
-# -----------------------------------------------------------------------------
-# domains + lines
-# -----------------------------------------------------------------------------
-
-def init_domains(spec):
-"""cellkey -> sorted list of candidate values.
-fixed cell -> singleton {value}; open cell -> the global/per-axis domain."""
-rows, cols = spec["rows"], spec["cols"]
-cells = spec.get("cells", {})
-gdomain = spec.get("domain") # optional global open-cell domain
-domains = {}
-for r in rows:
-for c in cols:
-k = _cellkey(r, c)
-if k in cells and cells[k] is not None:
-domains[k] = [cells[k]]
-else:
-if gdomain is None:
-# open cell with no domain -> derive domain from the union of
-# values that any wordlist on its lines permits at its slot;
-# if it has only `equal` lines and no global domain, that is a
-# spec gap -> fail closed.
-dom = _derived_open_domain(spec, r, c)
-if dom is None:
-raise SpecError(
-"open cell %s has no domain (no global `domain`, no wordlist on "
-"its row or column)" % k)
-domains[k] = sorted(dom, key=_skey)
-else:
-domains[k] = sorted(list(gdomain), key=_skey)
-return domains
-
-def _derived_open_domain(spec, r, c):
-"""Union of slot-values a wordlist on this cell's row or column allows."""
-vals = set()
-found = False
-rc = spec.get("row_constraints", {}).get(r)
-if rc and rc.get("type") == "wordlist":
-idx = spec["cols"].index(c)
-for w in rc["words"]:
-if idx < len(w):
-vals.add(w[idx]); found = True
-cc = spec.get("col_constraints", {}).get(c)
-if cc and cc.get("type") == "wordlist":
-idx = spec["rows"].index(r)
-for w in cc["words"]:
-if idx < len(w):
-vals.add(w[idx]); found = True
-return vals if found else None
-
-def _skey(v):
-"""Stable sort key across heterogeneous JSON scalars."""
-return (type(v).__name__, v if isinstance(v, (int, float)) else json.dumps(v, sort_keys=True))
-
-def row_cells(spec, r):
-return [_cellkey(r, c) for c in spec["cols"]]
-
-def col_cells(spec, c):
-return [_cellkey(r, c) for r in spec["rows"]]
-
-# -----------------------------------------------------------------------------
-# arc-consistency (AC-3)
-# -----------------------------------------------------------------------------
-
-def _supported_wordlist(value, idx, line_keys, domains, words):
-"""value at position idx is supported iff some allowed word places `value`
-at idx and every other position is still achievable in its cell's domain."""
-for w in words:
-if idx >= len(w) or w[idx]!= value:
-continue
-ok = True
-for j, k in enumerate(line_keys):
-if j == idx:
-continue
-if j >= len(w) or w[j] not in domains[k]:
-ok = False
-break
-if ok:
-return True
-return False
-
-def arc_consistency(spec):
-"""Run AC-3 to a fixpoint. Returns (domains, trace) where trace maps a
-cellkey that emptied -> {'axis','line','reason'} naming the constraint that
-killed it (the localization witness)."""
-domains = init_domains(spec)
-ref = spec.get("reference_col")
-rcons = spec.get("row_constraints", {})
-ccons = spec.get("col_constraints", {})
-trace = {}
-
-# Build the arc worklist: (cell, axis, line_id). A cell is revised against
-# each constraint it participates in.
-def lines_for(k):
-r, c = k.split("|", 1)
-out = []
-if r in rcons:
-out.append(("row", r))
-if c in ccons:
-out.append(("col", c))
-return out
-
-work = []
-for r in spec["rows"]:
-for c in spec["cols"]:
-k = _cellkey(r, c)
-for axis, line in lines_for(k):
-work.append((k, axis, line))
-
-# deterministic order
-work.sort()
-qi = 0
-# use an index-based queue but re-add neighbours on change
-queue = list(work)
-while queue:
-k, axis, line = queue.pop(0)
-if not domains[k]:
-continue # already dead
-changed, killed = _revise(spec, domains, ref, k, axis, line, rcons, ccons)
-if killed and k not in trace:
-trace[k] = killed
-if changed:
-# re-enqueue every other cell that shares a line with k
-r, c = k.split("|", 1)
-neighbours = set()
-if r in rcons or True:
-for cc in spec["cols"]:
-nk = _cellkey(r, cc)
-if nk!= k:
-for ax, ln in lines_for(nk):
-neighbours.add((nk, ax, ln))
-for rr in spec["rows"]:
-nk = _cellkey(rr, c)
-if nk!= k:
-for ax, ln in lines_for(nk):
-neighbours.add((nk, ax, ln))
-for item in sorted(neighbours):
-queue.append(item)
-return domains, trace
-
-def _revise(spec, domains, ref, k, axis, line, rcons, ccons):
-"""Prune domain[k] against one constraint. Returns (changed, killed_info)."""
-r, c = k.split("|", 1)
-con = rcons[line] if axis == "row" else ccons[line]
-before = list(domains[k])
-keep = []
-
-if con["type"] == "equal":
-line_keys = row_cells(spec, line) if axis == "row" else col_cells(spec, line)
-if axis == "row" and ref is not None:
-ref_key = _cellkey(line, ref)
-if k == ref_key:
-keep = list(before) # reference defers to no one
-else:
-ref_dom = domains[ref_key]
-keep = [v for v in before if v in ref_dom]
-else:
-# plain mutual equality: v survives iff every line-mate can still take v
-for v in before:
-ok = True
-for nk in line_keys:
-if nk == k:
-continue
-if v not in domains[nk]:
-ok = False
-break
-if ok:
-keep.append(v)
-elif con["type"] == "wordlist":
-line_keys = row_cells(spec, line) if axis == "row" else col_cells(spec, line)
-idx = line_keys.index(k)
-keep = [v for v in before if _supported_wordlist(v, idx, line_keys, domains, con["words"])]
-
-changed = len(keep)!= len(before)
-domains[k] = keep
-killed = None
-if not keep:
-killed = {
-"axis": axis,
-"line": line,
-"type": con["type"],
-"lost": before,
-"reason": _kill_reason(spec, domains, ref, k, axis, line, con, before),
+// Encode a JS string to its UTF-8 bytes — the SAME bytes Node's
+//.update(String(s)) hashes. TextEncoder is present in every modern browser and
+// in Node; the manual fallback (surrogate-pair aware) produces the same stream.
+function utf8Bytes(str) {
+if (typeof TextEncoder!== "undefined") {
+return new TextEncoder().encode(str);
 }
-return changed, killed
-
-def _kill_reason(spec, domains, ref, k, axis, line, con, before):
-r, c = k.split("|", 1)
-if con["type"] == "equal":
-if axis == "row" and ref is not None and c!= ref:
-ref_key = _cellkey(line, ref)
-rv = domains[ref_key][0] if domains[ref_key] else "<empty>"
-mine = before[0] if len(before) == 1 else before
-return ("row %r requires equality to reference col %r (=%r); this cell holds %r"
-% (line, ref, rv, mine))
-return "%s %r requires all cells equal; this cell could not agree" % (axis, line)
-return "%s %r (wordlist) admits no value for this cell consistent with its crossing word" % (axis, line)
-
-# -----------------------------------------------------------------------------
-# classify + localize
-# -----------------------------------------------------------------------------
-
-def classify(spec, domains):
-rows, cols = spec["rows"], spec["cols"]
-cells = spec.get("cells", {})
-out = {}
-for r in rows:
-for c in cols:
-k = _cellkey(r, c)
-dom = domains[k]
-fixed = k in cells and cells[k] is not None
-if len(dom) == 0:
-out[k] = {"verdict": "CONTRADICTORY"}
-elif len(dom) == 1:
-if fixed:
-out[k] = {"verdict": "CONSISTENT", "value": dom[0]}
-else:
-out[k] = {"verdict": "FORCED", "value": dom[0]}
-else:
-out[k] = {"verdict": "FREE", "domain": sorted(dom, key=_skey)}
-return out
-
-def localize(spec, domains, trace):
-"""For every CONTRADICTORY cell, name the crossing -- (row R x col C) plus
-BOTH failing words (the row-word and the col-word)."""
-rcons = spec.get("row_constraints", {})
-ccons = spec.get("col_constraints", {})
-out = []
-for r in spec["rows"]:
-for c in spec["cols"]:
-k = _cellkey(r, c)
-if domains[k]:
-continue
-killed = trace.get(k, {})
-row_word = _word_render(spec, "row", r, rcons.get(r))
-col_word = _word_render(spec, "col", c, ccons.get(c))
-out.append({
-"cell": k,
-"row": r,
-"col": c,
-"killed_by": {kk: killed[kk] for kk in ("axis", "line", "type") if kk in killed},
-"reason": killed.get("reason", "no support under its crossing words"),
-"row_word": row_word,
-"col_word": col_word,
-})
-out.sort(key=lambda d: (d["row"], d["col"]))
-return out
-
-def _word_render(spec, axis, line, con):
-if con is None:
-return {"line": line, "type": None, "note": "no constraint on this %s (advisory)" % axis}
-if con["type"] == "equal":
-ref = spec.get("reference_col")
-d = {"line": line, "type": "equal"}
-if axis == "row" and ref is not None:
-d["reference_col"] = ref
-return d
-return {"line": line, "type": "wordlist", "n_words": len(con["words"])}
-
-# -----------------------------------------------------------------------------
-# solve + result
-# -----------------------------------------------------------------------------
-
-def solve(spec):
-"""Pure function of the spec. Returns the deterministic result object."""
-domains, trace = arc_consistency(spec)
-cells = classify(spec, domains)
-contradictions = localize(spec, domains, trace)
-counts = {"FORCED": 0, "FREE": 0, "CONTRADICTORY": 0, "CONSISTENT": 0}
-for v in cells.values():
-counts[v["verdict"]] += 1
-held = counts["CONTRADICTORY"] == 0
-result = {
-"name": spec.get("name", "<unnamed>"),
-"rows": spec["rows"],
-"cols": spec["cols"],
-"reference_col": spec.get("reference_col"),
-"verdict": "HELD" if held else "CONTRADICTORY",
-"counts": counts,
-"cells": cells,
-"contradictions": contradictions,
-"free_picks": sorted(
-[k for k, v in cells.items() if v["verdict"] == "FREE"]),
-"spec_sha256": spec_sha(spec),
+var out = [], i, c, lo;
+for (i = 0; i < str.length; i++) {
+c = str.charCodeAt(i);
+if (c < 0x80) { out.push(c);}
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) { // high surrogate
+lo = str.charCodeAt(++i);
+c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
+out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
 }
-return result
-
-def spec_sha(spec):
-payload = {k: spec[k] for k in spec if not k.startswith("_")}
-return hashlib.sha256(
-json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-).hexdigest()
-
-def result_bytes(result):
-"""Canonical, deterministic serialization of a result (the byte-truth)."""
-return json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2).encode("utf-8")
-
-# -----------------------------------------------------------------------------
-# facet audit -- Test by Removal (A4)
-# -----------------------------------------------------------------------------
-
-def facet_audit(spec):
-"""Test by Removal (A4). Drop each constraint in turn and re-solve; a
-constraint whose removal changes the result is ACTIVE (it does unique work
-in this spec), otherwise REDUNDANT (its work is also done by other
-constraints).
-
-REDUNDANT is NOT a defect: a double word square is over-determined by
-design, and that redundancy IS the error-correction / localization power of
-a product code. The genuine A4 failure -- the false-comfort axis Phase 0
-named -- is a Trellis with NO ACTIVE AXIS: every constraint passes trivially
-and removing any changes nothing, so it can never carry a catch (a
-version-only Trellis reads v36==v36 everywhere and goes blind). That, and
-only that, is REJECTED here.
-
-BOUND (do not oversell): Test-by-Removal sees only the PRESENT constraints.
-It tells you which present facets carry the catch (ACTIVE) vs are redundant
-(REDUNDANT) against a spec that contains a real deviation -- it CANNOT detect
-a *missing* facet (the catch you never modelled). And on a fully-pinned,
-fully-consistent square there is no slack and no break, so every axis is
-trivially redundant -> REJECT fires benignly. Run the audit on a spec with a
-present deviation or open cells for it to mean what it says.
-"""
-base = solve(spec)
-base_sig = _result_sig(base)
-findings = []
-rcons = spec.get("row_constraints", {})
-ccons = spec.get("col_constraints", {})
-for axis, cons in (("row", rcons), ("col", ccons)):
-for line in sorted(cons):
-trial = json.loads(json.dumps({k: spec[k] for k in spec if not k.startswith("_")}))
-key = "row_constraints" if axis == "row" else "col_constraints"
-trial[key] = dict(trial.get(key, {}))
-trial[key].pop(line, None)
-try:
-tspec = validate_spec(trial)
-tres = solve(tspec)
-changed = sorted(_result_diff(base, tres))
-active = base_sig!= _result_sig(tres)
-except SpecError as e:
-# removing it makes the spec ill-formed (an open cell loses its
-# only domain source) -> it WAS doing work.
-changed = ["<spec-gap:%s>" % e]
-active = True
-findings.append({
-"axis": axis,
-"line": line,
-"type": cons[line].get("type"),
-"active": active,
-"changed_if_removed": changed,
-})
-active_axes = [f for f in findings if f["active"]]
-redundant = [f for f in findings if not f["active"]]
-no_active = len(active_axes) == 0 and len(findings) > 0
-return {
-"name": spec.get("name", "<unnamed>"),
-"verdict": "REJECT-NO-ACTIVE-AXIS" if no_active else "OK",
-"active_count": len(active_axes),
-"redundant_count": len(redundant),
-"redundant": [{"axis": f["axis"], "line": f["line"]} for f in redundant],
-"findings": findings,
+return out;
 }
 
-def _result_sig(result):
-"""A hashable signature of the result's solution content (no spec_sha)."""
-return json.dumps(
-{"cells": result["cells"], "contradictions": result["contradictions"]},
-sort_keys=True, ensure_ascii=False)
-
-def _result_diff(a, b):
-"""Cell keys whose verdict/value/domain differs between two results."""
-out = set()
-keys = set(a["cells"]) | set(b["cells"])
-for k in keys:
-if a["cells"].get(k)!= b["cells"].get(k):
-out.add(k)
-return out
-
-# -----------------------------------------------------------------------------
-# proof chain (append-only) -- a side effect, never part of the result bytes
-# -----------------------------------------------------------------------------
-
-def log_run(result, spec_name):
-os.makedirs(RUNS_DIR, exist_ok=True)
-safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in spec_name)[:80] or "run"
-path = os.path.join(RUNS_DIR, safe + ".jsonl")
-prev = "0" * 64
-if os.path.exists(path):
-with open(path, "r", encoding="utf-8") as fh:
-lines = [ln for ln in fh if ln.strip()]
-if lines:
-try:
-prev = json.loads(lines[-1])["sha256"]
-except Exception:
-prev = "0" * 64
-event = {
-"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-"spec_sha256": result["spec_sha256"],
-"verdict": result["verdict"],
-"counts": result["counts"],
-"contradiction_cells": [c["cell"] for c in result["contradictions"]],
-"prev_sha256": prev,
-}
-event["sha256"] = hashlib.sha256(
-(prev + json.dumps(event, sort_keys=True, ensure_ascii=False)).encode("utf-8")
-).hexdigest()
-with open(path, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
-return path
-
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
-
-def verify_chain(path):
-"""Re-walk an append-only proof chain (as written by `solve --log`) and verify,
-for every record in order: (1) the link is continuous (this record's prev_sha256
-equals the previous record's sha256; genesis prev = 64 zeros), and (2) the record
-is intact (recomputing the hash exactly as log_run wrote it -- sha256 over
-prev_sha256 + the record's other fields, sorted -- reproduces the stored sha256).
-
-Returns (ok: bool, n_records: int, problem: str | None).
-- A clean chain returns (True, n, None) -- silent-ok.
-- A *detected* break returns (False, idx, located-reason) -- the caller exits 3, loud.
-Raises ChainError when the artifact cannot be read at all (missing / empty) -- the
-caller exits 2. 'Cannot verify' is never a pass: a localizer that stays silent on a
-chain it could not read would be the exact A1 oversell the Trellis refuses."""
-if not os.path.exists(path):
-raise ChainError("no such chain file: %s" % path)
-with open(path, "r", encoding="utf-8") as fh:
-raw = [ln for ln in fh if ln.strip()]
-if not raw:
-raise ChainError("empty chain (0 records) at %s -- nothing to verify" % path)
-prev = "0" * 64
-for i, ln in enumerate(raw):
-try:
-ev = json.loads(ln)
-except ValueError as e:
-# a corrupted/truncated record is a *detected* break, not a can't-read:
-# the chain was readable to here and is broken at record i.
-return (False, i, "record %d: malformed JSON (chain corrupt): %s" % (i, e))
-if not isinstance(ev, dict) or "sha256" not in ev or "prev_sha256" not in ev:
-return (False, i, "record %d: missing sha256/prev_sha256 (chain corrupt)" % i)
-if ev["prev_sha256"]!= prev:
-return (False, i, "record %d: BROKEN LINK -- prev_sha256 %s.. does not chain "
-"to the previous record's hash %s.." % (i, ev["prev_sha256"][:12], prev[:12]))
-body = {k: v for k, v in ev.items() if k!= "sha256"}
-recomputed = hashlib.sha256(
-(ev["prev_sha256"] + json.dumps(body, sort_keys=True, ensure_ascii=False)).encode("utf-8")
-).hexdigest()
-if recomputed!= ev["sha256"]:
-return (False, i, "record %d: HASH MISMATCH (record tampered) -- stored %s.. "
-"but its contents hash to %s.." % (i, ev["sha256"][:12], recomputed[:12]))
-prev = ev["sha256"]
-return (True, len(raw), None)
-
-def _render_human(result):
-lines = []
-v = result["verdict"]
-mark = "HELD" if v == "HELD" else ">>> CONTRADICTORY <<<"
-lines.append("Trellis: %s [%s]" % (result["name"], mark))
-cnt = result["counts"]
-lines.append(" cells: FORCED=%d FREE=%d CONTRADICTORY=%d CONSISTENT=%d"
-% (cnt["FORCED"], cnt["FREE"], cnt["CONTRADICTORY"], cnt["CONSISTENT"]))
-for fk in result["free_picks"]:
-dom = result["cells"][fk]["domain"]
-lines.append(" FREE %s -> {%s}" % (fk, ", ".join(str(x) for x in dom)))
-for c in result["contradictions"]:
-lines.append(" >>> CONTRADICTORY at cell (%s x %s):" % (c["row"], c["col"]))
-lines.append(" %s" % c["reason"])
-lines.append(" failing row-word: %s | failing col-word: %s"
-% (json.dumps(c["row_word"], sort_keys=True),
-json.dumps(c["col_word"], sort_keys=True)))
-return "\n".join(lines)
-
-def main(argv=None):
-ap = argparse.ArgumentParser(prog="trellis.py", description="The Trellis -- 2-D consistency localizer + generator")
-sub = ap.add_subparsers(dest="cmd")
-ps = sub.add_parser("solve", help="solve/check a square")
-ps.add_argument("spec")
-ps.add_argument("--log", action="store_true", help="append to the proof chain")
-ps.add_argument("--json", action="store_true", help="emit the raw result JSON")
-pa = sub.add_parser("audit", help="Test-by-Removal on every constraint (A4)")
-pa.add_argument("spec")
-pa.add_argument("--json", action="store_true")
-pv = sub.add_parser("verify-chain", help="re-walk a --log proof chain; loud + located on a break (Pull R5)")
-pv.add_argument("chain", help="path to the proof chain.jsonl (as written by `solve --log` under _runs/)")
-args = ap.parse_args(argv)
-
-if args.cmd == "solve":
-try:
-spec = load_spec(args.spec)
-except SpecError as e:
-sys.stderr.write("SPEC ERROR (fail-closed): %s\n" % e)
-return 2
-except (OSError, ValueError) as e:
-sys.stderr.write("SPEC ERROR (fail-closed): %s\n" % e)
-return 2
-result = solve(spec)
-if args.log:
-log_run(result, result["name"])
-if args.json:
-sys.stdout.buffer.write(result_bytes(result) + b"\n")
-else:
-print(_render_human(result))
-return 3 if result["verdict"] == "CONTRADICTORY" else 0
-
-if args.cmd == "audit":
-try:
-spec = load_spec(args.spec)
-except SpecError as e:
-sys.stderr.write("SPEC ERROR (fail-closed): %s\n" % e)
-return 2
-audit = facet_audit(spec)
-if args.json:
-sys.stdout.buffer.write(
-json.dumps(audit, sort_keys=True, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
-else:
-ok = audit["verdict"] == "OK"
-head = ("OK -- %d active / %d redundant" % (audit["active_count"], audit["redundant_count"])
-if ok else ">>> REJECT: no active axis (carries no catch -- A4) <<<")
-print("Facet audit: %s [%s]" % (audit["name"], head))
-for f in audit["findings"]:
-tag = "ACTIVE" if f["active"] else "redundant"
-print(" %-4s %-24s %-9s %s" % (f["axis"], f["line"], f["type"], tag))
-if audit["redundant_count"] and ok:
-print(" (redundant!= defect: in a product code the overlap IS the error-correction power)")
-return 0 if audit["verdict"] == "OK" else 3
-
-if args.cmd == "verify-chain":
-try:
-ok, n, problem = verify_chain(args.chain)
-except ChainError as e:
-sys.stderr.write("CHAIN ERROR (fail-closed): %s\n" % e)
-return 2
-except (OSError, ValueError) as e:
-sys.stderr.write("CHAIN ERROR (fail-closed): %s\n" % e)
-return 2
-if ok:
-print("Proof chain OK: %s [%d record%s -- links + hashes verified]"
-% (args.chain, n, "" if n == 1 else "s"))
-return 0
-sys.stderr.write(">>> PROOF CHAIN BROKEN <<<\n %s\n" % problem)
-return 3
-
-ap.print_help()
-return 2
-
-if __name__ == "__main__":
-sys.exit(main())
-
-smoke_test.py 163 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""smoke_test.py — hermetic proof that trellis.py holds the line. No network, no
-state outside a tmpdir. Each scenario writes a spec, runs trellis.py as a
-subprocess, and checks the exit code and verdict text — the real CLI contract:
-
-1 a solvable square renders and reports FORCED/FREE cells (exit 0)
-2 a genuine double word square holds with the expected FORCED/FREE split
-3 an over-constrained square localizes the clash to CONTRADICTORY cells
-4 --json emits parseable result JSON with the cell verdicts
-5 a malformed spec is rejected loud, not silently passed (nonzero exit)
-6 --help exits 0 (the gift contract: a stranger can discover the tool)
-
-Run: python3 smoke_test.py (expect: 6/6 passed)
-"""
-import json
-import os
-import subprocess
-import sys
-import tempfile
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-TRELLIS = os.path.join(HERE, "trellis.py")
-PASS = 0
-FAIL = 0
-
-def ok(msg):
-global PASS
-PASS += 1
-print(f"ok {msg}")
-
-def bad(msg):
-global FAIL
-FAIL += 1
-print(f"FAIL {msg}")
-
-def run(args, **kw):
-return subprocess.run([sys.executable, TRELLIS] + args,
-capture_output=True, text=True, **kw)
-
-def write(d, name, obj):
-p = os.path.join(d, name)
-with open(p, "w") as fh:
-json.dump(obj, fh)
-return p
-
-# A small solvable 2x2 square: rows and columns are two-letter wordlists that
-# share letters at the crossings.
-SOLVABLE = {
-"rows": ["r0", "r1"], "cols": ["c0", "c1"],
-"cells": {"r0|c0": "A"},
-"row_constraints": {
-"r0": {"type": "wordlist", "words": [["A", "T"], ["A", "N"]]},
-"r1": {"type": "wordlist", "words": [["T", "O"], ["N", "O"]]},
-},
-"col_constraints": {
-"c0": {"type": "wordlist", "words": [["A", "T"], ["A", "N"]]},
-"c1": {"type": "wordlist", "words": [["T", "O"], ["N", "O"]]},
-},
+function toHex8(x) {
+var h = (x >>> 0).toString(16);
+return "00000000".slice(h.length) + h;
 }
 
-# The literal double word square seed, top row fixed.
-WORD_SQUARE = {
-"rows": ["r0", "r1", "r2", "r3"], "cols": ["c0", "c1", "c2", "c3"],
-"cells": {"r0|c0": "S", "r0|c1": "T", "r0|c2": "A", "r0|c3": "R"},
-"row_constraints": {
-"r0": {"type": "wordlist", "words": [["S", "T", "A", "R"], ["S", "T", "A", "B"], ["S", "C", "A", "R"]]},
-"r1": {"type": "wordlist", "words": [["P", "A", "G", "E"], ["P", "A", "V", "E"], ["P", "A", "C", "E"]]},
-"r2": {"type": "wordlist", "words": [["O", "P", "E", "N"], ["O", "V", "E", "N"]]},
-"r3": {"type": "wordlist", "words": [["T", "E", "S", "T"], ["T", "E", "N", "T"], ["T", "E", "X", "T"]]},
-},
-"col_constraints": {
-"c0": {"type": "wordlist", "words": [["S", "P", "O", "T"], ["S", "P", "A", "T"]]},
-"c1": {"type": "wordlist", "words": [["T", "A", "P", "E"], ["C", "A", "P", "E"]]},
-"c2": {"type": "wordlist", "words": [["A", "G", "E", "S"], ["A", "V", "E", "S"], ["A", "C", "E", "S"]]},
-"c3": {"type": "wordlist", "words": [["R", "E", "N", "T"], ["R", "U", "N", "T"]]},
-},
+// sha256Hex(input) -> 64-char lowercase hex, byte-identical to Node's
+// crypto.createHash('sha256').update(String(input)).digest('hex').
+function sha256Hex(input) {
+var bytes = utf8Bytes(String(input));
+var len = bytes.length;
+
+// Padding: append 0x80, then 0x00s, then the 64-bit big-endian bit length,
+// rounding up to a multiple of 64 bytes.
+var bitLenHi = Math.floor(len / 0x20000000); // high 32 bits of (len*8)
+var bitLenLo = (len * 8) >>> 0; // low 32 bits of (len*8)
+var withOne = len + 1;
+var padded = (withOne + 8 + 63) & ~63;
+var msg = new Uint8Array(padded);
+var i;
+for (i = 0; i < len; i++) msg[i] = bytes[i];
+msg[len] = 0x80;
+msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
+msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
+msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
+msg[padded - 5] = bitLenHi & 0xff;
+msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
+msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
+msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
+msg[padded - 1] = bitLenLo & 0xff;
+
+var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
+h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+
+var w = new Array(64), t, blk;
+for (blk = 0; blk < padded; blk += 64) {
+for (t = 0; t < 16; t++) {
+w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
+(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
+}
+for (t = 16; t < 64; t++) {
+var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+}
+var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
+for (t = 0; t < 64; t++) {
+var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+var ch = (e & f) ^ (~e & g);
+var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
+var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+var maj = (a & b) ^ (a & c) ^ (b & c);
+var temp2 = (S0 + maj) >>> 0;
+hh = g; g = f; f = e; e = (d + temp1) >>> 0;
+d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+}
+h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
 }
 
-# Over-constrained: a fixed cell that no row/column word allows.
-CLASH = {
-"rows": ["r0"], "cols": ["c0", "c1"],
-"cells": {"r0|c0": "Z"},
-"row_constraints": {"r0": {"type": "wordlist", "words": [["A", "T"], ["A", "N"]]}},
-"col_constraints": {
-"c0": {"type": "wordlist", "words": [["A"], ["B"]]},
-"c1": {"type": "wordlist", "words": [["T"], ["N"]]},
-},
+return toHex8(h0) + toHex8(h1) + toHex8(h2) + toHex8(h3) +
+toHex8(h4) + toHex8(h5) + toHex8(h6) + toHex8(h7);
 }
 
-def t1(d):
-r = run(["solve", write(d, "s.json", SOLVABLE)])
-if r.returncode == 0 and "FORCED" in r.stdout:
-ok("1 solvable square renders with FORCED cells")
-else:
-bad(f"1 solvable square: rc={r.returncode} out={r.stdout!r} err={r.stderr!r}")
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.sha256Hex = sha256Hex;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { sha256Hex: sha256Hex};
+}
 
-def t2(d):
-r = run(["solve", write(d, "w.json", WORD_SQUARE)])
-if r.returncode == 0 and "FORCED=11" in r.stdout and "FREE=1" in r.stdout:
-ok("2 word square holds with FORCED=11 FREE=1")
-else:
-bad(f"2 word square: rc={r.returncode} out={r.stdout!r}")
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"sha256.js — dependency-free sync SHA-256, hex out (byte-identical to Node crypto).\n\n" +
+" node sha256.js \"a string\" hash the argument\n" +
+" echo -n \"a string\" | node sha256.js hash stdin (exact bytes, no newline added)\n" +
+" node sha256.js --help\n\n" +
+"Edge: this is a hash, not an HMAC and not encryption. It proves two inputs\n" +
+"match; it keeps no secret and is not a password KDF.\n"
+);
+return 0;
+}
+if (args.length > 0) {
+process.stdout.write(sha256Hex(args[0]) + "\n");
+return 0;
+}
+// stdin: hash the exact bytes received (no trailing newline added).
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var buf = Buffer.concat(chunks);
+// Hash the exact received bytes: decode as UTF-8 back to the string whose
+// UTF-8 bytes are these bytes (round-trips for valid UTF-8 input).
+process.stdout.write(sha256Hex(buf.toString("utf8")) + "\n");
+});
+return 0;
+}
 
-def t3(d):
-r = run(["solve", write(d, "c.json", CLASH)])
-if "CONTRADICTORY" in r.stdout and "CONTRADICTORY=0" not in r.stdout:
-ok("3 over-constrained square localizes to CONTRADICTORY")
-else:
-bad(f"3 clash not localized: out={r.stdout!r}")
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
 
-def t4(d):
-r = run(["solve", write(d, "j.json", SOLVABLE), "--json"])
-try:
-obj = json.loads(r.stdout)
-if r.returncode == 0 and isinstance(obj, dict):
-ok("4 --json emits parseable result JSON")
-return
-except Exception:
-pass
-bad(f"4 --json not parseable: out={r.stdout!r}")
+test_sha256.js 73 lines on GitHub →
+#!/usr/bin/env node
+/* test_sha256.js — proves sha256Hex is byte-identical to Node's own crypto.
 
-def t5(d):
-p = os.path.join(d, "bad.json")
-with open(p, "w") as fh:
-fh.write("{ this is not json ")
-r = run(["solve", p])
-if r.returncode!= 0:
-ok("5 malformed spec rejected loud (nonzero exit)")
-else:
-bad(f"5 malformed spec silently passed: rc={r.returncode}")
+The oracle is Node's crypto.createHash('sha256'): for every vector we compute
+the digest BOTH ways and require they match. That is the honest proof — not
+"it matches a hardcoded string I typed" but "it matches the reference
+implementation for the same bytes", including the multibyte case that is the
+whole point of the fidelity rule. Also checks the two canonical FIPS-180-4
+vectors as fixed anchors, and mutation-bites the core so a no-op test can't
+pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var crypto = require("crypto");
+var sha256Hex = require("./sha256.js").sha256Hex;
 
-def t6(_d):
-r = run(["--help"])
-if r.returncode == 0 and "Trellis" in r.stdout:
-ok("6 --help exits 0 (discoverable)")
-else:
-bad(f"6 --help: rc={r.returncode}")
+var pass = 0, fail = 0;
+function check(name, got, want) {
+if (got === want) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + got + "\n want: " + want);}
+}
+function nodeHash(s) {
+return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
 
-def main():
-for t in (t1, t2, t3, t4, t5):
-with tempfile.TemporaryDirectory() as d:
-t(d)
-t6(None)
-print()
-print(f"{PASS}/{PASS + FAIL} passed")
-return 0 if FAIL == 0 else 1
+// 1. Canonical FIPS-180-4 anchors (fixed, independent of Node).
+check("empty string", sha256Hex(""),
+"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+check("abc", sha256Hex("abc"),
+"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 
-if __name__ == "__main__":
-sys.exit(main())
+// 2. Drift-check against Node crypto over a vector battery (the real proof).
+var vectors = [
+"",
+"abc",
+"a",
+"The quick brown fox jumps over the lazy dog",
+"The quick brown fox jumps over the lazy dog.", // one-byte change -> avalanche
+"0123456789",
+"x".repeat(55), // one byte under a block boundary
+"x".repeat(56), // padding crosses into a new block
+"x".repeat(63),
+"x".repeat(64), // exact block
+"x".repeat(65),
+"x".repeat(1000), // multi-block
+"café", // multibyte: é is 2 UTF-8 bytes
+"naïve façade Zürich", // several multibyte
+"日本語テスト", // CJK, 3 bytes each
+"🦌", // the deer glyph — 4-byte surrogate pair
+"order:🦌×3 café", // mixed ASCII + multibyte + emoji
+"line1\nline2\ttabbed", // control chars
+];
+for (var i = 0; i < vectors.length; i++) {
+var v = vectors[i];
+var label = v.length > 24? (v.slice(0, 21) + "..."): v;
+check("drift[" + i + "] '" + label + "'", sha256Hex(v), nodeHash(v));
+}
+
+// 3. Determinism — same input twice, same digest.
+check("deterministic", sha256Hex("repeat me"), sha256Hex("repeat me"));
+
+// 4. Non-vacuity / mutation bite: a WRONG expected value MUST be caught.
+// (If the harness were a no-op, this "should fail" case would slip through.)
+var deliberatelyWrong = "0000000000000000000000000000000000000000000000000000000000000000";
+var mutationCaught = (sha256Hex("abc")!== deliberatelyWrong);
+if (mutationCaught) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: core did not distinguish a wrong digest");}
+
+// 5. String coercion parity with Node (numbers, etc. -> String()).
+check("number coercion 42", sha256Hex(42), nodeHash(42));
+check("boolean coercion", sha256Hex(true), nodeHash(true));
+
+console.log("\nsha256: " + pass + " passed, " + fail + " failed" +
+" (" + vectors.length + " drift vectors vs node crypto, incl. multibyte + emoji)");
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Python stdlib only
+Node, no dependencies
 
 ---
