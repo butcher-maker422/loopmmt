@@ -1,1517 +1,810 @@
-# Loop MMT — corpus shard 53/63
+# Loop MMT — corpus shard 53/66
 
-> Bundle 53 of 63 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 53 of 66 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/gauntlet/, /gifts/gitlog/, /gifts/grain/, /gifts/hunkhole/)
+Nodes in this shard: 3 (/gifts/conductor/, /gifts/conflict/, /gifts/cruise/)
 
 ---
 
-# gauntlet — a Loop MMT gift
-https://loopmmt.com/gifts/gauntlet/
+# conductor — a Loop MMT gift
+https://loopmmt.com/gifts/conductor/
 [coverage: optional · branch: gifts]
 
-Fault-Injection Check-Tester break ← all gifts
+Provenance Pipeline Runner run ← all gifts
 
-gauntlet
+conductor
 
-Does your check actually catch a fault? A linter or validator can silently stop catching what it was written to catch, and nothing tells you until bad input reaches production. gauntlet copies your file into a disposable sandbox, injects ONE typed fault (truncate a tail, flip a byte, or apply a find/replace regression you name), runs YOUR check against the broken copy, and reports HELD (the check caught it) or ESCAPED (the check has a hole). The original file is never touched — only ever copied.
+Run a declared pipeline of small JSONL tools — A | B | C — with a record. conductor typechecks the pipeline before it runs (a broken pipeline never launches a stage), runs the stages in order under one trace-id piping stdout into stdin, and appends a per-stage receipt to a replayable ledger: exit code, bytes in and out, and which stage broke. A failing stage stops the run, is recorded failed, and every later stage is recorded skipped — so 'what happened to this run?' always has an answer.
 
 The honest edge
 
-gauntlet tests whether a check CATCHES the ONE fault you inject, not whether the check is correct in general: a HELD proves the check fired on this one broken input, never that it catches every fault. It runs your check command, so only point it at a command you trust. It only ever copies the target — it never modifies your original file.
+conductor runs the commands you give it — it is exactly as safe as the commands in the score, and it does not sandbox them. Its typecheck is the TYPE-level gate (ports line up so data can flow), not a proof the RECORDS fit or that a stage is correct. It proves the run happened in order with a receipt; it never proves the run was right.
 
 Run it
 
-python3 gauntlet.py --target data.json --fault truncate --check "python3 validate.py {}"
-test_gauntlet.py (12/12, mutation-bitten)
+python3 conductor.py check --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py'
+test_conductor.py (12/12, mutation-bitten)
 Python 3, standard library only
 
 The code — every file that ships
 
-gauntlet.py 230 lines on GitHub →
+conductor.py 381 lines on GitHub →
 #!/usr/bin/env python3
-"""gauntlet.py — does your check actually catch a fault?
+"""conductor — run a declared pipeline of small JSONL tools, with a record.
 
-A check (a linter, a validator, a test, a verifier) is only worth what it
-catches. The quiet failure is a check that passes on input it was supposed to
-reject — a green that means nothing. The way you find that out is to break the
-input ON PURPOSE, run the check, and see whether it fires. If you damage the
-file and the check still says PASS, the check has a hole.
+You have a saved "score" — an ordered pipeline of little JSON-lines tools, the
+kind the `declare` gift writes. You could run it by hand with a shell pipe. What
+the shell won't do: check the pipeline typechecks *before* it runs, thread one
+trace-id through the whole run, and hand you back a record of what each stage
+actually did — its exit code, how many bytes it read and wrote, whether it was
+the stage that broke. `conductor` does that. It is a provenance-runner, not a
+shell wrapper: every run leaves a receipt you can read back, and a run that fails
+tells you *which stage* failed, in order, not just that the pipe collapsed.
 
-gauntlet automates exactly that, safely:
+WHAT IT DOES, in order:
+1. Typecheck first. conductor carries its own copy of the five-verb composition
+gate (the same rule the `typecheck` and `declare` gifts use) and refuses to
+run a pipeline that does not compose — a sink that isn't last, a source that
+isn't first. You never watch a broken pipeline half-run; it is stopped at
+the desk (exit 3), before a single stage is launched.
+2. Run the stages in order, piping each stage's stdout into the next stage's
+stdin, exactly as a shell pipe would — but under one trace-id.
+3. Record every stage to an append-only ledger: trace-id, stage index, slug,
+command, exit code, bytes in, bytes out, and a verdict (ok / failed /
+skipped-after-failure). The ledger is JSON-lines you can replay by trace-id.
+4. Fail clean. If a stage exits non-zero, conductor stops the run, records that
+stage as failed and every later stage as skipped, and exits non-zero itself
+— naming the stage that broke. No later stage runs on a broken input.
 
-1. Copy the target file into a private, disposable sandbox. The original is
-NEVER touched.
-2. Inject ONE typed fault into the sandbox copy (truncate its tail, flip a
-byte, or apply a find/replace regression you name).
-3. Run YOUR check command against the mutated copy.
-4. Report the verdict:
-HELD -- the check FAILED on the broken input (good: it caught the fault)
-ESCAPED -- the check PASSED on the broken input (bad: your check has a hole)
+THE MODEL. Five port-verbs on the shared JSON-lines interface, and only five
+(the same five the `port`, `map`, `typecheck`, and `declare` gifts use):
 
-ONE FAULT PER SHOT, SANDBOX ONLY (the safety rails, kept from the tool this was
-stripped from). Never buckshot: one typed fault per run, so a HELD/ESCAPED
-verdict names exactly what got through. The sandbox is deleted when the run
-ends -- abort is just "delete the temp dir," and the original file is read-only
-to this tool by construction (it is only ever copied, never written).
+source: nothing -> JSONL (emits; no meaningful stdin)
+transform: JSONL -> JSONL (record in, record out)
+filter: JSONL -> JSONL' (record in, subset out; output type <= input)
+fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
+sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
 
-THE VERDICT IS INVERTED ON PURPOSE.
-A check that FAILS on broken input is doing its job -- so a non-zero exit from
-your check is a gauntlet PASS (HELD). A check that PASSES on broken input has a
-hole -- so a zero exit from your check is a gauntlet FAIL (ESCAPED). Read the
-exit codes below with that inversion in mind.
+A pipeline composes iff every adjacent join A -> B has A EMITS (A.verb!= sink)
+and B ACCEPTS (B.verb!= source). conductor carries its own copy of that gate so
+it stands alone — a gift is single-file and zero-dependency by covenant, so it
+agrees with `typecheck` and `declare` by sharing the RULE, not by importing them.
 
-EXITS
-0 HELD -- the check caught the fault (your check FAILED on broken input)
-3 ESCAPED -- the check missed the fault (your check PASSED on broken input)
-4 NO-FAULT -- the chosen fault could not be injected (e.g. --replace found no
-match, or the file was too small to truncate); nothing tested
-2 USAGE -- bad arguments, or the target file is missing
+WHY A RECORD, NOT JUST A PIPE. A shell pipe answers "did it work?" with a single
+combined exit status and a jumble of interleaved stderr. When a five-stage
+pipeline produces nothing, the shell won't tell you *which* stage went dark.
+conductor's ledger does: one record per stage, in order, so "what happened to
+this run?" has an answer. This is tracebus's trace-id-and-ledger idea (the
+`tracebus` gift is a routed message bus with a replayable ledger) applied to a
+LINEAR ordered run instead of a fanned-out bus — a different shape, the same
+honesty about leaving a receipt.
+
+THE SCORE / STAGE FORMAT. A stage is `{"slug":..., "port_verb":..., "cmd": [...]}`
+— the port-verb for the typecheck, and `cmd` the argv list conductor executes for
+that stage (e.g. ["python3", "census.py"]). Stages come from `--stage` flags, or
+piped in on stdin as JSON-lines (the shape `declare show` emits, with a `cmd`
+added), or read from a declare score file with `--score` when the score carries
+per-stage `cmd`s. A stage with a port-verb but no `cmd` can be typechecked but
+not run (conductor says so and exits 2 on a run).
+
+HONEST CEILING. conductor runs the commands you give it — it is exactly as safe
+as the commands in the score, and it does not sandbox them. Its typecheck is the
+TYPE-level gate (ports line up so data can flow), NOT a proof the RECORDS fit or
+that a stage is correct; a pipeline can typecheck clean, run to completion, and
+still have done the wrong thing. conductor proves the run happened, in order,
+with a receipt — it never proves the run was right.
+
+conductor's own port-verb is `sink`: it consumes a pipeline (and the data flowing
+through it) and produces side effects — the stages' work and the ledger — with no
+pipeable JSONL on its own stdout. The run record goes to the ledger; conductor's
+stdout is the final stage's stdout, passed through.
+
+No dependencies beyond the Python standard library. MIT licensed.
 
 USAGE
-# Truncate the tail 10% and see whether your validator catches it:
-python3 gauntlet.py --target data.json --fault truncate --check "python3 validate.py {}"
+conductor verbs
+Print the five port-verbs and their contracts (JSON-lines).
 
-# Flip one byte in the middle:
-python3 gauntlet.py --target data.json --fault bitflip --check "python3 validate.py {}"
+conductor check --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py'
+Typecheck the pipeline WITHOUT running it. Exit 0 if it composes, 3 if not,
+4 if a verb is undeclared. (Stage token: slug:verb:cmd, cmd shell-split.)
 
-# Apply a well-formed-wrong regression (the file still parses, it just lies):
-python3 gauntlet.py --target config.yaml --fault replace \\
---from "version: 3" --to "version: 2" --check "python3 validate.py {}"
+conductor run --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py' \
+[--ledger FILE] [--input FILE]
+Typecheck, then run the stages in order under one trace-id, piping
+stdout->stdin. --input seeds the first stage's stdin (default: empty).
+Appends one record per stage to --ledger (default: conductor.ledger.jsonl).
+Final stage's stdout goes to conductor's stdout. Exit 0 if every stage
+succeeded, 5 if a stage failed (naming it), 3/4 if the pipeline doesn't
+typecheck.
 
-The check command runs against the mutated SANDBOX copy: `{}` in --check is
-replaced with the sandbox path. If your check reads stdin instead, use
-`--stdin` and gauntlet pipes the mutated bytes to it.
+conductor replay --ledger FILE --trace TRACE_ID
+Print every stage record for a trace-id, in run order (JSON-lines).
 
-python3 gauntlet.py --json # machine-readable verdict
-python3 gauntlet.py --edge # print the edge and exit
+EXIT CODES
+0 ok (composed / ran clean / replayed)
+3 the pipeline does not typecheck — not run
+4 a stage's port-verb is undeclared or not one of the five
+5 a stage failed at runtime (the run stopped; the ledger names it)
+2 usage error (bad arguments, a stage with no cmd on a run, unreadable file)
 """
-
 import argparse
+import json
 import os
-import shutil
+import shlex
 import subprocess
 import sys
-import tempfile
+import uuid
 
-EXIT_HELD = 0
-EXIT_USAGE = 2
-EXIT_ESCAPED = 3
-EXIT_NO_FAULT = 4
-
-EDGE = (
-"gauntlet tests whether a check CATCHES the ONE fault you inject, not "
-"whether the check is correct in general: a HELD proves the check fired on "
-"this one broken input, never that it catches every fault. It runs your "
-"check command, so only point it at a command you trust. It only ever "
-"copies the target -- it never modifies your original file."
-)
-
-# --- the fault catalog: each returns (mutated_bytes, note) or (None, why) -----
-
-def _truncate(data):
-"""Tail-truncate 10% (byte loss). Well-formed-wrong on top-heavy files."""
-if len(data) < 10:
-return None, "file too small to truncate meaningfully"
-cut = int(len(data) * 0.9) or (len(data) - 1)
-return data[:cut], f"tail truncated: {len(data)}B -> {cut}B"
-
-def _bitflip(data):
-"""Flip one byte in the middle. Deterministic (always the midpoint byte)."""
-if not data:
-return None, "file is empty; nothing to flip"
-i = len(data) // 2
-b = bytearray(data)
-b[i] ^= 0xFF
-return bytes(b), f"byte flipped at offset {i}: 0x{data[i]:02x} -> 0x{b[i]:02x}"
-
-def _replace(data, frm, to):
-"""A find/replace regression: the file still parses, it just lies."""
-if frm is None or to is None:
-return None, "--replace requires --from and --to"
-fb, tb = frm.encode("utf-8"), to.encode("utf-8")
-if fb not in data:
-return None, f"--from string not found in target: {frm!r}"
-return data.replace(fb, tb, 1), f"replaced {frm!r} -> {to!r} (first match)"
-
-def inject(data, fault, frm=None, to=None):
-if fault == "truncate":
-return _truncate(data)
-if fault == "bitflip":
-return _bitflip(data)
-if fault == "replace":
-return _replace(data, frm, to)
-return None, f"unknown fault: {fault}"
-
-def run(target, fault, check_cmd, use_stdin=False, frm=None, to=None):
-"""Copy target to a sandbox, inject one fault, run the check, report verdict.
-
-Never touches the original target. Returns a result dict.
-"""
-result = {
-"target": target, "fault": fault, "status": "held",
-"note": "", "check_exit": None, "edge": EDGE,
+PORT_VERBS = {
+"source": "nothing -> JSONL (emits; no meaningful stdin)",
+"transform": "JSONL -> JSONL (record in, record out)",
+"filter": "JSONL -> JSONL' (record in, subset out; output type <= input)",
+"fold": "JSONL -> JSONL_agg (records in, an aggregate/narrower record out)",
+"sink": "JSONL -> nothing (terminal side effect, no pipeable stdout)",
 }
-if not os.path.isfile(target):
-result["status"] = "usage"
-result["error"] = f"target file not found: {target}"
-return result
 
-with open(target, "rb") as fh:
-original = fh.read()
+def emits(verb):
+"""True iff a stage with this verb produces pipeable stdout (can feed right)."""
+return verb!= "sink"
 
-mutated, note = inject(original, fault, frm, to)
-result["note"] = note
-if mutated is None:
-result["status"] = "no-fault"
-return result
-if mutated == original:
-result["status"] = "no-fault"
-result["note"] = note + " (no change to bytes)"
-return result
+def accepts(verb):
+"""True iff a stage with this verb consumes stdin (can be fed from the left)."""
+return verb!= "source"
 
-sandbox = tempfile.mkdtemp(prefix="gauntlet.")
-try:
-sandbox_file = os.path.join(sandbox, os.path.basename(target))
-with open(sandbox_file, "wb") as fh:
-fh.write(mutated)
+def typecheck_stages(stages):
+"""Decide a pipeline of (slug, verb, cmd) or (slug, verb) tuples.
 
-if use_stdin:
-proc = subprocess.run(
-check_cmd, shell=True, input=mutated,
-capture_output=True, timeout=300,
+Returns (ok, broken). Raises ValueError on an undeclared/unknown verb. The
+same gate `typecheck`/`declare` carry — copied, per the single-file covenant."""
+for st in stages:
+slug, verb = st[0], st[1]
+if verb not in PORT_VERBS:
+raise ValueError(
+"stage '%s' declares port_verb '%s', not one of the five (%s) — "
+"cannot decide" % (slug, verb, ", ".join(sorted(PORT_VERBS)))
 )
-else:
-cmd = check_cmd.replace("{}", sandbox_file)
-if cmd == check_cmd and "{}" not in check_cmd:
-# no placeholder given: append the path
-cmd = f"{check_cmd} {sandbox_file}"
-proc = subprocess.run(
-cmd, shell=True, capture_output=True, timeout=300,
-)
+broken = []
+for i in range(len(stages) - 1):
+a_slug, a_verb = stages[i][0], stages[i][1]
+b_slug, b_verb = stages[i + 1][0], stages[i + 1][1]
+reasons = []
+if not emits(a_verb):
+reasons.append({"side": "from", "slug": a_slug, "verb": a_verb,
+"why": "a sink emits nothing to feed the next stage — "
+"a sink is only legal as the last stage"})
+if not accepts(b_verb):
+reasons.append({"side": "to", "slug": b_slug, "verb": b_verb,
+"why": "a source accepts nothing from the previous stage — "
+"a source is only legal as the first stage"})
+if reasons:
+broken.append({"index": i, "from": a_slug, "to": b_slug, "reasons": reasons})
+return (len(broken) == 0, broken)
 
-result["check_exit"] = proc.returncode
-# INVERSION: check FAILED (non-zero) on broken input => HELD (good).
-# check PASSED (zero) on broken input => ESCAPED (bad).
-result["status"] = "held" if proc.returncode!= 0 else "escaped"
-return result
-finally:
-shutil.rmtree(sandbox, ignore_errors=True)
+def _emit(obj):
+"""Print one JSON-line, deterministically (sorted keys, compact separators)."""
+sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
 
-def main(argv=None):
-ap = argparse.ArgumentParser(
-description="Does your check actually catch a fault you inject?",
-epilog="EDGE: " + EDGE,
-)
-ap.add_argument("--target", help="the file to inject a fault into (copied, never modified)")
-ap.add_argument("--fault", choices=["truncate", "bitflip", "replace"],
-help="the single typed fault to inject")
-ap.add_argument("--check", help="the check command to run; {} is replaced with the sandbox path")
-ap.add_argument("--from", dest="frm", help="(--fault replace) the string to find")
-ap.add_argument("--to", dest="to", help="(--fault replace) the string to substitute")
-ap.add_argument("--stdin", action="store_true",
-help="pipe the mutated bytes to the check on stdin instead of a path")
-ap.add_argument("--json", action="store_true", help="machine-readable verdict")
-ap.add_argument("--edge", action="store_true", help="print the edge and exit")
-args = ap.parse_args(argv)
+def _parse_stage_token(tok):
+"""Parse 'slug:verb' or 'slug:verb:cmd' -> (slug, verb, cmd_list_or_None).
 
-if args.edge:
-print(EDGE)
-return EXIT_HELD
+Only the first two colons split slug/verb; the remainder is the command
+(shell-split), so a cmd may itself contain colons."""
+parts = tok.split(":", 2)
+if len(parts) < 2:
+raise ValueError("stage token '%s' must be slug:verb[:cmd]" % tok)
+slug, verb = parts[0], parts[1]
+cmd = shlex.split(parts[2]) if len(parts) == 3 and parts[2] else None
+return (slug, verb, cmd)
 
-if not (args.target and args.fault and args.check):
-print("USAGE ERROR — --target, --fault and --check are all required",
-file=sys.stderr)
-return EXIT_USAGE
-
-res = run(args.target, args.fault, args.check,
-use_stdin=args.stdin, frm=args.frm, to=args.to)
-status = res["status"]
-
-if args.json:
-import json
-print(json.dumps(res, indent=2, sort_keys=True))
-else:
-if status == "held":
-print(f"HELD — the check caught the {args.fault} fault "
-f"(check exited {res['check_exit']} on broken input)")
-print(f" fault: {res['note']}")
-elif status == "escaped":
-print(f"ESCAPED — the check MISSED the {args.fault} fault "
-f"(check exited 0 on broken input — it has a hole)")
-print(f" fault: {res['note']}")
-elif status == "no-fault":
-print(f"NO-FAULT — could not inject: {res['note']}")
-else:
-print(f"USAGE ERROR — {res.get('error', 'bad arguments')}", file=sys.stderr)
-
-return {
-"held": EXIT_HELD, "escaped": EXIT_ESCAPED,
-"no-fault": EXIT_NO_FAULT, "usage": EXIT_USAGE,
-}[status]
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_gauntlet.py 206 lines on GitHub →
-#!/usr/bin/env python3
-"""test_gauntlet.py — mutation-bitten behavior proof for the gauntlet gift.
-
-stdlib only. Each test asserts a distinct BEHAVIOR so deleting the behavior
-makes a test fail. Run: python3 test_gauntlet.py
-"""
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-GIFT = os.path.join(HERE, "gauntlet.py")
-
-HELD, USAGE, ESCAPED, NO_FAULT = 0, 2, 3, 4
-
-# A check that PASSES (exit 0) only if the file is exactly the 200-byte original.
-# Deterministic, stdlib-only, written per-test into the sandbox.
-STRICT_CHECK = (
-"python3 -c \"import sys; d=open(sys.argv[1],'rb').read(); "
-"sys.exit(0 if len(d)==200 and d==b'A'*200 else 1)\" {}"
-)
-# A weak check that ALWAYS passes — used to prove ESCAPED detection.
-WEAK_CHECK = "python3 -c \"import sys; sys.exit(0)\" {}"
-
-results = []
-
-def check(name, cond):
-results.append((name, bool(cond)))
-print(f" [{'PASS' if cond else 'FAIL'}] {name}")
-
-def _scratch_target(content=b"A" * 200):
-d = tempfile.mkdtemp(prefix="gauntlet-test.")
-p = os.path.join(d, "data.bin")
-with open(p, "wb") as f:
-f.write(content)
-return d, p
-
-def _run(*args):
-p = subprocess.run([sys.executable, GIFT, *args],
-capture_output=True, text=True, timeout=120)
-return p.returncode, p.stdout, p.stderr
-
-def t_held_when_strict_check_catches_truncation():
-"""A strict check that rejects a truncated file => HELD (exit 0)."""
-d, p = _scratch_target()
+def _collect_stages(args):
+"""Collect stages from --stage tokens or stdin JSON-lines. Returns (stages, err)."""
+stages = []
+if getattr(args, "stage", None):
+for tok in args.stage:
 try:
-rc, out, _ = _run("--target", p, "--fault", "truncate", "--check", STRICT_CHECK)
-check("HELD when strict check catches truncation", rc == HELD and "HELD" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_escaped_when_weak_check_misses():
-"""A check that always passes => ESCAPED (exit 3): the hole is detected."""
-d, p = _scratch_target()
-try:
-rc, out, _ = _run("--target", p, "--fault", "truncate", "--check", WEAK_CHECK)
-check("ESCAPED when weak check misses the fault", rc == ESCAPED and "ESCAPED" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_original_never_modified():
-"""The original target file is byte-identical after a run (sandbox only)."""
-d, p = _scratch_target()
-try:
-before = open(p, "rb").read()
-_run("--target", p, "--fault", "bitflip", "--check", WEAK_CHECK)
-after = open(p, "rb").read()
-check("original file untouched after a run", before == after)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_bitflip_held_by_strict_check():
-"""A single-byte flip is caught by the strict check => HELD."""
-d, p = _scratch_target()
-try:
-rc, out, _ = _run("--target", p, "--fault", "bitflip", "--check", STRICT_CHECK)
-check("HELD on bitflip caught by strict check", rc == HELD and "byte flipped" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_replace_regression_held():
-"""A find/replace regression the check rejects => HELD; note names the swap."""
-d = tempfile.mkdtemp(prefix="gauntlet-test.")
-p = os.path.join(d, "cfg.txt")
-open(p, "w").write("version: 3\n")
-# check passes only if it still says 'version: 3'
-chk = "python3 -c \"import sys; sys.exit(0 if 'version: 3' in open(sys.argv[1]).read() else 1)\" {}"
-try:
-rc, out, _ = _run("--target", p, "--fault", "replace",
-"--from", "version: 3", "--to", "version: 2", "--check", chk)
-check("HELD on replace regression + note names swap",
-rc == HELD and "version: 3" in out and "version: 2" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_no_fault_when_replace_string_absent():
-"""--replace with a --from that isn't present => NO-FAULT (exit 4), not a verdict."""
-d = tempfile.mkdtemp(prefix="gauntlet-test.")
-p = os.path.join(d, "cfg.txt")
-open(p, "w").write("hello\n")
-try:
-rc, out, _ = _run("--target", p, "--fault", "replace",
-"--from", "not-here", "--to", "x", "--check", WEAK_CHECK)
-check("NO-FAULT when --from absent", rc == NO_FAULT and "NO-FAULT" in out)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_usage_when_target_missing():
-"""A missing target file is a usage error (exit 2)."""
-rc, out, err = _run("--target", "/no/such/file", "--fault", "truncate", "--check", WEAK_CHECK)
-check("USAGE when target file missing", rc == USAGE and "USAGE" in (out + err))
-
-def t_usage_when_required_arg_missing():
-"""Missing --check is a usage error, not a crash."""
-d, p = _scratch_target()
-try:
-rc, out, err = _run("--target", p, "--fault", "truncate")
-check("USAGE when --check missing", rc == USAGE and "USAGE" in (out + err))
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_verdict_inversion_is_correct():
-"""The inversion holds: check-fails => HELD, check-passes => ESCAPED, same fault."""
-d, p = _scratch_target()
-try:
-rc_strict, _, _ = _run("--target", p, "--fault", "truncate", "--check", STRICT_CHECK)
-rc_weak, _, _ = _run("--target", p, "--fault", "truncate", "--check", WEAK_CHECK)
-check("inversion: strict->HELD(0), weak->ESCAPED(3)",
-rc_strict == HELD and rc_weak == ESCAPED)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_deterministic_verdict():
-"""Same target+fault+check => same verdict every run."""
-d, p = _scratch_target()
-try:
-verdicts = set()
-for _ in range(3):
-rc, _, _ = _run("--target", p, "--fault", "bitflip", "--check", STRICT_CHECK)
-verdicts.add(rc)
-check("deterministic: identical verdict across 3 runs", verdicts == {HELD})
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_json_mode_emits_status():
-"""--json emits a parseable object with the status and check_exit."""
-import json as _json
-d, p = _scratch_target()
-try:
-rc, out, _ = _run("--target", p, "--fault", "truncate", "--check", STRICT_CHECK, "--json")
-obj = _json.loads(out)
-check("--json emits status + check_exit",
-obj.get("status") == "held" and obj.get("check_exit") is not None)
-finally:
-shutil.rmtree(d, ignore_errors=True)
-
-def t_edge_present_and_printed():
-"""The printed edge is in the artifact and prints on --edge."""
-src = open(GIFT).read()
-rc, out, _ = _run("--edge")
-check("edge present in source AND on --edge",
-"never modifies your original" in src and "never modifies your original" in out)
-
-def main():
-print("test_gauntlet.py")
-for fn in [
-t_held_when_strict_check_catches_truncation,
-t_escaped_when_weak_check_misses,
-t_original_never_modified,
-t_bitflip_held_by_strict_check,
-t_replace_regression_held,
-t_no_fault_when_replace_string_absent,
-t_usage_when_target_missing,
-t_usage_when_required_arg_missing,
-t_verdict_inversion_is_correct,
-t_deterministic_verdict,
-t_json_mode_emits_status,
-t_edge_present_and_printed,
-]:
-fn()
-passed = sum(1 for _, ok in results if ok)
-total = len(results)
-print(f"\n{passed}/{total} passing")
-return 0 if passed == total else 1
-
-if __name__ == "__main__":
-sys.exit(main())
-
-Take the whole folder →
-MIT
-Python 3, standard library only
-
----
-
-# Gitlog — a Loop MMT gift
-https://loopmmt.com/gifts/gitlog/
-[coverage: optional · branch: gifts]
-
-Git History On A Pipe read ← all gifts
-
-Gitlog
-
-Turn a git history into one JSON object per commit on stdout, so the questions you actually have — how many commits touched this file, who authored what last week, churn per day — become one pipe away instead of re-parsing git's text yourself. Field names match what git-log folds already read.
-
-The honest edge
-
-It reports exactly what git reports — it's only as complete as the history you point it at. A shallow clone gives you a shallow answer, faithfully.
-
-Run it
-
-python3 gitlog.py --repo.
-test_gitlog.py (19/19)
-Python stdlib only
-
-The code — every file that ships
-
-gitlog.py 269 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""gitlog.py — turn a git history into one JSON object per commit, on stdout.
-
-A git repository already holds the truth about what happened and when: every
-commit is a dated, authored, immutable record. But that truth is trapped behind
-`git log`'s human-facing format. This reads the log and emits it as **JSON
-lines** — one object per commit, newest first by default — so the next tool in a
-pipe can fold, filter, count, or chart it without re-parsing git's output itself.
-
-It is a *source*: it emits records and consumes no stdin. Point it at a repo, get
-a clean stream of commits you can reason about. The whole point is to stop
-eyeballing `git log` and start folding it: "how many commits touched this file",
-"who authored what in this range", "what was the churn per day" all become one
-pipe away once the history is on the rail as records.
-
-Each commit becomes one object with these fields (always present):
-hash full 40-char commit SHA (git %H)
-short abbreviated SHA (git %h)
-committed committer date, ISO-8601 strict (git %cI)
-authored author date, ISO-8601 strict (git %aI)
-author author name (git %an)
-email author email (git %ae)
-subject first line of the message (git %s)
-
-With --churn, three more fields are added per commit (one extra git call each):
-files number of files changed in the commit (int)
-added total inserted lines across those files (int, None if binary-only)
-deleted total deleted lines (int, None if binary-only)
-
-The field names match what the existing git-log folds already read (%H, %h, %cI,
-%aI, %s), so a fold written against those consumes this source's output directly.
-
-------------------------------------------------------------------------------
-The JSON-lines contract (so this composes in a pipe):
-- emits ONE JSON object per line on stdout — a commit record.
-- order is git's default (reverse-chronological) unless --reverse is given.
-- --path P restricts to commits that touched P (repeatable).
-- --since / --until / --author / --max-count are passed through to git log.
-- errors go to stderr; stdout stays clean JSON-lines.
-
-Exit codes:
-0 the log was read and emitted (including the empty-history case)
-2 git failed / not a repository / git not found (don't trust the reading)
-3 usage / bad input
-"""
-
-import argparse
-import json
-import subprocess
-import sys
-
-# GIFT-013: field/record framing must use a byte that CANNOT occur in commit
-# text. The old 0x1f/0x1e (ASCII unit/record separators) were assumed "safe
-# inside commit text" but are not — git permits those control bytes inside a
-# subject or author name, so a crafted commit split one record into many
-# ("malformed log record: expected 7 fields, got 8"). NUL is the only byte git
-# guarantees absent from commit content (its objects are NUL-terminated
-# C-strings): fields are joined with %x00 and each record is terminated by
-# `git log -z`, so no field value can ever break the frame.
-NUL = "\x00"
-
-# The per-commit fields, in emit order. (placeholder, json_key) pairs.
-FIELDS = [
-("%H", "hash"),
-("%h", "short"),
-("%cI", "committed"),
-("%aI", "authored"),
-("%an", "author"),
-("%ae", "email"),
-("%s", "subject"),
-]
-
-class GitLogError(Exception):
-"""A git fault or usage error, carrying an exit code."""
-
-def __init__(self, message, code):
-super().__init__(message)
-self.code = code
-
-def _run_git(args, repo):
-"""Run a git command in repo, return stdout text. Raise GitLogError on failure."""
-try:
-proc = subprocess.run(
-["git", "-C", repo] + args,
-stdout=subprocess.PIPE,
-stderr=subprocess.PIPE,
-encoding="utf-8",
-)
-except FileNotFoundError:
-raise GitLogError("git executable not found on PATH", 2)
-if proc.returncode!= 0:
-detail = proc.stderr.strip() or "git exited %d" % proc.returncode
-raise GitLogError(detail, 2)
-return proc.stdout
-
-def read_commits(repo, ref="HEAD", paths=None, since=None, until=None,
-author=None, max_count=None, reverse=False):
-"""Read commits from repo and return a list of record dicts (no churn).
-
-The list is git's default order (reverse-chronological) unless reverse=True.
-An empty history returns [] and is NOT an error.
-"""
-# GIFT-014: an unborn repository (git init, zero commits) has no valid HEAD,
-# so `git log HEAD` fatals. The contract says an empty history returns [] and
-# is not an error. When the ref is the DEFAULT HEAD, detect the unborn case
-# with a quiet verify and honor that contract. An invalid EXPLICIT ref
-# (ref!= "HEAD") still errors, and stays distinguishable from an unborn HEAD.
-if ref == "HEAD":
-probe = subprocess.run(
-["git", "-C", repo, "rev-parse", "--verify", "--quiet", "HEAD"],
-stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
-)
-if probe.returncode!= 0:
-inside = subprocess.run(
-["git", "-C", repo, "rev-parse", "--git-dir"],
-stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
-)
-if inside.returncode == 0:
-return [] # unborn default HEAD -> empty history, per contract
-# not a git repo / unreadable -> fall through; _run_git raises properly.
-
-# Fields joined by a literal NUL (%x00); `-z` NUL-terminates each record.
-fmt = "%x00".join(p for p, _ in FIELDS)
-args = ["log", ref, "-z", "--format=%s" % fmt]
-if reverse:
-args.append("--reverse")
-if since:
-args.append("--since=%s" % since)
-if until:
-args.append("--until=%s" % until)
-if author:
-args.append("--author=%s" % author)
-if max_count is not None:
-args.append("--max-count=%d" % max_count)
-if paths:
-args.append("--")
-args.extend(paths)
-
-raw = _run_git(args, repo)
-# -z terminates every record (including the last) with a NUL, and fields are
-# NUL-joined, so the whole stream is NUL-separated tokens: every len(FIELDS)
-# tokens is one record. Drop the single trailing empty left by the final
-# terminator; interior empty tokens (e.g. an empty subject) are preserved.
-tokens = raw.split(NUL)
-if tokens and tokens[-1] == "":
-tokens.pop()
-if not tokens:
-return []
-n = len(FIELDS)
-if len(tokens) % n!= 0:
-# A malformed stream is a fault, not a silent drop.
-raise GitLogError(
-"malformed log stream: %d field tokens is not a multiple of %d"
-% (len(tokens), n),
-2,
-)
-records = []
-for i in range(0, len(tokens), n):
-group = tokens[i:i + n]
-rec = {key: group[j] for j, (_, key) in enumerate(FIELDS)}
-records.append(rec)
-return records
-
-def add_churn(repo, record):
-"""Add files/added/deleted to one record via `git show --numstat`.
-
-added/deleted are None when the commit is binary-only (git prints '-').
-Mutates and returns the record.
-"""
-out = _run_git(
-["show", "--numstat", "--format=", record["hash"]], repo
-)
-files = 0
-added = 0
-deleted = 0
-saw_binary = False
-for line in out.splitlines():
+stages.append(_parse_stage_token(tok))
+except ValueError as exc:
+sys.stderr.write("conductor: %s\n" % exc)
+return None, 2
+if getattr(args, "from_stdin", False):
+for line in sys.stdin:
 line = line.strip()
 if not line:
 continue
-cols = line.split("\t")
-if len(cols) < 3:
-continue
-files += 1
-a, d = cols[0], cols[1]
-if a == "-" or d == "-":
-saw_binary = True
+try:
+obj = json.loads(line)
+except ValueError:
+sys.stderr.write("conductor: stdin line is not JSON: %s\n" % line)
+return None, 2
+slug = obj.get("slug")
+if slug is None:
+sys.stderr.write("conductor: stdin record has no 'slug': %s\n" % line)
+return None, 2
+stages.append((slug, obj.get("port_verb", ""), obj.get("cmd")))
+if not stages:
+sys.stderr.write("conductor: no stages (use --stage, or --stdin with JSON-lines)\n")
+return None, 2
+return stages, None
+
+def _typecheck_or_report(stages):
+"""Run the gate; emit a report on failure. Returns exit code (0 ok, 3/4 fail)."""
+try:
+ok, broken = typecheck_stages(stages)
+except ValueError as exc:
+_emit({"kind": "error", "status": "undeclared", "detail": str(exc)})
+return 4
+if not ok:
+_emit({"kind": "refused", "reason": "pipeline does not typecheck", "broken_joins": broken})
+return 3
+return 0
+
+def cmd_verbs(args):
+for name in ["source", "transform", "filter", "fold", "sink"]:
+_emit({"port_verb": name, "contract": PORT_VERBS[name]})
+return 0
+
+def cmd_check(args):
+stages, err = _collect_stages(args)
+if err is not None:
+return err
+code = _typecheck_or_report(stages)
+if code == 0:
+_emit({"kind": "check", "typechecks": True, "n_stages": len(stages)})
+return code
+
+def _append_ledger(ledger_path, record):
+with open(ledger_path, "a") as f:
+f.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+def cmd_run(args):
+stages, err = _collect_stages(args)
+if err is not None:
+return err
+# 1. Typecheck first — never launch a stage of a broken pipeline.
+code = _typecheck_or_report(stages)
+if code!= 0:
+return code
+# Every stage must carry a cmd to be run.
+for slug, verb, cmd in stages:
+if not cmd:
+sys.stderr.write("conductor: stage '%s' has no cmd — cannot run "
+"(use slug:verb:cmd)\n" % slug)
+return 2
+ledger_path = args.ledger or "conductor.ledger.jsonl"
+trace_id = args.trace or str(uuid.uuid4())
+# Seed input.
+if args.input:
+try:
+with open(args.input, "rb") as f:
+data = f.read()
+except OSError as exc:
+sys.stderr.write("conductor: cannot read --input %s: %s\n" % (args.input, exc))
+return 2
+else:
+data = b""
+_append_ledger(ledger_path, {"kind": "run-start", "trace_id": trace_id,
+"n_stages": len(stages)})
+failed_index = None
+for i, (slug, verb, cmd) in enumerate(stages):
+if failed_index is not None:
+_append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
+"index": i, "slug": slug, "cmd": cmd,
+"verdict": "skipped", "reason": "an earlier stage failed"})
 continue
 try:
-added += int(a)
-deleted += int(d)
-except ValueError:
-saw_binary = True
-record["files"] = files
-# If every changed file was binary, added/deleted are not meaningful.
-if saw_binary and added == 0 and deleted == 0:
-record["added"] = None
-record["deleted"] = None
-else:
-record["added"] = added
-record["deleted"] = deleted
-return record
+proc = subprocess.run(cmd, input=data, stdout=subprocess.PIPE,
+stderr=subprocess.PIPE)
+except (OSError, ValueError) as exc:
+_append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
+"index": i, "slug": slug, "cmd": cmd,
+"verdict": "failed", "exit": None,
+"error": str(exc)})
+failed_index = i
+continue
+rec = {"kind": "stage", "trace_id": trace_id, "index": i, "slug": slug,
+"cmd": cmd, "exit": proc.returncode,
+"bytes_in": len(data), "bytes_out": len(proc.stdout),
+"verdict": "ok" if proc.returncode == 0 else "failed"}
+if proc.returncode!= 0:
+rec["stderr_tail"] = proc.stderr.decode("utf-8", "replace")[-500:]
+_append_ledger(ledger_path, rec)
+if proc.returncode!= 0:
+failed_index = i
+continue
+data = proc.stdout
+if failed_index is None:
+# Final stage's stdout is conductor's stdout (a sink typically emits none).
+sys.stdout.buffer.write(data)
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id, "verdict": "ok"})
+_emit_run_summary(trace_id, ledger_path, ok=True, failed_index=None, stages=stages)
+return 0
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id, "verdict": "failed",
+"failed_index": failed_index})
+_emit_run_summary(trace_id, ledger_path, ok=False, failed_index=failed_index, stages=stages)
+return 5
 
-def _emit(record, out=None):
-"""Write one JSON object as a single line to stdout (or the given stream)."""
-stream = out if out is not None else sys.stdout
-stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+def _emit_run_summary(trace_id, ledger_path, ok, failed_index, stages):
+summary = {"kind": "run-summary", "trace_id": trace_id, "ledger": ledger_path,
+"n_stages": len(stages), "ok": ok}
+if not ok:
+summary["failed_stage"] = {"index": failed_index, "slug": stages[failed_index][0]}
+# summary goes to stderr so it never pollutes the passed-through final stdout
+sys.stderr.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
+
+def cmd_replay(args):
+if not args.ledger or not args.trace:
+sys.stderr.write("conductor: replay needs --ledger and --trace\n")
+return 2
+try:
+with open(args.ledger, "r") as f:
+lines = f.readlines()
+except OSError as exc:
+sys.stderr.write("conductor: cannot read ledger %s: %s\n" % (args.ledger, exc))
+return 2
+found = False
+for line in lines:
+line = line.strip()
+if not line:
+continue
+try:
+rec = json.loads(line)
+except ValueError:
+continue
+if rec.get("trace_id") == args.trace:
+found = True
+_emit(rec)
+if not found:
+sys.stderr.write("conductor: no records for trace-id %s in %s\n" % (args.trace, args.ledger))
+return 2
+return 0
 
 def build_parser():
-p = argparse.ArgumentParser(
-prog="gitlog",
-description="Emit a git history as JSON lines, one object per commit.",
-)
-p.add_argument("--repo", default=".", help="path to the git repo (default:.)")
-p.add_argument("--ref", default="HEAD",
-help="ref/range to log (default: HEAD; e.g. main, v1..v2)")
-p.add_argument("--path", action="append", dest="paths", metavar="P",
-help="restrict to commits touching P (repeatable)")
-p.add_argument("--since", help="git --since passthrough (e.g. '2 weeks ago')")
-p.add_argument("--until", help="git --until passthrough")
-p.add_argument("--author", help="git --author filter passthrough")
-p.add_argument("-n", "--max-count", type=int, default=None,
-help="limit to the most recent N commits")
-p.add_argument("--reverse", action="store_true",
-help="oldest first (default is newest first)")
-p.add_argument("--churn", action="store_true",
-help="add files/added/deleted per commit (one extra git call each)")
+p = argparse.ArgumentParser(prog="conductor",
+description="Run a declared pipeline of JSONL tools, with a record.")
+sub = p.add_subparsers(dest="cmd", required=True)
+
+sp_verbs = sub.add_parser("verbs", help="print the five port-verbs and contracts")
+sp_verbs.set_defaults(func=cmd_verbs)
+
+sp_check = sub.add_parser("check", help="typecheck the pipeline without running it")
+sp_check.add_argument("--stage", action="append", help="slug:verb[:cmd] (repeatable, in order)")
+sp_check.add_argument("--stdin", dest="from_stdin", action="store_true", help="read stages as JSON-lines on stdin")
+sp_check.set_defaults(func=cmd_check)
+
+sp_run = sub.add_parser("run", help="typecheck then run the stages in order, with a record")
+sp_run.add_argument("--stage", action="append", help="slug:verb:cmd (repeatable, in order)")
+sp_run.add_argument("--stdin", dest="from_stdin", action="store_true", help="read stages as JSON-lines on stdin")
+sp_run.add_argument("--ledger", help="append per-stage records here (default: conductor.ledger.jsonl)")
+sp_run.add_argument("--input", help="file to seed the first stage's stdin (default: empty)")
+sp_run.add_argument("--trace", help="use this trace-id (default: a fresh uuid4)")
+sp_run.set_defaults(func=cmd_run)
+
+sp_replay = sub.add_parser("replay", help="print every stage record for a trace-id")
+sp_replay.add_argument("--ledger", required=True)
+sp_replay.add_argument("--trace", required=True)
+sp_replay.set_defaults(func=cmd_replay)
+
 return p
 
 def main(argv=None):
 parser = build_parser()
 args = parser.parse_args(argv)
-
-if args.max_count is not None and args.max_count < 1:
-sys.stderr.write("gitlog: -n must be >= 1\n")
-return 3
-
-try:
-records = read_commits(
-args.repo,
-ref=args.ref,
-paths=args.paths,
-since=args.since,
-until=args.until,
-author=args.author,
-max_count=args.max_count,
-reverse=args.reverse,
-)
-for rec in records:
-if args.churn:
-add_churn(args.repo, rec)
-_emit(rec)
-return 0
-except GitLogError as exc:
-sys.stderr.write("gitlog: %s\n" % exc)
-return exc.code
+return args.func(args)
 
 if __name__ == "__main__":
 sys.exit(main())
 
-test_gitlog.py 168 lines on GitHub →
+test_conductor.py 210 lines on GitHub →
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""Tests for gitlog.py — run against a REAL throwaway git repo, not a mock.
+"""Tests for the conductor gift.
 
-The point of a source gift is that it reads a real git log correctly, so the
-tests build an actual repository in a temp dir and assert on the emitted records.
-Each test is written to BITE: it asserts specific values a broken implementation
-would get wrong (field mapping, ordering, churn arithmetic, path filtering),
-not merely that "some output appeared".
+Mutation-bitten. The load-bearing behaviors, each asserted so that deleting the
+behavior would fail the test:
+* typecheck-first: a broken pipeline must NOT launch any stage (assert no
+ledger records for stages, exit 3);
+* fail-clean: a failing stage stops the run, is recorded 'failed', and every
+later stage is recorded 'skipped' (assert both, exit 5);
+* the ledger records every stage in order with exit/bytes;
+* replay returns exactly the records for a trace-id.
 
-Run: python3 test_gitlog.py (exits non-zero if any assertion fails)
+Uses tiny real python subprocess stages so execution is genuinely exercised.
+Run: python3 -m unittest test_conductor -v (stdlib only, no deps)
 """
-
 import io
 import json
 import os
-import subprocess
 import sys
 import tempfile
+import unittest
+from contextlib import redirect_stdout, redirect_stderr
 
-import gitlog
+import conductor as cd
 
-def _git(repo, *args, env=None):
-subprocess.run(["git", "-C", repo] + list(args), check=True,
-stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+PY = sys.executable
 
-def _commit(repo, path, content, message, when):
-"""Write a file and commit it with a fixed author/committer date."""
-full = os.path.join(repo, path)
-os.makedirs(os.path.dirname(full), exist_ok=True) if os.path.dirname(full) else None
-with open(full, "w", encoding="utf-8") as fh:
-fh.write(content)
-_git(repo, "add", path)
-env = dict(os.environ)
-env["GIT_AUTHOR_DATE"] = when
-env["GIT_COMMITTER_DATE"] = when
-env["GIT_AUTHOR_NAME"] = "Ada Lovelace"
-env["GIT_AUTHOR_EMAIL"] = "ada@example.com"
-env["GIT_COMMITTER_NAME"] = "Ada Lovelace"
-env["GIT_COMMITTER_EMAIL"] = "ada@example.com"
-subprocess.run(["git", "-C", repo, "commit", "-m", message],
-check=True, stdout=subprocess.DEVNULL,
-stderr=subprocess.DEVNULL, env=env)
+# tiny real stages (as shell-quotable command strings for slug:verb:cmd tokens)
+# emit: prints two json-lines, ignores stdin (a source)
+EMIT = "%s -c \"print('{\\\"a\\\":1}');print('{\\\"a\\\":2}')\"" % PY
+# pass: echoes stdin to stdout unchanged (a transform)
+PASS = "%s -c \"import sys;sys.stdout.write(sys.stdin.read())\"" % PY
+# count: reads stdin, prints one summary line (a fold)
+COUNT = "%s -c \"import sys;n=len([l for l in sys.stdin if l.strip()]);print('{\\\"n\\\":%%d}'%%n)\"" % PY
+# boom: exits 1 after reading stdin (a failing stage)
+BOOM = "%s -c \"import sys;sys.stdin.read();sys.exit(1)\"" % PY
+# sink: reads stdin, writes nothing to stdout, exit 0
+SINK = "%s -c \"import sys;sys.stdin.read()\"" % PY
 
-def _make_repo(tmp):
-repo = os.path.join(tmp, "r")
-os.makedirs(repo)
-_git(repo, "init")
-_git(repo, "config", "user.name", "Ada Lovelace")
-_git(repo, "config", "user.email", "ada@example.com")
-# three commits, oldest first
-_commit(repo, "a.txt", "one\ntwo\nthree\n", "first: add a.txt",
-"2026-01-01T09:00:00")
-_commit(repo, "b.txt", "x\n", "second: add b.txt",
-"2026-01-02T09:00:00")
-_commit(repo, "a.txt", "one\ntwo\nthree\nfour\n", "third: extend a.txt",
-"2026-01-03T09:00:00")
-return repo
-
-def _run(argv):
-"""Run main() capturing stdout; return (exit_code, [parsed records])."""
-buf = io.StringIO()
-old = sys.stdout
-sys.stdout = buf
+def run(argv, stdin_text=None):
+obuf, ebuf = io.StringIO(), io.StringIO()
+old_stdin = sys.stdin
+if stdin_text is not None:
+sys.stdin = io.StringIO(stdin_text)
+# conductor.run writes final stdout via sys.stdout.buffer; capture that too
+old_stdout_buffer = getattr(sys.stdout, "buffer", None)
 try:
-code = gitlog.main(argv)
+with redirect_stdout(obuf), redirect_stderr(ebuf):
+# give the redirected StringIO a.buffer that tees to bytes
+class _B:
+def __init__(self, s): self.s = s
+def write(self, b): self.s.write(b.decode("utf-8", "replace"))
+sys.stdout.buffer = _B(obuf)
+code = cd.main(argv)
 finally:
-sys.stdout = old
-records = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
-return code, records
+sys.stdin = old_stdin
+out_recs = [json.loads(l) for l in obuf.getvalue().splitlines() if l.strip().startswith("{")]
+err_recs = [json.loads(l) for l in ebuf.getvalue().splitlines() if l.strip().startswith("{")]
+return code, out_recs, err_recs
 
-RESULTS = []
+def read_ledger(path):
+recs = []
+if os.path.exists(path):
+with open(path) as f:
+for line in f:
+line = line.strip()
+if line:
+recs.append(json.loads(line))
+return recs
 
-def check(name, cond):
-RESULTS.append((name, bool(cond)))
-print(("PASS" if cond else "FAIL") + " " + name)
+class TmpCase(unittest.TestCase):
+def setUp(self):
+self.d = tempfile.mkdtemp()
+self.ledger = os.path.join(self.d, "l.jsonl")
 
-def main():
-tmp = tempfile.mkdtemp(prefix="gitlog-test-")
-repo = _make_repo(tmp)
+def tearDown(self):
+import shutil
+shutil.rmtree(self.d, ignore_errors=True)
 
-# 1. count: three commits in, three records out.
-code, recs = _run(["--repo", repo])
-check("emits one record per commit (3)", code == 0 and len(recs) == 3)
+class TestGate(unittest.TestCase):
+def test_emits_accepts(self):
+self.assertFalse(cd.emits("sink"))
+self.assertFalse(cd.accepts("source"))
+self.assertTrue(cd.emits("source"))
+self.assertTrue(cd.accepts("sink"))
 
-# 2. default order is newest-first — the third commit leads.
-check("default order newest-first",
-recs[0]["subject"] == "third: extend a.txt"
-and recs[2]["subject"] == "first: add a.txt")
+class TestCheck(unittest.TestCase):
+def test_check_valid(self):
+code, out, _ = run(["check", "--stage", "a:source", "--stage", "b:fold"])
+self.assertEqual(code, 0)
+self.assertTrue(out[-1]["typechecks"])
 
-# 3. --reverse flips to oldest-first. (Bites an ignored --reverse.)
-code, rrecs = _run(["--repo", repo, "--reverse"])
-check("--reverse gives oldest-first",
-rrecs[0]["subject"] == "first: add a.txt"
-and rrecs[2]["subject"] == "third: extend a.txt")
+def test_check_broken_is_3(self):
+code, out, _ = run(["check", "--stage", "a:sink", "--stage", "b:transform"])
+self.assertEqual(code, 3)
+self.assertEqual(out[-1]["kind"], "refused")
 
-# 4. field mapping: author/email/dates land in the right keys.
-# (Bites a transposed field map — the classic %an/%ae swap.)
-top = recs[0]
-check("author name mapped correctly", top["author"] == "Ada Lovelace")
-check("email mapped correctly", top["email"] == "ada@example.com")
-check("committed date is the fixed ISO date",
-top["committed"].startswith("2026-01-03T09:00:00"))
-check("hash is 40 hex chars", len(top["hash"]) == 40
-and all(c in "0123456789abcdef" for c in top["hash"]))
-check("short is a prefix of hash", top["hash"].startswith(top["short"]))
+def test_check_undeclared_is_4(self):
+code, out, _ = run(["check", "--stage", "a:source", "--stage", "b:emits"])
+self.assertEqual(code, 4)
 
-# 5. no churn fields unless asked. (Bites churn leaking in by default.)
-check("no churn fields by default", "added" not in top and "files" not in top)
+class TestTypecheckFirstNoLaunch(TmpCase):
+"""THE typecheck-first guarantee: a broken pipeline must NOT run any stage.
+Assert exit 3 AND zero stage records in the ledger — deleting the pre-run
+typecheck would let a stage launch and write a record."""
 
-# 6. --churn arithmetic: the first commit added 3 lines to a.txt, 0 deleted.
-code, crecs = _run(["--repo", repo, "--reverse", "--churn"])
-first = crecs[0]
-check("churn: files counted", first.get("files") == 1)
-check("churn: added lines correct (3)", first.get("added") == 3)
-check("churn: deleted lines correct (0)", first.get("deleted") == 0)
-# third commit: +1 line, -0 on a.txt
-third = crecs[2]
-check("churn: extend commit added 1", third.get("added") == 1
-and third.get("deleted") == 0)
+def test_broken_pipeline_launches_nothing(self):
+code, out, err = run(["run",
+"--stage", "a:sink:%s" % SINK, # sink not last
+"--stage", "b:transform:%s" % PASS,
+"--ledger", self.ledger])
+self.assertEqual(code, 3)
+led = read_ledger(self.ledger)
+stage_recs = [r for r in led if r.get("kind") == "stage"]
+self.assertEqual(stage_recs, [], "a broken pipeline launched a stage — typecheck-first failed")
 
-# 7. --path filters to commits touching that path.
-# a.txt was touched by commits 1 and 3 only (not 2). Bites a broken filter.
-code, precs = _run(["--repo", repo, "--path", "a.txt"])
-subjects = {r["subject"] for r in precs}
-check("--path a.txt selects only its 2 commits",
-len(precs) == 2 and "second: add b.txt" not in subjects)
+class TestRunCleanRecords(TmpCase):
+def test_full_run_records_every_stage_in_order(self):
+code, out, err = run(["run",
+"--stage", "emit:source:%s" % EMIT,
+"--stage", "pass:transform:%s" % PASS,
+"--stage", "count:fold:%s" % COUNT,
+"--ledger", self.ledger, "--trace", "T1"])
+self.assertEqual(code, 0)
+led = read_ledger(self.ledger)
+stage_recs = [r for r in led if r.get("kind") == "stage"]
+self.assertEqual([r["index"] for r in stage_recs], [0, 1, 2])
+self.assertEqual([r["slug"] for r in stage_recs], ["emit", "pass", "count"])
+self.assertTrue(all(r["verdict"] == "ok" for r in stage_recs))
+# bytes flow: emit produces >0, count reads what pass passed
+self.assertGreater(stage_recs[0]["bytes_out"], 0)
+self.assertEqual(stage_recs[1]["bytes_in"], stage_recs[0]["bytes_out"])
+# run-summary on stderr says ok
+self.assertTrue(err[-1]["ok"])
 
-# 8. -n limits count. Bites an ignored max-count.
-code, nrecs = _run(["--repo", repo, "-n", "1"])
-check("-n 1 yields exactly one record", code == 0 and len(nrecs) == 1)
+class TestFailClean(TmpCase):
+"""A failing stage stops the run: it is recorded 'failed', every LATER stage
+'skipped', exit 5, and the summary names the failed stage. Deleting the
+fail-stop would let a later stage run on broken input."""
 
-# 9. not-a-repo is exit 2, not a crash and not exit 0.
-code, _ = _run(["--repo", tmp]) # tmp itself is not a git repo
-check("non-repo path exits 2", code == 2)
+def test_failure_stops_and_marks_skipped(self):
+code, out, err = run(["run",
+"--stage", "emit:source:%s" % EMIT,
+"--stage", "boom:transform:%s" % BOOM, # fails
+"--stage", "count:fold:%s" % COUNT, # must be skipped
+"--ledger", self.ledger, "--trace", "T2"])
+self.assertEqual(code, 5)
+led = read_ledger(self.ledger)
+by_slug = {r["slug"]: r for r in led if r.get("kind") == "stage"}
+self.assertEqual(by_slug["boom"]["verdict"], "failed")
+self.assertEqual(by_slug["count"]["verdict"], "skipped")
+# summary names the failed stage
+summ = err[-1]
+self.assertFalse(summ["ok"])
+self.assertEqual(summ["failed_stage"]["slug"], "boom")
 
-# 10. -n 0 is a usage error (exit 3).
-code, _ = _run(["--repo", repo, "-n", "0"])
-check("-n 0 is usage error (exit 3)", code == 3)
+def test_missing_cmd_on_run_is_exit2(self):
+code, out, err = run(["run", "--stage", "a:source", "--ledger", self.ledger])
+self.assertEqual(code, 2)
 
-# 11. stdout is clean JSON-lines: every emitted line parses as a JSON object.
-code, recs = _run(["--repo", repo])
-check("every line is a JSON object",
-all(isinstance(r, dict) for r in recs) and len(recs) == 3)
+class TestReplay(TmpCase):
+def test_replay_returns_only_that_trace(self):
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TA"])
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TB"])
+code, out, _ = run(["replay", "--ledger", self.ledger, "--trace", "TA"])
+self.assertEqual(code, 0)
+self.assertTrue(out)
+self.assertTrue(all(r["trace_id"] == "TA" for r in out))
+# TB records are NOT in TA's replay
+self.assertFalse(any(r["trace_id"] == "TB" for r in out))
 
-# 12. empty range is exit 0 with zero records (not an error).
-code, erecs = _run(["--repo", repo, "--since", "2030-01-01"])
-check("empty result is exit 0, zero records", code == 0 and erecs == [])
+def test_replay_unknown_trace_is_exit2(self):
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TA"])
+code, _, _ = run(["replay", "--ledger", self.ledger, "--trace", "NOPE"])
+self.assertEqual(code, 2)
 
-# --- meta: the suite must not be vacuous ---
-ran = len(RESULTS)
-passed = sum(1 for _, ok in RESULTS if ok)
-print("\n%d/%d checks passed (%d ran)" % (passed, ran, ran))
-if ran < 12:
-print("VACUITY GUARD FAILED: too few checks ran")
-return 1
-return 0 if passed == ran else 1
+class TestStdinStages(TmpCase):
+def test_stages_from_stdin_run(self):
+stdin = "\n".join([
+json.dumps({"slug": "emit", "port_verb": "source", "cmd": cd.shlex.split(EMIT)}),
+json.dumps({"slug": "sink", "port_verb": "sink", "cmd": cd.shlex.split(SINK)}),
+])
+code, out, err = run(["run", "--stdin", "--ledger", self.ledger, "--trace", "TS"],
+stdin_text=stdin)
+self.assertEqual(code, 0)
+
+class TestVerbs(unittest.TestCase):
+def test_verbs_five_in_order(self):
+code, out, _ = run(["verbs"])
+self.assertEqual(code, 0)
+self.assertEqual([r["port_verb"] for r in out],
+["source", "transform", "filter", "fold", "sink"])
 
 if __name__ == "__main__":
-sys.exit(main())
+unittest.main()
 
 Take the whole folder →
 MIT
-Python stdlib only
+Python 3, standard library only
 
 ---
 
-# Grain — a Loop MMT gift
-https://loopmmt.com/gifts/grain/
+# Conflict — a Loop MMT gift
+https://loopmmt.com/gifts/conflict/
 [coverage: optional · branch: gifts]
 
-Structure Smell Test smell ← all gifts
+A Broken Merge Can't Land filter ← all gifts
 
-Grain
+Conflict
 
-Compress your data, compare the ratio against a size-matched random null model drawn live, and get a self-calibrating reading of how much structure vs. noise — no hand-set threshold. Snapshot it over time and it becomes a cheap drift alarm.
+A merge that goes wrong leaves <<<<<<<, =======, >>>>>>> markers wedged into a file; once committed, that file no longer parses — it isn't 'a merge in progress,' it's broken source that landed, and it hides until something tries to read it. Conflict is the one-command gate: wire it into a pre-commit hook or CI and a file carrying the marker triad simply cannot land. The clever part is the TRIAD RULE — ======= alone is a legal line (a Markdown rule, a comment banner), so conflict fires only on all three markers together, line-start only, and never cries wolf on a legal ======= or a marker mid-line.
 
 The honest edge
 
-It's a smell, not a proof — a smoke alarm, not an arson investigator. Great for staleness and homogenization drift; not a data-rot or dead-link checker.
+This is a check, not an immunity — it protects you only when it is RUN, so wire it into a hook or CI rather than trusting a human to remember. And it detects the standard git marker triad; a tool that uses different markers needs a different pattern. Visibility, not immunity.
 
 Run it
 
-python3 grain.py --help
-test_grain.py (5/5)
-Python stdlib only
-
-The code — every file that ships
-
-grain.py 315 lines on GitHub →
-#!/usr/bin/env python3
-"""
-grain.py — a self-calibrating structure & drift smell test for any corpus.
-
-Does this text/relation have *grain* — real structure — or is it slurry?
-
-WHAT IT DOES
-It compresses your data with zlib (a Kolmogorov UPPER bound: DEFLATE finds
-repeated substructure) and compares the compression ratio against a
-size-matched, deterministically-seeded RANDOM NULL MODEL built from your own
-data's own symbols. If your data compresses clearly *more* than random
-arrangements of the same symbols, it carries structure a random baseline does
-not — a rule, a template, a hub, a repetition. The threshold is drawn LIVE
-from the null model, so there is no magic number to hand-tune as your data
-grows. That self-calibration is the whole trick.
-
-WHAT IT IS GOOD FOR (graded honestly)
-* Corpus staleness / homogenization drift — its BEST fit. Snapshot the grain
-signature over time; a drift is a near-free staleness/homogenization alarm.
-No labels, no model, no training. (see: --drift)
-* "AI slop" smell — YES, as a SMELL, not a classifier.
-Machine-generated text trends more templated/redundant; rising structure
-against the null is a cheap smoke alarm. A smoke alarm, not an investigator.
-* Detecting a generating rule leaking into a published relation (hub / label
-reuse) — the original use this was extracted from. (see: --relation)
-
-WHAT IT IS *NOT* GOOD FOR
-* Data rot (dead links, broken references, bit-decay). Wrong tool — that is a
-reference-integrity problem; this measures structure, not reachability.
-* A proof of anything. It is a lower-bound SMELL. zlib is an upper bound on
-complexity, so a low ratio proves compressibility, not a specific cause; and
-it is WEAK on chain-shaped rules (a chain reuses each symbol ~twice, like a
-sparse random graph), so a clean reading is not a certificate of "no rule."
-
-Stdlib only. Deterministic (seeded). No dependencies. MIT licensed.
-
-Origin: extracted and generalized from the "non-compressibility gate" in the
-Loop MMT corpus-map builder. The specific application (generator-leak detection
-in a published edge graph) stayed home; this is the general kernel, given away.
-"""
-from __future__ import annotations
-
-import argparse
-import json
-import random
-import statistics
-import sys
-import zlib
-
-class GrainInputError(Exception):
-"""A clean, user-facing input error (bad path, unreadable baseline).
-
-Raised instead of letting an OSError traceback escape, so adversarial I/O
-fails with a one-line message and a nonzero exit (exit 2) rather than a
-stack trace."""
-
-# --- the one documented knob ------------------------------------------------
-Z_CUT = 2.0 # flag STRUCTURED when the real ratio is > Z sd below the
-# null MEAN — more compressible than random arrangements of
-# its own symbols, beyond normal variation. Self-calibrating
-# (mean+sd drawn live); no absolute number to drift.
-NULL_TRIALS = 64 # deterministic sample size of the random baseline
-NULL_SEED = 0xC0DE # fixed seed => folds-twice-identical (reproducible)
-MIN_SD = 1e-6 # sd-floor: below this the baseline is degenerate and the
-# z-cut is meaningless, so fall back to a coarse fraction.
-DEGENERATE_FRACTION = 0.5 # backstop only when the null baseline has ~no spread
-
-def _zlib_ratio(raw: bytes) -> float:
-"""rho = compressed_len / raw_len at max level. LOW rho => compressible => structure."""
-if not raw:
-return 1.0
-return len(zlib.compress(raw, 9)) / len(raw)
-
-def _serialize(tokens) -> bytes:
-"""
-Canonical bytes for a token sequence: newline-joined, real symbols kept.
-We keep the REAL tokens (never remap to a dense integer alphabet): structure
-manifests as repeated real tokens, and that reuse is exactly the compressible
-signal to catch. The null is serialized identically, so any per-token length
-effect cancels between actual and null.
-"""
-return "\n".join(tokens).encode("utf-8")
-
-def _null_stats(n_tokens, null_draw):
-"""
-zlib-ratio DISTRIBUTION of `NULL_TRIALS` size-matched RANDOM draws from the
-data's own alphabet — NOT a permutation of the same multiset. Drawing fresh
-from the alphabet is what lets a real rule stand out: the actual reuses a hub
-label (`x -> glossary` many times) far more than a uniform draw over the
-alphabet does, so the actual compresses more and its z_score drops. (A
-same-multiset permutation would hold that reuse INSIDE the null and detect
-nothing — the exact bug this replaced.) Deterministic (seeded). Returns
-(mean, population_sd) over the draws.
-
-`null_draw(rng, n)` returns one random size-n token list from the alphabet.
-"""
-if n_tokens < 2:
-return 1.0, 0.0
-rng = random.Random(NULL_SEED)
-ratios = [_zlib_ratio(_serialize(null_draw(rng, n_tokens)))
-for _ in range(NULL_TRIALS)]
-return statistics.mean(ratios), statistics.pstdev(ratios)
-
-def _alphabet_draw(alphabet):
-"""Default null: draw n symbols uniformly (with replacement) from `alphabet`.
-
-The pool is `sorted`, not a bare `list(alphabet)`: a set's iteration order is
-randomized per process (PYTHONHASHSEED), so an unsorted pool made the fixed
-PRNG seed index a differently-ordered pool in every process — same input, two
-processes, different z-score (GIFT-006). Determinism is a whole-pipeline
-property; the seed alone is not enough if upstream ordering is not canonical.
-The relation path already sorts its node pool; this brings the token path to
-the same footing.
-"""
-pool = sorted(alphabet)
-return lambda rng, n: [rng.choice(pool) for _ in range(n)]
-
-def signature(tokens, null_draw=None):
-"""
-The grain signature of a token sequence, self-calibrated against a size-matched
-uniform draw from its own alphabet. `z_score` is sigma below (negative) / above
-the null mean: strongly negative => structured (compresses more than a random
-draw of its size does). Pass `null_draw` to supply a domain-specific null (see
-the relation path); default is a uniform draw over the distinct tokens.
-"""
-tokens = list(tokens)
-if null_draw is None:
-null_draw = _alphabet_draw(set(tokens) or {""})
-rho_actual = _zlib_ratio(_serialize(tokens))
-mean_null, sd_null = _null_stats(len(tokens), null_draw)
-rel = (rho_actual / mean_null) if mean_null else 1.0
-z = ((rho_actual - mean_null) / sd_null) if sd_null > MIN_SD else 0.0
-degenerate = sd_null <= MIN_SD
-if not tokens:
-structured = False
-elif degenerate:
-structured = rho_actual < DEGENERATE_FRACTION * mean_null
-else:
-structured = z < -Z_CUT
-return {
-"tokens": len(tokens),
-"rho_actual": round(rho_actual, 4),
-"mean_null": round(mean_null, 4),
-"sd_null": round(sd_null, 4),
-"rel_to_null": round(rel, 4),
-"z_score": round(z, 3),
-"z_cut": Z_CUT,
-"null_trials": NULL_TRIALS,
-"degenerate_baseline": degenerate,
-"verdict": "STRUCTURED" if structured else "IDIOSYNCRATIC",
-}
-
-# --- input modes ------------------------------------------------------------
-
-def tokens_from_text(text, mode="lines"):
-if mode == "lines":
-return [ln for ln in text.splitlines() if ln.strip()]
-if mode == "words":
-return text.split()
-raise ValueError(f"unknown text mode: {mode}")
-
-def tokens_from_relation(text):
-"""Each non-empty line is an edge `a->b` or `a<TAB>b`; kept as a real token."""
-out = []
-for ln in text.splitlines():
-ln = ln.strip()
-if not ln:
-continue
-if "->" in ln:
-a, b = ln.split("->", 1)
-elif "\t" in ln:
-a, b = ln.split("\t", 1)
-else:
-a, b = ln, ""
-out.append(f"{a.strip()}->{b.strip()}")
-return sorted(out) # canonical order, like the original relation serializer
-
-def relation_null_draw(edge_tokens):
-"""
-Faithful relation null (from the original gate): the alphabet is the NODE set,
-and each null draw is `n` random DISTINCT directed pairs from it. A rule-leak
-(a hub reusing one target node across many edges) sits far below this uniform-
-pair baseline; a genuinely idiosyncratic dependency graph sits inside it.
-"""
-nodes = set()
-for tok in edge_tokens:
-if "->" in tok:
-a, b = tok.split("->", 1)
-nodes.add(a.strip())
-nodes.add(b.strip())
-nodes = sorted(nodes)
-all_pairs = [(a, b) for a in nodes for b in nodes if a!= b]
-
-def draw(rng, n):
-k = min(n, len(all_pairs))
-return [f"{a}->{b}" for a, b in sorted(rng.sample(all_pairs, k))] if k > 0 else []
-
-return draw
-
-def _read(path):
-if path == "-":
-return sys.stdin.read()
-try:
-with open(path, "r", encoding="utf-8", errors="replace") as fh:
-return fh.read()
-except (OSError, IOError) as exc:
-# A clean one-line refusal instead of a traceback: missing file,
-# a directory given as a file, permission denied, etc.
-raise GrainInputError("cannot read %r: %s" % (path, exc.strerror or exc))
-
-HONEST_CEILING = (
-"note: a lower-bound SMELL, never a proof. zlib is an upper bound on "
-"complexity, so a low ratio proves compressibility, not a specific cause; "
-"it is weak on chain-shaped rules; and it says nothing about data rot "
-"(broken references) — that is a different tool."
-)
-
-def main(argv=None):
-p = argparse.ArgumentParser(
-description="Self-calibrating structure & drift smell test for any corpus.",
-epilog=HONEST_CEILING,
-)
-p.add_argument("path", help="file to read, or '-' for stdin")
-p.add_argument("--relation", action="store_true",
-help="treat each line as an edge (a->b) instead of prose")
-p.add_argument("--words", action="store_true",
-help="tokenize prose by words instead of lines")
-p.add_argument("--drift", metavar="BASELINE.json",
-help="compare this input's signature against a saved baseline "
-"and report the change (the staleness alarm)")
-p.add_argument("--save", metavar="OUT.json",
-help="write this input's signature to OUT.json as a baseline")
-p.add_argument("--json", action="store_true", help="machine-readable output")
-args = p.parse_args(argv)
-
-try:
-return _run(args)
-except GrainInputError as exc:
-sys.stderr.write("grain: %s\n" % exc)
-return 2
-
-def _run(args):
-text = _read(args.path)
-if args.relation:
-toks = tokens_from_relation(text)
-sig = signature(toks, null_draw=relation_null_draw(toks))
-else:
-toks = tokens_from_text(text, "words" if args.words else "lines")
-sig = signature(toks)
-
-if args.save:
-try:
-with open(args.save, "w", encoding="utf-8") as fh:
-json.dump(sig, fh, indent=2, sort_keys=True)
-except (OSError, IOError) as exc:
-raise GrainInputError("cannot write %r: %s"
-% (args.save, exc.strerror or exc))
-
-if args.drift:
-try:
-with open(args.drift, "r", encoding="utf-8") as fh:
-base = json.load(fh)
-except (OSError, IOError) as exc:
-raise GrainInputError("cannot read baseline %r: %s"
-% (args.drift, exc.strerror or exc))
-except ValueError as exc:
-raise GrainInputError("baseline %r is not valid JSON: %s"
-% (args.drift, exc))
-delta_z = round(sig["z_score"] - base.get("z_score", 0.0), 3)
-delta_rel = round(sig["rel_to_null"] - base.get("rel_to_null", 1.0), 4)
-drift = {
-"baseline_z": base.get("z_score"),
-"current_z": sig["z_score"],
-"delta_z": delta_z,
-"delta_rel_to_null": delta_rel,
-# more structure than before => drift toward homogenization/staleness
-"reading": ("MORE STRUCTURED than baseline (homogenizing/staling)"
-if delta_z < -0.5 else
-"LESS STRUCTURED than baseline (diversifying)"
-if delta_z > 0.5 else
-"stable (within noise)"),
-}
-if args.json:
-print(json.dumps({"signature": sig, "drift": drift}, indent=2, sort_keys=True))
-else:
-print(f"grain drift: {drift['reading']} (delta_z={delta_z})")
-print(HONEST_CEILING)
-return 0
-
-if args.json:
-print(json.dumps(sig, indent=2, sort_keys=True))
-else:
-print(f"grain: {sig['verdict']} "
-f"(z={sig['z_score']} vs cut -{sig['z_cut']}; "
-f"{sig['tokens']} tokens; rho={sig['rho_actual']} vs null {sig['mean_null']})")
-print(HONEST_CEILING)
-return 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_grain.py 71 lines on GitHub →
-#!/usr/bin/env python3
-"""Tests for grain.py — the discrimination must be real, not a no-op."""
-import json
-import subprocess
-import sys
-import tempfile
-import os
-
-import grain
-
-def test_structured_vs_idiosyncratic():
-# A hub/template: every line reuses the same target token — a generator leak.
-structured = [f"class_{i}->glossary" for i in range(60)]
-# Idiosyncratic: distinct random-ish pairs, little reuse.
-import random
-rng = random.Random(1)
-nodes = [f"n{i}" for i in range(60)]
-idio = sorted({f"{rng.choice(nodes)}->{rng.choice(nodes)}" for _ in range(60)})
-s_struct = grain.signature(structured, null_draw=grain.relation_null_draw(structured))
-s_idio = grain.signature(idio, null_draw=grain.relation_null_draw(idio))
-# The structured set must read more compressible (lower z) than the idiosyncratic.
-assert s_struct["z_score"] < s_idio["z_score"], (s_struct, s_idio)
-assert s_struct["verdict"] == "STRUCTURED", s_struct
-
-def test_determinism():
-toks = [f"a{i}->b{i%7}" for i in range(50)]
-a = grain.signature(toks)
-b = grain.signature(toks)
-assert a == b, "signature must fold-twice-identical (seeded)"
-
-def test_empty_is_not_structured():
-s = grain.signature([])
-assert s["verdict"] == "IDIOSYNCRATIC", s
-
-def test_drift_detects_homogenization():
-diverse = [f"n{i}->m{i}" for i in range(60)] # low structure
-homogd = [f"n{i}->glossary" for i in range(60)] # high structure (hub)
-base = grain.signature(diverse, null_draw=grain.relation_null_draw(diverse))
-now = grain.signature(homogd, null_draw=grain.relation_null_draw(homogd))
-# Homogenized corpus is MORE structured => z drops.
-assert now["z_score"] < base["z_score"]
-
-def test_cli_json_and_honest_ceiling():
-with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
-fh.write("\n".join(f"class_{i}->glossary" for i in range(40)))
-path = fh.name
-try:
-out = subprocess.run(
-[sys.executable, "grain.py", path, "--relation", "--json"],
-capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
-)
-assert out.returncode == 0, out.stderr
-data = json.loads(out.stdout)
-assert "verdict" in data and "z_score" in data
-finally:
-os.unlink(path)
-
-if __name__ == "__main__":
-n = 0
-for name, fn in sorted(globals().items()):
-if name.startswith("test_") and callable(fn):
-fn()
-print(f"ok {name}")
-n += 1
-print(f"\n{n}/{n} passed")
-
-Take the whole folder →
-MIT
-Python stdlib only
-
----
-
-# Hunkhole — a Loop MMT gift
-https://loopmmt.com/gifts/hunkhole/
-[coverage: optional · branch: gifts]
-
-The Change Git Hides filter ← all gifts
-
-Hunkhole
-
-Git tells you which FILES changed. It does not tell you when a stale working tree, a bad merge, or a clumsy restore quietly REVERTED part of a file while leaving the file itself in place — a file-presence check reads that as a clean recovery. Hunkhole is the one command that catches it: it diffs the set of named top-level definitions (function / const / exports / def) between two git revisions and reports the ones that vanished. A symbol present before and gone after, with nothing renamed to take its place, is the reverted-hunk shape. Read-only, deterministic, stdlib-only.
-
-The honest edge
-
-Every hit is a QUESTION, not a verdict — a symbol you renamed or retired reads exactly like one that was reverted away, so hunkhole hands you the finite list and you rule on each. And a clean run is NOT a clean bill: it sees NAMED TOP-LEVEL definitions only, so a hunk reverted inside a surviving function body is invisible to it. Visibility, not immunity.
-
-Run it
-
-python3 hunkhole.py --help
-test_hunkhole.py (30 checks / 8 tests, mutation-bitten, pinned golden vanished-set + throwaway-repo end-to-end)
+python3 conflict.py --help
+test_conflict.py (18 checks / 7 tests, mutation-bitten, triad-rule + line-start guards + throwaway-repo end-to-end)
 Python standard library only, read-only, deterministic
 
 The code — every file that ships
 
-hunkhole.py 177 lines on GitHub →
+conflict.py 172 lines on GitHub →
 #!/usr/bin/env python3
-"""hunkhole — find the change that git's own tools hide: a reverted hunk.
+"""conflict — refuse to commit a file that no longer parses.
 
-THE HOLE THIS FILLS
+A merge that goes wrong leaves `<<<<<<<`, `=======`, `>>>>>>>` markers wedged
+into a file. Once committed, that file no longer parses — it isn't "a merge in
+progress," it's broken source that landed. Worse, it hides: the failure surfaces
+only when something tries to read the file, and if that read happens in a quiet
+place, it can sit on your main branch for days while everything downstream of it
+silently degrades.
 
-Git tells you which *files* changed. It does not tell you when a stale working
-tree, a bad merge, or a clumsy restore quietly *reverted* part of a file while
-leaving the file itself in place. A file-presence check reads that as a clean
-recovery — the file is there, so nothing looks wrong — while a load-bearing
-definition that used to live inside it is simply gone.
+`conflict` is the one-command gate that catches it. It scans a git tree for the
+merge-marker triad and exits non-zero if any file carries an unresolved merge, so
+you can wire it into a pre-commit hook or CI and a broken file simply cannot land.
 
-That failure is real and it hides well: a stale tree can revert tens of
-thousands of lines across dozens of files, a later restore returns every *file*,
-and because every file is present, no one notices the definitions that never
-came back. hunkhole is the one command that would have found it.
+WHY IT'S HONEST
 
-THE PROBE
+- **The triad, never the lone middle.** `=======` on its own is a legal line — a
+Markdown horizontal rule, a Python separator comment, an ASCII banner. It is a
+conflict marker ONLY in the company of `<<<<<<<` and `>>>>>>>` in the same
+file. `conflict` fires on the *triad within one file*, never on a bare
+`=======`. A lint that cries wolf on a legal line gets disabled, and a disabled
+lint is worse than none.
 
-Not "did this file change" (forward work changes files constantly) but "is a
-named, top-level definition that existed at BEFORE absent at AFTER." A symbol
-present in the old revision and gone in the new one, with nothing renamed to
-take its place, is the reverted-hunk shape. hunkhole diffs the *set of defined
-names* between two git revisions and reports the ones that vanished.
+- **Decidable from bytes.** A conflict marker on a branch needs no judgment, no
+review, no discussion — it is arithmetic. `conflict` reports the finding as an
+exit code, not a paragraph: exit codes don't decay, don't need finding, and
+cost nothing to re-run.
 
-WHY IT'S HONEST — read this before trusting a clean run
+- **It is read-only.** It reads blobs out of git (or off disk) and compares. It
+writes nothing and fixes nothing.
 
-- **Every hit is a QUESTION, not a verdict.** A symbol you deliberately renamed
-or retired reads exactly like one that was reverted away. hunkhole hands you
-the finite list of vanished names; you rule on each. It never claims a symbol
-"should" still be there.
+THE HONEST EDGE
 
-- **A clean run is NOT a clean bill.** hunkhole sees *named top-level*
-definitions (function / const / exports / def). A hunk reverted *inside* a
-surviving function body is invisible to it — the function name is still there.
-Absence of a finding is not proof of a clean restore, and the tool says so in
-its own output.
-
-- **It is read-only.** It writes nothing, changes nothing, fixes nothing. It
-reads two revisions out of git and compares symbol sets.
-
-Visibility, not immunity. You are the witness.
+This is a check, not an immunity — it protects you only when it is RUN. Wire it
+into a hook or CI so "run it" isn't something a human has to remember. And it
+detects the standard git marker triad; a tool that uses different markers needs a
+different pattern. Visibility, not immunity.
 
 USAGE
-python3 hunkhole.py <BEFORE> [AFTER]
-BEFORE a git revision (sha, tag, branch) — the "known-good" side
-AFTER a git revision to compare against (default: HEAD)
+python3 conflict.py # scan the working tree (tracked files)
+python3 conflict.py --ref main # scan any committed tree by ref
+python3 conflict.py --ignore _snapshots/ --ignore vendor/
+# skip path substrings (repeatable)
 
-python3 hunkhole.py <BEFORE> <AFTER> --against <CLOBBER>
---against limit the sweep to files touched by one suspect commit,
-instead of every file that differs between BEFORE and AFTER
-
-EXIT 0 = no vanished symbols · 3 = findings (the alarm) · 2 = error/usage
+EXIT 0 = clean · 3 = unresolved merge found (the alarm) · 2 = error/usage
 
 MIT licensed. Python standard library only. Read-only. Deterministic.
 """
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 
-# Named top-level definitions across the common scripting languages.
-# JS: function foo / const foo = / foo: function / exports.foo · Python: def foo
-_DEF_PATTERN = re.compile(
-r"^\s*(?:"
-r"function\s+(\w+)"
-r"|const\s+(\w+)\s*="
-r"|(\w+)\s*:\s*function"
-r"|exports\.(\w+)"
-r"|def\s+(\w+)"
-r")",
-re.M,
-)
-_CODE_SUFFIXES = (".js", ".py", ".sh", ".mjs", ".cjs")
+# The three markers git leaves on a conflicted merge. `=======` is only a marker
+# in the company of the other two — see the triad rule in main().
+MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
 
-def git(*args: str) -> str | None:
-"""Run a git command; return stdout on success, None on failure."""
-r = subprocess.run(["git", *args], capture_output=True, text=True)
-return r.stdout if r.returncode == 0 else None
+def git_files(ref: str | None) -> list[str]:
+"""List tracked files at `ref` (committed tree) or in the working tree."""
+if ref:
+out = subprocess.run(
+["git", "ls-tree", "-r", "--name-only", ref],
+capture_output=True, text=True,
+).stdout
+else:
+out = subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout
+return out.split()
 
-def symbols(text: str) -> set[str]:
-"""The set of named top-level definitions found in a blob of source text."""
-return {name for groups in _DEF_PATTERN.findall(text) for name in groups if name}
+def read_blob(f: str, ref: str | None) -> bytes:
+"""Read a file's bytes at `ref` or from the working tree."""
+if ref:
+return subprocess.run(["git", "show", f"{ref}:{f}"], capture_output=True).stdout
+with open(f, "rb") as fh:
+return fh.read()
 
-def vanished_symbols(before_text: str, after_text: str) -> list[str]:
-"""Names defined in `before_text` but not in `after_text`, sorted."""
-return sorted(symbols(before_text) - symbols(after_text))
+def marker_lines(text: str) -> dict[str, list[int]]:
+"""Map each marker to the 1-based line numbers where a line STARTS with it."""
+lines = text.split("\n")
+return {m: [i + 1 for i, ln in enumerate(lines) if ln.startswith(m)] for m in MARKERS}
 
-def is_code(path: str) -> bool:
-"""True iff the path has a suffix hunkhole probes for symbols."""
-return path.endswith(_CODE_SUFFIXES)
+def has_conflict(text: str) -> bool:
+"""True iff `text` contains the full marker TRIAD (not a lone `=======`)."""
+found = marker_lines(text)
+return all(found[m] for m in MARKERS)
 
-def scan(before: str, after: str = "HEAD", against: str | None = None):
-"""Compare two revisions; return (files_swept, holes, absent).
+def is_ignored(path: str, ignore: tuple[str,...]) -> bool:
+"""True iff `path` contains any ignore substring (skip it)."""
+return any(ig in path for ig in ignore)
 
-holes — list of (path, [vanished names]) for surviving code files.
-absent — list of paths present at `before` and absent at `after`
-(a whole-file drop; reported alongside hunk holes).
-Returns (None, None, None) if the underlying diff can't be produced.
-"""
-listing = git("diff", "--name-only", before, against or after)
-if listing is None:
-return None, None, None
-files = sorted(listing.split())
-
-holes: list[tuple[str, list[str]]] = []
-absent: list[str] = []
-for f in files:
-a = git("show", f"{before}:{f}")
-if a is None:
-continue # born after BEFORE — not hunkhole's business
-b = git("show", f"{after}:{f}")
-if b is None:
-absent.append(f) # whole-file drop — reported, not hunkhole's core probe
+def scan(ref: str | None = None, ignore: tuple[str,...] = ()) -> list[tuple[str, dict]]:
+"""Return [(path, marker_lines)] for every tracked file carrying the triad."""
+hits: list[tuple[str, dict]] = []
+for f in git_files(ref):
+if is_ignored(f, ignore):
 continue
-if not is_code(f):
-continue # symbols are a code probe; data files need a different lens
-gone = vanished_symbols(a, b)
-if gone:
-holes.append((f, gone))
-return files, holes, absent
+try:
+raw = read_blob(f, ref)
+except (OSError, FileNotFoundError):
+continue
+try:
+text = raw.decode("utf-8")
+except UnicodeDecodeError:
+continue # a binary blob has no markers to read
+if has_conflict(text):
+hits.append((f, marker_lines(text)))
+return hits
 
-def render(before: str, after: str, against: str | None, files, holes, absent) -> str:
-"""Render a scan result as the human-readable report text."""
-header = f"hunkhole: {before[:9]} -> {after}"
-if against:
-header += f" (files touched by {against[:9]})"
-header += f" · {len(files)} file(s) swept"
-lines = [header, "-" * 78]
-for f in absent:
-lines.append(f"FILE ABSENT {f}")
-for f, gone in holes:
-lines.append(f"HOLE {f}")
-for s in gone:
-lines.append(f" gone: {s}()")
-if not holes and not absent:
-lines.append("no named definition present at BEFORE is missing at AFTER.")
-lines.append("(NOT a clean bill — a hunk inside a surviving function body is invisible here.)")
-lines.append("-" * 78)
-n = len(holes) + len(absent)
-lines.append(
-f"{n} finding(s). Each is a QUESTION, not a verdict — a rename reads the same as a revert."
-)
-return "\n".join(lines)
+def _parse_args(argv: list[str]) -> tuple[str | None, tuple[str,...]]:
+ref: str | None = None
+ignore: list[str] = []
+i = 0
+while i < len(argv):
+a = argv[i]
+if a == "--ref":
+if i + 1 >= len(argv):
+raise ValueError("--ref needs a git ref")
+ref = argv[i + 1]
+i += 2
+elif a == "--ignore":
+if i + 1 >= len(argv):
+raise ValueError("--ignore needs a path substring")
+ignore.append(argv[i + 1])
+i += 2
+elif a in ("-h", "--help"):
+raise ValueError("__help__")
+else:
+raise ValueError(f"unknown argument: {a}")
+return ref, tuple(ignore)
 
 def main(argv: list[str]) -> int:
-if not argv or argv[0] in ("-h", "--help"):
+try:
+ref, ignore = _parse_args(argv)
+except ValueError as exc:
+if str(exc) == "__help__":
 sys.stdout.write(__doc__)
 return 2
-before = argv[0]
-after = argv[1] if len(argv) > 1 and not argv[1].startswith("--") else "HEAD"
-against = None
-if "--against" in argv:
-i = argv.index("--against")
-if i + 1 >= len(argv):
-sys.stderr.write("hunkhole: --against needs a revision\n")
-return 2
-against = argv[i + 1]
-
-files, holes, absent = scan(before, after, against)
-if files is None:
-sys.stderr.write(f"hunkhole: cannot diff {before}..{against or after}\n")
+sys.stderr.write(f"conflict: {exc}\n")
 return 2
 
-sys.stdout.write(render(before, after, against, files, holes, absent) + "\n")
-return 3 if (holes or absent) else 0
+hits = scan(ref, ignore)
+where = f"`{ref}`" if ref else "the working tree"
+
+if not hits:
+sys.stdout.write(f"conflict: clean — no unresolved merge in {where}.\n")
+return 0
+
+sys.stderr.write(
+f"conflict: {len(hits)} file(s) in {where} carry an UNRESOLVED MERGE.\n"
+)
+for f, found in hits:
+ln = found["<<<<<<< "][0]
+sys.stderr.write(
+f" {f}:{ln} <<<<<<< / ======= / >>>>>>> "
+f"({len(found['<<<<<<< '])} conflict block(s))\n"
+)
+sys.stderr.write(
+"\nA conflict marker on a branch is not a merge in progress — it is a "
+"FILE THAT NO LONGER PARSES, landed. Resolve it. Do not commit over it.\n"
+)
+return 3
 
 if __name__ == "__main__":
 raise SystemExit(main(sys.argv[1:]))
 
-test_hunkhole.py 185 lines on GitHub →
+test_conflict.py 181 lines on GitHub →
 #!/usr/bin/env python3
-"""test_hunkhole.py — the certifying properties of the hunkhole gift.
+"""test_conflict.py — the certifying properties of the conflict gift.
 
-Run: python3 test_hunkhole.py (exit 0 = all pass, 1 = a failure)
+Run: python3 test_conflict.py (exit 0 = all pass, 1 = a failure)
 
-hunkhole's git-facing shell is exercised end-to-end in a throwaway repo; its
-symbol-diff CORE (symbols / vanished_symbols / is_code / render) is pure and is
-tested directly on fixtures. Each test is MUTATION-BITTEN: it is here because a
-plausible mutation of hunkhole.py makes it fail loud. The core-diff test pins a
-GOLDEN sorted vanished-set — a rename reading identically to a revert is the
-exact property that must hold, and a golden proves the set, not just its size.
+The load-bearing property is the TRIAD RULE: a lone `=======` (a legal line) must
+NOT fire, while the full marker triad must. Each test is MUTATION-BITTEN — it is
+here because a plausible mutation of conflict.py makes it fail loud. The core is
+pure (marker_lines / has_conflict / is_ignored), so it's tested directly; the
+git-facing shell is exercised in a throwaway repo.
 """
-import hashlib
 import os
 import subprocess
 import sys
-import tempfile
 
-import hunkhole as h
+import conflict as c
 
 _FAILURES: list[str] = []
 _PASSES = 0
@@ -1523,129 +816,129 @@ _PASSES += 1
 else:
 _FAILURES.append(msg)
 
-# ---- fixtures: before/after source blobs -----------------------------------
-BEFORE_JS = """\
-function alpha() { return 1;}
-const beta = () => 2;
-gamma: function () { return 3;}
-exports.delta = function () {};
-function survivor() {
-let innerReverted = 9; // a hunk inside a surviving body (not def-shaped)
-return innerReverted;
-}
-"""
-AFTER_JS = """\
-const beta = () => 2;
-exports.delta = function () {};
-function survivor() {
-return 0; // innerReverted hunk reverted, name survives
-}
+CONFLICTED = """\
+line before
+<<<<<<< HEAD
+ours
+=======
+theirs
+>>>>>>> origin/main
+line after
 """
 
-BEFORE_PY = """\
-def one(): pass
-def two(): pass
-def three(): pass
+# a lone `=======` in legal, innocent company — MUST NOT fire
+INNOCENT_RULE = """\
+Section One
+=======
+Section Two
+
+Some prose under a Markdown setext rule.
 """
-AFTER_PY = """\
-def one(): pass
-def three(): pass
+
+INNOCENT_BANNER = """\
+# ============================================================
+# a decorative comment banner, not a conflict
+# ============================================================
+def f(): pass
 """
 
-# ---- 1. the core diff: vanished top-level names, pinned golden --------------
-def test_vanished_golden():
-gone_js = h.vanished_symbols(BEFORE_JS, AFTER_JS)
-# alpha (function) and gamma (obj-method) vanished; beta/delta/survivor stayed.
-check(gone_js == ["alpha", "gamma"], f"JS vanished set wrong: {gone_js}")
-# the hunk INSIDE survivor() is invisible — survivor is not reported gone
-check("survivor" not in gone_js, "survivor should NOT be flagged (in-body hunk is invisible)")
-# pin a golden signature over a combined fixture run
-gone_py = h.vanished_symbols(BEFORE_PY, AFTER_PY)
-check(gone_py == ["two"], f"PY vanished set wrong: {gone_py}")
-sig = hashlib.sha256(("|".join(gone_js) + "#" + "|".join(gone_py)).encode()).hexdigest()
-golden = "72e9237f911294dc57a66b67e296fb888a0d43373cbb485118d4f73a4df09f8b"
-check(sig == golden, f"golden vanished-set signature drifted: got {sig[:16]}...")
+# --- 1. the triad fires; a lone middle does not (the core property) ----------
+def test_triad_rule():
+check(c.has_conflict(CONFLICTED), "the full marker triad must be detected")
+check(not c.has_conflict(INNOCENT_RULE), "a lone ======= (Markdown rule) must NOT fire")
+check(not c.has_conflict(INNOCENT_BANNER), "a ==== banner must NOT fire")
+# a triad that is missing one leg must NOT fire
+missing_close = CONFLICTED.replace(">>>>>>> origin/main\n", "")
+check(not c.has_conflict(missing_close), "two-of-three markers must NOT fire (needs the triad)")
 
-# ---- 2. a rename reads the same as a revert (the honest-edge property) ------
-def test_rename_reads_as_revert():
-before = "def compute(): pass\n"
-after = "def calculate(): pass\n" # renamed
-gone = h.vanished_symbols(before, after)
-check(gone == ["compute"], f"rename should surface old name as gone: {gone}")
-# kills a mutation that tried to be 'smart' and suppress renames
+# --- 2. golden: marker_lines reports the exact line numbers ------------------
+def test_marker_lines_golden():
+found = c.marker_lines(CONFLICTED)
+check(found["<<<<<<< "] == [2], f"open marker line wrong: {found['<<<<<<< ']}")
+check(found["======="] == [4], f"middle marker line wrong: {found['=======']}")
+check(found[">>>>>>> "] == [6], f"close marker line wrong: {found['>>>>>>> ']}")
+# the three exact line-number asserts above ARE the golden: they pin the
+# detected positions, not merely the count.
 
-# ---- 3. no false hole when nothing vanished --------------------------------
-def test_no_false_hole():
-same = "def a(): pass\ndef b(): pass\n"
-check(h.vanished_symbols(same, same) == [], "identical source must yield no vanished names")
-# a purely ADDED symbol is not a hole
-added = "def a(): pass\ndef b(): pass\ndef c(): pass\n"
-check(h.vanished_symbols(same, added) == [], "an added symbol must not read as vanished")
-
-# ---- 4. symbols() sees each definition form; kills a dropped alternative ----
-def test_symbol_forms():
-src = "function f(){}\nconst g=1\nh: function(){}\nexports.i=1\ndef j(): pass\n"
-got = h.symbols(src)
-for name in ("f", "g", "h", "i", "j"):
-check(name in got, f"symbol form not detected: {name} (pattern lost an alternative)")
-
-# ---- 5. is_code gate: symbols probed only on code suffixes -----------------
-def test_is_code():
-for ok in ("x.js", "y.py", "z.sh", "a.mjs", "b.cjs"):
-check(h.is_code(ok), f"{ok} should be code")
-for no in ("data.json", "notes.md", "image.png", "LICENSE"):
-check(not h.is_code(no), f"{no} should NOT be treated as code")
-
-# ---- 6. render marks a clean run as NOT a clean bill ------------------------
-def test_render_clean_caveat():
-out = h.render("abc123def", "HEAD", None, files=["a.py"], holes=[], absent=[])
-check("NOT a clean bill" in out, "clean render must carry the not-a-clean-bill caveat")
-check("0 finding(s)" in out, "clean render must report 0 findings")
-
-# ---- 7. render shows holes and absent files distinctly ---------------------
-def test_render_findings():
-out = h.render(
-"abc123def", "HEAD", None,
-files=["a.py", "b.py"],
-holes=[("a.py", ["gone_one", "gone_two"])],
-absent=["b.py"],
+# --- 3. only a line that STARTS with a marker counts ------------------------
+def test_startswith_only():
+# a single marker mid-line (e.g. inside a string) is not a line-start conflict
+embedded = 'x = "<<<<<<< not a real marker"\n'
+check(not c.has_conflict(embedded), "a marker mid-line must not count as a conflict")
+# the discriminating case: ALL THREE markers mid-line. Under startswith this
+# is clean (no line STARTS with a marker); a naive `m in ln` would flag it.
+triad_midline = "a <<<<<<< b\nc ======= d\ne >>>>>>> f\n"
+check(
+not c.has_conflict(triad_midline),
+"three markers mid-line must NOT fire (startswith, not substring)",
 )
-check("HOLE a.py" in out, "hole line missing")
-check("gone: gone_one()" in out, "vanished symbol not rendered")
-check("FILE ABSENT b.py" in out, "absent-file line missing")
-check("2 finding(s)" in out, "finding count wrong (1 hole + 1 absent = 2)")
-check("QUESTION, not a verdict" in out, "the question-not-verdict disclaimer must render")
 
-# ---- 8. END-TO-END against a real throwaway git repo -----------------------
+# --- 4. is_ignored honors substrings ----------------------------------------
+def test_is_ignored():
+check(c.is_ignored("a/_snapshots/x.txt", ("_snapshots/",)), "ignore substring should match")
+check(not c.is_ignored("a/src/x.txt", ("_snapshots/",)), "non-matching path must not be ignored")
+check(not c.is_ignored("anything", ()), "empty ignore never ignores")
+
+# --- 5. arg parse: --ref, --ignore (repeatable), unknown ---------------------
+def test_parse_args():
+ref, ig = c._parse_args(["--ref", "main", "--ignore", "a/", "--ignore", "b/"])
+check(ref == "main", f"--ref not parsed: {ref}")
+check(ig == ("a/", "b/"), f"--ignore not repeatable: {ig}")
+raised = False
+try:
+c._parse_args(["--bogus"])
+except ValueError:
+raised = True
+check(raised, "unknown arg must raise")
+
+# --- 6. END-TO-END against a throwaway repo ---------------------------------
 def _run_git(cwd, *args):
 subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
 
-def test_end_to_end_reverted_hunk():
+def test_end_to_end():
+import tempfile
 with tempfile.TemporaryDirectory() as repo:
 _run_git(repo, "init", "-q")
 _run_git(repo, "config", "user.email", "t@t")
 _run_git(repo, "config", "user.name", "t")
-p = os.path.join(repo, "mod.py")
-with open(p, "w") as fh:
-fh.write("def keeper(): pass\ndef doomed(): pass\n")
-_run_git(repo, "add", "mod.py")
-_run_git(repo, "commit", "-qm", "before")
-before_sha = subprocess.run(
-["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
-).stdout.strip()
-# revert the 'doomed' definition, keep the file
-with open(p, "w") as fh:
-fh.write("def keeper(): pass\n")
-_run_git(repo, "commit", "-aqm", "after (doomed reverted)")
+# one clean file, one conflicted file
+with open(os.path.join(repo, "clean.py"), "w") as fh:
+fh.write("def ok(): pass\n")
+with open(os.path.join(repo, "broken.py"), "w") as fh:
+fh.write(CONFLICTED)
+_run_git(repo, "add", "-A")
+_run_git(repo, "commit", "-qm", "with a conflict")
 
 cwd0 = os.getcwd()
 os.chdir(repo)
 try:
-files, holes, absent = h.scan(before_sha, "HEAD")
+hits = c.scan(ref=None)
 finally:
 os.chdir(cwd0)
-check(holes == [("mod.py", ["doomed"])], f"end-to-end hole not found: {holes}")
-check(absent == [], f"nothing should be absent: {absent}")
+paths = sorted(f for f, _ in hits)
+check(paths == ["broken.py"], f"end-to-end should flag only broken.py: {paths}")
+
+# --- 7. ignore actually excludes a conflicted file --------------------------
+def test_end_to_end_ignore():
+import tempfile
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+os.makedirs(os.path.join(repo, "_snapshots"))
+with open(os.path.join(repo, "_snapshots", "past.txt"), "w") as fh:
+fh.write(CONFLICTED) # a deliberate record of a past conflict
+_run_git(repo, "add", "-A")
+_run_git(repo, "commit", "-qm", "snapshot")
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+with_ignore = c.scan(ref=None, ignore=("_snapshots/",))
+without = c.scan(ref=None)
+finally:
+os.chdir(cwd0)
+check(with_ignore == [], f"ignored path should not be flagged: {with_ignore}")
+check(len(without) == 1, f"without ignore the file should flag: {without}")
 
 def run() -> int:
 tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
@@ -1669,5 +962,515 @@ sys.exit(run())
 Take the whole folder →
 MIT
 Python standard library only, read-only, deterministic
+
+---
+
+# Cruise — a Loop MMT gift
+https://loopmmt.com/gifts/cruise/
+[coverage: optional · branch: gifts]
+
+Feature Inventory, No Hallucinations fold ← all gifts
+
+Cruise
+
+Walk a codebase and emit a ledger of byte-derived facts — the routes it serves, the calls it makes, the buttons a user can touch, the claims its tests make — each fact carrying what it proves and what it does NOT. Hand the ledger to an LLM and ask it to group and name features: it can't invent one with no route, no label, and no test behind it. The floor under the prose.
+
+The honest edge
+
+It's a text scan with a declared pattern set, not a language parser — a framework or idiom it wasn't told about is a fact it won't see (it fails safe: a real fact left out, never a fabricated one put in). Route/call matching is literal, so a served '/x/:id' and a called '/x/42' are different strings and a live parameterized route can read as headless. Treat headless as 'look here,' not 'delete this.'
+
+Run it
+
+python3 cruise.py src/
+test_cruise.py (17/17, mutation-bitten, pinned golden)
+Python stdlib only, deterministic
+
+The code — every file that ships
+
+cruise.py 321 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""cruise.py — a deterministic feature inventory of a codebase, so an LLM can't invent features.
+
+Ask a language model "list all the features of this app" and it does two bad things
+at once: it hallucinates plausible features that aren't there, and it misses real
+ones that are. It has no floor under it. Cruise builds the floor. It walks a source
+tree, extracts every byte-derived FACT about what the code actually exposes, and
+emits a **ledger** — one fact per line, each carrying what it PROVES and, just as
+important, what it does NOT prove. Hand that ledger to an LLM and ask it to *group
+and name* the facts into features, and it cannot invent one that has no route, no
+label, and no test behind it. The ledger is the floor; the prose is composed on top.
+
+The name is a timber cruise: a systematic field survey of a standing forest, run to
+produce a valuation for a buyer. This is that, for software — tally what is actually
+standing, emit the survey, let someone else write the sales sheet from real numbers.
+
+python3 cruise.py <tree-root> [options]
+
+------------------------------------------------------------------------------
+THE FOUR PLOTS (each a pure, independent extractor over byte-truth):
+
+routes server path literals in route/handler declarations
+-> what the backend SERVES. e.g. app.get("/api/x")
+calls client-side fetch/axios/request URLs
+-> what the frontend ASKS FOR. e.g. fetch("/api/x")
+affordances user-visible control labels (button/link/menu text)
+-> what a USER can touch. e.g. <button>Save</button>
+claims assertion descriptions in test files
+-> what the code CLAIMS about itself. NOT executed, just read.
+
+Each plot is a text scan with a declared pattern set, not a language parser. That is
+the honest limit (see THE EDGE). It fails SAFE: a real fact it can't pattern-match is
+a fact left out of the ledger, never a fabricated one put in.
+
+WHAT EACH FACT PROVES — AND WHAT IT DOESN'T:
+Every fact in the ledger ships its own `proves` and `does_not_prove` string, because
+a right number under a wrong noun is a lie with a receipt. A `route` proves the
+backend has a path literal; it does NOT prove the route works, is reachable, or is
+tested. A `claim` proves a test file SAYS something; it does NOT prove the test runs
+or passes. The ledger stops you inventing a FEATURE. It cannot stop you inventing a
+PROPERTY of a real one — so it tells you, per fact, which properties it did not check.
+
+TWO FREE GRADES (decidable, fall out of the plots):
+HEADLESS-ROUTE a served route that no client call anywhere names. Built, but
+nothing on the client side asks for it. (Fails SAFE: reported only
+when neither called nor mentioned — a missed grade, never invented.)
+UNCLAIMED a file with affordances but zero test claims -> unverified surface.
+
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+`--json` emits ONE JSON object per fact on stdout, sorted, deterministic:
+{"plot","value","path","line","proves","does_not_prove"}
+and the grades as {"grade","value","detail"} objects. Pipe the ledger into the
+next tool (count facts, filter to one plot, feed an LLM the whole thing).
+Without `--json` it prints a grouped human report.
+
+Determinism: the tree is walked in sorted order, facts are sorted by
+(plot, path, line, value), and the same tree always produces the same ledger —
+byte-identical, so it is diffable, hashable, and cache-keyable.
+
+Exit codes:
+0 ran clean (facts or none — a cruise is a report, not a gate)
+1 at least one HEADLESS-ROUTE grade AND --strict was given (gate mode)
+3 usage / unreadable root
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+DEFAULT_EXTS = [
+".py", ".js", ".cjs", ".mjs", ".ts", ".jsx", ".tsx",
+".go", ".rb", ".java", ".rs", ".php",
+".html", ".htm",
+]
+
+# What each plot proves and does not prove. Emitted INTO every fact so the ledger
+# can never be read as claiming more than a text scan can support.
+PLOT_PROVES = {
+"route": {
+"proves": "the server source declares this path literal in a route/handler",
+"does_not_prove": "that the route works, is reachable, is authorized, or is tested",
+},
+"call": {
+"proves": "the client source issues a request naming this URL",
+"does_not_prove": "that the request succeeds or that a server serves this path",
+},
+"affordance": {
+"proves": "the markup contains this user-visible control label",
+"does_not_prove": "that the control is enabled, wired to anything, or reachable",
+},
+"claim": {
+"proves": "a test file contains this assertion description string",
+"does_not_prove": "that the test executes, or that it passes",
+},
+}
+
+# ---- plot patterns (declared, so THE EDGE can name them) ---------------------
+
+# routes: common server frameworks' path-literal declarations.
+# The receiver must be a SERVER object (app/router/server/route/mux/r) — never a
+# client HTTP library (axios/fetch/http/xhr/request), so `axios.post("/x")` is a
+# CALL and not misread as a served route. The receiver group is the guard.
+_ROUTE_PATS = [
+# app.get("/x") / router.post('/x') / server.delete(`/x`) (Express/Koa/Fastify)
+re.compile(r"""\b(?:app|router|server|route|mux|r)\s*\.\s*(?:get|post|put|patch|delete|all|use|head|options)\s*\(\s*["'`](/[^"'`]*)["'`]""", re.I),
+# @app.route("/x") / @router.get("/x") (Flask/FastAPI style)
+re.compile(r"""@\w+\.(?:route|get|post|put|patch|delete)\s*\(\s*["'`](/[^"'`]*)["'`]""", re.I),
+# http.HandleFunc("/x") (Go style)
+re.compile(r"""HandleFunc\s*\(\s*["'`](/[^"'`]*)["'`]""", re.I),
+]
+
+# calls: client-side request URLs.
+_CALL_PATS = [
+re.compile(r"""\bfetch\s*\(\s*["'`](/[^"'`?]*)["'`?]""", re.I),
+re.compile(r"""\baxios\s*(?:\.\s*(?:get|post|put|patch|delete))?\s*\(\s*["'`](/[^"'`?]*)["'`?]""", re.I),
+re.compile(r"""\b(?:request|http\.request|xhr\.open)\s*\(\s*(?:["'][A-Z]+["']\s*,\s*)?["'`](/[^"'`?]*)["'`?]""", re.I),
+]
+
+# affordances: user-visible control text. <button>Save</button>, <a>Delete</a>, aria-label.
+_AFFORD_PATS = [
+re.compile(r"""<button\b[^>]*>\s*([^<>{][^<>]*?)\s*</button>""", re.I | re.S),
+re.compile(r"""<a\b[^>]*>\s*([^<>{][^<>]*?)\s*</a>""", re.I | re.S),
+re.compile(r"""\baria-label\s*=\s*["']([^"']+)["']""", re.I),
+re.compile(r"""<(?:li|span)\b[^>]*\brole\s*=\s*["']menuitem["'][^>]*>\s*([^<>{][^<>]*?)\s*</""", re.I | re.S),
+]
+
+# claims: test assertion descriptions. it("...")/test("...")/describe("...")/def test_x
+_CLAIM_PATS = [
+re.compile(r"""\b(?:it|test|describe)\s*\(\s*["'`]([^"'`]+)["'`]""", re.I),
+re.compile(r"""\bdef\s+(test_[A-Za-z0-9_]+)\s*\(""",),
+]
+
+_TEST_HINTS = ("test", "spec", "__tests__")
+
+def _is_test_file(rel):
+low = rel.lower()
+return any(h in low for h in _TEST_HINTS)
+
+def _line_starts(text):
+starts = [0]
+for m in re.finditer(r"\n", text):
+starts.append(m.end())
+return starts
+
+def _lineno(off, starts):
+lo, hi = 0, len(starts) - 1
+while lo < hi:
+mid = (lo + hi + 1) // 2
+if starts[mid] <= off:
+lo = mid
+else:
+hi = mid - 1
+return lo + 1
+
+def _clean(s):
+# collapse whitespace in a captured affordance/claim label
+return re.sub(r"\s+", " ", s).strip()
+
+def _extract(text, pats, plot, rel, starts):
+facts = []
+seen = set()
+for pat in pats:
+for m in pat.finditer(text):
+val = _clean(m.group(1))
+if not val:
+continue
+ln = _lineno(m.start(), starts)
+key = (plot, val, ln)
+if key in seen:
+continue
+seen.add(key)
+facts.append({
+"plot": plot,
+"value": val,
+"path": rel,
+"line": ln,
+"proves": PLOT_PROVES[plot]["proves"],
+"does_not_prove": PLOT_PROVES[plot]["does_not_prove"],
+})
+return facts
+
+def scan_file(path, rel):
+try:
+with open(path, encoding="utf-8", errors="replace") as fh:
+text = fh.read()
+except OSError:
+return []
+starts = _line_starts(text)
+facts = []
+facts += _extract(text, _ROUTE_PATS, "route", rel, starts)
+facts += _extract(text, _CALL_PATS, "call", rel, starts)
+facts += _extract(text, _AFFORD_PATS, "affordance", rel, starts)
+if _is_test_file(rel):
+facts += _extract(text, _CLAIM_PATS, "claim", rel, starts)
+return facts
+
+def scan_tree(root, exts):
+exts_l = tuple(e.lower() for e in exts)
+out = []
+for dp, dns, fns in os.walk(root):
+for skip in (".git", "node_modules", ".hg", ".svn", "__pycache__", "dist", "build"):
+if skip in dns:
+dns.remove(skip)
+dns.sort()
+for fn in sorted(fns):
+if fn.lower().endswith(exts_l):
+full = os.path.join(dp, fn)
+rel = os.path.relpath(full, root)
+out.extend(scan_file(full, rel))
+out.sort(key=lambda f: (f["plot"], f["path"], f["line"], f["value"]))
+return out
+
+def grade(facts):
+"""Two decidable grades over the fact set. Fail SAFE: reported only when the
+byte-truth is unambiguous (a missed grade, never an invented one)."""
+grades = []
+
+served = {f["value"] for f in facts if f["plot"] == "route"}
+named = {f["value"] for f in facts if f["plot"] == "call"}
+# a headless route is one served but never named by any client call
+for r in sorted(served - named):
+grades.append({
+"grade": "HEADLESS-ROUTE",
+"value": r,
+"detail": "served but no client call names it — built, unreached by the client source scanned",
+})
+
+# a file with affordances but no claims -> unclaimed surface
+afforded = {f["path"] for f in facts if f["plot"] == "affordance"}
+claimed_files = {f["path"] for f in facts if f["plot"] == "claim"}
+# claims live in test files, not the afforded file; grade at the tree level:
+if afforded and not any(f["plot"] == "claim" for f in facts):
+grades.append({
+"grade": "UNCLAIMED",
+"value": "(tree)",
+"detail": "%d file(s) expose affordances and the tree has zero test claims — unverified surface" % len(afforded),
+})
+return grades
+
+def main(argv=None):
+p = argparse.ArgumentParser(
+prog="cruise",
+description="a deterministic feature inventory of a codebase — the floor an LLM can't hallucinate through.",
+)
+p.add_argument("root", help="the directory to walk")
+p.add_argument("--ext", action="append", metavar=".EXT",
+help="a file extension to include (repeatable; default: common source types)")
+p.add_argument("--plot", action="append", metavar="NAME",
+choices=["route", "call", "affordance", "claim"],
+help="restrict to one plot (repeatable): route call affordance claim")
+p.add_argument("--json", action="store_true",
+help="emit one JSON object per fact and per grade on stdout (the pipe contract)")
+p.add_argument("--strict", action="store_true",
+help="exit 1 if any HEADLESS-ROUTE grade is found (gate mode)")
+args = p.parse_args(argv)
+
+if not os.path.isdir(args.root):
+sys.stderr.write("cruise: not a directory: %s\n" % args.root)
+return 3
+
+exts = args.ext if args.ext else DEFAULT_EXTS
+facts = scan_tree(args.root, exts)
+if args.plot:
+want = set(args.plot)
+facts = [f for f in facts if f["plot"] in want]
+grades = grade(facts)
+headless = sum(1 for g in grades if g["grade"] == "HEADLESS-ROUTE")
+
+if args.json:
+for f in facts:
+sys.stdout.write(json.dumps(f, sort_keys=True) + "\n")
+for g in grades:
+sys.stdout.write(json.dumps(g, sort_keys=True) + "\n")
+return 1 if (args.strict and headless) else 0
+
+if not facts:
+print("cruise: no features inventoried under %s" % args.root)
+return 0
+
+by_plot = {}
+for f in facts:
+by_plot.setdefault(f["plot"], []).append(f)
+order = ["route", "call", "affordance", "claim"]
+print("# cruise — feature ledger for %s" % args.root)
+print("# %d fact(s): %s\n" % (
+len(facts),
+", ".join("%d %s" % (len(by_plot[k]), k) for k in order if k in by_plot)))
+for k in order:
+if k not in by_plot:
+continue
+hs = by_plot[k]
+print("## %s (%d) — proves: %s" % (k, len(hs), PLOT_PROVES[k]["proves"]))
+print("## does NOT prove: %s" % PLOT_PROVES[k]["does_not_prove"])
+for f in hs:
+print(" %-40s %s:%d" % (f["value"][:40], f["path"], f["line"]))
+print()
+if grades:
+print("## grades")
+for g in grades:
+print(" [%s] %s — %s" % (g["grade"], g["value"], g["detail"]))
+print()
+print("\u2192 hand this ledger to an LLM and ask it to GROUP and NAME the facts.")
+print(" it cannot invent a feature with no route, no label, and no test behind it.")
+return 1 if (args.strict and headless) else 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_cruise.py 173 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_cruise.py — mutation-bitten tests for the cruise gift.
+
+Self-contained: builds its own fixture tree in a tempdir, runs cruise over it, and
+asserts on the ledger. Includes a PINNED GOLDEN wire string — the exact deterministic
+JSON-lines output for the fixture — so a change in extraction, ordering, or the
+proves/does-not-prove text is caught as a byte diff.
+
+Mutation bite (proven with teeth in the build):
+- remove the sort in scan_tree() -> ordering tests + golden fail
+- drop the server-receiver guard in routes -> a client call double-counts as a route
+- omit proves/does_not_prove from a fact -> the "every fact carries proves" test fails
+- break the headless grade set-difference -> the grade tests fail
+
+Run: python3 test_cruise.py (prints "N/N passed" and exits 0 on all-green)
+"""
+
+import io
+import json
+import os
+import sys
+import tempfile
+import contextlib
+
+import cruise
+
+# --- fixture -----------------------------------------------------------------
+
+FIXTURE = {
+"server/api.js": (
+'app.get("/api/users")\n'
+'app.post("/api/login")\n'
+'router.delete("/api/users/:id")\n'
+'app.get("/api/orphan")\n'
+),
+"client/ui.js": (
+'fetch("/api/users")\n'
+'axios.post("/api/login")\n'
+'// nobody calls /api/orphan\n'
+),
+"client/page.html": (
+"<button>Save Changes</button>\n"
+'<a aria-label="Delete account">x</a>\n'
+),
+"__tests__/api.test.js": (
+'it("returns users on GET /api/users")\n'
+'test("rejects bad login")\n'
+),
+}
+
+# The PINNED GOLDEN: the exact --json output over the fixture, one object per line.
+# Regenerate deliberately (never silently) if the contract changes.
+GOLDEN = [
+{"does_not_prove": "that the control is enabled, wired to anything, or reachable", "line": 1, "path": "client/page.html", "plot": "affordance", "proves": "the markup contains this user-visible control label", "value": "Save Changes"},
+{"does_not_prove": "that the control is enabled, wired to anything, or reachable", "line": 2, "path": "client/page.html", "plot": "affordance", "proves": "the markup contains this user-visible control label", "value": "Delete account"},
+{"does_not_prove": "that the control is enabled, wired to anything, or reachable", "line": 2, "path": "client/page.html", "plot": "affordance", "proves": "the markup contains this user-visible control label", "value": "x"},
+{"does_not_prove": "that the request succeeds or that a server serves this path", "line": 1, "path": "client/ui.js", "plot": "call", "proves": "the client source issues a request naming this URL", "value": "/api/users"},
+{"does_not_prove": "that the request succeeds or that a server serves this path", "line": 2, "path": "client/ui.js", "plot": "call", "proves": "the client source issues a request naming this URL", "value": "/api/login"},
+{"does_not_prove": "that the test executes, or that it passes", "line": 1, "path": "__tests__/api.test.js", "plot": "claim", "proves": "a test file contains this assertion description string", "value": "returns users on GET /api/users"},
+{"does_not_prove": "that the test executes, or that it passes", "line": 2, "path": "__tests__/api.test.js", "plot": "claim", "proves": "a test file contains this assertion description string", "value": "rejects bad login"},
+{"does_not_prove": "that the route works, is reachable, is authorized, or is tested", "line": 1, "path": "server/api.js", "plot": "route", "proves": "the server source declares this path literal in a route/handler", "value": "/api/users"},
+{"does_not_prove": "that the route works, is reachable, is authorized, or is tested", "line": 2, "path": "server/api.js", "plot": "route", "proves": "the server source declares this path literal in a route/handler", "value": "/api/login"},
+{"does_not_prove": "that the route works, is reachable, is authorized, or is tested", "line": 3, "path": "server/api.js", "plot": "route", "proves": "the server source declares this path literal in a route/handler", "value": "/api/users/:id"},
+{"does_not_prove": "that the route works, is reachable, is authorized, or is tested", "line": 4, "path": "server/api.js", "plot": "route", "proves": "the server source declares this path literal in a route/handler", "value": "/api/orphan"},
+{"detail": "served but no client call names it \u2014 built, unreached by the client source scanned", "grade": "HEADLESS-ROUTE", "value": "/api/orphan"},
+{"detail": "served but no client call names it \u2014 built, unreached by the client source scanned", "grade": "HEADLESS-ROUTE", "value": "/api/users/:id"},
+]
+
+def build_fixture(root):
+for rel, body in FIXTURE.items():
+full = os.path.join(root, rel)
+os.makedirs(os.path.dirname(full), exist_ok=True)
+with open(full, "w", encoding="utf-8") as fh:
+fh.write(body)
+
+def run_json(root, extra=None):
+argv = [root, "--json"] + (extra or [])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+rc = cruise.main(argv)
+lines = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+return rc, lines
+
+# --- tests -------------------------------------------------------------------
+
+RESULTS = []
+
+def check(name, cond):
+RESULTS.append((name, bool(cond)))
+
+def main():
+with tempfile.TemporaryDirectory() as root:
+build_fixture(root)
+rc, facts = run_json(root)
+
+# 1. pinned golden — exact deterministic ledger
+check("golden: ledger matches pinned wire objects exactly", facts == GOLDEN)
+
+# 2. determinism — same tree, byte-identical twice
+_, again = run_json(root)
+check("determinism: two runs byte-identical", facts == again)
+
+only_facts = [f for f in facts if "plot" in f]
+grades = [f for f in facts if "grade" in f]
+
+# 3. plot tallies
+routes = [f for f in only_facts if f["plot"] == "route"]
+calls = [f for f in only_facts if f["plot"] == "call"]
+affs = [f for f in only_facts if f["plot"] == "affordance"]
+claims = [f for f in only_facts if f["plot"] == "claim"]
+check("routes: exactly the 4 server declarations", len(routes) == 4)
+check("calls: exactly the 2 client requests", len(calls) == 2)
+check("affordances: exactly the 3 labels", len(affs) == 3)
+check("claims: exactly the 2 test descriptions", len(claims) == 2)
+
+# 4. the server-receiver guard — axios.post is a CALL, never a route (double-count bite)
+route_vals = {r["value"] for r in routes if r["path"] == "client/ui.js"}
+check("guard: no client-file value counted as a route", route_vals == set())
+
+# 5. every fact carries proves + does_not_prove (the honesty bite)
+check("honesty: every fact has proves", all(f.get("proves") for f in only_facts))
+check("honesty: every fact has does_not_prove", all(f.get("does_not_prove") for f in only_facts))
+
+# 6. headless grade — orphan (never called) is graded; users (called) is not
+hv = {g["value"] for g in grades if g["grade"] == "HEADLESS-ROUTE"}
+check("grade: /api/orphan is HEADLESS (never called)", "/api/orphan" in hv)
+check("grade: /api/users is NOT headless (it is called)", "/api/users" not in hv)
+
+# 7. ordering — sorted by (plot, path, line, value)
+keys = [(f["plot"], f["path"], f["line"], f["value"]) for f in only_facts]
+check("ordering: facts sorted by (plot,path,line,value)", keys == sorted(keys))
+
+# 8. --plot filter narrows to one plot
+_, ro = run_json(root, ["--plot", "route"])
+rof = [f for f in ro if "plot" in f]
+check("filter: --plot route yields only routes", all(f["plot"] == "route" for f in rof) and len(rof) == 4)
+
+# 9. --strict returns exit 1 when a headless route exists
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+rc_strict = cruise.main([root, "--json", "--strict"])
+check("strict: exit 1 with a headless route present", rc_strict == 1)
+
+# 10. non-strict default is exit 0 (report, not gate)
+check("default: exit 0 (a cruise is a report)", rc == 0)
+
+# 11. usage: non-directory root -> exit 3
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+rc_bad = cruise.main([os.path.join(root, "nope"), "--json"])
+check("usage: missing root -> exit 3", rc_bad == 3)
+
+# 12. empty tree -> no facts, exit 0
+with tempfile.TemporaryDirectory() as empty:
+rc_e, fe = run_json(empty)
+check("empty: no facts, exit 0", fe == [] and rc_e == 0)
+
+passed = sum(1 for _, ok in RESULTS if ok)
+total = len(RESULTS)
+for name, ok in RESULTS:
+print("%s %s" % ("ok " if ok else "FAIL", name))
+print("\n%d/%d passed" % (passed, total))
+return 0 if passed == total else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only, deterministic
 
 ---

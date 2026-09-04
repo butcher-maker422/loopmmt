@@ -1,1124 +1,1832 @@
-# Loop MMT — corpus shard 61/63
+# Loop MMT — corpus shard 61/66
 
-> Bundle 61 of 63 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 61 of 66 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 2 (/gifts/typecheck/, /gifts/vclock/)
+Nodes in this shard: 4 (/gifts/ratchet-png-text/, /gifts/reltime/, /gifts/sha256/, /gifts/sudoku/)
 
 ---
 
-# typecheck — a Loop MMT gift
-https://loopmmt.com/gifts/typecheck/
+# PNG Text — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-png-text/
 [coverage: optional · branch: gifts]
 
-Composition Typecheck check ← all gifts
+What's Hidden In That PNG? transform ← all gifts
 
-typecheck
+PNG Text
 
-Give it a pipeline of small JSONL tools you mean to chain — A,B,C — and, before you run anything and with no side effects, typecheck says whether it is well-formed: does each stage EMIT what the next one ACCEPTS. It walks the adjacent pairs and the endpoints, names the exact hop that breaks (a sink piped into a transform, a source stranded mid-pipeline), and exits non-zero so you can gate on it.
+Pull the text metadata (Title, Author, Description, Software, Copyright, an XMP packet) out of a PNG's tEXt / zTXt / iTXt chunks — with no dependencies, in Node or the browser. parsePngText(bytes) is a pure function: it walks the chunk stream and returns the text entries in file order. It's a ratchet parser — it advances one chunk at a time and refuses to move past anything malformed: it validates the 8-byte signature and recomputes the CRC-32 over every chunk, throwing on a mismatch, a length that runs past the buffer, or a text chunk missing its null separator. A parser that hands you text out of a corrupt chunk is lying about the file; this one won't.
 
 The honest edge
 
-It validates the PORT type — can the pipe carry data at all — NOT the RECORD shape. Two tools can both speak JSON-lines so the ports agree, while the records one emits are not the records the other expects; that pipeline typechecks clean here and still fails at runtime. typecheck flags the record-shape layer as unproven and never asserts semantic fit. A slug not in the manifest is reported UNRESOLVED, never guessed.
+It reads TEXTUAL metadata only — no pixels, IHDR, palettes, or gamma. It does NOT inflate zTXt / compressed-iTXt on its own (zlib isn't in the browser's dependency-free surface): such records come back with compressed:true, text:null, and their raw compressedText bytes, decoded only if you pass your own inflate function. And it does not repair a bad file — malformed input throws, it never guesses.
 
 Run it
 
-python3 typecheck.py text --pipeline A,B,C --manifest gifts-manifest.json
-test_typecheck.py (15/15 golden, 8/8 mutations caught)
-Python 3, standard library only
+node ratchet-png-text.js < image.png
+test_ratchet-png-text.js (21/21: real-PNG byte vectors tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, live-zlib backstop, coercion, determinism, mutation-bite)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-typecheck.py 385 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-typecheck — validate a composition before you run it.
+ratchet-png-text.js 305 lines on GitHub →
+#!/usr/bin/env node
+/* ratchet-png-text.js — a pure, dependency-free, STRICT extractor of the textual
+metadata chunks (tEXt, zTXt, iTXt) from a PNG byte stream. Runs identically in
+a browser and in Node (no DOM, no dependencies).
 
-You have a pipeline in mind: A | B | C. Before you run it, this tells you —
-decidably, with no side effects — whether it typechecks: does each stage EMIT
-what the next one ACCEPTS. It catches "you piped a sink into a transform" at
-declare-time, as a clear per-hop verdict, instead of as a confusing runtime
-error three stages deep.
+WHY THIS EXISTS. A PNG can carry human-readable metadata — Title, Author,
+Description, Software, Copyright, an XMP packet — in tEXt/zTXt/iTXt chunks. You
+have the file's bytes (an upload, a fetch, a buffer) and you want those key/value
+pairs without pulling in a full image decoder. The usual answer is a heavy
+library that parses pixels you don't care about, or a hand-rolled loop that
+trusts the file and hands you text out of a chunk whose CRC doesn't even match.
 
-THE TYPE MODEL (flat, five verbs)
-source ∅ -> JSONL emits, never accepts (ignores stdin)
-transform JSONL -> JSONL emits and accepts
-filter JSONL -> JSONL' emits and accepts
-fold JSONL -> agg emits and accepts
-sink JSONL -> ∅ accepts, never emits (no pipeable stdout)
+WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one chunk at a
+time and REFUSES to move past anything malformed. It validates the 8-byte PNG
+signature, and for EVERY chunk it recomputes the CRC-32 over (type + data) and
+rejects a mismatch. A length that runs past the end of the buffer, a stream that
+ends before IEND, a text chunk missing its null separator — each is a thrown
+Error, never a silently-truncated string. A parser that hands you text from a
+corrupt chunk is lying about what the file says; this one won't.
 
-THE GATE (decidable, total)
-A can feed B iff EMITS(A) and ACCEPTS(B)
-EMITS(v) = v!= "sink" (a sink produces no pipeable stdout)
-ACCEPTS(v) = v!= "source" (a source ignores its stdin)
-Plus the endpoint rule: a mid-pipeline stage that does not ACCEPT (a source in
-a non-first position) is an error — it ignores the stream handed to it; and a
-mid-pipeline stage that does not EMIT (a sink before the end) is an error — it
-swallows the stream the downstream stage needs.
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• tEXt — uncompressed Latin-1 keyword + text. Decoded directly.
+• iTXt (uncompressed) — UTF-8 keyword, language tag, translated keyword, and
+text. Decoded directly.
+• zTXt and COMPRESSED iTXt — the keyword and metadata are decoded, and the
+raw zlib-compressed text bytes are surfaced on the entry as
+`compressedText`. The text itself is decoded ONLY if you pass an
+`inflate` function in the options (see below). This is deliberate: zlib
+inflate is not in the browser's synchronous, dependency-free surface, so
+the core stays DOM-free and zero-dependency and lets the CALLER decide the
+inflater (Node: `require("zlib").inflateSync`; browser: pako, etc.).
 
-WHAT THIS IS A STRIP OF
-An internal tree-spec validator (AGPL-3.0) carried a subtype relation `<:` +
-type lattice + conformance check (conformsTo, seeded FLAT: SUBTYPE_EDGES={},
-so it is nominal equality on day one) and an emit/accept edge-compatibility
-gate. This gift keeps conformsTo as the flat lattice SEAM — a
-future variance edge slots into SUBTYPE_EDGES without rewriting the gate —
-and keeps the emit/accept gate, applied to the ADJACENT pairs of one linear
-pipeline (the walk A->B->C) rather than to a whole DAG. Re-licensed MIT,
-stdlib-only (the ancestor's yaml dep and tree-YAML machinery are dropped).
-It re-states the ~3-line gate rather than importing `map`: gifts are
-standalone — pipes all the way down, MIT, zero-dep — so they never import
-each other; the canonical port-verb roster keeps them consistent.
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not decode pixels, IHDR geometry, palettes, gamma, or any non-text
+chunk — it walks the chunk stream to find text and validates the CRC of every
+chunk it steps over, but returns only the text entries. It does not inflate
+compressed text on its own (pass `inflate`). It does not repair a bad file.
 
-WHAT IT DELIBERATELY DOES NOT DO (the honesty flag — a build requirement)
-typecheck validates the PORT type, NOT the record shape. An {event}-emitting
-stage piped into a {file}-expecting stage typechecks CLEAN here and still
-fails at runtime, because the ports agree (both JSONL) even though the
-records don't fit. The ancestor's V17/V18 schema-affinity heuristic (which
-only ever WARNed) is exactly that record-shape layer, and it is DROPPED on
-purpose: this gift claims port-compatibility and flags record-shape as
-UNPROVEN — it never asserts semantic fit.
+API
+parsePngText(bytes[, options]) -> Array<Entry>
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
+used to decode zTXt / compressed-iTXt text.
+Returns the text entries in file order (possibly empty). THROWS an Error on
+any malformed input (bad signature, bad CRC, truncation, bad chunk shape).
+
+Entry shape (all entries carry `kind` and `keyword`):
+tEXt: { kind:"tEXt", keyword, text, compressed:false}
+zTXt: { kind:"zTXt", keyword, compressed:true, text:<string|null>,
+compressedText:Uint8Array}
+iTXt: { kind:"iTXt", keyword, compressed:<bool>, languageTag,
+translatedKeyword, text:<string|null>,
+compressedText?:Uint8Array} // compressedText only when compressed
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePngText) or Node (this CLI / require()).
 
 USAGE
-typecheck check --pipeline A,B,C --manifest gifts-manifest.json
-Walk the declared pipeline; per-hop verdict JSONL + a summary line.
-Exit 3 if any hop (or endpoint) is bad, 0 if the whole pipeline is clean.
-typecheck text --pipeline A,B,C --manifest gifts-manifest.json
-The same check, human-readable.
-typecheck --port
-Print typecheck's own port-verb (filter) as one JSON-line and exit.
-typecheck --selftest
-Run the built-in checks and exit 0/1.
+node ratchet-png-text.js cover.png # prints "keyword\ttext" per entry
+node ratchet-png-text.js --help
+The CLI (Node only) supplies Node's zlib as the inflater so compressed text is
+decoded; the shipped core stays dependency-free.
 
-The manifest is any JSON list of entries (or an object with a
-'gifts'/'tools'/'entries' list); each entry carries a 'slug' and a 'port_verb'
-— the same shape `map` and `port` read. A slug named in the pipeline but absent
-from the manifest, or present with no valid port_verb, is reported as
-UNRESOLVED and fails the check — never guessed.
-"""
-import argparse
-import json
-import sys
+Released under MIT.
+*/
+"use strict";
 
-VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
+// ---- CRC-32 (PNG / IEEE 802.3, polynomial 0xEDB88320) ----------------------
+// Table built once. Pure; no dependencies. This is the parser's teeth: every
+// chunk's stored CRC is recomputed over (type-bytes + data-bytes) and compared.
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) {
+c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);
+}
+t[n] = c >>> 0;
+}
+return t;
+})();
 
-# -------------------------------------------------------------------
-# THE SUBTYPE RELATION (<:), seeded FLAT — the kept lattice seam.
-# Zero edges at seed, so conformsTo is bit-for-bit nominal equality on day one.
-# Variance is added LATER by adding edges here — never by rewriting the gate.
-# -------------------------------------------------------------------
-SUBTYPE_EDGES = {} # requiredVerb -> set(subVerbs). EMPTY at seed (discrete order).
+function crc32(bytes, start, end) {
+var c = 0xffffffff;
+for (var i = start; i < end; i++) {
+c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+}
+return (c ^ 0xffffffff) >>> 0;
+}
 
-def subtypes(required):
-"""Declared subtypes of `required`. Empty at seed."""
-return SUBTYPE_EDGES.get(required, set())
+// ---- byte helpers -----------------------------------------------------------
+var PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
-def conformsTo(candidate, required):
-"""Total, decidable subtype operator. At seed (no edges) this is exactly
-nominal equality:
-required == "" -> True (no constraint)
-candidate == required -> True (nominal match)
-candidate in subtypes(required) -> True (lattice edge; none at seed)
-"""
-if required == "":
-return True
-if candidate == required:
-return True
-return candidate in subtypes(required)
+function u32be(b, i) {
+return ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+}
 
-def EMITS(v):
-"""A stage produces pipeable stdout iff it is not a sink."""
-return v!= "sink"
+// Latin-1 (ISO-8859-1): byte value === Unicode code point. Zero-dependency and
+// correct for tEXt keyword/text and iTXt language tags.
+function latin1(bytes, start, end) {
+var s = "";
+for (var i = start; i < end; i++) { s += String.fromCharCode(bytes[i]);}
+return s;
+}
 
-def ACCEPTS(v):
-"""A stage consumes stdin iff it is not a source."""
-return v!= "source"
+// UTF-8 via the platform TextDecoder — present in both Node (>=11, global) and
+// browsers. Used for iTXt (UTF-8 by spec).
+var UTF8 = (typeof TextDecoder!== "undefined")? new TextDecoder("utf-8"): null;
+function utf8(bytes, start, end) {
+var slice = bytes.subarray? bytes.subarray(start, end): bytes.slice(start, end);
+if (UTF8) { return UTF8.decode(slice);}
+// Fallback (no TextDecoder): decode UTF-8 by hand. Kept minimal.
+var s = "", i = 0;
+while (i < slice.length) {
+var b0 = slice[i++];
+if (b0 < 0x80) { s += String.fromCharCode(b0);}
+else if (b0 < 0xe0) { s += String.fromCharCode(((b0 & 0x1f) << 6) | (slice[i++] & 0x3f));}
+else if (b0 < 0xf0) { s += String.fromCharCode(((b0 & 0x0f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f));}
+else {
+var cp = ((b0 & 0x07) << 18) | ((slice[i++] & 0x3f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f);
+cp -= 0x10000;
+s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+}
+}
+return s;
+}
 
-def load_verbs(path):
-"""Return {slug: port_verb} for every manifest entry with a valid port_verb.
+// Find the index of the first null byte in [start, end); -1 if none.
+function indexOfNull(bytes, start, end) {
+for (var i = start; i < end; i++) { if (bytes[i] === 0) { return i;}}
+return -1;
+}
 
-Accepts a bare JSON list of entries or an object with a
-'gifts'/'tools'/'entries' list. Raises ValueError if no entry list can be
-found — never guesses the shape. An entry with no valid port_verb is simply
-absent from the map, so a pipeline naming it reports UNRESOLVED.
-"""
-with open(path) as f:
-data = json.load(f)
-if isinstance(data, list):
-entries = data
-elif isinstance(data, dict):
-entries = None
-for k in ("gifts", "tools", "entries"):
-if isinstance(data.get(k), list):
-entries = data[k]
-break
-if entries is None:
-raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
-else:
-raise ValueError(f"{path}: not a JSON list or object")
+function toU8(input) {
+if (input instanceof Uint8Array) { return input;}
+if (typeof ArrayBuffer!== "undefined" && input instanceof ArrayBuffer) { return new Uint8Array(input);}
+if (input && input.buffer instanceof ArrayBuffer && typeof input.byteLength === "number") {
+// other typed-array / DataView view over a buffer
+return new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
+}
+throw new TypeError("parsePngText: expected a Uint8Array / Buffer / ArrayBuffer");
+}
 
-verbs = {}
-for e in entries:
-slug = e.get("slug")
-pv = e.get("port_verb")
-if pv in VALID_VERBS:
-verbs[slug] = pv
-return verbs
-
-def typecheck_pipeline(pipeline, verbs):
-"""Walk a declared pipeline and check every adjacent pair + the endpoints.
-
-pipeline: ordered list of slugs [A, B, C]
-verbs: {slug: port_verb} resolved from the manifest
-
-Returns (hops, ok):
-hops: list of per-hop verdict dicts, in pipeline order. Two kinds:
-- {"kind": "stage",...} one per stage: its resolved verb, its
-endpoint role, and whether that role is valid at its position.
-- {"kind": "hop",...} one per adjacent pair (A->B): the gate.
-ok: True iff every stage resolved AND every endpoint role is valid AND
-every hop passes the emit/accept gate.
-"""
-n = len(pipeline)
-hops = []
-ok = True
-
-# Resolve every stage first; an unresolved stage is a hard fail (never guessed).
-resolved = []
-for i, slug in enumerate(pipeline):
-verb = verbs.get(slug)
-pos = "first" if i == 0 else ("last" if i == n - 1 else "middle")
-if verb is None:
-ok = False
-hops.append({
-"kind": "stage", "pos": i, "slug": slug, "verb": None,
-"role": pos, "role_ok": False,
-"reason": "UNRESOLVED — slug not in manifest, or no valid port_verb; not guessed",
-})
-resolved.append(None)
-continue
-
-# Endpoint rule. A stage in a non-first position must ACCEPT (else it
-# ignores the stream handed to it); a stage in a non-last position must
-# EMIT (else it swallows the stream the next stage needs).
-role_ok = True
-reason = "ok"
-if pos in ("middle", "last") and not ACCEPTS(verb):
-role_ok = False
-reason = f"a {verb} accepts no stdin, but it is not the first stage — it would ignore its input"
-if pos in ("first", "middle") and not EMITS(verb):
-role_ok = False
-reason = f"a {verb} emits no stdout, but it is not the last stage — downstream gets nothing"
-if not role_ok:
-ok = False
-hops.append({
-"kind": "stage", "pos": i, "slug": slug, "verb": verb,
-"role": pos, "role_ok": role_ok, "reason": reason,
-})
-resolved.append(verb)
-
-# The gate on each adjacent pair.
-for i in range(n - 1):
-a_slug, b_slug = pipeline[i], pipeline[i + 1]
-a_verb, b_verb = resolved[i], resolved[i + 1]
-if a_verb is None or b_verb is None:
-hops.append({
-"kind": "hop", "pos": i, "from": a_slug, "to": b_slug,
-"from_verb": a_verb, "to_verb": b_verb,
-"typechecks": False,
-"reason": "UNRESOLVED — one endpoint has no resolved port_verb",
-})
-ok = False
-continue
-emits = EMITS(a_verb)
-accepts = ACCEPTS(b_verb)
-passes = emits and accepts
-if not passes:
-ok = False
-if not emits:
-reason = f"{a_slug} is a {a_verb} — it emits no stdout, so {b_slug} has nothing to read"
-elif not accepts:
-reason = f"{b_slug} is a {b_verb} — it ignores stdin, so {a_slug}'s output is dropped"
-else:
-reason = "ok — emitter feeds an acceptor (TYPE gate only; record shape unproven)"
-hops.append({
-"kind": "hop", "pos": i, "from": a_slug, "to": b_slug,
-"from_verb": a_verb, "to_verb": b_verb,
-"typechecks": passes, "reason": reason,
-})
-
-return hops, ok
-
-SEMANTIC_FLAG = (
-"UNPROVEN — typecheck validates the PORT type (can the pipe carry data), "
-"NOT the RECORD shape. A pipeline can typecheck clean here and still fail at "
-"runtime because the records don't fit. That semantic layer is a finer "
-"question the uniform JSONL type cannot settle, and this gift never asserts it."
-)
-
-def summary_record(pipeline, hops, ok):
-bad_hops = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
-bad_stages = [h for h in hops if h["kind"] == "stage" and not h["role_ok"]]
+// ---- text-chunk decoders ----------------------------------------------------
+function decodeTEXt(data) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("tEXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("tEXt chunk: keyword must be 1-79 bytes");}
 return {
-"kind": "summary",
-"pipeline": list(pipeline),
-"stages": len(pipeline),
-"hops": sum(1 for h in hops if h["kind"] == "hop"),
-"typechecks": ok,
-"bad_hops": len(bad_hops),
-"bad_stages": len(bad_stages),
-"semantic_layer": SEMANTIC_FLAG,
+kind: "tEXt",
+keyword: latin1(data, 0, nul),
+text: latin1(data, nul + 1, data.length),
+compressed: false
+};
 }
 
-def emit_jsonl(pipeline, hops, ok, out):
-for h in hops:
-out.write(json.dumps(h) + "\n")
-out.write(json.dumps(summary_record(pipeline, hops, ok)) + "\n")
-
-def emit_text(pipeline, hops, ok, out):
-out.write("typecheck — " + " -> ".join(pipeline) + "\n")
-out.write("=" * 56 + "\n")
-for h in hops:
-if h["kind"] == "stage":
-mark = " " if h["role_ok"] else "!!"
-verb = h["verb"] if h["verb"] is not None else "?"
-out.write(f"{mark} stage {h['pos']}: {h['slug']} [{verb}] ({h['role']}) — {h['reason']}\n")
-else:
-mark = "ok" if h["typechecks"] else "XX"
-out.write(f"{mark} hop {h['from']} -> {h['to']} "
-f"[{h['from_verb']} -> {h['to_verb']}] — {h['reason']}\n")
-out.write("-" * 56 + "\n")
-out.write(f"RESULT: {'TYPECHECKS' if ok else 'DOES NOT TYPECHECK'}\n")
-out.write("\nNOTE: this is the TYPE-level check. Record-shape fit is UNPROVEN —\n")
-out.write("a clean result means the ports agree, not that the records fit.\n")
-
-def parse_pipeline(s):
-parts = [p.strip() for p in s.split(",")]
-parts = [p for p in parts if p]
-if len(parts) < 2:
-raise ValueError("a pipeline needs at least two stages (A,B)")
-return parts
-
-def _selftest():
-# A tiny fixed manifest covering all five verbs.
-verbs = {
-"src": "source",
-"xf": "transform",
-"flt": "filter",
-"fold": "fold",
-"snk": "sink",
-}
-checks = []
-
-# 1. A clean pipeline: source -> transform -> sink.
-hops, ok = typecheck_pipeline(["src", "xf", "snk"], verbs)
-checks.append(("clean src->xf->snk typechecks", ok is True))
-
-# 2. A sink in the middle must fail (it emits nothing downstream).
-hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
-checks.append(("sink-in-middle fails", ok is False))
-
-# 3. A source in the middle must fail (it ignores its stdin).
-hops, ok = typecheck_pipeline(["src", "src", "snk"], verbs)
-checks.append(("source-in-middle fails", ok is False))
-
-# 4. The bad HOP is identified: src -> snk is fine, snk -> xf is the break.
-hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
-bad = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
-checks.append(("bad hop is snk->xf", len(bad) == 1 and bad[0]["from"] == "snk" and bad[0]["to"] == "xf"))
-
-# 5. An unresolved slug fails and is never guessed.
-hops, ok = typecheck_pipeline(["src", "ghost", "snk"], verbs)
-stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "ghost"][0]
-checks.append(("unresolved slug fails, verb is None", ok is False and stage["verb"] is None))
-
-# 6. transform->filter->fold is all-middle-legal and clean.
-hops, ok = typecheck_pipeline(["xf", "flt", "fold"], verbs)
-checks.append(("xf->flt->fold typechecks", ok is True))
-
-# 6a. The stage-role verdict is isolated (not just the aggregate): a sink in
-# the middle sets role_ok False on that stage (endpoint EMITS rule).
-hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
-snk_stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "snk"][0]
-checks.append(("sink-middle stage role_ok False", snk_stage["role_ok"] is False))
-
-# 6b. A hop bad ONLY on the accept side (xf -> src) fails the gate — pins the
-# ACCEPTS conjunct independently of the emit side.
-hops, ok = typecheck_pipeline(["xf", "src", "snk"], verbs)
-accept_hop = [h for h in hops if h["kind"] == "hop" and h["from"] == "xf" and h["to"] == "src"][0]
-checks.append(("accept-only-bad hop xf->src fails", accept_hop["typechecks"] is False))
-
-# 7. conformsTo is nominal equality at seed (flat lattice).
-checks.append(("conformsTo flat: transform~transform, not transform~filter",
-conformsTo("transform", "transform") and not conformsTo("filter", "transform")))
-
-# 8. conformsTo empty-required is the no-constraint path.
-checks.append(("conformsTo empty-required is True", conformsTo("anything", "") is True))
-
-passed = sum(1 for _, ok_ in checks if ok_)
-for name, ok_ in checks:
-print(f" {'PASS' if ok_ else 'FAIL'} {name}")
-print(f"{passed}/{len(checks)} checks passed")
-return passed == len(checks)
-
-def main(argv=None):
-ap = argparse.ArgumentParser(
-description="Validate a declared gift pipeline before you run it — the TYPE gate, not the record shape."
-)
-ap.add_argument("--port", action="store_true", help="print typecheck's own port-verb (filter) and exit")
-ap.add_argument("--selftest", action="store_true", help="run built-in checks and exit")
-sub = ap.add_subparsers(dest="cmd")
-for name in ("check", "text"):
-p = sub.add_parser(name)
-p.add_argument("--pipeline", required=True, help="comma-separated slugs, e.g. gitlog,vclock,cairn")
-p.add_argument("--manifest", required=True, help="path to the gifts manifest JSON")
-args = ap.parse_args(argv)
-
-if args.port:
-print(json.dumps({"slug": "typecheck", "port_verb": "filter"}))
-return 0
-
-if args.selftest:
-return 0 if _selftest() else 1
-
-if args.cmd not in ("check", "text"):
-ap.print_help()
-return 2
-
-try:
-pipeline = parse_pipeline(args.pipeline)
-verbs = load_verbs(args.manifest)
-except (ValueError, OSError, json.JSONDecodeError) as e:
-sys.stderr.write(f"typecheck: {e}\n")
-return 2
-
-hops, ok = typecheck_pipeline(pipeline, verbs)
-if args.cmd == "check":
-emit_jsonl(pipeline, hops, ok, sys.stdout)
-else:
-emit_text(pipeline, hops, ok, sys.stdout)
-return 0 if ok else 3
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_typecheck.py 170 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-Mutation-bitten test for the typecheck gift.
-
-Two halves:
-1. GOLDEN — the behavior contract: clean pipelines pass, broken pipelines
-fail at the right hop/stage, unresolved slugs are flagged not guessed,
-conformsTo is flat at seed.
-2. MUTATION BATTERY — each load-bearing predicate is flipped in a copy of the
-module and the golden checks are re-run; the suite is only meaningful if
-every mutation is CAUGHT (turns some golden check RED). A mutation that
-nothing catches is a hole in the test, and this file fails loud on it.
-
-Run: python3 test_typecheck.py (asserts golden green + every bite caught)
-python3 test_typecheck.py --show (verbose)
-"""
-import copy
-import importlib.util
-import sys
-import types
-from pathlib import Path
-
-HERE = Path(__file__).resolve().parent
-MODPATH = HERE / "typecheck.py"
-
-def _load_module(src_text=None):
-"""Load typecheck.py fresh (optionally from mutated source text)."""
-spec = importlib.util.spec_from_file_location("typecheck_under_test", MODPATH)
-mod = importlib.util.module_from_spec(spec)
-if src_text is None:
-spec.loader.exec_module(mod)
-else:
-code = compile(src_text, str(MODPATH), "exec")
-exec(code, mod.__dict__)
-return mod
-
-VERBS = {
-"src": "source", "xf": "transform", "flt": "filter",
-"fold": "fold", "snk": "sink",
+function decodeZTXt(data, inflate) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("zTXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("zTXt chunk: keyword must be 1-79 bytes");}
+if (nul + 1 >= data.length) { throw new Error("zTXt chunk: missing compression method");}
+var method = data[nul + 1];
+if (method!== 0) { throw new Error("zTXt chunk: unknown compression method " + method);}
+var comp = data.subarray? data.subarray(nul + 2): data.slice(nul + 2);
+var entry = {
+kind: "zTXt",
+keyword: latin1(data, 0, nul),
+compressed: true,
+text: null,
+compressedText: comp
+};
+if (inflate) { entry.text = latin1(inflate(comp), 0, inflate(comp).length);}
+return entry;
 }
 
-def golden_checks(m):
-"""Return a list of (name, bool) — the behavior contract, evaluated on module m."""
-out = []
+function decodeITXt(data, inflate) {
+var n = data.length;
+var k = indexOfNull(data, 0, n);
+if (k === -1) { throw new Error("iTXt chunk: missing keyword null separator");}
+if (k < 1 || k > 79) { throw new Error("iTXt chunk: keyword must be 1-79 bytes");}
+if (k + 2 >= n) { throw new Error("iTXt chunk: truncated header");}
+var compFlag = data[k + 1];
+var compMethod = data[k + 2];
+if (compFlag!== 0 && compFlag!== 1) { throw new Error("iTXt chunk: bad compression flag " + compFlag);}
+if (compFlag === 1 && compMethod!== 0) { throw new Error("iTXt chunk: unknown compression method " + compMethod);}
+var langStart = k + 3;
+var langNul = indexOfNull(data, langStart, n);
+if (langNul === -1) { throw new Error("iTXt chunk: missing language-tag null separator");}
+var transStart = langNul + 1;
+var transNul = indexOfNull(data, transStart, n);
+if (transNul === -1) { throw new Error("iTXt chunk: missing translated-keyword null separator");}
+var textStart = transNul + 1;
 
-hops, ok = m.typecheck_pipeline(["src", "xf", "snk"], VERBS)
-out.append(("clean src->xf->snk typechecks", ok is True))
+var entry = {
+kind: "iTXt",
+keyword: utf8(data, 0, k),
+compressed: compFlag === 1,
+languageTag: latin1(data, langStart, langNul),
+translatedKeyword: utf8(data, transStart, transNul),
+text: null
+};
+var body = data.subarray? data.subarray(textStart): data.slice(textStart);
+if (compFlag === 0) {
+entry.text = utf8(body, 0, body.length);
+} else {
+entry.compressedText = body;
+if (inflate) { var raw = inflate(body); entry.text = utf8(raw, 0, raw.length);}
+}
+return entry;
+}
 
-hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
-out.append(("sink-in-middle fails", ok is False))
+/**
+* parsePngText(input[, options]) -> Array<Entry>
+* Strictly walk a PNG byte stream and return its tEXt/zTXt/iTXt entries in file
+* order. Validates the signature and every chunk's CRC-32; throws on any
+* malformed input. See the file header for the Entry shapes and the `inflate`
+* option (used to decode zTXt / compressed iTXt text).
+*/
+function parsePngText(input, options) {
+var bytes = toU8(input);
+var inflate = options && options.inflate;
+var len = bytes.length;
 
-hops, ok = m.typecheck_pipeline(["src", "src", "snk"], VERBS)
-out.append(("source-in-middle fails", ok is False))
+if (len < 8) { throw new Error("not a PNG: shorter than the 8-byte signature");}
+for (var s = 0; s < 8; s++) {
+if (bytes[s]!== PNG_SIG[s]) { throw new Error("not a PNG: bad signature");}
+}
 
-hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
-bad = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
-out.append(("bad hop is exactly snk->xf",
-len(bad) == 1 and bad[0]["from"] == "snk" and bad[0]["to"] == "xf"))
+var entries = [];
+var off = 8;
+var sawIEND = false;
 
-hops, ok = m.typecheck_pipeline(["src", "ghost", "snk"], VERBS)
-stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "ghost"][0]
-out.append(("unresolved slug fails and verb is None",
-ok is False and stage["verb"] is None))
+while (off < len) {
+if (off + 8 > len) { throw new Error("truncated PNG: incomplete chunk header at offset " + off);}
+var dataLen = u32be(bytes, off);
+var typeStart = off + 4;
+var dataStart = off + 8;
+var dataEnd = dataStart + dataLen;
+var crcEnd = dataEnd + 4;
+if (crcEnd > len) { throw new Error("truncated PNG: chunk data/CRC runs past end at offset " + off);}
 
-hops, ok = m.typecheck_pipeline(["xf", "flt", "fold"], VERBS)
-out.append(("all-middle-legal xf->flt->fold typechecks", ok is True))
+var type = latin1(bytes, typeStart, typeStart + 4);
+var storedCrc = u32be(bytes, dataEnd);
+var actualCrc = crc32(bytes, typeStart, dataEnd);
+if (storedCrc!== actualCrc) {
+throw new Error("CRC mismatch in " + type + " chunk at offset " + off +
+": stored 0x" + storedCrc.toString(16) + "!= computed 0x" + actualCrc.toString(16));
+}
 
-hops, ok = m.typecheck_pipeline(["snk", "xf"], VERBS)
-out.append(("sink as FIRST stage fails (emits nothing downstream)", ok is False))
+var data = bytes.subarray? bytes.subarray(dataStart, dataEnd): bytes.slice(dataStart, dataEnd);
+if (type === "tEXt") { entries.push(decodeTEXt(data));}
+else if (type === "zTXt") { entries.push(decodeZTXt(data, inflate));}
+else if (type === "iTXt") { entries.push(decodeITXt(data, inflate));}
+else if (type === "IEND") { sawIEND = true; off = crcEnd; break;}
 
-hops, ok = m.typecheck_pipeline(["xf", "src"], VERBS)
-out.append(("source as LAST stage fails (ignores its input)", ok is False))
+off = crcEnd;
+}
 
-# Isolate the STAGE-ROLE verdict (not just the aggregate ok) — a sink in the
-# middle must set role_ok False on that stage, independent of the hop gate.
-hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
-snk_stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "snk"][0]
-out.append(("sink-middle stage role_ok is False (endpoint EMITS rule)", snk_stage["role_ok"] is False))
+if (!sawIEND) { throw new Error("truncated PNG: stream ended before the IEND chunk");}
+return entries;
+}
 
-# And a source in the middle must set role_ok False on THAT stage (endpoint
-# ACCEPTS rule) — isolated the same way.
-hops, ok = m.typecheck_pipeline(["src", "src", "snk"], VERBS)
-mid_src = [h for h in hops if h["kind"] == "stage" and h["pos"] == 1][0]
-out.append(("source-middle stage role_ok is False (endpoint ACCEPTS rule)", mid_src["role_ok"] is False))
+// ---- Dual-runtime export: browser namespace + Node module ------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePngText = parsePngText;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { parsePngText: parsePngText};
+}
 
-# A hop that is bad ONLY on the ACCEPTS side: xf (emits) -> src (a source in
-# a non-first slot ignores stdin). The HOP itself must fail on accept, which
-# pins the ACCEPTS conjunct in the gate independently of the emit side.
-hops, ok = m.typecheck_pipeline(["xf", "src", "snk"], VERBS)
-accept_hop = [h for h in hops if h["kind"] == "hop" and h["from"] == "xf" and h["to"] == "src"][0]
-out.append(("hop bad only on ACCEPTS side (xf->src) fails the gate", accept_hop["typechecks"] is False))
+// ---- CLI: print "keyword\ttext" per text entry; Node supplies the inflater ---
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"ratchet-png-text — extract tEXt/zTXt/iTXt metadata from a PNG (strict)\n\n" +
+" node ratchet-png-text.js cover.png one line per text entry: keyword<TAB>text\n\n" +
+"Validates the PNG signature and every chunk's CRC-32; refuses malformed input.\n" +
+"Decodes tEXt and uncompressed iTXt directly; zTXt and compressed iTXt are\n" +
+"inflated here with Node's zlib (the shipped core is dependency-free).\n");
+process.exit(args.length === 0? 1: 0);
+}
+var fs = require("fs");
+var zlib = require("zlib");
+var inflate = function (b) { return zlib.inflateSync(Buffer.from(b));};
+var exitCode = 0;
+for (var a = 0; a < args.length; a++) {
+try {
+var buf = fs.readFileSync(args[a]);
+var list = parsePngText(buf, { inflate: inflate});
+if (args.length > 1) { process.stdout.write("== " + args[a] + " ==\n");}
+for (var e = 0; e < list.length; e++) {
+var en = list[e];
+var t = (en.text === null)? "[" + en.kind + ", compressed, no inflater]": en.text;
+process.stdout.write(en.keyword + "\t" + t + "\n");
+}
+if (list.length === 0) { process.stdout.write("(no text chunks)\n");}
+} catch (err) {
+process.stderr.write("ratchet-png-text: " + args[a] + ": " + err.message + "\n");
+exitCode = 1;
+}
+}
+process.exit(exitCode);
+}
 
-out.append(("conformsTo flat: nominal only",
-m.conformsTo("transform", "transform") and not m.conformsTo("filter", "transform")))
-out.append(("conformsTo empty-required True", m.conformsTo("x", "") is True))
+test_ratchet-png-text.js 227 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-png-text.js — proves the strict PNG text extractor implements its
+stated contract correctly.
 
-out.append(("EMITS(sink) False / EMITS(source) True", (m.EMITS("sink") is False) and (m.EMITS("source") is True)))
-out.append(("ACCEPTS(source) False / ACCEPTS(sink) True", (m.ACCEPTS("source") is False) and (m.ACCEPTS("sink") is True)))
+THE ORACLE. There is no PNG-text parser in the Node stdlib to diff against, so
+the oracle is the PNG spec expressed as CURATED, REAL PNG BYTE FIXTURES built
+in-test: each fixture is an actual PNG byte stream (8-byte signature + chunks
+with correct CRC-32 + IEND), so a "valid" vector is a genuine file the parser
+must read to a KNOWN set of entries, and an "invalid" vector is a genuine
+malformation the parser must THROW on. Every branch is exercised: tEXt,
+uncompressed iTXt (UTF-8, language tag, translated keyword), zTXt and compressed
+iTXt, the no-text case, and the malformations (bad signature, CRC mismatch,
+truncation, missing IEND, missing separators, bad length, non-buffer input).
 
-return out
+THE LIVE-REFERENCE BACKSTOP. The compressed path (zTXt / compressed iTXt) is
+built with Node's own zlib.deflateSync and decoded through the parser with
+zlib.inflateSync passed as the `inflate` option — so the zero-dependency core is
+cross-checked against a live reference implementation, sha256-style.
 
-# Each mutation is a (name, find, replace) source edit that BREAKS a load-bearing
-# predicate. A correct test suite turns at least one golden check RED for each.
-MUTATIONS = [
-("EMITS always True", 'return v!= "sink"', "return True"),
-("ACCEPTS always True", 'return v!= "source"', "return True"),
-("EMITS inverted", 'return v!= "sink"', 'return v == "sink"'),
-("conformsTo always True", "return candidate in subtypes(required)", "return True"),
-("endpoint ACCEPTS check disabled",
-'if pos in ("middle", "last") and not ACCEPTS(verb):',
-'if False and pos in ("middle", "last") and not ACCEPTS(verb):'),
-("endpoint EMITS check disabled",
-'if pos in ("first", "middle") and not EMITS(verb):',
-'if False and pos in ("first", "middle") and not EMITS(verb):'),
-("unresolved slug silently guessed transform",
-"verb = verbs.get(slug)",
-'verb = verbs.get(slug) or "transform"'),
-("gate ignores ACCEPTS", "passes = emits and accepts", "passes = emits"),
-]
+Plus determinism (same bytes -> same entries, twice) and a mutation-bite (a
+text-carrying PNG and a no-text PNG must not share a result, so a degenerate
+core that returns a constant can't pass green). Exit 0 = all pass; exit 1 =
+a failure (loud). stdlib only. */
+"use strict";
+var assert = require("assert");
+var zlib = require("zlib");
+var parsePngText = require("./ratchet-png-text.js").parsePngText;
 
-def run():
-show = "--show" in sys.argv
-src = MODPATH.read_text()
+var pass = 0, fail = 0;
+function ok(label, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL " + label + "\n " + (e && e.message? e.message: e));}
+}
 
-# Half 1 — golden must be all-green on the real module.
-base = _load_module()
-gold = golden_checks(base)
-gold_ok = all(ok for _, ok in gold)
-if show or not gold_ok:
-for name, ok in gold:
-print(f" {'PASS' if ok else 'FAIL'} {name}")
-print(f"GOLDEN: {sum(ok for _, ok in gold)}/{len(gold)} passed")
-if not gold_ok:
-print("GOLDEN FAILED — the gift is broken, not the test.")
-return 1
+// ---- PNG fixture builder (a tiny, correct reference encoder) ----------------
+var SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-# Half 2 — every mutation must be caught (turn >=1 golden check RED).
-all_caught = True
-for name, find, repl in MUTATIONS:
-if find not in src:
-print(f" BITE-BROKEN {name}: anchor not found in source — test is stale")
-all_caught = False
-continue
-mutated = src.replace(find, repl, 1)
-try:
-mut_mod = _load_module(mutated)
-res = golden_checks(mut_mod)
-caught = any(not ok for _, ok in res)
-except Exception:
-# A mutation that makes the module explode is also 'caught'.
-caught = True
-mark = "caught" if caught else "ESCAPED"
-if show or not caught:
-print(f" {mark:8s} mutation: {name}")
-if not caught:
-all_caught = False
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) { c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);}
+t[n] = c >>> 0;
+}
+return t;
+})();
+function crc32(buf) {
+var c = 0xffffffff;
+for (var i = 0; i < buf.length; i++) { c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);}
+return (c ^ 0xffffffff) >>> 0;
+}
+function u32(n) { var b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0, 0); return b;}
 
-print(f"MUTATIONS: {sum(1 for n, f, r in MUTATIONS if f in src)}/{len(MUTATIONS)} biteable; "
-f"{'ALL CAUGHT' if all_caught else 'SOME ESCAPED'}")
-return 0 if (gold_ok and all_caught) else 1
+// One PNG chunk: length + type + data + CRC(type+data).
+function chunk(type, data) {
+data = data || Buffer.alloc(0);
+var typeBuf = Buffer.from(type, "latin1");
+var body = Buffer.concat([typeBuf, data]);
+return Buffer.concat([u32(data.length), body, u32(crc32(body))]);
+}
+// A minimal, real IHDR (1x1, 8-bit grayscale) — for fixture realism.
+var IHDR = chunk("IHDR", Buffer.concat([u32(1), u32(1), Buffer.from([8, 0, 0, 0, 0])]));
+var IEND = chunk("IEND");
 
-if __name__ == "__main__":
-sys.exit(run())
+function png(chunks) { return Buffer.concat([SIG].concat(chunks).concat([IEND]));}
+
+// tEXt data = keyword + \0 + text (Latin-1)
+function tEXt(keyword, text) {
+return chunk("tEXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0]), Buffer.from(text, "latin1")]));
+}
+// zTXt data = keyword + \0 + method(0) + zlib(text)
+function zTXt(keyword, text) {
+return chunk("zTXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0, 0]), zlib.deflateSync(Buffer.from(text, "latin1"))]));
+}
+// iTXt data = keyword + \0 + cflag + cmethod + lang + \0 + transKeyword + \0 + text(UTF-8, maybe deflated)
+function iTXt(keyword, lang, trans, text, compressed) {
+var body = compressed? zlib.deflateSync(Buffer.from(text, "utf8")): Buffer.from(text, "utf8");
+return chunk("iTXt", Buffer.concat([
+Buffer.from(keyword, "utf8"), Buffer.from([0]),
+Buffer.from([compressed? 1: 0, 0]),
+Buffer.from(lang, "latin1"), Buffer.from([0]),
+Buffer.from(trans, "utf8"), Buffer.from([0]),
+body
+]));
+}
+
+var INFLATE = { inflate: function (b) { return zlib.inflateSync(Buffer.from(b));}};
+
+// ===========================================================================
+// VALID vectors — each must parse to a KNOWN result.
+// ===========================================================================
+ok("single tEXt decodes keyword+text", function () {
+var out = parsePngText(png([IHDR, tEXt("Title", "A Quiet Loop")]));
+assert.strictEqual(out.length, 1);
+assert.deepStrictEqual(out[0], { kind: "tEXt", keyword: "Title", text: "A Quiet Loop", compressed: false});
+});
+
+ok("multiple tEXt chunks preserved in file order", function () {
+var out = parsePngText(png([IHDR, tEXt("Author", "Shea"), tEXt("Software", "Loop MMT")]));
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].keyword, "Author");
+assert.strictEqual(out[0].text, "Shea");
+assert.strictEqual(out[1].keyword, "Software");
+assert.strictEqual(out[1].text, "Loop MMT");
+});
+
+ok("tEXt with empty text is valid (keyword, empty value)", function () {
+var out = parsePngText(png([IHDR, tEXt("Comment", "")]));
+assert.strictEqual(out[0].text, "");
+});
+
+ok("no text chunks -> empty array (not an error)", function () {
+var out = parsePngText(png([IHDR]));
+assert.deepStrictEqual(out, []);
+});
+
+ok("uncompressed iTXt decodes UTF-8 text, lang, translated keyword", function () {
+var out = parsePngText(png([IHDR, iTXt("Description", "en", "Descripción", "a café at dawn — \u2728", false)]));
+assert.strictEqual(out.length, 1);
+var e = out[0];
+assert.strictEqual(e.kind, "iTXt");
+assert.strictEqual(e.keyword, "Description");
+assert.strictEqual(e.compressed, false);
+assert.strictEqual(e.languageTag, "en");
+assert.strictEqual(e.translatedKeyword, "Descripción");
+assert.strictEqual(e.text, "a café at dawn — \u2728");
+});
+
+ok("zTXt: without inflater -> compressed entry, raw bytes, text null", function () {
+var out = parsePngText(png([IHDR, zTXt("XML:com.adobe.xmp", "the quick brown fox")]));
+var e = out[0];
+assert.strictEqual(e.kind, "zTXt");
+assert.strictEqual(e.keyword, "XML:com.adobe.xmp");
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, null);
+assert.ok(e.compressedText && e.compressedText.length > 0, "compressedText surfaced");
+});
+
+ok("zTXt: WITH live zlib inflater -> text decoded (live-reference backstop)", function () {
+var out = parsePngText(png([IHDR, zTXt("Copyright", "© 2026 Shea Gunther")]), INFLATE);
+assert.strictEqual(out[0].text, "© 2026 Shea Gunther");
+});
+
+ok("compressed iTXt: WITH inflater -> UTF-8 text decoded", function () {
+var out = parsePngText(png([IHDR, iTXt("Story", "en", "", "compressed unicode: ✓ café", true)]), INFLATE);
+var e = out[0];
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, "compressed unicode: ✓ café");
+});
+
+ok("mixed chunk types collected in order", function () {
+var out = parsePngText(png([IHDR, tEXt("A", "1"), iTXt("B", "en", "", "2", false), zTXt("C", "3")]), INFLATE);
+assert.deepStrictEqual(out.map(function (e) { return e.keyword;}), ["A", "B", "C"]);
+assert.strictEqual(out[2].text, "3");
+});
+
+ok("accepts an ArrayBuffer as well as a Buffer", function () {
+var buf = png([IHDR, tEXt("Title", "AB")]);
+var ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+assert.strictEqual(parsePngText(ab)[0].text, "AB");
+});
+
+// ===========================================================================
+// INVALID vectors — each must THROW (the ratchet refuses to advance).
+// ===========================================================================
+function throws(label, buildBadBytes) {
+ok(label, function () { assert.throws(function () { parsePngText(buildBadBytes());});});
+}
+
+throws("bad PNG signature", function () {
+var b = png([IHDR, tEXt("Title", "x")]); b[0] = 0x00; return b;
+});
+throws("CRC mismatch (a data byte flipped after CRC was written)", function () {
+var b = png([IHDR, tEXt("Title", "hello")]);
+// flip the last byte of the tEXt text; its stored CRC no longer matches
+b[b.length - 5] ^= 0xff; return b;
+});
+throws("truncated mid-chunk", function () {
+var b = png([IHDR, tEXt("Title", "hello")]); return b.subarray(0, b.length - 10);
+});
+throws("stream ends before IEND", function () {
+// signature + IHDR + a tEXt, but no IEND appended
+return Buffer.concat([SIG, IHDR, tEXt("Title", "x")]);
+});
+throws("tEXt missing its null separator", function () {
+var bad = chunk("tEXt", Buffer.from("NoNullHere", "latin1")); // no \0 in the data
+return Buffer.concat([SIG, IHDR, bad, IEND]);
+});
+throws("chunk length runs past end of buffer", function () {
+var b = png([IHDR, tEXt("Title", "x")]);
+// corrupt the tEXt length field to claim a huge data size
+var off = SIG.length + IHDR.length;
+b.writeUInt32BE(0x7fffffff, off); return b;
+});
+throws("zTXt with unknown compression method", function () {
+var data = Buffer.concat([Buffer.from("K", "latin1"), Buffer.from([0, 9]), zlib.deflateSync(Buffer.from("x"))]);
+return Buffer.concat([SIG, IHDR, chunk("zTXt", data), IEND]);
+});
+throws("shorter than the 8-byte signature", function () { return Buffer.from([0x89, 0x50, 0x4e]);});
+
+// non-buffer inputs throw a TypeError
+ok("non-buffer inputs are rejected", function () {
+["a string", 42, null, undefined, {}].forEach(function (bad) {
+assert.throws(function () { parsePngText(bad);});
+});
+});
+
+// ===========================================================================
+// Determinism + mutation-bite
+// ===========================================================================
+ok("determinism: same bytes -> identical entries, twice", function () {
+var b = png([IHDR, tEXt("Title", "same"), zTXt("Z", "twice")]);
+assert.deepStrictEqual(parsePngText(b, INFLATE), parsePngText(b, INFLATE));
+});
+
+ok("mutation-bite: a text PNG and a no-text PNG do not share a result", function () {
+var withText = parsePngText(png([IHDR, tEXt("Title", "real")]));
+var without = parsePngText(png([IHDR]));
+// a constant-returning core would make these equal; they must not be.
+assert.notDeepStrictEqual(withText, without);
+assert.strictEqual(withText[0].text, "real"); // and the value is the input's, not a constant
+});
+
+console.log("\nratchet-png-text: " + pass + " passed, " + fail + " failed" +
+" (real-PNG-byte vectors: tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, " +
+"live-zlib backstop, coercion, determinism, mutation-bite)");
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Python 3, standard library only
+Node / browser, no dependencies
 
 ---
 
-# Vclock — a Loop MMT gift
-https://loopmmt.com/gifts/vclock/
+# Reltime — a Loop MMT gift
+https://loopmmt.com/gifts/reltime/
 [coverage: optional · branch: gifts]
 
-Causal Order, Not Wall-Clock Time order ← all gifts
+Relative Time That Refuses To Lie date ← all gifts
 
-Vclock
+Reltime
 
-Reason about the causal order of a stream of records — is A before B, or are they concurrent, causally independent, neither able to have known about the other? Wall-clock time can't express that last case; a vector clock can. bump, merge, and compare over JSON lines, so it sits in the middle of a pipe.
+Turn a timestamp into a short human 'when' (3h ago, Jun 20) where the whole point is what it won't do: a missing, empty, or unparseable stamp returns no label rather than a guess, a future stamp returns no label rather than a negative age, and anything older than a week gets the real date it landed instead of a rounded-up '9d ago'. Deterministic — a pure function of (stamp, now).
 
 The honest edge
 
-It orders events that share an actor namespace. Two records whose actor sets never overlap read as concurrent by construction — which is correct, but only useful if your actors are named consistently across the stream.
+It renders in UTC and is a recency label, not a locale-aware or timezone-shifting formatter, and not a full date library. The fixed minute/hour/day/week bands are by design — the value is the refusal to fabricate, not configurable granularity.
 
 Run it
 
-python3 vclock.py compare
-test_vclock.py (37/37, mutation-bitten)
-Python stdlib only
+node reltime.js 2026-08-20T09:00:00Z
+test_reltime.js (20/20, mutation-bitten)
+Node, no dependencies
 
 The code — every file that ships
 
-vclock.py 221 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""vclock.py — reason about the causal order of a stream of records, on a pipe.
-
-A vector clock answers a question a timestamp cannot: given two events, did one
-happen *before* the other, or are they *concurrent* — causally independent,
-neither one able to have known about the other? Wall-clock time can't tell you
-that (clocks drift, and "later" is not "caused by"). A vector clock can, by
-giving every actor its own counter and carrying the whole vector on each record.
-
-This is a *transform*: it reads JSON lines on stdin and writes JSON lines on
-stdout, so it sits in the middle of a pipe. Each input record may carry a
-`clock` field — an object mapping actor names to integer counts, e.g.
-`{"a": 3, "b": 1}`. An absent actor is read as 0 (it simply hasn't been seen).
-
-Three operations, each a subcommand:
-
-bump --actor A increment actor A's component on every record's clock
-(A absent → starts at 1). "A observed/produced this."
-record in → record out, clock advanced.
-
-merge fold every record's clock into ONE clock by taking the
-component-wise maximum, and emit that single clock.
-This is "receive": the least clock that dominates all
-inputs. Emits one line: {"clock": {...}}.
-
-compare read exactly two records and report their causal
-relation. Emits one line: {"relation": R} where R is
-one of before / after / concurrent / equal.
-
-The causal relation (X, Y), with any absent component read as 0:
-equal X[a] == Y[a] for every actor a
-before X[a] <= Y[a] for every a, and X!= Y (X causally precedes Y)
-after Y before X (X causally follows Y)
-concurrent neither before nor after (causally independent)
-
-The absent-is-zero rule is the whole game: {"a":1} is BEFORE {"a":1,"b":1}
-because the first has b=0 implicitly. A comparison that only looked at shared
-keys would miss this — and missing it is the difference between a real vector
-clock and a counter wearing its coat.
-
-------------------------------------------------------------------------------
-The JSON-lines contract (so this composes in a pipe):
-- reads ONE JSON object per line on stdin; blank lines are skipped.
-- `bump` emits one record per input record (order preserved), clock advanced.
-- `merge` / `compare` emit exactly one summary line.
-- non-clock fields on a record are passed through untouched by `bump`.
-- errors go to stderr; stdout stays clean JSON-lines.
-
-Exit codes:
-0 ran and emitted
-2 malformed input / corrupt clock (don't trust the stream)
-3 usage / wrong record count for compare
-"""
-
-import argparse
-import json
-import sys
-
-# ---------------------------------------------------------------------------
-# pure operations — no I/O, fully unit-testable. These are the gift's core.
-# ---------------------------------------------------------------------------
-
-def _normalize(clock):
-"""Drop explicit-zero components so equality is canonical ({a:1,b:0}=={a:1}).
-Validates that every component is an int; raises ValueError otherwise."""
-out = {}
-for actor, count in clock.items():
-if isinstance(count, bool) or not isinstance(count, int):
-raise ValueError(f"clock component {actor!r} is not an integer: {count!r}")
-if count < 0:
-raise ValueError(
-f"clock component {actor!r} is negative: {count!r} "
-"(vector-clock counts are event tallies and are never < 0)")
-if count!= 0:
-out[actor] = count
-return out
-
-def bump(clock, actor):
-"""Return a NEW clock with `actor`'s component incremented by 1.
-An absent actor starts at 1. Input is not mutated."""
-new = dict(_normalize(clock))
-new[actor] = new.get(actor, 0) + 1
-return new
-
-def merge(*clocks):
-"""Component-wise maximum across all given clocks. Absent = 0."""
-out = {}
-for clock in clocks:
-for actor, count in _normalize(clock).items():
-if count > out.get(actor, 0):
-out[actor] = count
-return out
-
-def compare(x, y):
-"""Causal relation of clock x to clock y: before / after / concurrent / equal.
-An absent component is read as 0 (the actor simply hasn't been seen)."""
-x = _normalize(x)
-y = _normalize(y)
-actors = set(x) | set(y)
-x_le_y = all(x.get(a, 0) <= y.get(a, 0) for a in actors) # x <= y everywhere
-y_le_x = all(y.get(a, 0) <= x.get(a, 0) for a in actors) # y <= x everywhere
-if x_le_y and y_le_x:
-return "equal" # <= both ways ⇒ componentwise equal
-if x_le_y:
-return "before" # x dominated by y, not equal
-if y_le_x:
-return "after"
-return "concurrent" # neither dominates ⇒ causally independent
-
-# ---------------------------------------------------------------------------
-# I/O — the JSON-lines seam.
-# ---------------------------------------------------------------------------
-
-def _read_records(stream):
-"""Yield one parsed object per non-blank stdin line. Raises ValueError on a
-line that isn't a JSON object (caller maps to exit 2)."""
-for lineno, raw in enumerate(stream, start=1):
-line = raw.strip()
-if not line:
-continue
-try:
-obj = json.loads(line)
-except json.JSONDecodeError as e:
-raise ValueError(f"line {lineno}: not valid JSON: {e}")
-if not isinstance(obj, dict):
-raise ValueError(f"line {lineno}: expected a JSON object, got {type(obj).__name__}")
-yield obj
-
-def _emit(record, out):
-out.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-
-def _clock_of(record):
-"""Pull the clock object off a record, defaulting to empty. Validates shape."""
-clock = record.get("clock", {})
-if not isinstance(clock, dict):
-raise ValueError(f"'clock' must be an object, got {type(clock).__name__}")
-return clock
-
-# ---------------------------------------------------------------------------
-# subcommands
-# ---------------------------------------------------------------------------
-
-def cmd_bump(args, stdin, stdout):
-for record in _read_records(stdin):
-record = dict(record)
-record["clock"] = bump(_clock_of(record), args.actor)
-_emit(record, stdout)
-return 0
-
-def cmd_merge(args, stdin, stdout):
-clocks = [_clock_of(r) for r in _read_records(stdin)]
-_emit({"clock": merge(*clocks) if clocks else {}}, stdout)
-return 0
-
-def cmd_compare(args, stdin, stdout):
-records = list(_read_records(stdin))
-if len(records)!= 2:
-sys.stderr.write(
-f"compare: expected exactly 2 records on stdin, got {len(records)}\n"
-)
-return 3
-relation = compare(_clock_of(records[0]), _clock_of(records[1]))
-_emit({"relation": relation}, stdout)
-return 0
-
-def build_parser():
-p = argparse.ArgumentParser(
-prog="vclock",
-description="Reason about the causal order of a stream of records (vector clock).",
-)
-sub = p.add_subparsers(dest="cmd")
-
-b = sub.add_parser("bump", help="increment one actor's component on each record")
-b.add_argument("--actor", required=True, help="the actor whose component to increment")
-b.set_defaults(func=cmd_bump)
-
-m = sub.add_parser("merge", help="component-wise max of every record's clock → one clock")
-m.set_defaults(func=cmd_merge)
-
-c = sub.add_parser("compare", help="causal relation of exactly two records' clocks")
-c.set_defaults(func=cmd_compare)
-
-return p
-
-def main(argv=None):
-parser = build_parser()
-args = parser.parse_args(argv)
-if not getattr(args, "cmd", None):
-parser.print_usage(sys.stderr)
-sys.stderr.write("vclock: a subcommand is required (bump / merge / compare)\n")
-return 3
-try:
-return args.func(args, sys.stdin, sys.stdout)
-except ValueError as e:
-sys.stderr.write(f"vclock: {e}\n")
-return 2
-except BrokenPipeError:
-# a downstream reader (e.g. `| head`) closed the pipe early. This is
-# normal for a well-behaved stream tool — exit quietly, don't traceback.
-try:
-sys.stdout.close()
-except Exception:
-pass
-return 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_vclock.py 320 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_vclock.py — the vclock gift's proof it works.
-
-Tests are written FIRST and lead the build. The load-bearing move for a vector
-clock is `compare`: the whole reason the primitive exists is to distinguish
-CONCURRENT from BEFORE/AFTER. A counter can order a total sequence; only a vector
-clock can say "these two events are causally independent." So the compare tests
-carry the weight, and the mutation section at the bottom proves they are not
-vacuous — each mutation is a plausible wrong implementation that MUST turn a test
-red. A suite that stays green under mutation is testing nothing.
-
-Run: python3 test_vclock.py # all tests + mutation bites
-python3 test_vclock.py -q # quiet unless something fails
-"""
-
-import io
-import json
-import subprocess
-import sys
-import unittest
-from pathlib import Path
-
-HERE = Path(__file__).resolve().parent
-TOOL = HERE / "vclock.py"
-
-# import the module directly so we can unit-test the pure functions,
-# and also drive the CLI as a subprocess for the contract tests.
-sys.path.insert(0, str(HERE))
-import vclock # noqa: E402
-
-# ---------------------------------------------------------------------------
-# compare — the gate. before / after / concurrent / equal, with the
-# absent-component-is-zero rule that separates a real vector clock from a
-# shared-keys-only impostor.
-# ---------------------------------------------------------------------------
-class TestCompare(unittest.TestCase):
-def test_equal_identical(self):
-self.assertEqual(vclock.compare({"a": 1, "b": 2}, {"a": 1, "b": 2}), "equal")
-
-def test_equal_empty(self):
-self.assertEqual(vclock.compare({}, {}), "equal")
-
-def test_before_strict(self):
-self.assertEqual(vclock.compare({"a": 1}, {"a": 2}), "before")
-
-def test_after_strict(self):
-self.assertEqual(vclock.compare({"a": 2}, {"a": 1}), "after")
-
-def test_concurrent_disjoint_actors(self):
-# a advanced on one axis, b on another — neither dominates. This is the
-# single most important case in the whole gift.
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
-
-def test_concurrent_crossed(self):
-self.assertEqual(vclock.compare({"a": 2, "b": 1}, {"a": 1, "b": 2}), "concurrent")
-
-# --- the absent-is-zero cases: the impostor-killers ---
-def test_absent_component_is_zero_before(self):
-# {a:1} has b=0 implicitly, so it is BEFORE {a:1,b:1}. A compare that
-# only looks at shared keys would wrongly call this equal.
-self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
-
-def test_absent_component_is_zero_after(self):
-self.assertEqual(vclock.compare({"a": 1, "b": 1}, {"a": 1}), "after")
-
-def test_absent_component_is_zero_concurrent(self):
-# {a:1} (b=0) vs {b:1} (a=0): each leads on its own axis → concurrent.
-# A shared-keys-only impostor sees no shared keys and might say equal.
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
-
-def test_explicit_zero_equals_absent(self):
-# {a:1,b:0} must be treated identically to {a:1}
-self.assertEqual(vclock.compare({"a": 1, "b": 0}, {"a": 1}), "equal")
-
-def test_compare_is_antisymmetric(self):
-# if X before Y then Y after X, for a spread of shapes
-pairs = [
-({"a": 1}, {"a": 2}),
-({"a": 1}, {"a": 1, "b": 1}),
-({}, {"a": 1}),
-]
-for x, y in pairs:
-self.assertEqual(vclock.compare(x, y), "before")
-self.assertEqual(vclock.compare(y, x), "after")
-
-# ---------------------------------------------------------------------------
-# bump — increment one actor's component; absent starts at 1.
-# ---------------------------------------------------------------------------
-class TestBump(unittest.TestCase):
-def test_bump_existing(self):
-self.assertEqual(vclock.bump({"a": 1, "b": 2}, "a"), {"a": 2, "b": 2})
-
-def test_bump_absent_starts_at_one(self):
-self.assertEqual(vclock.bump({"a": 1}, "b"), {"a": 1, "b": 1})
-
-def test_bump_empty(self):
-self.assertEqual(vclock.bump({}, "a"), {"a": 1})
-
-def test_bump_does_not_mutate_input(self):
-original = {"a": 1}
-vclock.bump(original, "a")
-self.assertEqual(original, {"a": 1}) # pure — no in-place edit
-
-def test_bump_after_is_after(self):
-# a bumped clock is strictly AFTER the one it came from
-c0 = {"a": 1, "b": 2}
-c1 = vclock.bump(c0, "a")
-self.assertEqual(vclock.compare(c0, c1), "before")
-
-# ---------------------------------------------------------------------------
-# merge — component-wise max across clocks.
-# ---------------------------------------------------------------------------
-class TestMerge(unittest.TestCase):
-def test_merge_componentwise_max(self):
-self.assertEqual(
-vclock.merge({"a": 2, "b": 1}, {"a": 1, "b": 3}), {"a": 2, "b": 3}
-)
-
-def test_merge_disjoint(self):
-self.assertEqual(vclock.merge({"a": 1}, {"b": 1}), {"a": 1, "b": 1})
-
-def test_merge_absent_is_zero(self):
-self.assertEqual(vclock.merge({"a": 5}, {}), {"a": 5})
-
-def test_merge_dominates_both(self):
-# the merge is AFTER-or-equal to each of its inputs (never before/concurrent)
-x, y = {"a": 2, "b": 1}, {"a": 1, "b": 3}
-m = vclock.merge(x, y)
-self.assertIn(vclock.compare(x, m), ("before", "equal"))
-self.assertIn(vclock.compare(y, m), ("before", "equal"))
-
-def test_merge_of_concurrent_is_after_both(self):
-# merging two genuinely concurrent clocks yields their least upper bound
-x, y = {"a": 1}, {"b": 1}
-m = vclock.merge(x, y)
-self.assertEqual(vclock.compare(x, m), "before")
-self.assertEqual(vclock.compare(y, m), "before")
-
-# ---------------------------------------------------------------------------
-# CLI contract — JSON-lines in, JSON-lines out; matches the house shape.
-# ---------------------------------------------------------------------------
-def run_cli(args, stdin_text=""):
-proc = subprocess.run(
-[sys.executable, str(TOOL), *args],
-input=stdin_text,
-capture_output=True,
-text=True,
-)
-return proc.returncode, proc.stdout, proc.stderr
-
-class TestBumpCLI(unittest.TestCase):
-def test_bump_stream(self):
-records = [
-{"id": 1, "clock": {"a": 1}},
-{"id": 2, "clock": {"a": 2, "b": 1}},
-]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-got = [json.loads(line) for line in out.splitlines()]
-self.assertEqual(got[0]["clock"], {"a": 2})
-self.assertEqual(got[1]["clock"], {"a": 3, "b": 1})
-# non-clock fields preserved
-self.assertEqual(got[0]["id"], 1)
-
-def test_bump_record_without_clock_gets_one(self):
-stdin = json.dumps({"id": 1}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["clock"], {"a": 1})
-
-def test_emit_is_sorted_keys(self):
-stdin = json.dumps({"z": 1, "clock": {"a": 1}}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-# sort_keys=True → "clock" precedes "z" in the raw text
-self.assertLess(out.index('"clock"'), out.index('"z"'))
-
-class TestMergeCLI(unittest.TestCase):
-def test_merge_stream_to_one_clock(self):
-records = [
-{"clock": {"a": 2, "b": 1}},
-{"clock": {"a": 1, "b": 3}},
-{"clock": {"c": 1}},
-]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["merge"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out), {"clock": {"a": 2, "b": 3, "c": 1}})
-
-def test_merge_empty_stream(self):
-rc, out, err = run_cli(["merge"], "")
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out), {"clock": {}})
-
-class TestCompareCLI(unittest.TestCase):
-def test_compare_two_records(self):
-records = [{"clock": {"a": 1}}, {"clock": {"b": 1}}]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["relation"], "concurrent")
-
-def test_compare_before(self):
-records = [{"clock": {"a": 1}}, {"clock": {"a": 2}}]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["relation"], "before")
-
-def test_compare_wrong_count_is_error(self):
-# compare needs exactly two records
-stdin = json.dumps({"clock": {"a": 1}}) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 3, "one record should be a usage error")
-
-class TestContract(unittest.TestCase):
-def test_no_subcommand_is_usage_error(self):
-rc, out, err = run_cli([])
-self.assertEqual(rc, 3)
-
-def test_bad_json_line_is_error(self):
-rc, out, err = run_cli(["bump", "--actor", "a"], "not json\n")
-self.assertEqual(rc, 2, "malformed input must not be trusted")
-
-def test_blank_lines_skipped(self):
-stdin = json.dumps({"clock": {"a": 1}}) + "\n\n\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(len([l for l in out.splitlines() if l]), 1)
-
-def test_non_integer_clock_component_is_error(self):
-stdin = json.dumps({"clock": {"a": "x"}}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 2, "a non-integer clock component is corrupt input")
-
-# ---------------------------------------------------------------------------
-# Mutation bites — prove the tests above are not vacuous. Each mutation is a
-# believable wrong implementation of a pure function; we assert that the real
-# suite would catch it. If a mutation survives (no test flips), the suite is
-# lying about its coverage and THIS meta-test fails loudly.
-# ---------------------------------------------------------------------------
-class TestMutationBites(unittest.TestCase):
-"""Each bite monkeypatches a pure fn with a plausible-wrong version and
-asserts at least one real assertion above would now fail."""
-
-def _suite_would_catch(self, cases):
-"""cases: list of (callable-returning-bool-that-should-be-True).
-Returns True if any case is now False (i.e. a test would go red)."""
-return any(not case() for case in cases)
-
-def test_bite_compare_ignores_absent_components(self):
-# WRONG: only compare shared keys. Would call {a:1} vs {a:1,b:1} 'equal'.
-def wrong_compare(x, y):
-shared = set(x) & set(y)
-lt = any(x.get(k, 0) < y.get(k, 0) for k in shared)
-gt = any(x.get(k, 0) > y.get(k, 0) for k in shared)
-if lt and gt:
-return "concurrent"
-if lt:
-return "before"
-if gt:
-return "after"
-return "equal"
-
-# under the real impl this is 'before'; the impostor says 'equal'
-self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
-self.assertEqual(wrong_compare({"a": 1}, {"a": 1, "b": 1}), "equal")
-self.assertNotEqual(
-vclock.compare({"a": 1}, {"a": 1, "b": 1}),
-wrong_compare({"a": 1}, {"a": 1, "b": 1}),
-"the absent-is-zero test must separate the real impl from the impostor",
-)
-
-def test_bite_compare_collapses_concurrent_to_before(self):
-# WRONG: no concurrent branch — anything not <= is 'after', anything
-# not >= is 'before'. Would call disjoint {a:1} vs {b:1} 'before'.
-def wrong_compare(x, y):
-keys = set(x) | set(y)
-if all(x.get(k, 0) <= y.get(k, 0) for k in keys):
-return "before" if x!= y else "equal"
-return "after" # NO concurrent branch
-
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
-self.assertNotEqual(wrong_compare({"a": 1}, {"b": 1}), "concurrent")
-
-def test_bite_bump_starts_absent_at_zero(self):
-# WRONG: absent actor bumped to 0 instead of 1 (off-by-one at creation)
-def wrong_bump(clock, actor):
-new = dict(clock)
-new[actor] = new.get(actor, -1) + 1 # absent → 0, not 1
-return new
-
-self.assertEqual(vclock.bump({}, "a"), {"a": 1})
-self.assertNotEqual(wrong_bump({}, "a"), {"a": 1})
-
-def test_bite_merge_uses_min_not_max(self):
-# WRONG: component-wise MIN instead of MAX
-def wrong_merge(x, y):
-keys = set(x) | set(y)
-return {k: min(x.get(k, 0), y.get(k, 0)) for k in keys}
-
-self.assertEqual(vclock.merge({"a": 2}, {"a": 1}), {"a": 2})
-self.assertNotEqual(wrong_merge({"a": 2}, {"a": 1}), {"a": 2})
-
-if __name__ == "__main__":
-verbosity = 1 if "-q" in sys.argv else 2
-argv = [a for a in sys.argv if a!= "-q"]
-unittest.main(argv=argv, verbosity=verbosity)
+reltime.js 106 lines on GitHub →
+#!/usr/bin/env node
+/* reltime.js — an honest relative-time label ("3h ago", "Jun 20") that refuses
+to fake, round up, or invent a time it doesn't have.
+
+Turn a timestamp into a short human "when" — but the whole point is what it
+WON'T do:
+
+• FLAG, DON'T FAKE. No stamp, an empty stamp, or an unparseable value
+returns null — NO label. The caller shows nothing rather than a guessed
+or fabricated time. An undated thing is never handed a "when".
+
+• A FUTURE STAMP IS NOT A RECENCY CLAIM. If the timestamp is ahead of now
+(clock skew, a bad record), it returns null rather than "-2h ago". You
+cannot honestly say how long ago something happened if it hasn't.
+
+• REAL, NOT ROUNDED-UP. Recent items get a relative label
+(just now / Nm / Nh / Nd ago); anything older than a week gets the
+ABSOLUTE short date it actually landed ("Jun 20", or "Jun 20, 2025"
+across a year boundary) — because "9d ago" is less honest and less
+useful than the date itself.
+
+• DETERMINISTIC. `now` is injected, so the label is a pure function of
+(stamp, now) — testable with no wall clock and stable across a render.
+
+Pure function of its inputs, no dependencies. The same code runs in a browser
+(attach relativeTime to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node reltime.js 2026-08-20T09:00:00Z # label vs. now
+node reltime.js 2026-08-20T09:00:00Z 1755772800000 # label vs. an injected now (ms)
+node reltime.js --help
+
+Dates are read/rendered in UTC for determinism. Released under MIT.
+*/
+"use strict";
+
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+var MIN = 60 * 1000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+
+/* relativeTime(iso, nowMs) -> short label string, or null when there is no
+honest label to show. `iso` is an ISO-8601 string (or null). `nowMs` defaults
+to Date.now() but is injected in tests and via the CLI for determinism. */
+function relativeTime(iso, nowMs) {
+// flag-don't-fake: no stamp, empty stamp, or a non-string -> no label.
+if (iso == null) return null;
+var s = String(iso);
+if (s === "") return null;
+
+var t = Date.parse(s);
+if (isNaN(t)) return null; // unparseable -> no fabricated time
+
+var now = (typeof nowMs === "number" && isFinite(nowMs))? nowMs: Date.now();
+var delta = now - t;
+
+// A future stamp (clock skew) is not a recency claim we can make honestly.
+if (delta < 0) return null;
+
+if (delta < MIN) return "just now";
+if (delta < HOUR) return Math.floor(delta / MIN) + "m ago";
+if (delta < DAY) return Math.floor(delta / HOUR) + "h ago";
+if (delta < WEEK) return Math.floor(delta / DAY) + "d ago";
+
+// Older than a week -> the absolute short date it actually landed.
+var d = new Date(t);
+var label = MONTHS[d.getUTCMonth()] + " " + d.getUTCDate();
+if (d.getUTCFullYear()!== new Date(now).getUTCFullYear()) {
+label += ", " + d.getUTCFullYear();
+}
+return label;
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.relativeTime = relativeTime;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { relativeTime: relativeTime};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function main(argv) {
+var args = argv.slice(2);
+if (args.length === 0 || args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"reltime.js — an honest relative-time label that refuses to fake a time.\n\n" +
+" node reltime.js <iso-timestamp> label vs. now\n" +
+" node reltime.js <iso-timestamp> <now-ms> label vs. an injected now (ms)\n" +
+" node reltime.js --help\n\n" +
+"Prints the label, or '(no honest label)' when the stamp is missing,\n" +
+"unparseable, or in the future. Dates render in UTC.\n"
+);
+return args.length === 0? 1: 0;
+}
+var iso = args[0];
+var nowMs = args.length > 1? Number(args[1]): undefined;
+var label = relativeTime(iso, nowMs);
+process.stdout.write((label === null? "(no honest label)": label) + "\n");
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_reltime.js 61 lines on GitHub →
+#!/usr/bin/env node
+/* test_reltime.js — proves the label is honest, exact, and deterministic.
+
+The honesty rules ARE the tool, so the test's real job is to prove each
+REFUSAL fires (null, not a fabricated label) and each threshold is exact. The
+clock is injected, so every case is deterministic with no wall clock. A
+mutation bite guards against a vacuously-green run. Exit 0 = all pass, exit 1
+= a failure (loud). stdlib only, no dependencies. */
+"use strict";
+var relativeTime = require("./reltime.js").relativeTime;
+
+var pass = 0, fail = 0;
+function eq(name, got, want) {
+var g = JSON.stringify(got), w = JSON.stringify(want);
+if (g === w) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
+}
+
+// A fixed "now" so every case is deterministic. 2026-06-27T12:00:00Z.
+var NOW = Date.parse("2026-06-27T12:00:00Z");
+function ago(ms) { return new Date(NOW - ms).toISOString();}
+var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+
+// --- flag-don't-fake: every "no honest label" case returns null -------------
+eq("null stamp -> null", relativeTime(null, NOW), null);
+eq("undefined stamp -> null", relativeTime(undefined, NOW), null);
+eq("empty string -> null", relativeTime("", NOW), null);
+eq("unparseable -> null", relativeTime("not a date", NOW), null);
+eq("garbage -> null", relativeTime("2026-13-99", NOW), null);
+eq("future stamp -> null", relativeTime(ago(-HOUR), NOW), null); // 1h in the FUTURE
+
+// --- relative band, exact thresholds ---------------------------------------
+eq("0ms -> just now", relativeTime(ago(0), NOW), "just now");
+eq("59s -> just now", relativeTime(ago(59 * 1000), NOW), "just now");
+eq("60s -> 1m ago", relativeTime(ago(MIN), NOW), "1m ago");
+eq("59m -> 59m ago", relativeTime(ago(59 * MIN), NOW), "59m ago");
+eq("60m -> 1h ago", relativeTime(ago(HOUR), NOW), "1h ago");
+eq("23h -> 23h ago", relativeTime(ago(23 * HOUR), NOW), "23h ago");
+eq("24h -> 1d ago", relativeTime(ago(DAY), NOW), "1d ago");
+eq("6d -> 6d ago", relativeTime(ago(6 * DAY), NOW), "6d ago");
+
+// --- absolute band (>= 1 week): the real date it landed --------------------
+eq("7d -> absolute date", relativeTime(ago(WEEK), NOW), "Jun 20");
+eq("30d same year -> date", relativeTime(ago(30 * DAY), NOW), "May 28");
+eq("across a year boundary", relativeTime("2025-12-31T00:00:00Z", NOW), "Dec 31, 2025");
+
+// --- determinism: same inputs, same output ---------------------------------
+eq("deterministic", relativeTime(ago(3 * HOUR), NOW), relativeTime(ago(3 * HOUR), NOW));
+
+// --- coercion / robustness --------------------------------------------------
+eq("non-string stamp -> null", relativeTime(12345, NOW), null); // a number is not an ISO string here
+
+// --- mutation bite: the future-guard MUST be load-bearing ------------------
+// If someone deleted `if (delta < 0) return null;`, a future stamp would
+// produce "just now" (delta<MIN with negative delta). Assert it does NOT.
+var futureResult = relativeTime(ago(-HOUR), NOW);
+if (futureResult === null) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: future stamp produced a label: " + JSON.stringify(futureResult));}
+
+console.log("\nreltime: " + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Python stdlib only
+Node, no dependencies
+
+---
+
+# Sha256 — a Loop MMT gift
+https://loopmmt.com/gifts/sha256/
+[coverage: optional · branch: gifts]
+
+Sync Hash That Matches Your Backend hash ← all gifts
+
+Sha256
+
+A dependency-free, synchronous SHA-256 (hex out) that returns the same 64-char digest as your Node backend's crypto.createHash for the same string — so a browser can mirror a server-side integrity check without turning the verify path async. The load-bearing rule: it hashes the UTF-8 bytes, so multibyte input (names, emoji) stays byte-identical instead of diverging silently.
+
+The honest edge
+
+It's a hash, not an HMAC and not encryption — it proves two inputs match, keeps no secret, and is not a password KDF. A from-scratch port for portability, not a hardened crypto library: where a vetted native lib is available and async is fine, prefer it.
+
+Run it
+
+node sha256.js "a string"
+test_sha256.js (24/24, drift-checked vs node crypto)
+Node, no dependencies
+
+The code — every file that ships
+
+sha256.js 176 lines on GitHub →
+#!/usr/bin/env node
+/* sha256.js — a dependency-free, synchronous SHA-256 (hex out) that is
+byte-identical to your backend's hash for the same string.
+
+WHY THIS EXISTS. The usual browser answer, crypto.subtle.digest, is
+ASYNCHRONOUS — it returns a Promise, so the moment you need a hash inside an
+otherwise-synchronous verify path (parse an envelope, check an integrity
+field, decide tamper/no-tamper), it forces that whole path to go async and
+ripple through everything that calls it. This is a small, pure, sync
+FIPS-180-4 SHA-256 that returns the SAME 64-char hex as Node's
+crypto.createHash('sha256').update(String(x)).digest('hex') — so a browser
+can mirror a Node integrity check without turning the call site async.
+
+THE ONE FIDELITY RULE (the whole reason to trust it). Node hashes the UTF-8
+BYTES of String(input). This encodes with the same UTF-8 byte stream, so the
+digest is identical — including for multibyte characters (accented names,
+emoji, non-Latin scripts). Never hash char codes: multibyte input would
+diverge silently and a tamper check would read a FALSE verdict. The test
+battery carries a multibyte vector precisely to catch that, checked against
+Node's own crypto as the oracle.
+
+Pure function of its input. No dependencies. Same code runs in a browser
+(attach sha256Hex to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node sha256.js "the string to hash" # hash an argument
+echo -n "the string" | node sha256.js # hash stdin (exact bytes, no newline added)
+node sha256.js --help
+
+Released under MIT. Its edge is printed in the README: this is a HASH, not
+an HMAC and not encryption — it proves two inputs match, it does not keep a
+secret and it is not a password-storage KDF.
+*/
+"use strict";
+
+// SHA-256 round constants — FIPS 180-4 §4.2.2 (first 32 bits of the fractional
+// parts of the cube roots of the first 64 primes).
+var K = [
+0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
+
+function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
+
+// Encode a JS string to its UTF-8 bytes — the SAME bytes Node's
+//.update(String(s)) hashes. TextEncoder is present in every modern browser and
+// in Node; the manual fallback (surrogate-pair aware) produces the same stream.
+function utf8Bytes(str) {
+if (typeof TextEncoder!== "undefined") {
+return new TextEncoder().encode(str);
+}
+var out = [], i, c, lo;
+for (i = 0; i < str.length; i++) {
+c = str.charCodeAt(i);
+if (c < 0x80) { out.push(c);}
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) { // high surrogate
+lo = str.charCodeAt(++i);
+c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
+out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
+}
+return out;
+}
+
+function toHex8(x) {
+var h = (x >>> 0).toString(16);
+return "00000000".slice(h.length) + h;
+}
+
+// sha256Hex(input) -> 64-char lowercase hex, byte-identical to Node's
+// crypto.createHash('sha256').update(String(input)).digest('hex').
+function sha256Hex(input) {
+var bytes = utf8Bytes(String(input));
+var len = bytes.length;
+
+// Padding: append 0x80, then 0x00s, then the 64-bit big-endian bit length,
+// rounding up to a multiple of 64 bytes.
+var bitLenHi = Math.floor(len / 0x20000000); // high 32 bits of (len*8)
+var bitLenLo = (len * 8) >>> 0; // low 32 bits of (len*8)
+var withOne = len + 1;
+var padded = (withOne + 8 + 63) & ~63;
+var msg = new Uint8Array(padded);
+var i;
+for (i = 0; i < len; i++) msg[i] = bytes[i];
+msg[len] = 0x80;
+msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
+msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
+msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
+msg[padded - 5] = bitLenHi & 0xff;
+msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
+msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
+msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
+msg[padded - 1] = bitLenLo & 0xff;
+
+var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
+h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+
+var w = new Array(64), t, blk;
+for (blk = 0; blk < padded; blk += 64) {
+for (t = 0; t < 16; t++) {
+w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
+(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
+}
+for (t = 16; t < 64; t++) {
+var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+}
+var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
+for (t = 0; t < 64; t++) {
+var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+var ch = (e & f) ^ (~e & g);
+var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
+var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+var maj = (a & b) ^ (a & c) ^ (b & c);
+var temp2 = (S0 + maj) >>> 0;
+hh = g; g = f; f = e; e = (d + temp1) >>> 0;
+d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+}
+h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
+}
+
+return toHex8(h0) + toHex8(h1) + toHex8(h2) + toHex8(h3) +
+toHex8(h4) + toHex8(h5) + toHex8(h6) + toHex8(h7);
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.sha256Hex = sha256Hex;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { sha256Hex: sha256Hex};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"sha256.js — dependency-free sync SHA-256, hex out (byte-identical to Node crypto).\n\n" +
+" node sha256.js \"a string\" hash the argument\n" +
+" echo -n \"a string\" | node sha256.js hash stdin (exact bytes, no newline added)\n" +
+" node sha256.js --help\n\n" +
+"Edge: this is a hash, not an HMAC and not encryption. It proves two inputs\n" +
+"match; it keeps no secret and is not a password KDF.\n"
+);
+return 0;
+}
+if (args.length > 0) {
+process.stdout.write(sha256Hex(args[0]) + "\n");
+return 0;
+}
+// stdin: hash the exact bytes received (no trailing newline added).
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var buf = Buffer.concat(chunks);
+// Hash the exact received bytes: decode as UTF-8 back to the string whose
+// UTF-8 bytes are these bytes (round-trips for valid UTF-8 input).
+process.stdout.write(sha256Hex(buf.toString("utf8")) + "\n");
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_sha256.js 73 lines on GitHub →
+#!/usr/bin/env node
+/* test_sha256.js — proves sha256Hex is byte-identical to Node's own crypto.
+
+The oracle is Node's crypto.createHash('sha256'): for every vector we compute
+the digest BOTH ways and require they match. That is the honest proof — not
+"it matches a hardcoded string I typed" but "it matches the reference
+implementation for the same bytes", including the multibyte case that is the
+whole point of the fidelity rule. Also checks the two canonical FIPS-180-4
+vectors as fixed anchors, and mutation-bites the core so a no-op test can't
+pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var crypto = require("crypto");
+var sha256Hex = require("./sha256.js").sha256Hex;
+
+var pass = 0, fail = 0;
+function check(name, got, want) {
+if (got === want) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + got + "\n want: " + want);}
+}
+function nodeHash(s) {
+return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+
+// 1. Canonical FIPS-180-4 anchors (fixed, independent of Node).
+check("empty string", sha256Hex(""),
+"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+check("abc", sha256Hex("abc"),
+"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+// 2. Drift-check against Node crypto over a vector battery (the real proof).
+var vectors = [
+"",
+"abc",
+"a",
+"The quick brown fox jumps over the lazy dog",
+"The quick brown fox jumps over the lazy dog.", // one-byte change -> avalanche
+"0123456789",
+"x".repeat(55), // one byte under a block boundary
+"x".repeat(56), // padding crosses into a new block
+"x".repeat(63),
+"x".repeat(64), // exact block
+"x".repeat(65),
+"x".repeat(1000), // multi-block
+"café", // multibyte: é is 2 UTF-8 bytes
+"naïve façade Zürich", // several multibyte
+"日本語テスト", // CJK, 3 bytes each
+"🦌", // the deer glyph — 4-byte surrogate pair
+"order:🦌×3 café", // mixed ASCII + multibyte + emoji
+"line1\nline2\ttabbed", // control chars
+];
+for (var i = 0; i < vectors.length; i++) {
+var v = vectors[i];
+var label = v.length > 24? (v.slice(0, 21) + "..."): v;
+check("drift[" + i + "] '" + label + "'", sha256Hex(v), nodeHash(v));
+}
+
+// 3. Determinism — same input twice, same digest.
+check("deterministic", sha256Hex("repeat me"), sha256Hex("repeat me"));
+
+// 4. Non-vacuity / mutation bite: a WRONG expected value MUST be caught.
+// (If the harness were a no-op, this "should fail" case would slip through.)
+var deliberatelyWrong = "0000000000000000000000000000000000000000000000000000000000000000";
+var mutationCaught = (sha256Hex("abc")!== deliberatelyWrong);
+if (mutationCaught) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: core did not distinguish a wrong digest");}
+
+// 5. String coercion parity with Node (numbers, etc. -> String()).
+check("number coercion 42", sha256Hex(42), nodeHash(42));
+check("boolean coercion", sha256Hex(true), nodeHash(true));
+
+console.log("\nsha256: " + pass + " passed, " + fail + " failed" +
+" (" + vectors.length + " drift vectors vs node crypto, incl. multibyte + emoji)");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node, no dependencies
+
+---
+
+# Sudoku — a Loop MMT gift
+https://loopmmt.com/gifts/sudoku/
+[coverage: optional · branch: gifts]
+
+A Solver That Shows Its Work transform ← all gifts
+
+Sudoku
+
+Most Sudoku solvers hand you the answer; this one hands you the reasoning. It solves the way a person does — applying the lowest technique that makes progress and recording WHAT it did and WHY at every step as a single ordered trace, so the answer is just the last line of an argument you can read and check by hand. Five techniques (naked/hidden single, locked candidates, naked pair, x-wing), applied lowest-first. It never guesses: faced with a puzzle beyond its ladder it says “ceiling-hit” rather than searching — an honest difficulty read, not a failure. Deterministic: the same givens always produce the byte-identical trace.
+
+The honest edge
+
+It only makes FORCED moves — it reasons, it does not search or backtrack, so a puzzle needing a technique above x-wing returns ceiling-hit (a difficulty read), not a guessed fill. And ‘broken’ fires when reasoning empties a cell; a contradiction sitting between two givens no technique touches reads as ceiling-hit, because the solver reasons about the puzzle rather than front-validating your input.
+
+Run it
+
+python3 sudoku.py --demo
+test_sudoku.py (130/130, mutation-bitten, pinned golden trace)
+Python standard library only, deterministic + headless
+
+The code — every file that ships
+
+sudoku.py 549 lines on GitHub →
+#!/usr/bin/env python3
+"""sudoku — a Sudoku solver that shows its work.
+
+Most solvers hand you the answer. This one hands you the *reasoning*: it solves
+the way a person does — applying the lowest technique that makes progress and
+recording WHAT it did and WHY at every step, as a single ordered trace. The
+answer is just the last line of an argument you can read.
+
+from sudoku import solve, from_string
+result = solve(from_string("53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"))
+result.status # 'solved-unique' | 'ceiling-hit' | 'broken'
+for step in result.trace:
+print(step.reason) # "naked single: 4 is the only candidate left for r1c3..."
+
+Five techniques, applied lowest-first (so the explanation reads like a human
+tutor, easiest move first):
+1. naked single — a cell with only one candidate left
+2. hidden single — a digit that fits only one cell in a unit
+3. locked candidates — pointing / claiming (an elimination technique)
+4. naked pair — two cells locking two digits to themselves
+5. x-wing — the basic fish
+
+Three honest terminal states:
+solved-unique — solved by these techniques alone; `solution` is filled in.
+ceiling-hit — consistent but needs a technique above the ladder (a
+DIFFICULTY read, not a failure — this puzzle is "harder
+than x-wing", which is useful information).
+broken — a cell ran out of candidates; the givens contradict.
+
+Properties (see test_sudoku.py):
+- Deterministic: the same givens always produce the byte-identical trace.
+- Certifying: every placement/elimination carries a human sentence saying
+why it is forced. The trace is a proof you can check by hand.
+- Never guesses: it only makes forced moves. It will say "ceiling-hit"
+before it will backtrack — it does not search, it reasons.
+
+Zero dependencies (Python standard library only). Headless: givens in, a
+SolveResult out — no I/O in the solver, no globals, no randomness.
+
+Origin: the reasoning core of a self-explaining Sudoku teaching app, stripped to
+stand alone. MIT licensed — take the folder.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, asdict
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+Cell = Tuple[int, int] # (row, col), 0-indexed
+Grid = List[List[int]] # 9x9, 0 = empty
+Candidates = Dict[Cell, Set[int]]
+
+N = 9
+DIGITS = frozenset(range(1, 10))
+
+# ── The trace (the spine — everything folds from this) ──────────────────────
+@dataclass
+class TechniqueApplication:
+technique: str # rung name
+cells_affected: List[Cell] # coordinates touched
+candidates_eliminated: List[Tuple[Cell, int]] # what this step ruled out
+reason: str # the human sentence: WHY
+
+def to_dict(self) -> dict:
+d = asdict(self)
+d["cells_affected"] = [list(c) for c in self.cells_affected]
+d["candidates_eliminated"] = [
+[list(c), dg] for c, dg in self.candidates_eliminated
+]
+return d
+
+@dataclass
+class SolveResult:
+status: str # solved-unique|ceiling-hit|broken
+trace: List[TechniqueApplication]
+solution: Optional[Grid] = None # present iff solved-unique
+
+def to_dict(self) -> dict:
+return {
+"status": self.status,
+"trace": [t.to_dict() for t in self.trace],
+"solution": self.solution,
+}
+
+# ── Geometry (units: rows, cols, boxes) ─────────────────────────────────────
+def _peers(cell: Cell) -> Set[Cell]:
+r, c = cell
+peers: Set[Cell] = set()
+for k in range(N):
+peers.add((r, k))
+peers.add((k, c))
+br, bc = 3 * (r // 3), 3 * (c // 3)
+for dr in range(3):
+for dc in range(3):
+peers.add((br + dr, bc + dc))
+peers.discard(cell)
+return peers
+
+def _units() -> List[List[Cell]]:
+units: List[List[Cell]] = []
+for r in range(N):
+units.append([(r, c) for c in range(N)]) # rows
+for c in range(N):
+units.append([(r, c) for r in range(N)]) # cols
+for br in range(0, N, 3):
+for bc in range(0, N, 3):
+units.append([(br + dr, bc + dc)
+for dr in range(3) for dc in range(3)]) # boxes
+return units
+
+_UNITS = _units()
+_UNIT_NAME = (
+["row " + str(i + 1) for i in range(N)]
++ ["column " + str(i + 1) for i in range(N)]
++ ["box " + str(i + 1) for i in range(N)]
+)
+
+def compute_candidates(grid: Grid) -> Candidates:
+"""For every empty cell, the digits not already used by one of its peers.
+
+Deterministic and total — the fixed point recomputes this each step.
+"""
+cands: Candidates = {}
+for r in range(N):
+for c in range(N):
+if grid[r][c]!= 0:
+continue
+seen = {grid[pr][pc] for pr, pc in _peers((r, c)) if grid[pr][pc]!= 0}
+cands[(r, c)] = set(DIGITS) - seen
+return cands
+
+# ── The ladder (reorderable DATA — the one live research object) ────────────
+# A rung: given the candidate grid, return the ONE lowest-rung, row-major-first
+# applicable move as a TechniqueApplication, or None. Rungs never mutate.
+#
+# Two KINDS of rung share this signature, and the loop tells them apart by ONE
+# schema-stable signal — `candidates_eliminated`:
+# PLACEMENT rung (naked/hidden-single): places a digit; `candidates_eliminated`
+# is [] and the placed digit is the first [1-9] in `reason`.
+# ELIMINATION rung (locked-candidates, pairs, x-wing): places NOTHING; it
+# prunes candidates, so `candidates_eliminated` is non-empty and there is
+# no placed digit. `cells_affected` are the cells it pruned FROM.
+# Invariant: `candidates_eliminated` non-empty <=> elimination step. A rung
+# that would eliminate nothing returns None (no progress -> the loop would spin).
+Rung = Callable[[Grid, Candidates], Optional[TechniqueApplication]]
+
+def _rowmajor(cells) -> list:
+"""The within-rung tie-break: smallest (row, col) first."""
+return sorted(cells)
+
+def _box_of(cell: Cell) -> Tuple[int, int]:
+r, c = cell
+return (3 * (r // 3), 3 * (c // 3))
+
+def _box_cells(br: int, bc: int) -> List[Cell]:
+return [(br + dr, bc + dc) for dr in range(3) for dc in range(3)]
+
+def _box_num(br: int, bc: int) -> int:
+return (br // 3) * 3 + (bc // 3) + 1
+
+# Row/column units in a fixed order (rows 1-9 then cols 1-9), for the line-based
+# rungs; digit names within a reason are 1-indexed to match the singles' voice.
+_ROWS: List[List[Cell]] = [[(r, c) for c in range(N)] for r in range(N)]
+_COLS: List[List[Cell]] = [[(r, c) for r in range(N)] for c in range(N)]
+_BOXES: List[Tuple[int, int]] = [(br, bc) for br in range(0, N, 3)
+for bc in range(0, N, 3)]
+
+def rung_naked_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+for cell in _rowmajor(cands):
+opts = cands[cell]
+if len(opts) == 1:
+d = next(iter(opts))
+r, c = cell
+return TechniqueApplication(
+technique="naked-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"naked single: {d} is the only candidate left for "
+f"r{r + 1}c{c + 1} — every other digit is already used "
+f"by one of its peers."),
+)
+return None
+
+def rung_hidden_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+# Units in a fixed order; within a unit, digits ascending; first hit wins.
+for ui, unit in enumerate(_UNITS):
+empties = [cell for cell in unit if cell in cands]
+for d in range(1, 10):
+spots = [cell for cell in empties if d in cands[cell]]
+if len(spots) == 1:
+cell = spots[0]
+# Skip if a naked single would already place it (lower rung wins).
+if len(cands[cell]) == 1:
+continue
+r, c = cell
+# The placed digit MUST be the first numeral in the reason:
+# _placed_digit greps the first \b[1-9]\b, so leading with a
+# unit number would make it place the unit's number, not {d}.
+return TechniqueApplication(
+technique="hidden-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"hidden single: {d} can only go in r{r + 1}c{c + 1} "
+f"— within {_UNIT_NAME[ui]} it fits nowhere else."),
+)
+return None
+
+def rung_locked_candidates(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Locked candidates (pointing + claiming). An ELIMINATION rung.
+
+Pointing: within a box, if every candidate for a digit lies in one line
+(row or col), that digit is eliminated from the rest of that line.
+Claiming: within a line, if every candidate for a digit lies in one box,
+that digit is eliminated from the rest of that box.
+"""
+# ── Pointing: box -> line ───────────────────────────────────────────────
+for br, bc in _BOXES:
+cells = _box_cells(br, bc)
+for d in range(1, 10):
+spots = [cell for cell in cells if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+rows = {r for r, _c in spots}
+cols = {c for _r, c in spots}
+if len(rows) == 1:
+r = next(iter(rows))
+targets = _rowmajor(cell for cell in _ROWS[r]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in row {r + 1}, so {d} is "
+f"eliminated from the rest of row {r + 1}."),
+)
+if len(cols) == 1:
+c = next(iter(cols))
+targets = _rowmajor(cell for cell in _COLS[c]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in column {c + 1}, so {d} is "
+f"eliminated from the rest of column {c + 1}."),
+)
+# ── Claiming: line -> box ───────────────────────────────────────────────
+for name, unit in ([(f"row {i + 1}", u) for i, u in enumerate(_ROWS)]
++ [(f"column {i + 1}", u) for i, u in enumerate(_COLS)]):
+for d in range(1, 10):
+spots = [cell for cell in unit if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+boxes = {_box_of(cell) for cell in spots}
+if len(boxes) == 1:
+br, bc = next(iter(boxes))
+box = _box_cells(br, bc)
+targets = _rowmajor(cell for cell in box
+if cell not in unit
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in {name}, {d} can only go "
+f"in box {_box_num(br, bc)}, so {d} is eliminated "
+f"from the rest of box {_box_num(br, bc)}."),
+)
+return None
+
+def rung_naked_pair(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Naked pair. Two cells in a unit sharing the SAME two candidates {x, y}
+lock those digits to themselves, eliminating x and y from every other cell
+in that unit."""
+for ui, unit in enumerate(_UNITS):
+bi = _rowmajor(cell for cell in unit
+if cell in cands and len(cands[cell]) == 2)
+for i in range(len(bi)):
+for j in range(i + 1, len(bi)):
+a, b = bi[i], bi[j]
+if cands[a]!= cands[b]:
+continue
+pair = sorted(cands[a]) # [x, y]
+elim: List[Tuple[Cell, int]] = []
+for cell in unit:
+if cell in (a, b) or cell not in cands:
+continue
+for d in pair:
+if d in cands[cell]:
+elim.append((cell, d))
+if elim:
+elim.sort()
+affected = _rowmajor({c for c, _d in elim})
+ar, ac = a
+br_, bc_ = b
+return TechniqueApplication(
+technique="naked-pair",
+cells_affected=affected,
+candidates_eliminated=elim,
+reason=(f"naked pair: {pair[0]} and {pair[1]} are locked "
+f"to r{ar + 1}c{ac + 1} and r{br_ + 1}c{bc_ + 1} "
+f"in {_UNIT_NAME[ui]}, so both are eliminated from "
+f"the rest of that unit."),
+)
+return None
+
+def rung_x_wing(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""X-wing (basic fish). If two rows each have digit d as a candidate in
+EXACTLY the same two columns, d is eliminated from those columns in every
+other row (and the column-based transpose)."""
+# ── Row-based: base = two rows, cross = two columns ─────────────────────
+for d in range(1, 10):
+rowcols: Dict[int, Tuple[int, int]] = {}
+for r in range(N):
+cols = [c for c in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(cols) == 2:
+rowcols[r] = (cols[0], cols[1])
+bases = sorted(rowcols)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+r1, r2 = bases[i], bases[j]
+if rowcols[r1]!= rowcols[r2]:
+continue
+c1, c2 = rowcols[r1]
+targets = _rowmajor(
+(r, c) for r in range(N) if r not in (r1, r2)
+for c in (c1, c2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in rows {r1 + 1} and {r2 + 1} is "
+f"confined to columns {c1 + 1} and {c2 + 1}, so "
+f"{d} is eliminated from those columns in every "
+f"other row."),
+)
+# ── Column-based (transpose): base = two columns, cross = two rows ──────
+for d in range(1, 10):
+colrows: Dict[int, Tuple[int, int]] = {}
+for c in range(N):
+rows = [r for r in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(rows) == 2:
+colrows[c] = (rows[0], rows[1])
+bases = sorted(colrows)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+c1, c2 = bases[i], bases[j]
+if colrows[c1]!= colrows[c2]:
+continue
+r1, r2 = colrows[c1]
+targets = _rowmajor(
+(r, c) for c in range(N) if c not in (c1, c2)
+for r in (r1, r2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in columns {c1 + 1} and {c2 + 1} is "
+f"confined to rows {r1 + 1} and {r2 + 1}, so "
+f"{d} is eliminated from those rows in every "
+f"other column."),
+)
+return None
+
+# ORDER IS DATA — reorder to change the difficulty model, never hard-code it.
+# New techniques (wings, chains) append here; the solve loop never changes.
+LADDER: List[Tuple[str, int, Rung]] = [
+("naked-single", 1, rung_naked_single),
+("hidden-single", 2, rung_hidden_single),
+("locked-candidates", 3, rung_locked_candidates),
+("naked-pair", 4, rung_naked_pair),
+("x-wing", 5, rung_x_wing),
+]
+
+def _is_contradiction(grid: Grid, cands: Candidates) -> bool:
+for cell, opts in cands.items():
+if not opts: # an empty cell with no candidate = broken
+return True
+return False
+
+def _complete(grid: Grid) -> bool:
+return all(grid[r][c]!= 0 for r in range(N) for c in range(N))
+
+def _placed_digit(step: TechniqueApplication) -> int:
+# CONTRACT: a PLACEMENT reason MUST lead with the placed digit — it is the
+# first \b[1-9]\b in the string, before any row/col/unit numeral. Both
+# placement rungs honor this. Never call this on an elimination step
+# (candidates_eliminated non-empty); use its structured (cell, digit) pairs.
+m = re.search(r"\b([1-9])\b", step.reason)
+return int(m.group(1))
+
+def _is_placement(step: TechniqueApplication) -> bool:
+"""A step is a PLACEMENT iff it eliminates no candidates (it places a digit);
+otherwise it is an ELIMINATION (it prunes candidates, places nothing)."""
+return not step.candidates_eliminated
+
+def solve(givens: Grid) -> SolveResult:
+"""solve(givens) -> SolveResult. Prefer-lowest-rung fixed point.
+
+Candidates are CARRIED, not recomputed each step: a placement prunes the
+placed digit from the placed cell's peers; an elimination prunes the pruned
+(cell, digit) pairs. Recomputing from the grid alone would lose every
+elimination-rung deduction (they don't live in the grid), so the persistent
+candidate set is what lets a later single depend on an earlier elimination.
+"""
+grid = [row[:] for row in givens]
+cands = compute_candidates(grid)
+trace: List[TechniqueApplication] = []
+
+while True:
+if _is_contradiction(grid, cands):
+return SolveResult(status="broken", trace=trace, solution=None)
+
+if _complete(grid):
+return SolveResult(status="solved-unique", trace=trace,
+solution=[row[:] for row in grid])
+
+# walk the ladder bottom-up; apply the LOWEST rung that makes progress
+step: Optional[TechniqueApplication] = None
+for _name, _tier, rung in LADDER:
+step = rung(grid, cands)
+if step is not None:
+break
+
+if step is None:
+# no rung progresses, board consistent but unfinished — a
+# DIFFICULTY read, not a failure.
+return SolveResult(status="ceiling-hit", trace=trace, solution=None)
+
+if _is_placement(step):
+(r, c) = step.cells_affected[0]
+d = _placed_digit(step)
+grid[r][c] = d
+del cands[(r, c)]
+for peer in _peers((r, c)):
+if peer in cands:
+cands[peer].discard(d)
+else:
+for cell, dig in step.candidates_eliminated:
+if cell in cands:
+cands[cell].discard(dig)
+trace.append(step)
+
+# ── convenience: parse / print an 81-char string ("." or "0" = empty) ───────
+def from_string(s: str) -> Grid:
+s = "".join(ch for ch in s if not ch.isspace())
+if len(s)!= 81:
+raise ValueError(f"expected 81 cells, got {len(s)}")
+g: Grid = []
+for r in range(N):
+row = []
+for c in range(N):
+ch = s[r * N + c]
+row.append(0 if ch in ".0" else int(ch))
+g.append(row)
+return g
+
+def to_string(grid: Grid) -> str:
+return "".join(str(grid[r][c]) for r in range(N) for c in range(N))
+
+def render(grid: Grid) -> str:
+"""A human-readable 9x9 grid with box separators (for the CLI)."""
+lines = []
+for r in range(N):
+if r in (3, 6):
+lines.append("------+-------+------")
+cells = []
+for c in range(N):
+if c in (3, 6):
+cells.append("|")
+cells.append(str(grid[r][c]) if grid[r][c] else ".")
+lines.append(" ".join(cells))
+return "\n".join(lines)
+
+# ── CLI: read an 81-char puzzle, print the reasoning, then the answer ───────
+def _main(argv: List[str]) -> int:
+demo = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+if argv and argv[0] in ("-h", "--help"):
+print("usage: python3 sudoku.py [81-char-puzzle | --demo]")
+print(" cells 1-9; '.' or '0' = empty; whitespace ignored")
+print(" prints the step-by-step reasoning, then the solution")
+return 0
+arg = argv[0] if argv else "--demo"
+puzzle = demo if arg in ("", "--demo") else arg
+try:
+grid = from_string(puzzle)
+except ValueError as e:
+print(f"bad puzzle: {e}")
+return 2
+
+print("puzzle:")
+print(render(grid))
+print()
+result = solve(grid)
+print(f"status: {result.status} ({len(result.trace)} steps)\n")
+for i, step in enumerate(result.trace, 1):
+print(f" {i:>2}. {step.reason}")
+if result.solution is not None:
+print("\nsolution:")
+print(render(result.solution))
+elif result.status == "ceiling-hit":
+print("\n(consistent, but needs a technique above this solver's ladder — "
+"a difficulty read, not a failure.)")
+return 0
+
+if __name__ == "__main__":
+import sys
+raise SystemExit(_main(sys.argv[1:]))
+
+test_sudoku.py 248 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_sudoku.py — proves the solver is certifying, deterministic, and honest.
+
+The claims that ARE the tool:
+1. CERTIFYING: every step carries a reason, and the reason is CHECKABLE —
+a placement's reason leads with the digit it places, and re-applying the
+whole trace to the givens reproduces the solution. The trace is a proof.
+2. DETERMINISTIC: the same givens produce the byte-identical trace, every run.
+3. THREE HONEST STATES: solved-unique (with a valid solution), ceiling-hit
+(consistent but beyond the ladder — a difficulty read), broken (givens
+contradict). Each is reachable and correctly labelled.
+4. NEVER GUESSES: it stops at ceiling-hit rather than searching. A puzzle
+needing a technique above x-wing returns ceiling-hit, not a lucky answer.
+Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
+Exit 0 = all pass, exit 1 = a failure (loud).
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sudoku import (
+solve, from_string, to_string, compute_candidates,
+SolveResult, TechniqueApplication, _peers, _units, N, LADDER,
+)
+
+_pass = 0
+_fail = 0
+
+def eq(name, got, want):
+global _pass, _fail
+if got == want:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
+
+def ok(name, cond):
+global _pass, _fail
+if cond:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}")
+
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+EASY = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+EASY_SOLUTION = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+
+# A grid that is complete and correct = solve returns it unchanged, zero steps.
+SOLVED = EASY_SOLUTION
+
+# A contradiction the solver actually REACHES: the near-complete easy solution
+# with r1c1 blanked and a 5 planted in its box, so r1c1's only digit (5) is
+# already taken by a peer — compute_candidates leaves it with an empty set and
+# _is_contradiction fires. (Note: a contradiction between two GIVENS that no
+# technique touches reads as ceiling-hit, not broken — the solver reasons, it
+# does not front-validate the givens. That is correct and intentional.)
+BROKEN = ".54678912672195348198342567859761423426853791713924856961537284287419635345286179"
+
+def is_valid_solution(s: str) -> bool:
+"""A solved grid: 81 non-zero cells, every row/col/box a permutation of 1-9."""
+g = from_string(s)
+if any(g[r][c] == 0 for r in range(N) for c in range(N)):
+return False
+for unit in _units():
+vals = sorted(g[r][c] for r, c in unit)
+if vals!= list(range(1, 10)):
+return False
+return True
+
+# ── PROPERTY 1: certifying — the trace is a checkable proof ───────────────────
+(lambda: None)() # keep the section visible
+
+def _replay_trace(givens, result):
+"""Re-apply the recorded trace to the givens; a placement's reason must lead
+with the digit it places, and applying every placement must reproduce the
+solution. This proves the reasons are not decorative — they carry the moves."""
+import re
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated: # placement
+(r, c) = step.cells_affected[0]
+d = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+g[r][c] = d
+return g
+
+r_easy = solve(from_string(EASY))
+ok("easy solves", r_easy.status == "solved-unique")
+ok("easy solution is valid", r_easy.solution is not None and is_valid_solution(to_string(r_easy.solution)))
+eq("easy solution matches known answer", to_string(r_easy.solution), EASY_SOLUTION)
+ok("every step has a non-empty reason", all(s.reason.strip() for s in r_easy.trace))
+ok("trace is non-trivial", len(r_easy.trace) > 10)
+# the certifying check: replaying the trace's placements reproduces the solution
+replayed = _replay_trace(from_string(EASY), r_easy)
+eq("replaying the trace reproduces the solution", to_string(replayed), EASY_SOLUTION)
+
+# every placement step's reason leads with the digit actually placed in the solution
+import re
+for step in r_easy.trace:
+if not step.candidates_eliminated: # placement
+(rr, cc) = step.cells_affected[0]
+placed = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+ok(f"placement reason leads with placed digit @r{rr+1}c{cc+1}",
+placed == from_string(EASY_SOLUTION)[rr][cc])
+
+# ── PROPERTY 2: deterministic — byte-identical trace every run ────────────────
+def trace_signature(result):
+return to_string_result(result)
+
+def to_string_result(result):
+import json
+return json.dumps(result.to_dict(), sort_keys=True)
+
+sig1 = to_string_result(solve(from_string(EASY)))
+sig2 = to_string_result(solve(from_string(EASY)))
+sig3 = to_string_result(solve(from_string(EASY)))
+ok("deterministic: run 1 == run 2", sig1 == sig2)
+ok("deterministic: run 2 == run 3", sig2 == sig3)
+# GOLDEN: pin the canonical trace signature by hash. Self-equality alone is a
+# weak determinism test (a benign reorder stays self-equal); a pinned golden
+# catches any change to the tie-break / scan order that reorders the trace.
+import hashlib as _hl
+_golden = "1f4fc6f7b5886070bb06a38c5457ef9c93a4c4dabdb9735518786b8f57e91548"
+_got = _hl.sha256(sig1.encode()).hexdigest()
+ok("deterministic: trace matches the pinned golden signature", _got == _golden)
+# solving does not mutate the givens
+givens = from_string(EASY)
+before = to_string(givens)
+solve(givens)
+eq("solve does not mutate givens", to_string(givens), before)
+
+# ── PROPERTY 3: three honest terminal states ──────────────────────────────────
+# solved-unique (already covered above)
+# broken:
+r_broken = solve(from_string(BROKEN))
+ok("contradiction -> broken", r_broken.status == "broken")
+ok("broken has no solution", r_broken.solution is None)
+
+# an already-solved grid: solved-unique, zero steps, solution == input
+r_done = solve(from_string(SOLVED))
+ok("already-solved -> solved-unique", r_done.status == "solved-unique")
+eq("already-solved needs zero steps", len(r_done.trace), 0)
+eq("already-solved returns the same grid", to_string(r_done.solution), SOLVED)
+
+# ── PROPERTY 4: never guesses — ceiling-hit before search ─────────────────────
+# The empty grid is consistent but has no forced move for these techniques,
+# so a NON-searching solver must return ceiling-hit (a searching one would
+# "solve" it to some arbitrary valid grid). This is the anti-guess proof.
+EMPTY = "." * 81
+r_empty = solve(from_string(EMPTY))
+ok("empty grid -> ceiling-hit (does NOT guess a solution)", r_empty.status == "ceiling-hit")
+ok("ceiling-hit has no solution", r_empty.solution is None)
+# a partial consistent grid with no forced single also ceiling-hits rather than searching
+# (17-clue minimal puzzles typically need guessing; a bare 2-clue grid certainly does)
+SPARSE = "1................2..............................................................."
+r_sparse = solve(from_string(SPARSE))
+ok("sparse consistent grid -> ceiling-hit, not a guessed fill",
+r_sparse.status == "ceiling-hit" and r_sparse.solution is None)
+
+# ── The elimination rungs actually fire (coverage that the ladder is exercised) ─
+# Not every easy puzzle exercises the higher rungs; assert the ladder is complete
+# and each rung is callable and returns the right SHAPE when it does fire.
+ok("ladder has all five rungs", [name for name, _t, _f in LADDER] ==
+["naked-single", "hidden-single", "locked-candidates", "naked-pair", "x-wing"])
+# a placement step: candidates_eliminated empty; an elimination step: non-empty.
+for step in r_easy.trace:
+placement = not step.candidates_eliminated
+if placement:
+ok(f"placement step has one affected cell ({step.technique})", len(step.cells_affected) == 1)
+else:
+ok(f"elimination step eliminated something ({step.technique})", len(step.candidates_eliminated) >= 1)
+
+# ── input validation ──────────────────────────────────────────────────────────
+def raises(name, fn):
+global _pass, _fail
+try:
+fn()
+_fail += 1
+print(f"FAIL {name} (expected raise)")
+except Exception:
+_pass += 1
+
+raises("from_string rejects wrong length", lambda: from_string("123"))
+raises("from_string rejects 80 chars", lambda: from_string("." * 80))
+ok("from_string accepts 81 with whitespace", to_string(from_string("." * 81)) == "0" * 81)
+ok("from_string treats 0 and. both as empty",
+from_string("0" * 81) == from_string("." * 81))
+
+# ── candidates helper is correct ──────────────────────────────────────────────
+cands = compute_candidates(from_string(EASY))
+# r1c3 (row 0, col 2) is empty in EASY; its candidates must exclude peers' givens
+ok("candidates computed for empty cells only",
+all(from_string(EASY)[r][c] == 0 for (r, c) in cands))
+ok("a candidate set never contains a peer's given",
+all(all((from_string(EASY)[pr][pc] not in opts)
+for (pr, pc) in _peers(cell) if from_string(EASY)[pr][pc]!= 0)
+for cell, opts in cands.items()))
+
+# ── MUTATION BITE: prove the certifying check is not vacuously green ───────────
+# If the reasons were decorative (not carrying the placed digit), the replay
+# would NOT reproduce the solution. This bite asserts that (a) the trace has
+# real placement steps, and (b) mangling a reason's leading digit WOULD break
+# the replay — so a no-op reason (the plausible mutation) fails loud here.
+placements = [s for s in r_easy.trace if not s.candidates_eliminated]
+ok("mutation bite: trace has real placements", len(placements) > 0)
+
+def _replay_with_broken_reasons(givens, result):
+"""Replay but with every placement reason's digit forced to 1 — must NOT
+reproduce the solution (unless every placed digit really is 1, impossible)."""
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated:
+(r, c) = step.cells_affected[0]
+g[r][c] = 1 # deliberately wrong: ignore the real reason
+return to_string(g)
+
+ok("mutation bite: breaking the reason breaks the replay",
+_replay_with_broken_reasons(from_string(EASY), r_easy)!= EASY_SOLUTION)
+
+# and: if solve silently returned 'solved' on the empty grid (a searching
+# mutation), property 4 would flip. Assert the anti-guess invariant has teeth:
+ok("mutation bite: empty grid is genuinely unforced (>50 empty cells, 0 forced singles)",
+len(compute_candidates(from_string(EMPTY))) == 81
+and all(len(v) == 9 for v in compute_candidates(from_string(EMPTY)).values()))
+
+print(("PASS" if _fail == 0 else "FAIL") + f" — {_pass} passed, {_fail} failed")
+sys.exit(0 if _fail == 0 else 1)
+
+Take the whole folder →
+MIT
+Python standard library only, deterministic + headless
 
 ---

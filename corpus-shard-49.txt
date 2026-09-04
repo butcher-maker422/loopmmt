@@ -1,1383 +1,1584 @@
-# Loop MMT — corpus shard 49/63
+# Loop MMT — corpus shard 49/66
 
-> Bundle 49 of 63 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 49 of 66 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/cairn/, /gifts/callsigns/, /gifts/census/)
-
----
-
-# Cairn — a Loop MMT gift
-https://loopmmt.com/gifts/cairn/
-[coverage: optional · branch: gifts]
-
-Multi-Store Git Redundancy survive ← all gifts
-
-Cairn
-
-Priority-ordered failover clone, a host-aware credential helper, and redundant push across distinct-class git stores — so your canonical history survives any one store going away. The load-bearing idea is the independence class: two mirrors on one provider aren't redundancy.
-
-The honest edge
-
-It survives store loss, not corruption you push yourself. Push a bad commit and every mirror faithfully keeps your mistake.
-
-Run it
-
-./cairn.sh
-smoke_test.sh (5/5)
-Bash + git
-
-The code — every file that ships
-
-cairn.sh 275 lines on GitHub →
-#!/usr/bin/env bash
-# cairn.sh — a self-healing, multi-store git fabric in one script.
-#
-# Keep the same repo on several INDEPENDENT git stores so the loss of any one
-# store (a host outage, a deleted account, a revoked token, a dead disk) never
-# costs you the repo. Three moves:
-#
-# clone Priority-ordered FAILOVER clone: try store 1, then 2, then 3;
-# the first reachable+authed store wins. LOUD STOP only when ALL
-# are dead. (This is the cold-boot path — how a fresh machine gets
-# the repo when you don't know which store is up.)
-#
-# push Redundant fan-out push to every enabled store, in parallel, with
-# a bounded per-store timeout. The write succeeds iff at least
-# THRESHOLD distinct INDEPENDENCE CLASSES confirm it — never a raw
-# store count. Two stores that share a class (two repos on the same
-# provider) count ONCE, because losing that provider loses both.
-# A store that fails is a "laggard": noted, never fatal, as long as
-# the class threshold is met. A laggard is behind, not wrong.
-#
-# frontier Probe every store's main head and REPORT the MAX head among ones
-# that are comparable (one is an ancestor of the other — a laggard
-# just catches up). READ-ONLY: it records discovered heads under
-# refs/cairn/heads/ and reports the frontier SHA — it moves nothing
-# (no main, no HEAD, no laggard heal). To adopt, run yourself:
-# git fetch && git merge --ff-only <frontier>. If two heads are
-# INCOMPARABLE — a real fork,
-# neither an ancestor of the other — that is a DIVERGENCE: it is
-# recorded under refs/cairn/divergence/<utc>/ and surfaced LOUD, and
-# is NEVER auto-merged. Divergence is a human decision.
-#
-# The whole point is expressed in the config, not the code: see `stores`
-# (`stores.example` to start). Each store is tagged with a failure CLASS; the
-# durability threshold is a number of DISTINCT CLASSES. Edit the config, never
-# this script.
-#
-# Credentials never live here. Private stores authenticate through git's askpass
-# (see `askpass.example.sh`): a helper that reads a token from a GITIGNORED file
-# at call time and writes it ONLY to git's stdin — never to disk, a log, an
-# argument, or a stored remote URL. This script contains no secret and needs to
-# know none.
-#
-# git-only + POSIX-ish bash. No dependencies. MIT licensed.
-#
-# Usage:
-# cairn.sh clone <dest> # failover clone into <dest>
-# cairn.sh push [ref] # fan-out push (ref default: HEAD)
-# cairn.sh frontier # REPORT max comparable head (read-only); loud on divergence
-# cairn.sh doctor # validate the stores config
-#
-# Config resolution: $CAIRN_STORES (default:./stores)
-# Knobs (env): CAIRN_TIMEOUT (per-store seconds, default 10)
-#
-# Exit codes: 0 ok · 1 loud failure (below threshold / all stores dead) ·
-# 2 frontier divergence · 3 config problem
-set -euo pipefail
-
-CAIRN_STORES="${CAIRN_STORES:-stores}"
-CAIRN_TIMEOUT="${CAIRN_TIMEOUT:-10}"
-
-CEILING="note: the Cairn survives the LOSS of a store (host, account, token, disk) \
-— it does NOT survive corruption YOU push yourself; a bad commit fans out to every \
-mirror. It heals AVAILABILITY, not correctness. Incomparable heads are surfaced as a \
-divergence, never auto-merged."
-
-die() { echo "cairn: $*" >&2; exit 3;}
-
-# --- config parsing (git-only; no jq) ---------------------------------------
-# A store line is 5 pipe-separated fields: name | class | priority | url | enabled
-# The threshold is one line: threshold = <N> (default 2 if absent)
-# Blank lines and lines beginning with '#' are ignored.
-
-_threshold() {
-awk -F= '
-/^[[:space:]]*#/ {next}
-tolower($1) ~ /threshold/ { v=$2; gsub(/[^0-9]/,"",v); if (v!="") { print v; exit}}
-' "$1"
-}
-
-# Emit enabled stores as "name|class|priority|url", priority-ascending.
-_enabled_stores() {
-awk -F'|' '
-/^[[:space:]]*#/ {next}
-NF < 5 {next}
-{
-for (i=1;i<=5;i++){ gsub(/^[ \t]+|[ \t]+$/,"",$i)}
-if ($5=="true") print $3"|"$1"|"$2"|"$4
-}
-' "$1" | sort -t'|' -k1,1n | awk -F'|' '{print $2"|"$3"|"$1"|"$4}'
-}
-
-_require_config() { [ -f "$CAIRN_STORES"] || die "no stores config at '$CAIRN_STORES' (set CAIRN_STORES, or copy stores.example -> stores)";}
-
-# --- doctor: validate the config --------------------------------------------
-cmd_doctor() {
-_require_config
-local stores thr classes ncanon problems=0
-stores="$(_enabled_stores "$CAIRN_STORES")"
-[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
-thr="$(_threshold "$CAIRN_STORES")"; thr="${thr:-2}"
-# distinct enabled classes
-classes="$(printf '%s\n' "$stores" | awk -F'|' '{print $2}' | sort -u | wc -l)"
-echo "cairn doctor: $(printf '%s\n' "$stores" | grep -c.) enabled store(s), $classes distinct class(es), threshold=$thr"
-if [ "$classes" -lt "$thr"]; then
-echo " WARN: only $classes distinct class(es) enabled but threshold is $thr — a push cannot meet durability until you enable more independent classes." >&2
-problems=1
-fi
-# duplicate priorities
-if printf '%s\n' "$stores" | awk -F'|' '{print $3}' | sort | uniq -d | grep -q.; then
-echo " WARN: duplicate priorities — failover order is ambiguous." >&2
-problems=1
-fi
-[ "$problems" -eq 0] && echo " ok."
-echo "$CEILING"
-# GIFT-005: doctor is a validation gate, not a pretty-printer. A below-threshold
-# or duplicate-priority config makes the durability contract impossible/ambiguous
-# -> loud failure (exit 1, per the documented convention above), never exit 0.
-[ "$problems" -eq 0] && return 0
-return 1
-}
-
-# --- clone: priority-ordered failover ---------------------------------------
-cmd_clone() {
-local dest="${1:-}"
-[ -n "$dest"] || die "usage: cairn.sh clone <dest>"
-_require_config
-local n=0 name class prio url
-while IFS='|' read -r name class prio url; do
-[ -n "$name"] || continue
-n=$((n+1))
-echo "cairn: trying $name ($class)..." >&2
-if timeout "$CAIRN_TIMEOUT" git clone --quiet "$url" "$dest" 2>/dev/null; then
-echo "cairn: cloned from $name ($class)." >&2
-echo "$CEILING" >&2
-return 0
-fi
-echo "cairn: $name unreachable/auth-fail — failing over." >&2
-done <<EOF
-$(_enabled_stores "$CAIRN_STORES")
-EOF
-[ "$n" -gt 0] || die "no enabled stores in '$CAIRN_STORES'"
-echo "cairn: LOUD STOP — every store is unreachable. Nothing to clone from." >&2
-exit 1
-}
-
-# --- push: distinct-class fan-out -------------------------------------------
-cmd_push() {
-local ref="${1:-HEAD}"
-_require_config
-local thr work stores name class prio url
-thr="$(_threshold "$CAIRN_STORES")"; thr="${thr:-2}"
-stores="$(_enabled_stores "$CAIRN_STORES")"
-[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
-work="$(mktemp -d)"
-
-# fan out, parallel, each store writes its own result file
-while IFS='|' read -r name class prio url; do
-[ -n "$name"] || continue
-(
-if timeout "$CAIRN_TIMEOUT" git push --quiet "$url" "${ref}:refs/heads/main" >/dev/null 2>&1; then
-echo "OK|$class"
-else
-echo "FAIL|$class"
-fi
-) >"$work/$name" &
-done <<EOF
-$stores
-EOF
-wait
-
-# aggregate by DISTINCT class
-local confirmed="" ok="" fail="" line st nc
-while IFS='|' read -r name class prio url; do
-[ -n "$name"] || continue
-line="$(cat "$work/$name")"; st="${line%%|*}"
-if [ "$st" = "OK"]; then
-ok="$ok $name($class)"
-case " $confirmed " in *" $class "*):;; *) confirmed="$confirmed $class";; esac
-else
-fail="$fail $name($class)"
-fi
-done <<EOF
-$stores
-EOF
-nc="$(echo $confirmed | wc -w)"
-
-echo "cairn push: confirmed classes=$nc (need >=$thr) |$ok | laggards:${fail:- none}"
-echo "$CEILING"
-rm -rf "$work"
-if [ "$nc" -ge "$thr"]; then
-return 0
-fi
-echo "cairn push LOUD-FAIL: only $nc distinct class(es) [$confirmed] confirmed, threshold is $thr — durability NOT met for this push." >&2
-return 1
-}
-
-# --- frontier: REPORT max comparable head (read-only), loud on divergence ----
-cmd_frontier() {
-_require_config
-git rev-parse --git-dir >/dev/null 2>&1 || die "frontier must run inside a git repo (it fetches store heads into refs/cairn/heads/)"
-local stores name class prio url sha names="" a b
-declare -A HEAD
-stores="$(_enabled_stores "$CAIRN_STORES")"
-[ -n "$stores"] || die "no enabled stores in '$CAIRN_STORES'"
-
-while IFS='|' read -r name class prio url; do
-[ -n "$name"] || continue
-sha="$(timeout "$CAIRN_TIMEOUT" git ls-remote "$url" refs/heads/main 2>/dev/null | awk '{print $1}' | head -1)"
-if [ -z "$sha"]; then
-echo "cairn: $name ($class) — no main head or unreachable (skip)." >&2
-continue
-fi
-# fetch the objects so ancestry is decidable locally; a store that advertises
-# a head it cannot actually serve is corrupt-at-that-head — fail past it.
-if timeout "$CAIRN_TIMEOUT" git fetch --quiet "$url" refs/heads/main 2>/dev/null \
-&& git cat-file -e "$sha" 2>/dev/null; then
-git update-ref "refs/cairn/heads/$name" "$sha"
-HEAD[$name]="$sha"
-names="$names $name"
-else
-echo "cairn: $name ($class) advertises $sha but cannot serve it — failing past (fixity)." >&2
-fi
-done <<EOF
-$stores
-EOF
-
-[ -n "$names"] || die "frontier: no servable store heads found."
-
-# find a store whose head is a descendant-or-equal of every other head
-local best="" dominates
-for a in $names; do
-dominates=1
-for b in $names; do
-[ "$a" = "$b"] && continue
-if! git merge-base --is-ancestor "${HEAD[$b]}" "${HEAD[$a]}" 2>/dev/null; then
-dominates=0; break
-fi
-done
-if [ "$dominates" -eq 1]; then best="$a"; break; fi
-done
-
-if [ -n "$best"]; then
-echo "cairn frontier: frontier=${HEAD[$best]} (from $best). READ-ONLY report — nothing was moved. To adopt: git fetch && git merge --ff-only ${HEAD[$best]}"
-echo "$CEILING"
-return 0
-fi
-
-# no dominator => incomparable heads => divergence. Record, never merge.
-local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
-for a in $names; do
-git update-ref "refs/cairn/divergence/$ts/$a" "${HEAD[$a]}"
-done
-echo "cairn frontier LOUD: incomparable store heads — this is a FORK, not a lag." >&2
-echo "cairn frontier: divergence recorded at refs/cairn/divergence/$ts/* — NOT auto-merged; resolve by hand." >&2
-echo "$CEILING" >&2
-return 2
-}
-
-# --- dispatch ---------------------------------------------------------------
-main() {
-local cmd="${1:-}"; shift || true
-case "$cmd" in
-clone) cmd_clone "$@";;
-push) cmd_push "$@";;
-frontier) cmd_frontier "$@";;
-reconverge) die "reconverge was renamed to 'frontier': it reports the max comparable head but never moved main or touched other stores (the old name overpromised). Use 'cairn frontier'.";;
-doctor) cmd_doctor "$@";;
-""|-h|--help|help)
-sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
-;;
-*) die "unknown command '$cmd' (try: clone | push | frontier | doctor)";;
-esac
-}
-
-main "$@"
-
-askpass.example.sh 62 lines on GitHub →
-#!/bin/sh
-# askpass.example.sh — a host-aware git credential helper. COPY to askpass.sh
-# and edit the host arms + field names for your stores.
-#
-# WHY THIS EXISTS
-# Private stores need a token. The unsafe habits are (a) baking the token into
-# the remote URL (it lands in.git/config and every `git remote -v`), and
-# (b) exporting it as an environment variable (it leaks into child processes
-# and is gone across separate shells, so the NEXT push silently fails auth).
-# This helper avoids both: git calls it at push/fetch time, it reads the token
-# from a GITIGNORED file at CALL TIME, and writes it ONLY to git's stdin.
-#
-# SAFE TO COMMIT — once you've replaced the placeholders with your HOSTS and
-# FIELD NAMES (which are not secret). The SECRET never appears here: it lives in
-# a separate file you never commit. This example is verifiably credential-free.
-#
-# WIRE IT (before any push/fetch):
-# cp askpass.example.sh askpass.sh # then edit the host arms below
-# git config core.askpass "$PWD/askpass.sh"
-# git config credential.username x-access-token # if your host wants a user
-#
-# THE CRED FILE
-# Put your tokens in a file your.gitignore excludes, e.g. `cairn.cred`
-# (add `cairn.cred` and `*.cred` to.gitignore). One token per line, keyed:
-# HOST_A_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
-# HOST_B_TOKEN=yyyyyyyyyyyyyyyyyyyyyyyy
-# Point the helper at it: export CAIRN_CRED=/abs/path/to/cairn.cred
-#
-# Git passes the prompt string as $1, e.g. "Password for 'https://host-b.example':"
-# and, for username prompts, a string beginning "Username". Route by host so ONE
-# helper can serve MANY stores, each with its OWN scoped token (one leak reaches
-# one store — the independence the class model buys). Each token is written only
-# to git's stdin, never to disk, a log, or a URL.
-
-CRED="${CAIRN_CRED:-./cairn.cred}"
-
-# read a keyed value from the cred file, keeping only the value (no spaces/CR)
-_field() {
-grep -m1 -E "^[[:space:]]*$1[[:space:]]*=" "$CRED" 2>/dev/null \
-| sed -E 's/^[^=]*=[[:space:]]*//' | tr -d '[:space:]'
-}
-
-case "$1" in
-*host-b.example*)
-# Example: a public host that wants username=account, password=token.
-case "$1" in
-Username*) printf '%s\n' "your-host-b-account";; # public, not a secret
-*) printf '%s\n' "$(_field HOST_B_TOKEN)";;
-esac
-;;
-*box.example*)
-# Example: a self-hosted git server (git-over-HTTPS).
-case "$1" in
-Username*) printf '%s\n' "your-selfhost-account";; # public, not a secret
-*) printf '%s\n' "$(_field SELFHOST_TOKEN)";;
-esac
-;;
-*)
-# Default / your primary host. Adjust the field name to your store.
-printf '%s\n' "$(_field HOST_A_TOKEN)"
-;;
-esac
-
-stores.example 34 lines on GitHub →
-# cairn stores — copy this to `stores` and edit. This file ships as an EXAMPLE;
-# it contains NO real hosts, accounts, or credentials.
-#
-# One store per line, 5 pipe-separated fields:
-#
-# name | class | priority | url | enabled
-#
-# name a short handle for the store (used in output + ref namespacing)
-# class the INDEPENDENCE CLASS. This is the load-bearing field. Two stores
-# in the SAME class are NOT independent — if the thing that class
-# names goes down (a provider, a machine, an account), both go with
-# it. Give each genuinely-separate failure domain its own class.
-# Examples of distinct classes: a big public host (cloud-A), a
-# different public host (cloud-B), a box you run yourself
-# (self-host), an offline bundle (offline).
-# priority failover order for `clone` (lower first). Keep them unique.
-# url a git remote URL (https://…/repo.git, ssh://…, or a local path).
-# enabled true | false. Disabled stores are ignored entirely.
-#
-# The durability threshold is a number of DISTINCT CLASSES (not stores):
-threshold = 2
-# A push succeeds iff at least this many distinct classes confirm it. Set it to
-# the number of independent failures you want to survive, plus one.
-
-# name | class | priority | url | enabled
-primary | cloud-A | 1 | https://host-a.example/you/repo.git | true
-mirror-public | cloud-B | 2 | https://host-b.example/you/repo.git | true
-mirror-selfhost | self-host | 3 | https://box.example/you/repo.git | true
-
-# An offline class is real durability against a total network outage, but a live
-# `file://` store inside an ephemeral machine is a phantom — it vanishes with the
-# machine. Realize the offline class as an operator-held `git clone --all` bundle
-# regenerated on a cadence, and keep this entry disabled:
-# local-bundle | offline | 4 | file:///path/to/repo.bundle.git | false
-
-smoke_test.sh 157 lines on GitHub →
-#!/usr/bin/env bash
-# smoke_test.sh — hermetic proof that cairn.sh works. No network: every "store"
-# is a local bare git repo standing in for a remote. Five scenarios, mirroring
-# the durability claims:
-#
-# 1 failover clone skips a dead store and clones from the next live one
-# 2 a distinct-class fan-out push succeeds when >= threshold classes confirm
-# 3 two SAME-class stores count ONCE — below threshold => loud fail (exit 1)
-# 4 frontier REPORTS the MAX head (read-only) when heads are comparable
-# 5 frontier records INCOMPARABLE heads as divergence (exit 2), moves nothing
-#
-# Run: bash smoke_test.sh (expect: 5/5 passed)
-set -uo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CAIRN="$HERE/cairn.sh"
-PASS=0; FAIL=0
-ROOT="$(mktemp -d)"; trap 'rm -rf "$ROOT"' EXIT
-
-ok() { echo "ok $1"; PASS=$((PASS+1));}
-bad() { echo "FAIL $1: $2"; FAIL=$((FAIL+1));}
-
-git_q() { git -c init.defaultBranch=main -c user.name=t -c user.email=t@t "$@";}
-
-mk_source() { # $1 dest; makes a repo on main with one commit
-git_q init -q "$1"
-( cd "$1"; echo "base" > file.txt; git_q add file.txt; git_q commit -q -m base)
-}
-mk_bare() { git_q init -q --bare "$1";}
-seed() { git_q -C "$1" push -q "$2" main:refs/heads/main;} # $1 src $2 bare
-head_of() { git_q -C "$1" rev-parse HEAD;}
-bare_main(){ git_q --git-dir="$1" rev-parse refs/heads/main 2>/dev/null;}
-
-# --- 1: failover clone ------------------------------------------------------
-t1() {
-local d="$ROOT/t1"; mkdir -p "$d"
-mk_source "$d/src"
-mk_bare "$d/live.git"; seed "$d/src" "$d/live.git"
-cat > "$d/stores" <<EOF
-threshold = 2
-dead | cloud-A | 1 | $d/does-not-exist.git | true
-live | cloud-B | 2 | $d/live.git | true
-EOF
-if CAIRN_STORES="$d/stores" bash "$CAIRN" clone "$d/clone" >/dev/null 2>&1 \
-&& [ -f "$d/clone/file.txt"] \
-&& [ "$(cat "$d/clone/file.txt")" = "base"]; then
-ok "failover clone skips dead store, clones from next"
-else
-bad "failover clone" "did not clone from the live store after the dead one"
-fi
-}
-
-# --- 2: distinct-class push succeeds ----------------------------------------
-t2() {
-local d="$ROOT/t2"; mkdir -p "$d"
-mk_source "$d/src"
-mk_bare "$d/a.git"; mk_bare "$d/b.git"; mk_bare "$d/c.git"
-cat > "$d/stores" <<EOF
-threshold = 2
-a | cloud-A | 1 | $d/a.git | true
-b | cloud-B | 2 | $d/b.git | true
-c | self-host | 3 | $d/c.git | true
-EOF
-local want; want="$(head_of "$d/src")"
-if ( cd "$d/src"; CAIRN_STORES="$d/stores" bash "$CAIRN" push HEAD) >/dev/null 2>&1 \
-&& [ "$(bare_main "$d/a.git")" = "$want"] \
-&& [ "$(bare_main "$d/b.git")" = "$want"] \
-&& [ "$(bare_main "$d/c.git")" = "$want"]; then
-ok "distinct-class push confirmed 3 classes >= threshold 2"
-else
-bad "distinct-class push" "not all stores received main, or exit nonzero"
-fi
-}
-
-# --- 3: two same-class stores count once => below threshold => loud fail -----
-t3() {
-local d="$ROOT/t3"; mkdir -p "$d"
-mk_source "$d/src"
-mk_bare "$d/a1.git"; mk_bare "$d/a2.git"
-cat > "$d/stores" <<EOF
-threshold = 2
-a1 | cloud-A | 1 | $d/a1.git | true
-a2 | cloud-A | 2 | $d/a2.git | true
-EOF
-# both pushes SUCCEED, but they share a class => 1 distinct class < 2 => exit 1
-( cd "$d/src"; CAIRN_STORES="$d/stores" bash "$CAIRN" push HEAD) >/dev/null 2>&1
-if [ "$?" -eq 1]; then
-ok "two same-class stores count once; below threshold is a loud fail"
-else
-bad "same-class threshold" "expected exit 1 (durability not met), got $?"
-fi
-}
-
-# --- 4: frontier REPORTS the max comparable head (read-only) ----------------
-t4() {
-local d="$ROOT/t4"; mkdir -p "$d"
-mk_source "$d/src"
-mk_bare "$d/a.git"; mk_bare "$d/b.git"
-seed "$d/src" "$d/a.git"; seed "$d/src" "$d/b.git" # both at base
-# A moves ahead by one commit; B stays behind (a laggard)
-( cd "$d/src"; echo more >> file.txt; git_q add file.txt; git_q commit -q -m ahead)
-seed "$d/src" "$d/a.git"
-local ahead; ahead="$(head_of "$d/src")"
-git_q clone -q "$d/b.git" "$d/recon" # recon starts behind
-cat > "$d/stores" <<EOF
-threshold = 2
-a | cloud-A | 1 | $d/a.git | true
-b | cloud-B | 2 | $d/b.git | true
-EOF
-# frontier is DISCOVERY-ONLY: it must REPORT the ahead head, RECORD it under
-# refs/cairn/heads/, and MOVE NOTHING. Assert by inspecting refs, never by
-# accepting printed prose as proof of adoption (the false-green this fixes).
-local before; before="$( cd "$d/recon"; git rev-parse HEAD)"
-local out rc
-out="$( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" frontier 2>&1)"; rc=$?
-local reported; reported="$( printf '%s' "$out" | sed -n 's/.*frontier=\([0-9a-f]\{7,\}\).*/\1/p' | head -1)"
-local after; after="$( cd "$d/recon"; git rev-parse HEAD)"
-local recorded; recorded="$( cd "$d/recon"; git rev-parse refs/cairn/heads/a 2>/dev/null)"
-if [ "$rc" -eq 0] && [ "$reported" = "$ahead"] && [ "$after" = "$before"] && [ "$recorded" = "$ahead"]; then
-ok "frontier reports the max comparable head, records it under refs/cairn/heads/, and does NOT move local HEAD (read-only)"
-else
-bad "frontier discovery" "rc=$rc reported=$reported ahead=$ahead before=$before after=$after recorded=$recorded"
-fi
-}
-
-# --- 5: frontier records incomparable heads as divergence (moves nothing) ---
-t5() {
-local d="$ROOT/t5"; mkdir -p "$d"
-mk_source "$d/base"
-mk_bare "$d/a.git"; mk_bare "$d/b.git"
-# two SIBLING commits on top of the same base => incomparable heads
-git_q clone -q "$d/base" "$d/x"
-( cd "$d/x"; echo x >> file.txt; git_q add file.txt; git_q commit -q -m fork-x)
-seed "$d/x" "$d/a.git"
-git_q clone -q "$d/base" "$d/y"
-( cd "$d/y"; echo y >> file.txt; git_q add file.txt; git_q commit -q -m fork-y)
-seed "$d/y" "$d/b.git"
-git_q clone -q "$d/a.git" "$d/recon" # recon has X
-cat > "$d/stores" <<EOF
-threshold = 2
-a | cloud-A | 1 | $d/a.git | true
-b | cloud-B | 2 | $d/b.git | true
-EOF
-( cd "$d/recon"; CAIRN_STORES="$d/stores" bash "$CAIRN" frontier) >/dev/null 2>&1
-local rc=$?
-local divs
-divs="$(git_q -C "$d/recon" for-each-ref --format='%(refname)' 'refs/cairn/divergence/' | wc -l)"
-if [ "$rc" -eq 2] && [ "$divs" -ge 2]; then
-ok "frontier records incomparable heads as a divergence, never merges (exit 2)"
-else
-bad "frontier divergence" "expected exit 2 with recorded divergence refs; rc=$rc divs=$divs"
-fi
-}
-
-t1; t2; t3; t4; t5
-echo
-echo "$((PASS))/$((PASS+FAIL)) passed"
-[ "$FAIL" -eq 0]
-
-Take the whole folder →
-MIT
-Bash + git
+Nodes in this shard: 2 (/apps/loop21/docs/course-outline.html, /apps/loop21/docs/field-guide.html)
 
 ---
 
-# Callsigns — a Loop MMT gift
-https://loopmmt.com/gifts/callsigns/
-[coverage: optional · branch: gifts]
+# Loop 2.1 — CS 1XX Course Outline
+https://loopmmt.com/apps/loop21/docs/course-outline.html
+[coverage: optional · branch: apps]
 
-Memorable IDs, Safe by Construction source ← all gifts
+CS 1XX
 
-Callsigns
+Computing from First Principles
 
-A random identifier you can read aloud, remember for the length of a standup, and paste anywhere without escaping. Every token is word-word-hash (e.g. sunny-champion-8h3kq7): two human-readable words plus a six-character disambiguating hash. The point is that all three parts are ref-, path-, URL-, and shell-safe by construction — not “usually fine,” but safe as a proven property of the alphabet each part draws from, so a callsign drops straight into a git branch, a directory name, a URL segment, or a shell argument with no quoting. The hash alphabet is confusable-free (digits + a-z minus i/l/o/u) and lowercase-only, so there are no case-fold collisions. Seed it and the same seed yields the same token on any machine, forever.
+A semester course using the Loop 2.1 manual flow computer.
 
-The honest edge
+Format 15 weeks · 8 modules · two sessions per week
 
-A callsign is a memorable, SAFE identifier — not a guaranteed-unique one. The hash makes an accidental collision astronomically unlikely, but “unlikely” is not “impossible”: if your correctness depends on uniqueness, pair a callsign with a real uniqueness source (a timestamp, a sequence, a registry that rejects duplicates). It buys memorability and paste-safety, not a uniqueness authority.
+Level Second-semester first-year undergraduates
 
-Run it
+Prerequisites None. A willingness to be confused for short periods and to work through that confusion.
 
-python3 callsigns.py --demo
-test_callsigns.py (2061 checks / 10 tests, mutation-bitten, pinned golden batch hash)
-Python standard library only, deterministic under --seed, headless
+Primary instrument Loop 2.1 simulator — loop2.computer
 
-The code — every file that ships
+Supplementary materials Loop 2.1 User Manual · Loopscript 1.0 Specification
 
-callsigns.py 203 lines on GitHub →
-#!/usr/bin/env python3
-"""callsigns — memorable IDs that are safe by construction.
+This course uses Loop 2.1 as its primary instrument. The machine has no stored program. Data circulates in hardware loops. The student is the program. Every concept introduced — data representation, memory, arithmetic, logic, algorithms, networks, protocols — is first experienced physically on the machine before it is named, formalized, or abstracted.
 
-A random unique identifier you can read aloud, remember for the length of a
-standup, and paste anywhere without escaping. Every token has the shape
+The course is built around the conviction that understanding a thing costs more than learning its name, and is worth more.
 
-word-word-hash e.g. sunny-champion-8h3kq7
+Instructional Principle
+Experience before terminology. Every concept is encountered on the machine first. The formal name arrives after the student has already felt the thing. By the time a student learns what "latency" means in a textbook, they have already sat at a machine waiting 41 ticks for a bus transfer to complete and wondered why it was taking so long.
 
-Two human-readable words drawn from a curated pool, then a six-character
-disambiguating hash. The point is that all three parts are *ref-, path-, URL-,
-and shell-safe by construction* — not "usually fine," but safe as a proven
-property of the alphabet each part draws from, so a callsign drops straight into
-a git branch name, a directory name, a URL segment, or a shell argument with no
-quoting and no surprises.
+Course Philosophy
 
-WHY IT'S HONEST
+Why This Machine
 
-- **Safe by construction, not by hope.** The words pass a lowercase-ASCII
-allowlist; the hash draws from a confusable-free, case-safe base32 alphabet
-(digits + a-z minus i/l/o/u). Every character clears git refs, Windows and
-macOS filenames, RFC-3986 URL segments, and the shell. There is no escaping
-step to forget because there is nothing to escape.
+Modern CS education teaches computation at the level of abstractions. Students write filter(x => x % 4 === 0) in JavaScript and get an answer in one millisecond. The data teleports. The cost is zero. The cost was never zero — it was just invisible, which is a different thing entirely.
 
-- **No case-fold collisions.** Everything is lowercase, so two callsigns can
-never collide only because a filesystem folded their case.
+Loop 2.1 dissolves the abstraction. Data has position. Data has width. Data moves at finite speed through a finite channel. Every operation has a setup cost and a time cost and a routing cost, and the operator cannot pretend those costs are zero, because the operator is the one paying them.
 
-- **The namespace is a stated number, not a vibe.** 64 x 64 word-pairs = 4096
-memorable prefixes; the six-char hash adds 32^6 (~1.07e9) per prefix, for
-~4.4e12 total. You can reason about collision odds because the size is exact.
+This course does not replace a traditional CS curriculum. It precedes one. Students who spend a semester operating Loop 2.1 will enter their second year having felt the physical reality of everything they will spend the rest of their education abstracting. That foundation changes how abstractions land.
 
-- **No degenerate pairs.** A token is never `word-word` with the two words
-equal; the draw rejects and redraws, so every callsign reads as two distinct
-words.
+The Oh Moment
+In early classroom trials, instructors identified a recurring phenomenon they called the "oh moment" — the instant a student makes an unexpected conceptual connection. A student routing data between loops pauses and says: "wait, is this why you can't just do two things at once in a CPU?" The machine produces these moments at a rate that traditional instruction does not. This course is designed to maximize them.
 
-- **Seed it and it's deterministic.** Pass a seed and the same seed yields the
-same callsign on any machine, forever — so a demo, a test, or a reproducible
-fixture is byte-identical. Leave the seed off and it draws from the system CSPRNG.
+Curriculum
 
-THE HONEST EDGE
+The Eight Modules
 
-A callsign is a *memorable, safe* identifier, not a *guaranteed-unique* one.
-The hash makes an accidental collision astronomically unlikely, but "unlikely"
-is not "impossible": if your system's correctness depends on uniqueness, pair a
-callsign with a real uniqueness source (a timestamp prefix, a sequence, a
-registry that rejects duplicates) — exactly as the Loop MMT session floor does,
-joining a callsign to a UTC timestamp. Callsigns buy you memorability and
-paste-safety; they do not replace a uniqueness authority.
+The course is organized into eight two-week modules. Each module introduces concepts through direct machine experience first, then names and formalizes them. CS concepts listed under each module are introduced experientially in that module; formal treatment may continue into subsequent modules.
 
-USAGE
-python3 callsigns.py # one callsign
-python3 callsigns.py --n 5 # five callsigns, one per line
-python3 callsigns.py --seed 42 # deterministic: same seed, same token
-python3 callsigns.py --demo # a short, reproducible demonstration
+Module 1
+The Physical Reality of Data
+Weeks 1–2
 
-MIT licensed. Python standard library only. Deterministic under --seed; headless.
-"""
-from __future__ import annotations
+Theme: Data is not abstract. It has location, velocity, and cost.
 
-import argparse
-import json
-import os
-import random
-import sys
+Week by Week
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-WORDLIST = os.path.join(HERE, "wordlist.json")
+Week 1: What the machine is and isn't. The operator-as-program paradigm. First session: inject a value, watch it circulate, find it at the read head. The 17-bit word format — marker bit, data bits, why the marker bit exists. Binary representation hands-on: flip switches, read the display, develop fluency with bit patterns before any formal notation is introduced.
 
-# A drawn word must be ref-/path-/URL-/shell-safe by construction.
-SAFE = frozenset("abcdefghijklmnopqrstuvwxyz")
+Week 2: The cost of moving data. Bus transfers take 41 ticks. Students measure this empirically before being told the formula. The concept of latency as physical distance. Comparison: why the same operation in Python feels instantaneous. First challenge: Add Two Numbers. Score on efficiency. Discuss why the score matters.
 
-# Hash field: confusable-free, case-safe base32 — digits + a-z minus i,l,o,u.
-# Lowercase-only (no case-fold collision); every char clears git refs,
-# Windows/macOS filenames, RFC-3986 unreserved URL chars, and the shell.
-# Length is the lever, not the alphabet: 32^6 ~= 1.07e9 per word-pair.
-HASH_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz" # 32 chars: a-z drop i,l,o,u
-HASH_LEN = 6
+CS Concepts Introduced
 
-_MAX_REDRAW = 64 # attempts to avoid a degenerate equal-word pair before forcing
+binary representation
+word size
+circular storage
+latency
+clock cycles
+instruction cost
+marker / sentinel bits
 
-def _is_safe(word: str) -> bool:
-"""True iff word is non-empty and every char is in the safe allowlist."""
-return bool(word) and all(c in SAFE for c in word)
+Challenge Work
 
-def draw_hash(rng: random.Random, length: int = HASH_LEN) -> str:
-"""Draw a `length`-char hash from the case-safe base32 alphabet."""
-if length < 0:
-raise ValueError("hash length must be non-negative")
-return "".join(rng.choice(HASH_ALPHABET) for _ in range(length))
+Add Two Numbers — first scored session
 
-def load_pools(path: str = WORDLIST) -> tuple[list[str], list[str]]:
-"""Load and safety-filter the two word pools from the wordlist JSON.
+Empirical latency measurement — measure bus transfer time, derive the formula
 
-Raises ValueError if either pool is empty after the safety filter — a
-wordlist that can't produce a safe word is a loud failure, never a silent
-empty draw.
-"""
-with open(path, "r", encoding="utf-8") as fh:
-data = json.load(fh)
-pool_one = [w for w in data["pool_one"] if _is_safe(w)]
-pool_two = [w for w in data["pool_two"] if _is_safe(w)]
-if not pool_one or not pool_two:
-raise ValueError("wordlist pools are empty after the safety filter")
-return pool_one, pool_two
+Module 2
+Arithmetic and Logic
+Weeks 3–4
 
-def draw(
-rng: random.Random | None = None,
-path: str = WORDLIST,
-pools: tuple[list[str], list[str]] | None = None,
-) -> str:
-"""Draw one callsign: `word-word-hash`, the two words always distinct.
+Theme: Computation is transformation. The ALU is a transformer.
 
-`rng` — a random.Random (seed it for determinism); defaults to the CSPRNG.
-`pools` — optional pre-loaded (pool_one, pool_two); loaded from `path` if omitted.
-"""
-rng = rng or random.SystemRandom()
-pool_one, pool_two = pools if pools is not None else load_pools(path)
-# Reject the degenerate identical-word pair and redraw.
-for _ in range(_MAX_REDRAW):
-a, b = rng.choice(pool_one), rng.choice(pool_two)
-if a!= b:
-return f"{a}-{b}-{draw_hash(rng)}"
-# Vanishingly unlikely fallthrough: force a distinct pair.
-a = rng.choice(pool_one)
-alt = [w for w in pool_two if w!= a]
-if not alt:
-raise ValueError("cannot form a distinct word pair from these pools")
-b = rng.choice(alt)
-return f"{a}-{b}-{draw_hash(rng)}"
+Week by Week
 
-def draw_many(
-count: int,
-rng: random.Random | None = None,
-path: str = WORDLIST,
-) -> list[str]:
-"""Draw `count` callsigns, reusing one loaded pool and one RNG."""
-if count < 0:
-raise ValueError("count must be non-negative")
-rng = rng or random.SystemRandom()
-pools = load_pools(path)
-return [draw(rng=rng, pools=pools) for _ in range(count)]
+Week 3: The ALU in depth. Registers A, B, C, D and flexible operand routing. ADD, SUB, the carry flag — what overflow means physically. The five flags (Zero, Carry, Overflow, Sign, Parity) as information the operator reads and acts on. Why flags don't branch automatically: the operator decides. The Multiply challenge using repeated addition — students discover binary multiplication (SHL + ADD) independently when they realize it's faster.
 
-def demo(rng: random.Random | None = None) -> str:
-"""A short, reproducible demonstration rendered as text.
+Week 4: Bitwise operations. AND, OR, XOR, NOT as physical bit manipulation. Mask patterns — students discover the concept by configuring the Pattern Matcher before the word "bitmask" appears in any slide. The Filter challenge. Debrief: write filter(x => x % 4 === 0) in JavaScript in one second, then build the same operation on the machine in twenty minutes. What did the twenty minutes teach that the one second didn't?
 
-Deterministic when `rng` is seeded — the same seed prints the same block.
-"""
-rng = rng or random.Random(42)
-pools = load_pools()
-lines = [
-"callsigns — memorable IDs safe by construction",
-"",
-"Five draws (seed=42):",
-]
-for _ in range(5):
-lines.append(" " + draw(rng=rng, pools=pools))
-lines += [
-"",
-"Same seed, same tokens — reproducible anywhere.",
-f"Namespace: {len(pools[0])} x {len(pools[1])} pairs x {len(HASH_ALPHABET)}^{HASH_LEN}"
-f" ~= {len(pools[0]) * len(pools[1]) * len(HASH_ALPHABET) ** HASH_LEN:.2e} total.",
-]
-return "\n".join(lines)
+CS Concepts Introduced
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-p = argparse.ArgumentParser(
-prog="callsigns",
-description="Draw memorable, safe-by-construction identifiers (word-word-hash).",
-)
-p.add_argument("--n", type=int, default=1, help="how many callsigns to draw (default 1)")
-p.add_argument("--seed", type=int, default=None, help="seed for deterministic output")
-p.add_argument("--demo", action="store_true", help="print a short reproducible demonstration")
-return p
+integer arithmetic
+overflow
+two's complement
+bitwise logic
+masking
+condition flags
+cost of operations
+flags vs. branches
 
-def main(argv: list[str] | None = None) -> int:
-args = _build_arg_parser().parse_args(argv)
-try:
-if args.demo:
-rng = random.Random(args.seed) if args.seed is not None else random.Random(42)
-sys.stdout.write(demo(rng=rng) + "\n")
-return 0
-if args.n < 0:
-sys.stderr.write("callsigns: FATAL: --n must be non-negative\n")
-return 1
-rng = random.Random(args.seed) if args.seed is not None else random.SystemRandom()
-pools = load_pools()
-for _ in range(args.n):
-sys.stdout.write(draw(rng=rng, pools=pools) + "\n")
-return 0
-except Exception as exc: # loud, never silent
-sys.stderr.write(f"callsigns: FATAL: {exc}\n")
-return 1
+Challenge Work
 
-if __name__ == "__main__":
-raise SystemExit(main())
+Multiply — discover SHL+ADD optimization independently
 
-wordlist.json 35 lines on GitHub →
-{
-"_meta": {
-"name": "callsign-wordlist",
-"version": "v1",
-"produced": "S05.1342 (Mature Maple)",
-"product_of": "Wes (FWW(C) vocabulary) + Tamar (structural guarantee)",
-"purpose": "Source vocabulary for The Callsign Convention. A session callsign is one word drawn from pool_one and one from pool_two, joined by a hyphen, e.g. sunny-champion, taco-disco, feral-biscuit.",
-"structure": "Cartesian product pool_one x pool_two. Draw is uniform-random over the product; reject and redraw the degenerate case where word_one == word_two (Tamar's exclusion rule).",
-"namespace": 4096,
-"namespace_note": "|pool_one| (64) x |pool_two| (64) = 4096 distinct callsigns, minus the handful of identical-word pairs the draw rejects. Same-minute twin-collision probability is 1/namespace ~ 0.024%; scaling is additive (add words to either pool).",
-"token_rule": "Every token is lowercase ASCII [a-z] only: no spaces, no punctuation, no path/ref-hostile characters. The drawn callsign 'word-word' is safe as a git branch segment and a directory name by construction. (Nyx: the callsign is never free user input, so there is no injection surface — the wordlist IS the allowlist.)",
-"display_form": "Stored/path form is lowercase-hyphenated (sunny-champion). Spoken/display form is Title-Case (Sunny-Champion).",
-"fwwc": "Pools are curated HEAVY with FWW(C) per operator directive: Taco-Disco energy, not Server-Node-7. Both pools individually vetted clean; the product of two clean pools reads clean (no slur, no unfortunate phrase) for this vocabulary."
-},
-"pool_one": [
-"sunny", "turbo", "velvet", "feral", "cosmic", "disco", "rowdy", "mellow",
-"plucky", "saucy", "zesty", "wobbly", "snazzy", "brisk", "crispy", "nimble",
-"goblin", "thunder", "mossy", "taco", "rascal", "dapper", "jazzy", "breezy",
-"fuzzy", "sneaky", "peppy", "glossy", "rugged", "swift", "gilded", "frosty",
-"hasty", "lucky", "moody", "nifty", "prickly", "quirky", "rusty", "spunky",
-"tidal", "vivid", "witty", "amber", "bouncy", "chunky", "drowsy", "eager",
-"frantic", "gallant", "husky", "ironic", "jolly", "keen", "lanky", "merry",
-"noble", "oaken", "pesky", "quiet", "ruddy", "stout", "twangy", "untamed"
-],
-"pool_two": [
-"champion", "disco", "taco", "walrus", "comet", "biscuit", "bandit", "lighthouse",
-"mango", "otter", "tuba", "cyclone", "pickle", "falcon", "wizard", "noodle",
-"dynamo", "llama", "kraken", "sprocket", "pumpkin", "raccoon", "satchel", "thunder",
-"vortex", "whistle", "anvil", "beacon", "cactus", "domino", "ember", "fjord",
-"gadget", "harpoon", "igloo", "jukebox", "kazoo", "lantern", "marmot", "nugget",
-"octopus", "pelican", "quartz", "rocket", "saxophone", "tangerine", "ukulele", "viper",
-"waffle", "xylophone", "yeti", "zeppelin", "badger", "conch", "dragon", "ferret",
-"gizmo", "hatchet", "jamboree", "koala", "lobster", "mammoth", "narwhal", "oyster"
-]
-}
+Filter — the central lesson of this module
 
-test_callsigns.py 166 lines on GitHub →
-#!/usr/bin/env python3
-"""test_callsigns.py — the certifying properties of the callsigns gift.
+Written reflection: what is the cost of an operation?
 
-Run: python3 test_callsigns.py (exit 0 = all pass, 1 = a failure)
+Module 3
+Memory and State
+Weeks 5–6
 
-The tests are chosen to be MUTATION-BITTEN: each one is here because a plausible
-mutation of callsigns.py makes it fail loud. In particular the determinism test
-pins a GOLDEN sha256 of a seeded batch rather than checking self-equality — a
-weak self-equality test passes benign reorders (the Loop MMT sudoku lesson), a
-pinned golden does not.
-"""
-import hashlib
-import random
-import sys
+Theme: Memory is where computation lives between operations.
 
-import callsigns as c
+Week by Week
 
-# --- pinned golden: a seeded batch must reproduce this exact signature -------
-# Regenerate ONLY on an intentional change:
-# python3 -c "import hashlib,random,callsigns as c; \
-# rng=random.Random(1234); p=c.load_pools(); \
-# b=[c.draw(rng=rng,pools=p) for _ in range(50)]; \
-# print(hashlib.sha256('\n'.join(b).encode()).hexdigest())"
-GOLDEN_SEED = 1234
-GOLDEN_N = 50
-GOLDEN_SHA256 = "815a0dc83fa371ebb1df70e9a82961aeeea11cd3ad05b80e9e73a90c2e10448f"
+Week 5: The 16 memory slots as addressable storage. 4-bit addressing — why 4 bits gives exactly 16 addresses. Write mode, read mode, auto-increment. Building a simple lookup table. The distinction between a value in a loop (transient, moving) and a value in a slot (persistent, addressed). Address-read mode: encoding destination addresses inside data words. Students discover why real memory systems need an address bus.
 
-_FAILURES: list[str] = []
-_PASSES = 0
+Week 6: Working scratch registers as fast local storage. Why a register file exists alongside main memory. The cost model: scratch register access vs. memory slot access vs. loop circulation. State machines implemented manually — route values through a sequence of operations, tracking state in memory slots. Introduction to the session log as a record of state transitions.
 
-def check(cond: bool, msg: str) -> None:
-global _PASSES
-if cond:
-_PASSES += 1
-else:
-_FAILURES.append(msg)
+Week 6 Extension — Persistent Storage: The /local file system. Saving memory slots as a.L21 binary snapshot requires bit movement — the operator runs Batch Write All directed to the FILE SAVE bus destination and watches the 16-word stream arrive. Loading streams 16 words through the Memory loop's writeback pipeline. The null-slot invariant: why empty slots must produce marker=1, data=0 rather than nothing, or position information is lost. The.l21x archive format as human-readable hex — editable in any text editor, importable without touching the machine. Discussion: what does "persistent" mean when a browser tab closing destroys all loop state?
 
-def _batch(seed: int, n: int) -> list[str]:
-rng = random.Random(seed)
-pools = c.load_pools()
-return [c.draw(rng=rng, pools=pools) for _ in range(n)]
+CS Concepts Introduced
 
-# --- 1. determinism: seeded draw reproduces the pinned golden ----------------
-def test_golden_signature():
-batch = _batch(GOLDEN_SEED, GOLDEN_N)
-sig = hashlib.sha256("\n".join(batch).encode()).hexdigest()
-check(
-sig == GOLDEN_SHA256,
-f"golden signature drifted: got {sig[:16]}... expected {GOLDEN_SHA256[:16]}...",
-)
-# kills a mutation that drops the redraw and lets equal-word pairs through:
-for tok in batch:
-a, b, _ = tok.split("-")
-check(a!= b, f"golden batch contains a degenerate equal-word pair: {tok}")
+addressable memory
+registers
+memory hierarchy
+addressing modes
+state machines
+persistent vs. transient storage
+why caches exist
+file systems
+serialization
+binary formats vs. text formats
 
-# --- 2. same seed => same first token; different seed => (almost surely) not --
-def test_seed_repeatability():
-r1 = random.Random(7)
-r2 = random.Random(7)
-p = c.load_pools()
-check(c.draw(rng=r1, pools=p) == c.draw(rng=r2, pools=p), "same seed produced different tokens")
-r3 = random.Random(8)
-# different seeds SHOULD differ (namespace ~4.4e12, collision astronomically rare)
-p2 = c.load_pools()
-check(
-c.draw(rng=random.Random(7), pools=p)!= c.draw(rng=r3, pools=p2),
-"different seeds produced identical tokens (namespace or seeding is broken)",
-)
+Challenge Work
 
-# --- 3. shape: exactly three dash-parts, word-word-hash ----------------------
-def test_shape():
-for tok in _batch(99, 200):
-parts = tok.split("-")
-check(len(parts) == 3, f"token is not word-word-hash: {tok!r}")
+Count Matches — requires accumulation across multiple passes
 
-# --- 4. every char of the words is in the safe allowlist ---------------------
-def test_words_safe():
-for tok in _batch(101, 200):
-a, b, _ = tok.split("-")
-check(all(ch in c.SAFE for ch in a), f"word 1 has an unsafe char: {a!r}")
-check(all(ch in c.SAFE for ch in b), f"word 2 has an unsafe char: {b!r}")
+State machine exercise — implement a 3-state sequence using memory slots
 
-# --- 5. the hash never contains a confusable (i/l/o/u) or an out-of-alphabet char
-def test_hash_alphabet():
-banned = set("ilou")
-for tok in _batch(202, 300):
-h = tok.split("-")[2]
-check(len(h) == c.HASH_LEN, f"hash wrong length: {h!r}")
-check(all(ch in c.HASH_ALPHABET for ch in h), f"hash has out-of-alphabet char: {h!r}")
-check(not (set(h) & banned), f"hash contains a confusable char (i/l/o/u): {h!r}")
-# kills a mutation that swaps HASH_ALPHABET for a plain base32 including i/l/o/u
-check(not (set(c.HASH_ALPHABET) & banned), "HASH_ALPHABET must not contain i/l/o/u")
+File snapshot exercise — save a working memory state, reload it, verify slot-by-slot that the round trip is exact
 
-# --- 6. no degenerate equal-word pair, ever, across a large sample -----------
-def test_no_equal_pairs():
-for tok in _batch(303, 500):
-a, b, _ = tok.split("-")
-check(a!= b, f"degenerate equal-word pair produced: {tok}")
+Module 4
+Algorithms as Physical Procedures
+Weeks 7–8
 
-# --- 7. empty-pool wordlist is a loud failure, not a silent empty draw -------
-def test_empty_pool_is_loud():
-import json
-import os
-import tempfile
+Theme: An algorithm is a plan for moving data. Elegance is measurable.
 
-with tempfile.TemporaryDirectory() as d:
-bad = os.path.join(d, "wordlist.json")
-with open(bad, "w") as fh:
-json.dump({"pool_one": [], "pool_two": ["x"]}, fh)
-raised = False
-try:
-c.load_pools(bad)
-except ValueError:
-raised = True
-check(raised, "empty pool did not raise ValueError (silent-empty-draw regression)")
+Week by Week
 
-# --- 8. namespace math is the stated exact number ---------------------------
-def test_namespace_is_exact():
-p1, p2 = c.load_pools()
-total = len(p1) * len(p2) * len(c.HASH_ALPHABET) ** c.HASH_LEN
-check(len(p1) == 64 and len(p2) == 64, f"pools not 64x64: {len(p1)}x{len(p2)}")
-check(len(c.HASH_ALPHABET) == 32, f"hash alphabet not 32 chars: {len(c.HASH_ALPHABET)}")
-check(total == 64 * 64 * 32 ** 6, f"namespace math changed: {total}")
+Week 7: Sorting. Students attempt to sort 8 values in the Big Loop by hand — manual comparison, swap, repeat. They discover selection sort independently. Then: using the Threshold Gate as a comparator to extract minimums systematically. Comparison of the manual approach vs. the hardware-assisted approach — same O(n²) complexity, very different operator action count. Introduction to the par scoring system as a formal measure of algorithmic quality.
 
-# --- 9. draw_many honors count and reuses one pool --------------------------
-def test_draw_many():
-got = c.draw_many(0, rng=random.Random(1))
-check(got == [], "draw_many(0) should be empty")
-got5 = c.draw_many(5, rng=random.Random(1))
-check(len(got5) == 5, f"draw_many(5) returned {len(got5)}")
+Week 8: Searching and accumulation. Find the Maximum challenge — brute force vs. TG-assisted rising threshold. XOR Checksum: why XOR works for integrity verification. Running sums and the Accumulate to Threshold challenge. Discussion: what makes one algorithm better than another when all of them produce the correct answer?
 
-# --- 10. demo is deterministic under a seed ---------------------------------
-def test_demo_deterministic():
-d1 = c.demo(rng=random.Random(42))
-d2 = c.demo(rng=random.Random(42))
-check(d1 == d2, "demo(seed=42) is not reproducible")
+Week 8 Extension — Algorithm Specification: Custom challenge authorship. Students write a generate(params) function that produces challenge values and a correct answer, and a par(result, params) function that specifies the expert score for that instance. The machine validates both — eight structural checks, five dry runs, 50ms timeout — and rejects anything that doesn't meet contract. The exercise forces students to specify an algorithm precisely enough that a machine can verify it: what are the inputs, what is the output, what counts as correct, what is efficient? This is the first time in the course students write a formal algorithm specification rather than implementing one.
 
-def run() -> int:
-tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-for t in tests:
-t()
-total = _PASSES + len(_FAILURES)
-if _FAILURES:
-print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
-for f in _FAILURES:
-print(f" ✗ {f}")
-return 1
-print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
-return 0
+CS Concepts Introduced
 
-if __name__ == "__main__":
-sys.exit(run())
+sorting algorithms
+algorithmic complexity
+search
+checksums
+data integrity
+algorithmic efficiency
+optimization
 
-Take the whole folder →
-MIT
-Python standard library only, deterministic under --seed, headless
+Challenge Work
+
+Sort Values — scored; par gap reveals optimization potential
+
+Find the Maximum — attempt brute force first, then TG method
+
+XOR Checksum
+
+Accumulate to Threshold
+
+Custom challenge design — write, validate, and exchange challenge definitions with another student
+
+Midterm: timed challenge session with written debrief
+
+Module 5
+Hardware Pipelines and Parallel Operations
+Weeks 9–10
+
+Theme: Multiple things can happen at the same time if you design for it.
+
+Week by Week
+
+Week 9: Running multiple buses simultaneously. Buses A and B operating in parallel — two transfers at once. The four-bus mega-loop pipeline (Working → ALU → Memory → Big → Working). Students discover pipeline hazards empirically: what happens when two buses try to deliver to the same loop in the same tick? The concept of resource contention. Counter-triggered operations and the Op Count halt system as hardware-level flow control.
+
+Week 10: The Pattern Matcher and Threshold Gate as parallel hardware. PM1 and PM2 in cascade: a two-stage pipeline that operates independently of any bus. TG1 and TG2 cascade: a band-pass filter built from two comparators. The full four-stage Big Loop pipeline running without operator routing between stages. Discussion: what is a hardware pipeline? Why does a CPU have one?
+
+CS Concepts Introduced
+
+instruction pipelining
+parallel execution
+resource contention
+pipeline hazards
+hardware filtering
+throughput vs. latency
+flow control
+
+Challenge Work
+
+Transform Nth — requires simultaneous bus and gate management
+
+Pipeline design exercise: build a four-stage loop pipeline, measure throughput improvement
+
+Module 6
+Networks and Protocols
+Weeks 11–12
+
+Theme: When two machines talk, they need a shared language. That language is a protocol.
+
+Week by Week
+
+Week 11: P2P connections. The WebRTC SDP exchange — why connection setup requires an out-of-band handshake. Latency measurement and what it means. Sending words from one machine to another via Bus F (left neighbor) or Bus G (right neighbor). Two students connect machines and build a simple two-node distributed computation: one machine generates values, the other processes them. Students discover handshaking independently: what happens when the receiving loop isn't ready? Introduction to Buses H and I — routed net buses that send words to any machine in the connected topology by machine ID, not just direct neighbors. Run PING NETWORK to discover topology; select a peer target in the Bus H or I sidebar; words route through intermediate machines without touching their loops. Students use Bus H to send a value three hops away and confirm arrival.
+
+Week 12: The CBX protocol and the Network Monitor. The Network Monitor captures the last 20 meaningful packets flowing through the machine — INVITE, ASSIGN, GO, SUBMIT, SUM_OK, SUM_FAIL, ABORT, COMPLETE, and file transfer packets. Students watch a Chain Sum challenge unfold packet by packet: the invitation goes out, each machine's acceptance returns, the GO fires, running sums arrive and are verified in real time. Then: capture a packet in the staging area, modify a field (change a submitted sum), inject it back. The origin's SUM_FAIL arrives immediately with the exact discrepancy. Discussion: this is not a security exercise — this is how you learn what the protocol is actually doing by attempting to defeat it. TTL and packet lifecycle: set a packet's TTL to 1, watch it die at the next hop.
+
+CS Concepts Introduced
+
+network protocols
+packet structure
+addressing
+TTL
+checksums
+handshaking
+flow control
+layered network model
+routing by address
+packet inspection and debugging
+protocol verification
+
+Challenge Work
+
+Two-node pipeline exercise — design and implement a protocol between two directly connected machines using Bus F and G
+
+Routed delivery exercise — send a value via Bus H to a non-adjacent machine; verify arrival
+
+Network Monitor exercise — watch a Chain Sum run packet by packet; capture, modify, inject a SUBMIT; observe SUM_FAIL with discrepancy
+
+Written reflection: why does the internet work this way?
+
+Module 7
+Distributed Systems and Human Coordination
+Weeks 13–14
+
+Theme: When multiple computers work together, the humans coordinating them are part of the system.
+
+Week by Week
+
+Week 13: The Chain Sum challenge as a distributed algorithm. Five students, five machines, one correct answer that requires every machine to contribute. The origin assigns all values and therefore knows every correct intermediate sum — this is a zero-trust verification scheme: no machine needs to trust any other, because the origin can verify independently. What happens when one machine submits a wrong answer: full abort, the failing position and exact discrepancy are named, the network restarts. Students deliberately submit a wrong value (via Network Monitor injection) and observe the detection. Discussion: what does fault tolerance mean? What makes a distributed algorithm correct?
+
+Week 14: Named networks and file transfer. Students form a named network, observe hub election when the hub machine is deliberately disconnected, read the distributed routing table. Then: file transfer. A student selects a.L21 file from their /local folder, presses SEND TO PEER, selects a recipient two hops away. The FTP_OFFER packet routes through the intermediate machine (visible in that machine's Network Monitor), arrives at the destination. The recipient sees filename, sender handle, and slot count before deciding whether to accept. Discussion: this is a three-message protocol — offer, accept, decline. What guarantees does it provide? What doesn't it guarantee? What would a production file transfer protocol add? Students also use Buses H and I in a router pattern: receive data from one remote machine, transform in loops, forward to a third. The operator is the routing layer. Students design a multi-machine computation that requires this pattern to complete.
+
+CS Concepts Introduced
+
+distributed algorithms
+consensus
+fault tolerance
+routing tables
+leader election
+CAP theorem (intuition)
+network topology
+zero-trust verification
+file transfer protocols
+operator as routing layer
+
+Challenge Work
+
+Chain Sum — full class participation, multi-machine; includes deliberate wrong-submission via Network Monitor injection
+
+Network formation exercise — form, observe, and deliberately break a named network; trigger hub re-election
+
+File transfer exercise — send a memory snapshot two hops across the chain; the recipient loads it and verifies the slot values match the sender's
+
+Multi-machine computation with router pattern — use Bus H and I to route data through an intermediate operator who transforms it
+
+Protocol design discussion: what does the three-message FTP protocol guarantee? What would you add for production use?
+
+Module 8
+Integration and Reflection
+Week 15
+
+Theme: Everything you've learned is connected.
+
+Week 15
+
+Final project presentations. Students present their most efficient solution to a challenge of their choice, explaining the algorithmic decisions, the hardware components used, and what they would do differently.
+
+Course-level synthesis: how does everything covered — binary representation, memory, arithmetic, algorithms, pipelines, networks, protocols — appear in a conventional computer?
+
+The Loop 2.1 machine as a model that makes all of it visible.
+
+Closing discussion: what did you understand in week 15 that you couldn't have understood in week 1?
+
+Final Project Requirements
+
+A novel computation of the student's own design
+
+Documented with a session log
+
+Transcribed as a Loopscript.lps file
+
+Annotated with explanation of every significant decision
+
+Presented live — demonstrated and discussed, not read from notes
+
+Synthesis Question
+
+Written: "Name one thing the machine taught you that a textbook could not have."
+
+Assessment
+
+Grading Structure
+
+Component Weight Notes
+
+Weekly challenge scores
+35%
+Efficiency and speed modes, logged via the session log system. Scored against par. Best N of M sessions count — students are not penalized for early inefficiency.
+
+Short written reflections
+20%
+One per module, 200–300 words. Prompt provided. Graded on evidence of genuine engagement with the concept, not correctness. A wrong but thoughtful reflection scores better than a correct but superficial one.
+
+Midterm
+20%
+A timed challenge session (end of Module 4) with a written debrief explaining every significant decision made during the session. The debrief is graded; the challenge score is context.
+
+Final project
+25%
+Novel computation, session log, Loopscript documentation, live presentation. Graded on algorithmic quality, clarity of documentation, and the quality of the live explanation.
+
+On Scoring
+Challenge scores reward efficiency — getting from input to correct output in the fewest operator actions and ticks. The par system provides a reference target for each challenge. Beating par is unusual in the first half of the course and should not be expected. Approaching par by the end of the semester is the goal. The score is a tool for developing intuition about algorithmic quality, not a measure of student worth.
+
+On Collaboration
+Operating Loop 2.1 is an individual activity — each student runs their own machine. Discussion of strategies, approaches, and architectural ideas is encouraged and should happen constantly. Sharing session logs or Loopscript files as study aids is permitted. Submitting another student's session log as your own is not.
+
+Reference
+
+CS Topic Cross-Reference
+
+Every topic in this table is encountered experientially on the machine before it is formalized in lecture or reading. The "First Encountered" column indicates when students have already felt the concept; "Formalized" indicates when it receives its proper name, definition, and theoretical treatment.
+
+CS Topic
+First Encountered
+Formalized
+
+Binary representation Week 1 Week 1
+
+Word size and bit width Week 1 Week 1
+
+Clock cycles and instruction cost Week 1 Week 2
+
+Latency as physical distance Week 2 Week 2
+
+Integer arithmetic Week 3 Week 3
+
+Overflow and carry Week 3 Week 3
+
+Two's complement representation Week 3 Week 3
+
+Condition flags Week 3 Week 3
+
+Bitwise logic and masking Week 4 Week 4
+
+Addressable memory Week 5 Week 5
+
+Register files Week 5 Week 6
+
+Memory hierarchy Week 6 Week 6
+
+Addressing modes Week 5 Week 6
+
+State machines Week 6 Week 6
+
+Sorting algorithms Week 7 Week 7
+
+Algorithmic complexity (O notation) Week 7 Week 8
+
+Search algorithms Week 8 Week 8
+
+Checksums and data integrity Week 8 Week 12
+
+Algorithmic optimization Week 7 Week 8
+
+Instruction pipelining Week 9 Week 10
+
+Parallel execution Week 9 Week 10
+
+Resource contention and hazards Week 9 Week 10
+
+Throughput vs. latency Week 10 Week 10
+
+Network protocols Week 11 Week 12
+
+Packet structure and addressing Week 11 Week 12
+
+TTL and packet lifecycle Week 12 Week 12
+
+Handshaking and connection setup Week 11 Week 12
+
+Layered network model Week 12 Week 12
+
+Distributed algorithms Week 13 Week 13
+
+Consensus and fault tolerance Week 13 Week 14
+
+Routing tables Week 14 Week 14
+
+Leader election Week 14 Week 14
+
+CAP theorem (intuition) Week 13 Week 14
+
+File systems and persistent storage Week 6 Week 6
+
+Serialization and binary formats Week 6 Week 6
+
+Algorithm specification (generate / par) Week 8 Week 8
+
+Routed networking (non-adjacent delivery) Week 11 Week 12
+
+Packet inspection and protocol debugging Week 12 Week 12
+
+Zero-trust verification Week 13 Week 13
+
+File transfer protocols Week 14 Week 14
 
 ---
 
-# Census — a Loop MMT gift
-https://loopmmt.com/gifts/census/
-[coverage: optional · branch: gifts]
+# Loop 2.1 — Operator's Field Guide
+https://loopmmt.com/apps/loop21/docs/field-guide.html
+[coverage: optional · branch: apps]
 
-Marker Census, Buried Ones Flagged count ← all gifts
+Home
+The Thesis
+The Case
+Timeline
+Corpus
+The Apps
+Sweet Prompts
+Discoveries
+The Threads
+Gifts
+Knowledge
+Who
 
-Census
+Loop 2.1 · Operator's Field Guide
 
-Walk a tree, count your markers (TODO, FIXME, or whatever you define), and say which ones are buried inside comments where nobody will act on them. A report, not a gate — until you add --strict, and then a buried marker is an exit code your CI can catch.
+Skin
+OG
+Winamp
+Sunrise
 
-The honest edge
+Loop 2.1
 
-It's a text scan, not a parser — it finds markers by pattern, so a marker written in a syntax it wasn't told about is a marker it won't see. You define the patterns; their completeness is your call.
+Operator's Field Guide
 
-Run it
+30 named techniques for the manual flow computer — Volume I: Single Machine
 
-python3 census.py src/
-smoke_test.py (10/10, mutation-bitten)
-Python stdlib only, deterministic
+Designed by Shea Gunther · New Gloucester, Maine · 2026
 
-The code — every file that ships
+loop2.computer
 
-census.py 254 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""census.py — walk a tree, find your markers, and say which ones are BURIED.
+"The operator is the program. These are the moves."
 
-You leave markers in a codebase all the time: TODO, FIXME, "you write this", a
-tag that says a section is a stub. A visual pass catches the ones you can see.
-The dangerous one is the marker **buried inside a comment** — it never renders,
-so scanning the file by eye sails right past it. Census walks a file tree, finds
-every marker you name, and for each one says whether it sits in **visible** text
-or is **buried** inside a comment. The buried ones are the report: those are the
-spots a human pass will miss.
+Introduction
 
-It is deliberately dumb about *meaning* — a marker is a marker. What it is precise
-about is **visibility**: does this thing render where a person would see it, or is
-it hidden in a `<!-- -->` / `/* */` / `#` comment where only a grep will find it.
+How to Use This Guide
 
-python3 census.py <tree-root> [options]
+This is a recipe book. Each entry is a named technique — a reusable move with a clear purpose, a defined set of components, and step-by-step instructions for executing it on the machine. Techniques are the vocabulary of Loop 2.1. Knowing them by name lets you think in terms of composition rather than individual button presses.
 
-By default it looks for `TODO`, `FIXME`, `XXX`, `HACK`, and `STUB` in the common
-source extensions. Point it at your own markers with `--marker` (repeatable) and
-your own file types with `--ext`.
+Every recipe follows the same structure: a one-line description, the components it uses, setup requirements, steps, par estimate, and a note covering alternatives or gotchas. Par estimates assume 24 Hz and competent but not superhuman execution. They're targets, not guarantees.
 
-------------------------------------------------------------------------------
-The JSON-lines contract (so this composes in a pipe):
-`--json` emits ONE JSON object per hit on stdout —
-{"path","line","marker","visible":true|false,"excerpt"}
-so you can pipe the census into the next tool (count them, filter to buried,
-feed the paths onward). Without `--json` it prints a grouped human report.
+The guide is organized into six sections — Injection & Loading, Bus Routing, ALU Operations, Memory, Pattern Matcher, and Threshold Gate & Counters. Techniques within each section are ordered roughly from simple to complex. If you're looking for something specific, the table of contents lists every recipe with its component tags.
 
-Exit codes:
-0 ran clean (hits or none — a census is a report, not a gate)
-1 at least one BURIED marker AND --strict was given (gate mode)
-3 usage / unreadable root
-"""
+This is Volume I: single-machine techniques only. Networked operations — Bus H/I routing, P2P word transfer, chain operations — will be covered in a separate volume.
 
-import argparse
-import json
-import os
-import re
-import sys
+Architecture constants you'll need
+BPW = 17 bits per word (1 marker + 16 data). BUS_N = 24 bits (bus transit time: 24 ticks per word at position 0). Loop capacities: Working 18 words, ALU 24 words, Memory 24 words, Big 48 words. Recommended clock: 24 Hz.
 
-DEFAULT_MARKERS = ["TODO", "FIXME", "XXX", "HACK", "STUB"]
-DEFAULT_EXTS = [
-".py", ".js", ".cjs", ".mjs", ".ts", ".jsx", ".tsx",
-".c", ".h", ".cpp", ".cc", ".java", ".go", ".rs", ".rb",
-".html", ".htm", ".css", ".md", ".sh", ".yaml", ".yml",
-]
+Contents
 
-# Comment spans, by the syntaxes that actually bury text. These cover the vast
-# majority of source files without a per-language parser (which would be the wrong
-# amount of machinery for "is this in a comment").
-#
-# GIFT-012: the openers are recognised by a SINGLE-PASS, STRING-AWARE scanner, not
-# by raw regexes. The old regexes (`#[^\n]*`, `//[^\n]*`) matched a comment opener
-# even INSIDE a string literal, so `label = "widget # TODO"` or `url = "http://x/TODO"`
-# opened a false comment span and a LIVE marker read as buried-in-a-comment — the
-# exact inversion census exists to catch. The scanner walks the text once, tracking
-# whether it is inside a quote ('...' "..." `...`, with \ escapes); a comment opener
-# is only honoured OUTSIDE a string. It is quote-state + comment-state, NOT a parser.
-_LINE_OPENERS = ("//", "#") # run to end of line
-_BLOCK_OPENERS = (("<!--", "-->"), ("/*", "*/")) # run to their closer
-_QUOTES = ("'", '"', "`")
+I — Injection & Loading
+01 Clean Single Inject Inject channel
+02 Sequential Multi-Inject Inject channel
+03 Zero-Pulse Construction Inject · Gate
+04 RNG Flood Inject channel · RNG
 
-def _comment_spans(text):
-spans = []
-i, n = 0, len(text)
-in_str = None # the open quote char, or None when outside any string
-while i < n:
-ch = text[i]
-if in_str is not None:
-# inside a string: consume escapes, look only for the matching close
-if ch == "\\":
-i += 2
-continue
-if ch == in_str:
-in_str = None
-i += 1
-continue
-# not in a string — a block comment opener?
-matched = False
-for open_tok, close_tok in _BLOCK_OPENERS:
-if text.startswith(open_tok, i):
-end = text.find(close_tok, i + len(open_tok))
-end = (end + len(close_tok)) if end!= -1 else n
-spans.append((i, end))
-i = end
-matched = True
-break
-if matched:
-continue
-# a line comment opener?
-for open_tok in _LINE_OPENERS:
-if text.startswith(open_tok, i):
-end = text.find("\n", i)
-end = end if end!= -1 else n
-spans.append((i, end))
-i = end
-matched = True
-break
-if matched:
-continue
-# a quote opening a string region?
-if ch in _QUOTES:
-in_str = ch
-i += 1
-return spans
+II — Bus Routing
+05 Single Value Transfer Bus A–D · Gate
+06 Non-Destructive Read Bus · Gate · Destructive toggle
+07 Stream Routing Bus A–D · Gate
+08 Loop Echo Bus · same source & dest
+09 Cross-Loop Hold Two buses · Two loops
 
-def _buried(pos, spans):
-for a, b in spans:
-if a <= pos < b:
-return True
-return False
+III — ALU Operations
+10 Two-Register Computation ALU · Bus · Gate
+11 Running Accumulator ALU · Auto-Writeback
+12 Auto-Writeback Counter ALU · Auto-Writeback
+13 Running Maximum ALU · Comparator · Working Scratch
+14 Conditional Swap ALU · Comparator
+15 Absolute Difference ALU · Comparator
+16 Binary Multiplication ALU · loop iteration
+17 Scratch Register Hold Working Scratch · ALU
 
-def _line_index(text):
-starts = [0]
-for m in re.finditer(r"\n", text):
-starts.append(m.end())
-return starts
+IV — Memory
+18 Sequential Store Memory · Bus · Auto-Increment
+19 Address-Keyed Store Memory · Addr-Read mode
+20 Destructive Recall Memory · Destructive mode
+21 Batch Recall Memory · Batch Write All
+22 Memory Snapshot Save & Load Memory · Files · Bus File Save
 
-def _lineno(off, starts):
-lo, hi = 0, len(starts) - 1
-while lo < hi:
-mid = (lo + hi + 1) // 2
-if starts[mid] <= off:
-lo = mid
-else:
-hi = mid - 1
-return lo + 1
+V — Pattern Matcher
+23 Exact Value Eject PM1 · Big Loop
+24 Bit-Field Filter PM1 · Bus · Big Loop
+25 Rewrite in Place PM1 rewrite mode
+26 PM Cascade — Two-Stage Filter PM1 + PM2
+27 Match Count PM1 match counter · Big Loop
 
-def scan_file(path, markers, word_boundary):
-"""Return list of {line, marker, visible, excerpt} for one file."""
-try:
-with open(path, encoding="utf-8", errors="replace") as fh:
-text = fh.read()
-except OSError:
-return []
-spans = _comment_spans(text)
-starts = _line_index(text)
-hits = []
-seen = set() # (line, marker) — one hit per marker per line
-for marker in markers:
-pat = r"\b" + re.escape(marker) + r"\b" if word_boundary else re.escape(marker)
-for m in re.finditer(pat, text, re.IGNORECASE):
-ln = _lineno(m.start(), starts)
-key = (ln, marker.lower())
-if key in seen:
-continue
-seen.add(key)
-excerpt = text[starts[ln - 1]:].split("\n", 1)[0].strip()
-if len(excerpt) > 110:
-excerpt = excerpt[:107] + "..."
-hits.append({
-"line": ln,
-"marker": marker,
-"visible": not _buried(m.start(), spans),
-"excerpt": excerpt,
-})
-hits.sort(key=lambda h: h["line"])
-return hits
+VI — Threshold Gate & Counters
+28 Minimum Extraction TG1 · Big Loop
+29 Range Gate TG1 + TG2 · Big Loop
+30 Counter as Data Counter · Bus · ALU
 
-def scan_tree(root, markers, exts, word_boundary):
-exts_l = tuple(e.lower() for e in exts)
-out = []
-for dp, dns, fns in os.walk(root):
-# never descend into VCS / dependency dirs
-for skip in (".git", "node_modules", ".hg", ".svn", "__pycache__"):
-if skip in dns:
-dns.remove(skip)
-for fn in sorted(fns):
-if fn.lower().endswith(exts_l):
-full = os.path.join(dp, fn)
-for h in scan_file(full, markers, word_boundary):
-h = dict(h)
-h["path"] = os.path.relpath(full, root)
-out.append(h)
-return out
+Section I
 
-def main(argv=None):
-p = argparse.ArgumentParser(
-prog="census",
-description="walk a tree, find your markers, say which are buried in comments.",
-)
-p.add_argument("root", help="the directory to walk")
-p.add_argument("--marker", action="append", metavar="TEXT",
-help="a marker to look for (repeatable; default: TODO FIXME XXX HACK STUB)")
-p.add_argument("--ext", action="append", metavar=".EXT",
-help="a file extension to include (repeatable; default: common source types)")
-p.add_argument("--no-word-boundary", action="store_true",
-help="match a marker as a raw substring, not a whole word "
-"(needed for glyph/punctuation markers like '<!--WRITE-->')")
-p.add_argument("--buried-only", action="store_true",
-help="report only markers buried in comments (the miss-risk set)")
-p.add_argument("--json", action="store_true",
-help="emit one JSON object per hit on stdout (the pipe contract)")
-p.add_argument("--strict", action="store_true",
-help="exit 1 if any buried marker is found (gate mode)")
-args = p.parse_args(argv)
+Injection & Loading
 
-if not os.path.isdir(args.root):
-sys.stderr.write("census: not a directory: %s\n" % args.root)
-return 3
+01
 
-markers = args.marker if args.marker else DEFAULT_MARKERS
-exts = args.ext if args.ext else DEFAULT_EXTS
-word_boundary = not args.no_word_boundary
+Clean Single Inject
 
-hits = scan_tree(args.root, markers, exts, word_boundary)
-if args.buried_only:
-hits = [h for h in hits if not h["visible"]]
+Load one value into the Working loop without collision artifacts.
 
-buried = sum(1 for h in hits if not h["visible"])
+Inject
 
-if args.json:
-for h in hits:
-sys.stdout.write(json.dumps({
-"path": h["path"], "line": h["line"], "marker": h["marker"],
-"visible": h["visible"], "excerpt": h["excerpt"],
-}, sort_keys=True) + "\n")
-return 1 if (args.strict and buried) else 0
+Components
+Inject channel
 
-if not hits:
-print("census: no markers found under %s" % args.root)
-return 0
+Par
+17 ticks · 1 op
 
-by_path = {}
-for h in hits:
-by_path.setdefault(h["path"], []).append(h)
-print("# census — %d marker(s) across %d file(s) (%d buried in comments)\n"
-% (len(hits), len(by_path), buried))
-for path in sorted(by_path):
-hs = by_path[path]
-nb = sum(1 for h in hs if not h["visible"])
-flag = " \u26a0 %d BURIED" % nb if nb else ""
-print("## %s (%d marker%s)%s" % (path, len(hs), "" if len(hs) == 1 else "s", flag))
-for h in hs:
-tag = "buried " if not h["visible"] else "visible"
-print(" L%4d [%s] %s %s" % (h["line"], tag, h["marker"], h["excerpt"]))
-print()
-if buried:
-print("\u2192 %d marker(s) are BURIED in comments \u2014 a visual pass will miss them." % buried)
-else:
-print("\u2192 every marker is in visible text \u2014 nothing is buried.")
-return 1 if (args.strict and buried) else 0
+Setup
+Machine running
 
-if __name__ == "__main__":
-sys.exit(main())
+Steps
 
-smoke_test.py 123 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""smoke_test.py — non-vacuous tests for census.py.
+1
+Set the inject value. Type decimal directly — no binary conversion needed.
 
-The load-bearing claim is the visible/buried distinction. The suite plants a
-marker in visible code AND the same marker inside a comment and asserts census
-tells them apart — a census that called everything visible (or everything
-buried) would fail. Run: python3 smoke_test.py
-"""
+2
+Press INJECT. The 17-bit word enters the inject channel (INJ_N = 17 slots) and shifts into the Working loop's write head over 17 ticks.
 
-import io
-import json
-import os
-import sys
-import tempfile
+3
+Wait for the INJECT LED in the control bar to go dark before injecting again. The LED indicates bits still in the channel.
 
-import census
+Why it matters
+The inject channel is exactly BPW = 17 bits long. If you inject a second value before the first clears, the second word's marker bit collides with the first word's trailing data bits. The result is a corrupted value in the loop with no error message. The LED is your only guard. When in doubt, wait an extra tick or two.
 
-FAIL = 0
+02
 
-def ok(cond, msg):
-global FAIL
-print((" ok " if cond else " FAIL ") + msg)
-if not cond:
-FAIL += 1
+Sequential Multi-Inject
 
-def run(root, *args):
-old = sys.stdout
-sys.stdout = io.StringIO()
-try:
-code = census.main([root] + list(args))
-out = sys.stdout.getvalue()
-finally:
-sys.stdout = old
-return code, out
+Load N values into the Working loop in sequence with correct spacing.
 
-def main():
-with tempfile.TemporaryDirectory() as d:
-# a python file: one visible TODO (a whole word in a string), one buried
-# in a # comment. NB the visible one must be a WHOLE word — `TODO_x` has
-# no word boundary after TODO and correctly would not match.
-with open(os.path.join(d, "a.py"), "w") as fh:
-fh.write("x = 1 # TODO buried in a comment\n")
-fh.write('label = \"TODO\" # visible marker in a string literal\n')
-# an html file: a marker buried in an html comment
-with open(os.path.join(d, "b.html"), "w") as fh:
-fh.write("<p>hello</p>\n<!-- FIXME buried html marker -->\n")
-# a js file: a visible marker (whole word) and a block-comment-buried one
-with open(os.path.join(d, "c.js"), "w") as fh:
-fh.write('const label = \"XXX\";\n/* HACK buried in a block comment */\n')
-# a file type NOT in defaults — must be ignored
-with open(os.path.join(d, "ignore.log"), "w") as fh:
-fh.write("TODO this should never be seen (.log not scanned)\n")
+Inject
 
-# 1. JSON-lines contract + the core visible/buried distinction.
-code, out = run(d, "--json")
-recs = [json.loads(l) for l in out.splitlines() if l.strip()]
-ok(code == 0, "json run exits 0")
-# a.py: line1 TODO buried, line2 TODO visible
-a_todos = sorted([r for r in recs if r["path"] == "a.py"], key=lambda r: r["line"])
-ok(len(a_todos) == 2 and a_todos[0]["visible"] is False and a_todos[1]["visible"] is True,
-"a.py: the # -comment TODO is BURIED, the code TODO is VISIBLE (the distinction bites)")
+Components
+Inject channel
 
-# 2. html comment burial.
-b = [r for r in recs if r["path"] == "b.html"]
-ok(len(b) == 1 and b[0]["marker"] == "FIXME" and b[0]["visible"] is False,
-"b.html: FIXME inside <!-- --> is BURIED")
+Par
+17n + gap ticks · n ops
 
-# 3. js: visible XXX + block-comment-buried HACK.
-c = sorted([r for r in recs if r["path"] == "c.js"], key=lambda r: r["line"])
-ok([(r["marker"], r["visible"]) for r in c] == [("XXX", True), ("HACK", False)],
-"c.js: XXX visible, HACK buried in /* */ block comment")
+Setup
+Machine running · loop has room
 
-# 4. the.log file is never scanned (extension filter).
-ok(not any(r["path"] == "ignore.log" for r in recs),
-".log is not in default extensions — never scanned")
+Steps
 
-# 5. --buried-only drops the visible ones.
-code, out = run(d, "--json", "--buried-only")
-recs2 = [json.loads(l) for l in out.splitlines() if l.strip()]
-ok(all(r["visible"] is False for r in recs2) and len(recs2) == 3,
-"--buried-only reports exactly the 3 buried markers, no visible ones")
+1
+Check that the Working loop has room for all N values. Working holds 18 words max. At 17 bits each, a full loop is 306 bits. Leave space — circulating values pack tightly.
 
-# 6. --strict exits 1 when a buried marker exists.
-code, _ = run(d, "--json", "--strict")
-ok(code == 1, "--strict exits 1 because buried markers are present")
+2
+Set first value, press INJECT, wait for INJECT LED to go dark.
 
-# 7. custom --marker finds a non-default token; word boundary respected.
-with open(os.path.join(d, "d.py"), "w") as fh:
-fh.write("WRITEME = 1\n")
-fh.write("REWRITEMEN = 2 # a longer token, no whole-word hit here\n")
-code, out = run(d, "--json", "--marker", "WRITEME")
-recs3 = [json.loads(l) for l in out.splitlines() if l.strip()]
-dhits = [r for r in recs3 if r["path"] == "d.py"]
-ok(len(dhits) == 1 and dhits[0]["line"] == 1,
-"custom --marker WRITEME matches the whole word only, not the substring in REWRITEMEN")
+3
+Repeat for each subsequent value. The natural gap from LED-wait provides sufficient spacing between words.
 
-# 8. --no-word-boundary lets a glyph/substring marker match.
-with open(os.path.join(d, "e.html"), "w") as fh:
-fh.write("<!--WRITE--> visible? no, it's in a comment\n")
-code, out = run(d, "--json", "--marker", "<!--WRITE-->", "--no-word-boundary", "--ext", ".html")
-recs4 = [json.loads(l) for l in out.splitlines() if l.strip()]
-ehits = [r for r in recs4 if r["path"] == "e.html"]
-ok(len(ehits) == 1, "--no-word-boundary matches a punctuation marker like <!--WRITE-->")
+Timing note
+At 24 Hz, 17 ticks takes about 0.7 seconds. For large N at high clock rates, you can inject faster by watching the canvas instead of the LED — once the trailing dark bits of the previous word have cleared the write head, the channel is free. With practice, experienced operators can inject at one-per-second cadence without collision.
 
-# 9. MUTATION CHECK — a census that called everything visible would fail
-# test 1/2/3. Prove the buried-detector is not vacuous by asserting the
-# two populations are genuinely non-empty and disjoint.
-vis = [r for r in recs if r["visible"]]
-bur = [r for r in recs if not r["visible"]]
-ok(len(vis) >= 2 and len(bur) >= 3,
-"mutation check: both visible (>=2) and buried (>=3) populations are non-empty "
-"(an all-visible or all-buried classifier could not produce this)")
+03
 
-print("\n" + ("CENSUS: %d FAILED" % FAIL if FAIL else "CENSUS: ALL GREEN"))
-return 1 if FAIL else 0
+Zero-Pulse Construction
 
-if __name__ == "__main__":
-sys.exit(main())
+Build a specific value bit by bit using timed zero injections and loop pause.
 
-Take the whole folder →
-MIT
-Python stdlib only, deterministic
+Inject
+Gate
+
+Components
+Inject · Gate · Loop pause
+
+Par
+~17 × (1-bits) ticks
+
+Difficulty
+Advanced · precise timing
+
+The inject channel fires a marker bit followed by 16 data bits. By injecting a zero-value word and pausing the Working loop at the exact moment a specific data-bit position exits the inject channel, you allow only that one bit position to land in the loop. Repeat for each 1-bit in your target value.
+
+Steps
+
+1
+Identify the bit positions you need to set. Example: value 420 = 0000000110100100. 1-bits at positions b8, b7, b5, b2 (counting from b0 = LSB). That's four pulses.
+
+2
+Set inject value to 0. Press INJECT. The zero word begins entering the Working loop.
+
+3
+Count ticks as the word shifts in. Marker arrives at tick 1. Bit D15 at tick 2, D14 at tick 3 … D0 at tick 17. At the exact tick for the bit you want to set, PAUSE the Working loop. This freezes that bit position at the write head while the rest of the inject channel clears.
+
+4
+The channel finishes draining (ticks pass in the channel but nothing lands in the paused loop). Resume the loop. That bit position now holds a 1.
+
+5
+Repeat steps 2–4 for each remaining 1-bit. Each pass adds one bit to the value accumulating in Working.
+
+When to use this
+Almost never in practice — injecting the value directly is vastly faster. Zero-pulse construction exists as a technique demonstration: it proves you understand how the inject channel works at the bit level. It's used in Challenge Problem D ("Building Numbers from Nothing") as a learning exercise.
+
+04
+
+RNG Flood
+
+Fill a loop with random values for testing or challenge setup.
+
+Inject
+RNG
+
+Components
+Inject channel · RNG button
+
+Par
+17n ticks · n ops
+
+Setup
+Machine running
+
+Steps
+
+1
+Press the RNG button next to the inject value field. This loads a random 16-bit value (0–65535) into the inject field without injecting it.
+
+2
+Press INJECT. Wait for the LED.
+
+3
+Repeat until the loop is filled to the desired density.
+
+RNG implementation
+The RNG is a linear feedback shift register (LFSR) — deterministic from its seed, not truly random. The same sequence will repeat if the seed is the same. For testing scenarios where you need genuinely varied data across multiple sessions, re-seed by injecting a manually chosen value first. The LFSR's output distribution is even across the 0–65535 range over a full period.
+
+Section II
+
+Bus Routing
+
+05
+
+Single Value Transfer
+
+Move one value from one loop to another via a bus.
+
+Bus
+Gate
+
+Components
+Any Bus A–D · Gate
+
+Par
+24 + circ ticks · 3 ops
+
+Setup
+Source loop has a value
+
+Steps
+
+1
+Set the bus Source to the source loop, Destination to the target loop.
+
+2
+Turn the bus on.
+
+3
+Watch the source loop canvas. When your value reaches the gate position (G dot), press OPEN GATE. The gate closes automatically after the word exits.
+
+4
+The word traverses the bus (BUS_N = 24 ticks) and enters the destination loop's write head. Turn the bus off when done to prevent stray bits.
+
+Bus transit time
+A word takes exactly 24 ticks to traverse the bus from gate to write head regardless of clock rate. At 24 Hz that's one second. At 8 Hz it's three. Plan accordingly when timing matters — the value is unavailable to the source loop during transit.
+
+06
+
+Non-Destructive Read
+
+Copy a value to another loop while keeping it in the source.
+
+Bus
+Gate
+
+Components
+Bus · Gate · Destructive off
+
+Par
+24 + circ ticks · 3 ops
+
+Setup
+Destructive toggle OFF
+
+Steps
+
+1
+Confirm the Destructive toggle on the source loop's gate is OFF. This is the default — the gate ejects a copy and the original continues circulating.
+
+2
+Execute a Single Value Transfer (recipe 05). The value leaves the source loop via the gate but immediately re-enters from the bus bits still in the loop — net effect: the source loop retains its value.
+
+Destructive mode
+With Destructive ON, the gate physically removes the word from the loop — it exits and is gone. Use destructive mode when you want to move a value (not copy it), or when you're deliberately consuming data from a loop one word at a time. For the Memory loop, destructive mode zeroes the slot after the writeback completes.
+
+07
+
+Stream Routing
+
+Route multiple values in sequence from one loop to another.
+
+Bus
+Gate
+
+Components
+Bus A–D · Gate
+
+Par
+41n ticks · n ops
+
+Setup
+Bus on · destination loop has room
+
+Steps
+
+1
+Configure and enable the bus (source → destination).
+
+2
+For each value: watch the source loop, open the gate as each word approaches the G dot. The 41-tick cadence — approximately one full loop revolution at 24 Hz — gives you one gate-open per word comfortably.
+
+3
+After the last word, turn the bus off to prevent the circulating values from re-entering the gate.
+
+Destination capacity
+Check that the destination loop has capacity before starting. Routing 12 values into a Working loop (18-word capacity) that already holds 8 values will overflow — older values get overwritten by the write head. The Big loop (48 words) is the natural staging area when you need to hold a large dataset before processing.
+
+08
+
+Loop Echo
+
+Route a loop back into itself to refresh values at the write head position.
+
+Bus
+
+Components
+Bus (same src & dst)
+
+Par
+N/A — continuous
+
+Use case
+Bus E output mirroring
+
+Set a bus source and destination to the same loop. Values that exit via the gate travel across the bus and re-enter at the write head. The effect: values are not lost when they exit the gate, but they do travel the 24-tick bus delay before re-entering. This creates a brief gap in the loop where the value is in transit.
+
+When this is useful
+The primary use case is monitoring Bus E outbound while preserving values in Working: set Bus A source = Working, dest = Working (echo), then also configure Bus E outbound from Working. Values exit the gate, go to Bus E for challenge evaluation, and simultaneously echo back into Working. The challenge module receives the answer and the operator keeps their data. Requires careful gate timing — two bus outputs from one gate open.
+
+09
+
+Cross-Loop Hold
+
+Park a value in a second loop while working in the first, then retrieve it.
+
+Bus
+Two loops
+
+Components
+Two buses · Two loops
+
+Par
+48 ticks round-trip · 6 ops
+
+Alternative
+Working Scratch (recipe 17)
+
+Steps
+
+1
+Route value from source loop to a second loop via Bus A (one gate open).
+
+2
+The value circulates in the second loop while you work in the first.
+
+3
+When needed: configure Bus B (source = second loop, dest = first loop), open gate to retrieve.
+
+Working Scratch is usually better
+The Working Scratch registers (recipe 17) are a faster and simpler alternative to cross-loop hold for temporary value storage during ALU operations. Use cross-loop hold when you need to park a full dataset (not a single value) or when you're working with loops that don't connect to Working Scratch.
+
+Section III
+
+ALU Operations
+
+10
+
+Two-Register Computation
+
+Load two values into ALU registers and compute a result.
+
+ALU
+Bus
+
+Components
+ALU · Bus A · Gate
+
+Par
+~120 ticks · 6 ops
+
+Setup
+Values in Working or ALU loop
+
+Steps
+
+1
+Set Bus A: source = Working, dest = ALU. Enable bus.
+
+2
+In the ALU panel, set capture route to A. Open gate — first value crosses to ALU loop, passes R head, loads into Reg A.
+
+3
+Set capture route to B. Open gate — second value crosses, loads into Reg B.
+
+4
+Result is computed instantly. Press SEND TO LOOP to write the result into the ALU loop for further use.
+
+The ALU is combinational
+The ALU recomputes its result the instant any register changes. There is no execute button, no clock cycle for the operation. Set the operation before or after loading registers — it doesn't matter. The result is always the current operation applied to the current register values.
+
+11
+
+Running Accumulator
+
+Accumulate a running total across a stream of values.
+
+ALU
+Auto-Writeback
+
+Components
+ALU · Bus · Auto-Writeback
+
+Par
+77n + 5 ticks · 3n + 4 ops
+
+Setup
+Op = ADD · Reg A or B = 0 initially
+
+Steps
+
+1
+Set ALU op to ADD. Load 0 into Reg A (inject 0 and capture, or the registers start at null — the first captured value becomes the initial total automatically).
+
+2
+Enable AUTO-SEND: ON. Now the result writes back to the ALU loop whenever it changes.
+
+3
+Set capture route to A. As each successive value passes the ALU R head, it loads into Reg A. With ADD and auto-writeback, the previous result is in the loop and will recapture into Reg A or B on the next pass — route the first total to Reg B by adjusting the route mid-accumulation.
+
+4
+The cleanest approach: set Reg A = Op A source, Reg B = running total source. Each new value goes to A; the current total is in B. After each ADD, the new total writes back to the ALU loop, recaptures into B, and A is ready for the next value.
+
+Watch for overflow
+16-bit addition wraps at 65535. If your sum exceeds this, the carry flag lights but the result silently wraps. Check the C (carry) flag on each addition if overflow is a concern. The 12-bit mode toggle masks the top 4 bits and caps at 4095 — useful if your values are known to be small.
+
+12
+
+Auto-Writeback Counter
+
+Build a self-incrementing counter that runs at the clock rate.
+
+ALU
+Auto-Writeback
+
+Components
+ALU · Auto-Writeback
+
+Par
+N/A — runs continuously
+
+Setup
+ALU loop has a value · Op = INC
+
+Steps
+
+1
+Inject a starting value into the ALU loop (or use 0).
+
+2
+Set capture route to A. The value loads into Reg A as it passes the R head.
+
+3
+Set ALU op to INC.
+
+4
+Enable AUTO-SEND: ON. The result (starting value + 1) writes back to the ALU loop, recaptures into Reg A, increments again. The loop now counts upward at every R-head pass.
+
+This is powerful
+Change the op to DEC for a countdown. Change to SHL (shift left) for a doubling sequence: 1, 2, 4, 8, 16… Change to ADD with a constant in Reg B for counting by any interval. The auto-writeback counter is one of the most expressive single-setup configurations on the machine — it turns the ALU loop into a programmable number generator with no further operator action required.
+
+13
+
+Running Maximum
+
+Track the largest value in a stream using the comparator.
+
+ALU
+Comparator
+
+Components
+ALU · Bus · Comparator
+
+Par
+82n + 41 ticks · 3n + 4 ops
+
+Setup
+Values in ALU loop · Op = SUB
+
+Steps
+
+1
+Route values to ALU loop. Capture first value into Reg B (current maximum candidate). Set op to SUB (A − B). Set Reg A as the source for each incoming value.
+
+2
+Capture next value into Reg A. Check the GT flag on the comparator: if A > B (GT lit), the new value is larger — press B ← A to copy Reg A into Reg B.
+
+3
+If GT is not lit, B remains the maximum. Capture next value into A and repeat.
+
+4
+After all values: Reg B holds the maximum. Send to loop or route out.
+
+Comparator flags are live
+The comparator continuously computes all six flags (GT, LT, EQ, GTE, LTE, NEQ) against the current Reg A and Reg B values. You read the flags, decide whether to update B, and move on. No explicit "compare" step — the comparison is already done the moment A loads.
+
+14
+
+Conditional Swap
+
+Replace the current maximum/minimum only when a new value beats it.
+
+ALU
+Comparator
+
+Components
+ALU · Comparator flags
+
+Par
+~60 ticks · 2 ops per value
+
+Builds on
+Running Maximum (recipe 13)
+
+The core of Running Maximum, extracted as a standalone technique because it appears in many contexts. Load a candidate into Reg A, check a comparator flag, execute one of two actions based on the flag state. The decision is yours — the flag is just information.
+
+Pattern
+
+1
+Hold the current champion in Reg B. Load candidate into Reg A.
+
+2
+Read the relevant flag (GT for max, LT for min, EQ for duplicate detection).
+
+3
+If flag condition met: copy A → B (press the B←A button). If not: do nothing, B stays.
+
+Variations
+Use LT flag to track the minimum instead of maximum. Use EQ flag to detect duplicate values. Use NEQ to route only novel (unseen) values. The flag system is simple but combining flags with register swaps produces surprisingly expressive conditional logic without any branching infrastructure.
+
+15
+
+Absolute Difference
+
+Compute |A − B| without signed arithmetic.
+
+ALU
+Comparator
+
+Components
+ALU · Comparator
+
+Par
+~80 ticks · 5 ops
+
+Use case
+Running Delta challenge · distance
+
+Steps
+
+1
+Load both values into Reg A and Reg B. Set op to SUB.
+
+2
+Check the S (sign) flag. If S is lit, the result is negative (A < B).
+
+3
+If S is not lit: result is the absolute difference. Send to loop.
+
+4
+If S is lit: send the result to the loop and re-capture it into Reg A, then set op to NEG. The result is now the positive absolute difference. Send to loop.
+
+Why two cases
+Loop 2.1 values are unsigned (0–65535). Subtraction that would go negative wraps around via two's complement. The S flag catches this — it lights when bit 15 of the result is 1, indicating the result wrapped. NEG (two's complement negation) converts it back to the positive distance. For the Running Delta challenge (recipe 30 in the challenge guide) you execute this pattern once per consecutive pair.
+
+16
+
+Binary Multiplication
+
+Multiply two values using repeated addition.
+
+ALU
+Loop iteration
+
+Components
+ALU · loop · Working Scratch
+
+Par
+36(m−1) + 82 ticks · 3m + 5 ops
+
+m = min(a, b)
+
+Steps
+
+1
+Identify which operand is smaller — use it as the repeat count to minimize iterations. Call the smaller value m and the larger value n.
+
+2
+Load n into Reg A and Reg B. Set op to ADD.
+
+3
+Send result to loop, recapture into Reg A. Now Reg A = 2n, Reg B = n. This is the result after 1 iteration. Send and recapture m−1 times total.
+
+4
+After m−1 sends, Reg A holds n × m. Send to loop for use.
+
+SHL shortcut for powers of 2
+If your multiplier is a power of 2, use SHL (shift left) instead of repeated addition. SHL doubles the value in one operation. Multiply by 8: SHL three times. Multiply by 6: SHL twice (×4), then ADD the original value twice. Hybrid approaches combining SHL and ADD can significantly reduce iteration count for non-power-of-2 multipliers.
+
+17
+
+Scratch Register Hold
+
+Park up to four values in Working Scratch during an ALU operation.
+
+Working Scratch
+ALU
+
+Components
+Working Scratch · Working loop
+
+Par
+0 ticks overhead · 2 ops per slot
+
+Capacity
+4 slots (0–3)
+
+Steps
+
+1
+Press CAPTURE: ON in the Working Scratch panel. The next complete word that passes the Working R head is captured into slot 0. Capture auto-advances to slot 1, then 2, then 3, cycling back to 0.
+
+2
+The word remains circulating in Working — capture is non-destructive. Multiple words can be captured in sequence as they circulate past.
+
+3
+To retrieve: press →W next to the slot. The value enters a 17-tick writeback pipeline into Working's write head.
+
+Scratch vs cross-loop hold
+Working Scratch is faster and requires fewer setup steps than cross-loop hold (recipe 09). Use it whenever you need to temporarily hold 1–4 Working loop values during a computation. Its limitation: values in scratch are copies — if the Working loop value changes, scratch doesn't update automatically.
+
+Section IV
+
+Memory
+
+18
+
+Sequential Store
+
+Store a stream of values into consecutive memory slots using auto-increment.
+
+Memory
+Auto-Increment
+
+Components
+Memory · Bus · Auto-Inc
+
+Par
+41n + 24 ticks · n+2 ops
+
+Setup
+Memory loop running
+
+Steps
+
+1
+Set the starting address on the Memory address selector. Enable TURN AUTO-INC ON. Enable ENABLE WRITE TO SLOTS.
+
+2
+Route values from your source loop to the Memory loop via Bus B (or any bus). Each word that passes the Memory R head is written to the current address and the address advances to the next slot.
+
+3
+After all values are stored, disable Write to Slots to prevent subsequent loop circulation from overwriting slots.
+
+Auto-increment wraps at 16
+After filling slot 15, auto-increment wraps back to slot 0. If your stream is longer than 16 − startAddress values, earlier slots will be overwritten. For a full 16-slot store, start from slot 0.
+
+19
+
+Address-Keyed Store
+
+Use the top 4 bits of each arriving word to determine its destination slot.
+
+Memory
+Addr-Read
+
+Components
+Memory · Addr-Read mode
+
+Par
+41n ticks · n+2 ops
+
+Prerequisite
+Values pre-encoded with address
+
+Steps
+
+1
+Enable ADDR-READ: ON and ENABLE WRITE TO SLOTS on the Memory panel.
+
+2
+Route pre-encoded values into the Memory loop. Each arriving word's top 4 bits (b15–b12) are decoded as a 4-bit address (0–15), overriding the manual address selector. The word is written to that slot, full 16-bit value intact.
+
+How to encode addresses into values
+To store value V into slot S, the encoded word is (S << 12) | (V & 0x0FFF). This sacrifices the top 4 bits of the data range — maximum stored value is 4095 (0x0FFF). Use Addr-Read mode when you want non-sequential writes (slot 7, then slot 2, then slot 14) or when values are arriving already-encoded from a previous computation.
+
+20
+
+Destructive Recall
+
+Read a memory slot, use its value, and automatically clear the slot.
+
+Memory
+Destructive
+
+Components
+Memory · SEND TO LOOP
+
+Par
+17 ticks · 2 ops
+
+Setup
+TURN DESTRUCT ON
+
+Steps
+
+1
+Enable TURN DESTRUCT ON in the Memory panel.
+
+2
+Press SEND TO LOOP next to the target slot. The value enters the 17-tick writeback pipeline and the slot is cleared (set to null) when the pipeline completes.
+
+When to use it
+Destructive recall is useful when you're consuming values from memory rather than reading them — building a sorted output stream, for example, where each extracted value should not be reused. Also useful for guaranteed-once semantics: a value in a destructive-read slot will be consumed exactly once.
+
+21
+
+Batch Recall
+
+Stream all 16 memory slots into the Memory loop in slot order.
+
+Memory
+Batch Write All
+
+Components
+Memory · Batch Write All
+
+Par
+272 ticks · 1 op
+
+Output
+Always 16 words
+
+Steps
+
+1
+Press BATCH WRITE ALL. All 16 slots stream into the Memory loop in order (slot 0 first, slot 15 last). Empty (null) slots write a zero word — marker=1, data=0 — to preserve position information in the stream.
+
+2
+The stream is 16 × 17 = 272 bits. At 24 Hz, approximately 11 seconds from start to finish. Watch the log for each slot's transmission.
+
+The null-to-zero behavior
+Empty slots produce marker=1, data=0 words rather than being skipped. This means slot 7's value will always be the 8th word in the stream regardless of how many earlier slots are populated. Position is preserved. On the receiving side (Write to Slots + Auto-Increment), a zero word writes 0 to the corresponding slot — null and zero are indistinguishable after a batch recall cycle. This is an accepted tradeoff.
+
+22
+
+Memory Snapshot Save & Load
+
+Persist the full 16-slot memory state to a.L21 file and restore it later.
+
+Memory
+Files
+
+Components
+Files panel · Bus · FILE SAVE dst
+
+Par (save)
+272 ticks · 2 ops
+
+Par (load)
+272 ticks · 3 ops
+
+Save steps
+
+1
+Open the Files panel. Press NEW FILE, enter a name, press SAVE. The system arms and displays: "Ready — send Batch Write All to FILE SAVE on Bus A, B, C, or D."
+
+2
+Set any bus destination to File Save. Press BATCH WRITE ALL. All 16 words stream to the Files system and the snapshot is saved automatically.
+
+Load steps
+
+1
+Enable Write to Slots and Auto-Increment (starting at slot 0) on the Memory panel. Ensure the Memory loop is running.
+
+2
+Select the file in the Files panel. Press LOAD. The 16 words stream through the Memory loop's writeback pipeline into consecutive slots. The load pauses if the loop pauses — no bits are lost.
+
+Persistence across sessions
+.L21 files are stored in browser localStorage and survive between sessions on the same browser. Use EXPORT.l21x to archive your full /local folder to a real computer file. The.l21x format is plain text and can be opened, read, and edited in any text editor.
+
+Section V
+
+Pattern Matcher
+
+23
+
+Exact Value Eject
+
+Eject a specific value from the Big Loop when it passes PM1.
+
+PM1
+Big Loop
+
+Components
+PM1 · Big Loop · Bus A
+
+Par
+circ + 1 ticks · 3 ops
+
+Setup
+Value in Big Loop
+
+Steps
+
+1
+Set PM1 mask to 1111111111111111 (all 16 bits). Set PM1 match to the exact value you want to eject (all 16 bits).
+
+2
+Enable PM1. Enable EJECT: DESTRUCTIVE to remove the value from the loop, or EJECT: COPY to keep it circulating while also outputting a copy.
+
+3
+Set Bus A source to PM (PM1 bridge). The ejected value exits onto Bus A. Route to your desired destination.
+
+PM1 eject position
+PM1 fires at bit index 359 on the Big Loop. There is a small cooldown after each eject to prevent the same word from triggering multiple times as it passes. With COPY mode, the value continues circulating and will re-trigger PM1 on the next pass — disable PM1 after ejecting if you only want one copy.
+
+24
+
+Bit-Field Filter
+
+Route only values matching a bit pattern — odd, top-bit-set, divisible by 4, etc.
+
+PM1
+Big Loop
+Bus
+
+Components
+PM1 · Big Loop · Bus source = PM
+
+Par
+41n + 18m ticks · n+m ops
+
+m = match count
+
+Configuration examples
+
+Common PM1 configurations
+Odd values (b0 = 1): Mask = 0000000000000001, Match = 0000000000000001
+
+Even values (b0 = 0): Mask = 0000000000000001, Match = 0000000000000000
+
+Top bit set (≥ 32768): Mask = 1000000000000000, Match = 1000000000000000
+
+Divisible by 4 (b1,b0 = 00): Mask = 0000000000000011, Match = 0000000000000000
+
+Steps
+
+1
+Route your stream into the Big Loop.
+
+2
+Configure PM1 mask and match bits for your condition. Enable PM1 with EJECT: DESTRUCTIVE.
+
+3
+Set Bus A source to PM. Route matching values to your destination as they eject. Non-matching values continue circulating in the Big Loop.
+
+Mask vs Match
+The mask controls which bits are checked. The match controls what those bits must equal. Only bits where mask=1 are compared — bits where mask=0 are ignored regardless of their value in the word. This lets you check any subset of the 16 data bits independently.
+
+25
+
+Rewrite in Place
+
+Modify specific bits of matching values without ejecting them from the loop.
+
+PM1
+Rewrite mode
+
+Components
+PM1 rewrite mode · Big Loop
+
+Par
+n × circ ticks · 2 ops
+
+Eject mode
+COPY (not destructive)
+
+Steps
+
+1
+Configure PM1 mask and match for your condition.
+
+2
+Set the Change Mask to indicate which bits to rewrite (1 = change this bit, 0 = leave it).
+
+3
+Set the Change Value to what those bits should become.
+
+4
+Enable PM1 with EJECT: COPY. When a matching word passes, its selected bits are rewritten in place — the modified word continues in the loop at the same position. No ejection, no routing needed.
+
+Example — clear the top bit of all values ≥ 32768
+Mask = 1000000000000000, Match = 1000000000000000 (top bit set). Change Mask = 1000000000000000, Change Value = 0000000000000000. Every value ≥ 32768 has its top bit cleared in place. One full loop revolution processes all values — no bus routing, no ALU involvement.
+
+26
+
+PM Cascade — Two-Stage Filter
+
+Use PM1 and PM2 in sequence to split a stream into three groups.
+
+PM1
+PM2
+Big Loop
+
+Components
+PM1 + PM2 · Big Loop · Two buses
+
+Groups
+PM1 match · PM2 match · Neither
+
+Eject order
+PM1 at idx 359, PM2 at idx 342
+
+PM1 is at bit index 359 on the Big Loop; PM2 is 17 bits downstream at index 342. Words pass PM1 first, then PM2. PM2 only sees words that PM1 did not eject (or that PM1 passed through in COPY mode).
+
+Steps
+
+1
+Configure PM1 to match Group A. Enable with EJECT: DESTRUCTIVE. Set Bus A source = PM (PM1 bridge). Group A values eject here.
+
+2
+Configure PM2 to match Group B. Enable with EJECT: DESTRUCTIVE. Set Bus B source = PM2. Group B values eject here after passing PM1 without matching.
+
+3
+Values matching neither condition continue circulating — Group C stays in the Big Loop.
+
+PM2 has additional outputs
+PM2 has separate bridge outputs for matched and rejected values ( pm2.bridge and pm2.rejectBridge). Set Bus source to PM2 Match or PM2 Reject to route those streams independently. This gives you four potential output streams from a two-PM cascade.
+
+27
+
+Match Count
+
+Count how many values in a stream satisfy a bit condition.
+
+PM1
+Match counter
+
+Components
+PM1 match counter · Big Loop · Bus
+
+Par
+41n + 544 + 41 ticks · n+8 ops
+
+544t = counter eject latency
+
+Steps
+
+1
+Configure PM1 for your condition. Enable PM1. Enable the PM1 MATCH COUNTER. The counter increments every time PM1 fires.
+
+2
+Route your stream through the Big Loop. Let all values pass PM1. No bus routing needed — you only care about the count, not the matched values themselves.
+
+3
+After all values have circulated: press the PM1 counter eject button. The count value enters the Big Loop as a word and circulates to the R head.
+
+4
+Route the count word to your destination (Bus E for challenge output, Bus B to Memory, etc.).
+
+The 544-tick eject latency
+The counter ejects into the Big Loop, and the Big Loop is 48 words × 17 bits = 816 bits. The ejected count word circulates approximately one-third of the loop (from eject point to R head) before it's readable — roughly 544 bits at the Big Loop's circulation rate. At 24 Hz that's about 22 seconds. Plan for it.
+
+Section VI
+
+Threshold Gate & Counters
+
+28
+
+Minimum Extraction
+
+Extract the smallest value in a loop using the Threshold Gate in ≤ mode.
+
+TG1
+Big Loop
+
+Components
+TG1 · Big Loop · Bus
+
+Par
+~circ × n ticks per pass
+
+Use case
+Sort Values challenge core op
+
+Steps
+
+1
+Set TG1 threshold to a value you believe is larger than the minimum in the loop. Set TG1 mode to ≤ (less than or equal). Enable TG1 with EJECT: DESTRUCTIVE.
+
+2
+Let the Big Loop circulate one full revolution. The first value ≤ threshold ejects. If no value ejects, lower the threshold and try again.
+
+3
+To find the true minimum: start with a high threshold, extract the first matching value, lower the threshold to that value, and repeat. The extracted values come out in ascending order.
+
+Iterative minimum sort
+This is the foundational operation for sorting via the Threshold Gate. Each iteration extracts the current minimum and removes it from the loop, so the next iteration's minimum is the next-smallest remaining value. For n values, you do n extractions — the Sort Values challenge is exactly this loop, run n times, with each extracted value routed to Bus E outbound.
+
+29
+
+Range Gate
+
+Pass only values within a specific range using two Threshold Gates in series.
+
+TG1
+TG2
+Big Loop
+
+Components
+TG1 + TG2 · Big Loop
+
+Eject order
+TG1 at idx 325, TG2 at idx 308
+
+Passes through
+lo ≤ value ≤ hi
+
+Steps
+
+1
+Set TG1 threshold = lower bound (lo). Set TG1 mode to < (less than). Enable TG1 EJECT: DESTRUCTIVE. Values below lo eject here — they're out of range and consumed.
+
+2
+Set TG2 threshold = upper bound (hi). Set TG2 mode to > (greater than). Enable TG2 EJECT: DESTRUCTIVE. Values above hi eject here — also out of range and consumed.
+
+3
+Values that pass both gates (≥ lo and ≤ hi) continue circulating. Route them via a PM or bus from there.
+
+You can also set TG threshold via bus
+Bus destinations include TG1·Thresh and TG2·Thresh. Route a value from Working or ALU loop to a TG threshold destination to set it dynamically. This lets you change the gate thresholds during operation — useful when the range itself is computed from the data rather than known in advance.
+
+30
+
+Counter as Data
+
+Eject a loop counter's value into the loop as a usable word.
+
+Counter
+Bus
+ALU
+
+Components
+Counter · Bus Ctr·W/A/M/B dst
+
+Par
+17 ticks · 2 ops
+
+Use case
+Count-based routing decisions
+
+Steps
+
+1
+Configure a counter trigger on the desired loop (Word Written, Bit Written, or Full Cycle). Let it accumulate during normal operation.
+
+2
+To read the counter value: press the counter eject button. The current count enters the loop as a 17-bit word via a 17-tick writeback pipeline.
+
+3
+Alternatively: set a bus destination to Ctr·W (Working counter), Ctr·A (ALU), etc. Route a value from any loop into the counter destination — this loads the counter with that value rather than incrementing it. Useful for initializing a counter to a specific starting point.
+
+Counters are six digits
+The loop counters track up to 999,999 events before rolling over. For measuring word counts in a session, this is effectively unlimited. The Op Count (operator action counter) is separate and can be linked to Op Count Halt — when the count reaches its target, the machine stops automatically. This enables timed sessions and repeatable benchmarks without manual intervention.
+
+Loop 2.1 · Operator's Field Guide · Volume I — Single Machine
+
+loop2.computer · "The Operator Is the Program"
+
+Designed by Shea Gunther · New Gloucester, Maine · 2026
+
+Home
+The Thesis
+The Case
+Timeline
+Corpus
+The Apps
+Sweet Prompts
+Discoveries
+The Threads
+Gifts
+Knowledge
+Who
+
+Dario — you should get in touch.
+
+Loop MMT is pre-launch. The site is reachable but we’re not sharing it yet — still finishing the work before we open it up. Cross-cutting design register: honest-badge (§4.5.d).
+
+Documents: Creed, PiF, Glossary & the full corpus →
+
+© 2026 Shea Gunther · New Gloucester, Maine · CC BY-NC 4.0
+
+shea@loopmmt.com
+
+Curious how this site is built? How This Site Is Made | the Receipts | How to Build for AI, Too
+
+SOURCE. This page is site-root/apps/loop21/docs/field-guide.html. The rendered HTML you are reading is a view; the source file is the canonical artifact. When a rendered page and its source disagree, the source wins.
 
 ---

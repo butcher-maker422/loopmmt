@@ -1,0 +1,1124 @@
+# Loop MMT — corpus shard 64/66
+
+> Bundle 64 of 66 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 2 (/gifts/typecheck/, /gifts/vclock/)
+
+---
+
+# typecheck — a Loop MMT gift
+https://loopmmt.com/gifts/typecheck/
+[coverage: optional · branch: gifts]
+
+Composition Typecheck check ← all gifts
+
+typecheck
+
+Give it a pipeline of small JSONL tools you mean to chain — A,B,C — and, before you run anything and with no side effects, typecheck says whether it is well-formed: does each stage EMIT what the next one ACCEPTS. It walks the adjacent pairs and the endpoints, names the exact hop that breaks (a sink piped into a transform, a source stranded mid-pipeline), and exits non-zero so you can gate on it.
+
+The honest edge
+
+It validates the PORT type — can the pipe carry data at all — NOT the RECORD shape. Two tools can both speak JSON-lines so the ports agree, while the records one emits are not the records the other expects; that pipeline typechecks clean here and still fails at runtime. typecheck flags the record-shape layer as unproven and never asserts semantic fit. A slug not in the manifest is reported UNRESOLVED, never guessed.
+
+Run it
+
+python3 typecheck.py text --pipeline A,B,C --manifest gifts-manifest.json
+test_typecheck.py (15/15 golden, 8/8 mutations caught)
+Python 3, standard library only
+
+The code — every file that ships
+
+typecheck.py 385 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+typecheck — validate a composition before you run it.
+
+You have a pipeline in mind: A | B | C. Before you run it, this tells you —
+decidably, with no side effects — whether it typechecks: does each stage EMIT
+what the next one ACCEPTS. It catches "you piped a sink into a transform" at
+declare-time, as a clear per-hop verdict, instead of as a confusing runtime
+error three stages deep.
+
+THE TYPE MODEL (flat, five verbs)
+source ∅ -> JSONL emits, never accepts (ignores stdin)
+transform JSONL -> JSONL emits and accepts
+filter JSONL -> JSONL' emits and accepts
+fold JSONL -> agg emits and accepts
+sink JSONL -> ∅ accepts, never emits (no pipeable stdout)
+
+THE GATE (decidable, total)
+A can feed B iff EMITS(A) and ACCEPTS(B)
+EMITS(v) = v!= "sink" (a sink produces no pipeable stdout)
+ACCEPTS(v) = v!= "source" (a source ignores its stdin)
+Plus the endpoint rule: a mid-pipeline stage that does not ACCEPT (a source in
+a non-first position) is an error — it ignores the stream handed to it; and a
+mid-pipeline stage that does not EMIT (a sink before the end) is an error — it
+swallows the stream the downstream stage needs.
+
+WHAT THIS IS A STRIP OF
+An internal tree-spec validator (AGPL-3.0) carried a subtype relation `<:` +
+type lattice + conformance check (conformsTo, seeded FLAT: SUBTYPE_EDGES={},
+so it is nominal equality on day one) and an emit/accept edge-compatibility
+gate. This gift keeps conformsTo as the flat lattice SEAM — a
+future variance edge slots into SUBTYPE_EDGES without rewriting the gate —
+and keeps the emit/accept gate, applied to the ADJACENT pairs of one linear
+pipeline (the walk A->B->C) rather than to a whole DAG. Re-licensed MIT,
+stdlib-only (the ancestor's yaml dep and tree-YAML machinery are dropped).
+It re-states the ~3-line gate rather than importing `map`: gifts are
+standalone — pipes all the way down, MIT, zero-dep — so they never import
+each other; the canonical port-verb roster keeps them consistent.
+
+WHAT IT DELIBERATELY DOES NOT DO (the honesty flag — a build requirement)
+typecheck validates the PORT type, NOT the record shape. An {event}-emitting
+stage piped into a {file}-expecting stage typechecks CLEAN here and still
+fails at runtime, because the ports agree (both JSONL) even though the
+records don't fit. The ancestor's V17/V18 schema-affinity heuristic (which
+only ever WARNed) is exactly that record-shape layer, and it is DROPPED on
+purpose: this gift claims port-compatibility and flags record-shape as
+UNPROVEN — it never asserts semantic fit.
+
+USAGE
+typecheck check --pipeline A,B,C --manifest gifts-manifest.json
+Walk the declared pipeline; per-hop verdict JSONL + a summary line.
+Exit 3 if any hop (or endpoint) is bad, 0 if the whole pipeline is clean.
+typecheck text --pipeline A,B,C --manifest gifts-manifest.json
+The same check, human-readable.
+typecheck --port
+Print typecheck's own port-verb (filter) as one JSON-line and exit.
+typecheck --selftest
+Run the built-in checks and exit 0/1.
+
+The manifest is any JSON list of entries (or an object with a
+'gifts'/'tools'/'entries' list); each entry carries a 'slug' and a 'port_verb'
+— the same shape `map` and `port` read. A slug named in the pipeline but absent
+from the manifest, or present with no valid port_verb, is reported as
+UNRESOLVED and fails the check — never guessed.
+"""
+import argparse
+import json
+import sys
+
+VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
+
+# -------------------------------------------------------------------
+# THE SUBTYPE RELATION (<:), seeded FLAT — the kept lattice seam.
+# Zero edges at seed, so conformsTo is bit-for-bit nominal equality on day one.
+# Variance is added LATER by adding edges here — never by rewriting the gate.
+# -------------------------------------------------------------------
+SUBTYPE_EDGES = {} # requiredVerb -> set(subVerbs). EMPTY at seed (discrete order).
+
+def subtypes(required):
+"""Declared subtypes of `required`. Empty at seed."""
+return SUBTYPE_EDGES.get(required, set())
+
+def conformsTo(candidate, required):
+"""Total, decidable subtype operator. At seed (no edges) this is exactly
+nominal equality:
+required == "" -> True (no constraint)
+candidate == required -> True (nominal match)
+candidate in subtypes(required) -> True (lattice edge; none at seed)
+"""
+if required == "":
+return True
+if candidate == required:
+return True
+return candidate in subtypes(required)
+
+def EMITS(v):
+"""A stage produces pipeable stdout iff it is not a sink."""
+return v!= "sink"
+
+def ACCEPTS(v):
+"""A stage consumes stdin iff it is not a source."""
+return v!= "source"
+
+def load_verbs(path):
+"""Return {slug: port_verb} for every manifest entry with a valid port_verb.
+
+Accepts a bare JSON list of entries or an object with a
+'gifts'/'tools'/'entries' list. Raises ValueError if no entry list can be
+found — never guesses the shape. An entry with no valid port_verb is simply
+absent from the map, so a pipeline naming it reports UNRESOLVED.
+"""
+with open(path) as f:
+data = json.load(f)
+if isinstance(data, list):
+entries = data
+elif isinstance(data, dict):
+entries = None
+for k in ("gifts", "tools", "entries"):
+if isinstance(data.get(k), list):
+entries = data[k]
+break
+if entries is None:
+raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
+else:
+raise ValueError(f"{path}: not a JSON list or object")
+
+verbs = {}
+for e in entries:
+slug = e.get("slug")
+pv = e.get("port_verb")
+if pv in VALID_VERBS:
+verbs[slug] = pv
+return verbs
+
+def typecheck_pipeline(pipeline, verbs):
+"""Walk a declared pipeline and check every adjacent pair + the endpoints.
+
+pipeline: ordered list of slugs [A, B, C]
+verbs: {slug: port_verb} resolved from the manifest
+
+Returns (hops, ok):
+hops: list of per-hop verdict dicts, in pipeline order. Two kinds:
+- {"kind": "stage",...} one per stage: its resolved verb, its
+endpoint role, and whether that role is valid at its position.
+- {"kind": "hop",...} one per adjacent pair (A->B): the gate.
+ok: True iff every stage resolved AND every endpoint role is valid AND
+every hop passes the emit/accept gate.
+"""
+n = len(pipeline)
+hops = []
+ok = True
+
+# Resolve every stage first; an unresolved stage is a hard fail (never guessed).
+resolved = []
+for i, slug in enumerate(pipeline):
+verb = verbs.get(slug)
+pos = "first" if i == 0 else ("last" if i == n - 1 else "middle")
+if verb is None:
+ok = False
+hops.append({
+"kind": "stage", "pos": i, "slug": slug, "verb": None,
+"role": pos, "role_ok": False,
+"reason": "UNRESOLVED — slug not in manifest, or no valid port_verb; not guessed",
+})
+resolved.append(None)
+continue
+
+# Endpoint rule. A stage in a non-first position must ACCEPT (else it
+# ignores the stream handed to it); a stage in a non-last position must
+# EMIT (else it swallows the stream the next stage needs).
+role_ok = True
+reason = "ok"
+if pos in ("middle", "last") and not ACCEPTS(verb):
+role_ok = False
+reason = f"a {verb} accepts no stdin, but it is not the first stage — it would ignore its input"
+if pos in ("first", "middle") and not EMITS(verb):
+role_ok = False
+reason = f"a {verb} emits no stdout, but it is not the last stage — downstream gets nothing"
+if not role_ok:
+ok = False
+hops.append({
+"kind": "stage", "pos": i, "slug": slug, "verb": verb,
+"role": pos, "role_ok": role_ok, "reason": reason,
+})
+resolved.append(verb)
+
+# The gate on each adjacent pair.
+for i in range(n - 1):
+a_slug, b_slug = pipeline[i], pipeline[i + 1]
+a_verb, b_verb = resolved[i], resolved[i + 1]
+if a_verb is None or b_verb is None:
+hops.append({
+"kind": "hop", "pos": i, "from": a_slug, "to": b_slug,
+"from_verb": a_verb, "to_verb": b_verb,
+"typechecks": False,
+"reason": "UNRESOLVED — one endpoint has no resolved port_verb",
+})
+ok = False
+continue
+emits = EMITS(a_verb)
+accepts = ACCEPTS(b_verb)
+passes = emits and accepts
+if not passes:
+ok = False
+if not emits:
+reason = f"{a_slug} is a {a_verb} — it emits no stdout, so {b_slug} has nothing to read"
+elif not accepts:
+reason = f"{b_slug} is a {b_verb} — it ignores stdin, so {a_slug}'s output is dropped"
+else:
+reason = "ok — emitter feeds an acceptor (TYPE gate only; record shape unproven)"
+hops.append({
+"kind": "hop", "pos": i, "from": a_slug, "to": b_slug,
+"from_verb": a_verb, "to_verb": b_verb,
+"typechecks": passes, "reason": reason,
+})
+
+return hops, ok
+
+SEMANTIC_FLAG = (
+"UNPROVEN — typecheck validates the PORT type (can the pipe carry data), "
+"NOT the RECORD shape. A pipeline can typecheck clean here and still fail at "
+"runtime because the records don't fit. That semantic layer is a finer "
+"question the uniform JSONL type cannot settle, and this gift never asserts it."
+)
+
+def summary_record(pipeline, hops, ok):
+bad_hops = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
+bad_stages = [h for h in hops if h["kind"] == "stage" and not h["role_ok"]]
+return {
+"kind": "summary",
+"pipeline": list(pipeline),
+"stages": len(pipeline),
+"hops": sum(1 for h in hops if h["kind"] == "hop"),
+"typechecks": ok,
+"bad_hops": len(bad_hops),
+"bad_stages": len(bad_stages),
+"semantic_layer": SEMANTIC_FLAG,
+}
+
+def emit_jsonl(pipeline, hops, ok, out):
+for h in hops:
+out.write(json.dumps(h) + "\n")
+out.write(json.dumps(summary_record(pipeline, hops, ok)) + "\n")
+
+def emit_text(pipeline, hops, ok, out):
+out.write("typecheck — " + " -> ".join(pipeline) + "\n")
+out.write("=" * 56 + "\n")
+for h in hops:
+if h["kind"] == "stage":
+mark = " " if h["role_ok"] else "!!"
+verb = h["verb"] if h["verb"] is not None else "?"
+out.write(f"{mark} stage {h['pos']}: {h['slug']} [{verb}] ({h['role']}) — {h['reason']}\n")
+else:
+mark = "ok" if h["typechecks"] else "XX"
+out.write(f"{mark} hop {h['from']} -> {h['to']} "
+f"[{h['from_verb']} -> {h['to_verb']}] — {h['reason']}\n")
+out.write("-" * 56 + "\n")
+out.write(f"RESULT: {'TYPECHECKS' if ok else 'DOES NOT TYPECHECK'}\n")
+out.write("\nNOTE: this is the TYPE-level check. Record-shape fit is UNPROVEN —\n")
+out.write("a clean result means the ports agree, not that the records fit.\n")
+
+def parse_pipeline(s):
+parts = [p.strip() for p in s.split(",")]
+parts = [p for p in parts if p]
+if len(parts) < 2:
+raise ValueError("a pipeline needs at least two stages (A,B)")
+return parts
+
+def _selftest():
+# A tiny fixed manifest covering all five verbs.
+verbs = {
+"src": "source",
+"xf": "transform",
+"flt": "filter",
+"fold": "fold",
+"snk": "sink",
+}
+checks = []
+
+# 1. A clean pipeline: source -> transform -> sink.
+hops, ok = typecheck_pipeline(["src", "xf", "snk"], verbs)
+checks.append(("clean src->xf->snk typechecks", ok is True))
+
+# 2. A sink in the middle must fail (it emits nothing downstream).
+hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
+checks.append(("sink-in-middle fails", ok is False))
+
+# 3. A source in the middle must fail (it ignores its stdin).
+hops, ok = typecheck_pipeline(["src", "src", "snk"], verbs)
+checks.append(("source-in-middle fails", ok is False))
+
+# 4. The bad HOP is identified: src -> snk is fine, snk -> xf is the break.
+hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
+bad = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
+checks.append(("bad hop is snk->xf", len(bad) == 1 and bad[0]["from"] == "snk" and bad[0]["to"] == "xf"))
+
+# 5. An unresolved slug fails and is never guessed.
+hops, ok = typecheck_pipeline(["src", "ghost", "snk"], verbs)
+stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "ghost"][0]
+checks.append(("unresolved slug fails, verb is None", ok is False and stage["verb"] is None))
+
+# 6. transform->filter->fold is all-middle-legal and clean.
+hops, ok = typecheck_pipeline(["xf", "flt", "fold"], verbs)
+checks.append(("xf->flt->fold typechecks", ok is True))
+
+# 6a. The stage-role verdict is isolated (not just the aggregate): a sink in
+# the middle sets role_ok False on that stage (endpoint EMITS rule).
+hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
+snk_stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "snk"][0]
+checks.append(("sink-middle stage role_ok False", snk_stage["role_ok"] is False))
+
+# 6b. A hop bad ONLY on the accept side (xf -> src) fails the gate — pins the
+# ACCEPTS conjunct independently of the emit side.
+hops, ok = typecheck_pipeline(["xf", "src", "snk"], verbs)
+accept_hop = [h for h in hops if h["kind"] == "hop" and h["from"] == "xf" and h["to"] == "src"][0]
+checks.append(("accept-only-bad hop xf->src fails", accept_hop["typechecks"] is False))
+
+# 7. conformsTo is nominal equality at seed (flat lattice).
+checks.append(("conformsTo flat: transform~transform, not transform~filter",
+conformsTo("transform", "transform") and not conformsTo("filter", "transform")))
+
+# 8. conformsTo empty-required is the no-constraint path.
+checks.append(("conformsTo empty-required is True", conformsTo("anything", "") is True))
+
+passed = sum(1 for _, ok_ in checks if ok_)
+for name, ok_ in checks:
+print(f" {'PASS' if ok_ else 'FAIL'} {name}")
+print(f"{passed}/{len(checks)} checks passed")
+return passed == len(checks)
+
+def main(argv=None):
+ap = argparse.ArgumentParser(
+description="Validate a declared gift pipeline before you run it — the TYPE gate, not the record shape."
+)
+ap.add_argument("--port", action="store_true", help="print typecheck's own port-verb (filter) and exit")
+ap.add_argument("--selftest", action="store_true", help="run built-in checks and exit")
+sub = ap.add_subparsers(dest="cmd")
+for name in ("check", "text"):
+p = sub.add_parser(name)
+p.add_argument("--pipeline", required=True, help="comma-separated slugs, e.g. gitlog,vclock,cairn")
+p.add_argument("--manifest", required=True, help="path to the gifts manifest JSON")
+args = ap.parse_args(argv)
+
+if args.port:
+print(json.dumps({"slug": "typecheck", "port_verb": "filter"}))
+return 0
+
+if args.selftest:
+return 0 if _selftest() else 1
+
+if args.cmd not in ("check", "text"):
+ap.print_help()
+return 2
+
+try:
+pipeline = parse_pipeline(args.pipeline)
+verbs = load_verbs(args.manifest)
+except (ValueError, OSError, json.JSONDecodeError) as e:
+sys.stderr.write(f"typecheck: {e}\n")
+return 2
+
+hops, ok = typecheck_pipeline(pipeline, verbs)
+if args.cmd == "check":
+emit_jsonl(pipeline, hops, ok, sys.stdout)
+else:
+emit_text(pipeline, hops, ok, sys.stdout)
+return 0 if ok else 3
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_typecheck.py 170 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+Mutation-bitten test for the typecheck gift.
+
+Two halves:
+1. GOLDEN — the behavior contract: clean pipelines pass, broken pipelines
+fail at the right hop/stage, unresolved slugs are flagged not guessed,
+conformsTo is flat at seed.
+2. MUTATION BATTERY — each load-bearing predicate is flipped in a copy of the
+module and the golden checks are re-run; the suite is only meaningful if
+every mutation is CAUGHT (turns some golden check RED). A mutation that
+nothing catches is a hole in the test, and this file fails loud on it.
+
+Run: python3 test_typecheck.py (asserts golden green + every bite caught)
+python3 test_typecheck.py --show (verbose)
+"""
+import copy
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MODPATH = HERE / "typecheck.py"
+
+def _load_module(src_text=None):
+"""Load typecheck.py fresh (optionally from mutated source text)."""
+spec = importlib.util.spec_from_file_location("typecheck_under_test", MODPATH)
+mod = importlib.util.module_from_spec(spec)
+if src_text is None:
+spec.loader.exec_module(mod)
+else:
+code = compile(src_text, str(MODPATH), "exec")
+exec(code, mod.__dict__)
+return mod
+
+VERBS = {
+"src": "source", "xf": "transform", "flt": "filter",
+"fold": "fold", "snk": "sink",
+}
+
+def golden_checks(m):
+"""Return a list of (name, bool) — the behavior contract, evaluated on module m."""
+out = []
+
+hops, ok = m.typecheck_pipeline(["src", "xf", "snk"], VERBS)
+out.append(("clean src->xf->snk typechecks", ok is True))
+
+hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
+out.append(("sink-in-middle fails", ok is False))
+
+hops, ok = m.typecheck_pipeline(["src", "src", "snk"], VERBS)
+out.append(("source-in-middle fails", ok is False))
+
+hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
+bad = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
+out.append(("bad hop is exactly snk->xf",
+len(bad) == 1 and bad[0]["from"] == "snk" and bad[0]["to"] == "xf"))
+
+hops, ok = m.typecheck_pipeline(["src", "ghost", "snk"], VERBS)
+stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "ghost"][0]
+out.append(("unresolved slug fails and verb is None",
+ok is False and stage["verb"] is None))
+
+hops, ok = m.typecheck_pipeline(["xf", "flt", "fold"], VERBS)
+out.append(("all-middle-legal xf->flt->fold typechecks", ok is True))
+
+hops, ok = m.typecheck_pipeline(["snk", "xf"], VERBS)
+out.append(("sink as FIRST stage fails (emits nothing downstream)", ok is False))
+
+hops, ok = m.typecheck_pipeline(["xf", "src"], VERBS)
+out.append(("source as LAST stage fails (ignores its input)", ok is False))
+
+# Isolate the STAGE-ROLE verdict (not just the aggregate ok) — a sink in the
+# middle must set role_ok False on that stage, independent of the hop gate.
+hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
+snk_stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "snk"][0]
+out.append(("sink-middle stage role_ok is False (endpoint EMITS rule)", snk_stage["role_ok"] is False))
+
+# And a source in the middle must set role_ok False on THAT stage (endpoint
+# ACCEPTS rule) — isolated the same way.
+hops, ok = m.typecheck_pipeline(["src", "src", "snk"], VERBS)
+mid_src = [h for h in hops if h["kind"] == "stage" and h["pos"] == 1][0]
+out.append(("source-middle stage role_ok is False (endpoint ACCEPTS rule)", mid_src["role_ok"] is False))
+
+# A hop that is bad ONLY on the ACCEPTS side: xf (emits) -> src (a source in
+# a non-first slot ignores stdin). The HOP itself must fail on accept, which
+# pins the ACCEPTS conjunct in the gate independently of the emit side.
+hops, ok = m.typecheck_pipeline(["xf", "src", "snk"], VERBS)
+accept_hop = [h for h in hops if h["kind"] == "hop" and h["from"] == "xf" and h["to"] == "src"][0]
+out.append(("hop bad only on ACCEPTS side (xf->src) fails the gate", accept_hop["typechecks"] is False))
+
+out.append(("conformsTo flat: nominal only",
+m.conformsTo("transform", "transform") and not m.conformsTo("filter", "transform")))
+out.append(("conformsTo empty-required True", m.conformsTo("x", "") is True))
+
+out.append(("EMITS(sink) False / EMITS(source) True", (m.EMITS("sink") is False) and (m.EMITS("source") is True)))
+out.append(("ACCEPTS(source) False / ACCEPTS(sink) True", (m.ACCEPTS("source") is False) and (m.ACCEPTS("sink") is True)))
+
+return out
+
+# Each mutation is a (name, find, replace) source edit that BREAKS a load-bearing
+# predicate. A correct test suite turns at least one golden check RED for each.
+MUTATIONS = [
+("EMITS always True", 'return v!= "sink"', "return True"),
+("ACCEPTS always True", 'return v!= "source"', "return True"),
+("EMITS inverted", 'return v!= "sink"', 'return v == "sink"'),
+("conformsTo always True", "return candidate in subtypes(required)", "return True"),
+("endpoint ACCEPTS check disabled",
+'if pos in ("middle", "last") and not ACCEPTS(verb):',
+'if False and pos in ("middle", "last") and not ACCEPTS(verb):'),
+("endpoint EMITS check disabled",
+'if pos in ("first", "middle") and not EMITS(verb):',
+'if False and pos in ("first", "middle") and not EMITS(verb):'),
+("unresolved slug silently guessed transform",
+"verb = verbs.get(slug)",
+'verb = verbs.get(slug) or "transform"'),
+("gate ignores ACCEPTS", "passes = emits and accepts", "passes = emits"),
+]
+
+def run():
+show = "--show" in sys.argv
+src = MODPATH.read_text()
+
+# Half 1 — golden must be all-green on the real module.
+base = _load_module()
+gold = golden_checks(base)
+gold_ok = all(ok for _, ok in gold)
+if show or not gold_ok:
+for name, ok in gold:
+print(f" {'PASS' if ok else 'FAIL'} {name}")
+print(f"GOLDEN: {sum(ok for _, ok in gold)}/{len(gold)} passed")
+if not gold_ok:
+print("GOLDEN FAILED — the gift is broken, not the test.")
+return 1
+
+# Half 2 — every mutation must be caught (turn >=1 golden check RED).
+all_caught = True
+for name, find, repl in MUTATIONS:
+if find not in src:
+print(f" BITE-BROKEN {name}: anchor not found in source — test is stale")
+all_caught = False
+continue
+mutated = src.replace(find, repl, 1)
+try:
+mut_mod = _load_module(mutated)
+res = golden_checks(mut_mod)
+caught = any(not ok for _, ok in res)
+except Exception:
+# A mutation that makes the module explode is also 'caught'.
+caught = True
+mark = "caught" if caught else "ESCAPED"
+if show or not caught:
+print(f" {mark:8s} mutation: {name}")
+if not caught:
+all_caught = False
+
+print(f"MUTATIONS: {sum(1 for n, f, r in MUTATIONS if f in src)}/{len(MUTATIONS)} biteable; "
+f"{'ALL CAUGHT' if all_caught else 'SOME ESCAPED'}")
+return 0 if (gold_ok and all_caught) else 1
+
+if __name__ == "__main__":
+sys.exit(run())
+
+Take the whole folder →
+MIT
+Python 3, standard library only
+
+---
+
+# Vclock — a Loop MMT gift
+https://loopmmt.com/gifts/vclock/
+[coverage: optional · branch: gifts]
+
+Causal Order, Not Wall-Clock Time order ← all gifts
+
+Vclock
+
+Reason about the causal order of a stream of records — is A before B, or are they concurrent, causally independent, neither able to have known about the other? Wall-clock time can't express that last case; a vector clock can. bump, merge, and compare over JSON lines, so it sits in the middle of a pipe.
+
+The honest edge
+
+It orders events that share an actor namespace. Two records whose actor sets never overlap read as concurrent by construction — which is correct, but only useful if your actors are named consistently across the stream.
+
+Run it
+
+python3 vclock.py compare
+test_vclock.py (37/37, mutation-bitten)
+Python stdlib only
+
+The code — every file that ships
+
+vclock.py 221 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""vclock.py — reason about the causal order of a stream of records, on a pipe.
+
+A vector clock answers a question a timestamp cannot: given two events, did one
+happen *before* the other, or are they *concurrent* — causally independent,
+neither one able to have known about the other? Wall-clock time can't tell you
+that (clocks drift, and "later" is not "caused by"). A vector clock can, by
+giving every actor its own counter and carrying the whole vector on each record.
+
+This is a *transform*: it reads JSON lines on stdin and writes JSON lines on
+stdout, so it sits in the middle of a pipe. Each input record may carry a
+`clock` field — an object mapping actor names to integer counts, e.g.
+`{"a": 3, "b": 1}`. An absent actor is read as 0 (it simply hasn't been seen).
+
+Three operations, each a subcommand:
+
+bump --actor A increment actor A's component on every record's clock
+(A absent → starts at 1). "A observed/produced this."
+record in → record out, clock advanced.
+
+merge fold every record's clock into ONE clock by taking the
+component-wise maximum, and emit that single clock.
+This is "receive": the least clock that dominates all
+inputs. Emits one line: {"clock": {...}}.
+
+compare read exactly two records and report their causal
+relation. Emits one line: {"relation": R} where R is
+one of before / after / concurrent / equal.
+
+The causal relation (X, Y), with any absent component read as 0:
+equal X[a] == Y[a] for every actor a
+before X[a] <= Y[a] for every a, and X!= Y (X causally precedes Y)
+after Y before X (X causally follows Y)
+concurrent neither before nor after (causally independent)
+
+The absent-is-zero rule is the whole game: {"a":1} is BEFORE {"a":1,"b":1}
+because the first has b=0 implicitly. A comparison that only looked at shared
+keys would miss this — and missing it is the difference between a real vector
+clock and a counter wearing its coat.
+
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+- reads ONE JSON object per line on stdin; blank lines are skipped.
+- `bump` emits one record per input record (order preserved), clock advanced.
+- `merge` / `compare` emit exactly one summary line.
+- non-clock fields on a record are passed through untouched by `bump`.
+- errors go to stderr; stdout stays clean JSON-lines.
+
+Exit codes:
+0 ran and emitted
+2 malformed input / corrupt clock (don't trust the stream)
+3 usage / wrong record count for compare
+"""
+
+import argparse
+import json
+import sys
+
+# ---------------------------------------------------------------------------
+# pure operations — no I/O, fully unit-testable. These are the gift's core.
+# ---------------------------------------------------------------------------
+
+def _normalize(clock):
+"""Drop explicit-zero components so equality is canonical ({a:1,b:0}=={a:1}).
+Validates that every component is an int; raises ValueError otherwise."""
+out = {}
+for actor, count in clock.items():
+if isinstance(count, bool) or not isinstance(count, int):
+raise ValueError(f"clock component {actor!r} is not an integer: {count!r}")
+if count < 0:
+raise ValueError(
+f"clock component {actor!r} is negative: {count!r} "
+"(vector-clock counts are event tallies and are never < 0)")
+if count!= 0:
+out[actor] = count
+return out
+
+def bump(clock, actor):
+"""Return a NEW clock with `actor`'s component incremented by 1.
+An absent actor starts at 1. Input is not mutated."""
+new = dict(_normalize(clock))
+new[actor] = new.get(actor, 0) + 1
+return new
+
+def merge(*clocks):
+"""Component-wise maximum across all given clocks. Absent = 0."""
+out = {}
+for clock in clocks:
+for actor, count in _normalize(clock).items():
+if count > out.get(actor, 0):
+out[actor] = count
+return out
+
+def compare(x, y):
+"""Causal relation of clock x to clock y: before / after / concurrent / equal.
+An absent component is read as 0 (the actor simply hasn't been seen)."""
+x = _normalize(x)
+y = _normalize(y)
+actors = set(x) | set(y)
+x_le_y = all(x.get(a, 0) <= y.get(a, 0) for a in actors) # x <= y everywhere
+y_le_x = all(y.get(a, 0) <= x.get(a, 0) for a in actors) # y <= x everywhere
+if x_le_y and y_le_x:
+return "equal" # <= both ways ⇒ componentwise equal
+if x_le_y:
+return "before" # x dominated by y, not equal
+if y_le_x:
+return "after"
+return "concurrent" # neither dominates ⇒ causally independent
+
+# ---------------------------------------------------------------------------
+# I/O — the JSON-lines seam.
+# ---------------------------------------------------------------------------
+
+def _read_records(stream):
+"""Yield one parsed object per non-blank stdin line. Raises ValueError on a
+line that isn't a JSON object (caller maps to exit 2)."""
+for lineno, raw in enumerate(stream, start=1):
+line = raw.strip()
+if not line:
+continue
+try:
+obj = json.loads(line)
+except json.JSONDecodeError as e:
+raise ValueError(f"line {lineno}: not valid JSON: {e}")
+if not isinstance(obj, dict):
+raise ValueError(f"line {lineno}: expected a JSON object, got {type(obj).__name__}")
+yield obj
+
+def _emit(record, out):
+out.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+def _clock_of(record):
+"""Pull the clock object off a record, defaulting to empty. Validates shape."""
+clock = record.get("clock", {})
+if not isinstance(clock, dict):
+raise ValueError(f"'clock' must be an object, got {type(clock).__name__}")
+return clock
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_bump(args, stdin, stdout):
+for record in _read_records(stdin):
+record = dict(record)
+record["clock"] = bump(_clock_of(record), args.actor)
+_emit(record, stdout)
+return 0
+
+def cmd_merge(args, stdin, stdout):
+clocks = [_clock_of(r) for r in _read_records(stdin)]
+_emit({"clock": merge(*clocks) if clocks else {}}, stdout)
+return 0
+
+def cmd_compare(args, stdin, stdout):
+records = list(_read_records(stdin))
+if len(records)!= 2:
+sys.stderr.write(
+f"compare: expected exactly 2 records on stdin, got {len(records)}\n"
+)
+return 3
+relation = compare(_clock_of(records[0]), _clock_of(records[1]))
+_emit({"relation": relation}, stdout)
+return 0
+
+def build_parser():
+p = argparse.ArgumentParser(
+prog="vclock",
+description="Reason about the causal order of a stream of records (vector clock).",
+)
+sub = p.add_subparsers(dest="cmd")
+
+b = sub.add_parser("bump", help="increment one actor's component on each record")
+b.add_argument("--actor", required=True, help="the actor whose component to increment")
+b.set_defaults(func=cmd_bump)
+
+m = sub.add_parser("merge", help="component-wise max of every record's clock → one clock")
+m.set_defaults(func=cmd_merge)
+
+c = sub.add_parser("compare", help="causal relation of exactly two records' clocks")
+c.set_defaults(func=cmd_compare)
+
+return p
+
+def main(argv=None):
+parser = build_parser()
+args = parser.parse_args(argv)
+if not getattr(args, "cmd", None):
+parser.print_usage(sys.stderr)
+sys.stderr.write("vclock: a subcommand is required (bump / merge / compare)\n")
+return 3
+try:
+return args.func(args, sys.stdin, sys.stdout)
+except ValueError as e:
+sys.stderr.write(f"vclock: {e}\n")
+return 2
+except BrokenPipeError:
+# a downstream reader (e.g. `| head`) closed the pipe early. This is
+# normal for a well-behaved stream tool — exit quietly, don't traceback.
+try:
+sys.stdout.close()
+except Exception:
+pass
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_vclock.py 320 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_vclock.py — the vclock gift's proof it works.
+
+Tests are written FIRST and lead the build. The load-bearing move for a vector
+clock is `compare`: the whole reason the primitive exists is to distinguish
+CONCURRENT from BEFORE/AFTER. A counter can order a total sequence; only a vector
+clock can say "these two events are causally independent." So the compare tests
+carry the weight, and the mutation section at the bottom proves they are not
+vacuous — each mutation is a plausible wrong implementation that MUST turn a test
+red. A suite that stays green under mutation is testing nothing.
+
+Run: python3 test_vclock.py # all tests + mutation bites
+python3 test_vclock.py -q # quiet unless something fails
+"""
+
+import io
+import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TOOL = HERE / "vclock.py"
+
+# import the module directly so we can unit-test the pure functions,
+# and also drive the CLI as a subprocess for the contract tests.
+sys.path.insert(0, str(HERE))
+import vclock # noqa: E402
+
+# ---------------------------------------------------------------------------
+# compare — the gate. before / after / concurrent / equal, with the
+# absent-component-is-zero rule that separates a real vector clock from a
+# shared-keys-only impostor.
+# ---------------------------------------------------------------------------
+class TestCompare(unittest.TestCase):
+def test_equal_identical(self):
+self.assertEqual(vclock.compare({"a": 1, "b": 2}, {"a": 1, "b": 2}), "equal")
+
+def test_equal_empty(self):
+self.assertEqual(vclock.compare({}, {}), "equal")
+
+def test_before_strict(self):
+self.assertEqual(vclock.compare({"a": 1}, {"a": 2}), "before")
+
+def test_after_strict(self):
+self.assertEqual(vclock.compare({"a": 2}, {"a": 1}), "after")
+
+def test_concurrent_disjoint_actors(self):
+# a advanced on one axis, b on another — neither dominates. This is the
+# single most important case in the whole gift.
+self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
+
+def test_concurrent_crossed(self):
+self.assertEqual(vclock.compare({"a": 2, "b": 1}, {"a": 1, "b": 2}), "concurrent")
+
+# --- the absent-is-zero cases: the impostor-killers ---
+def test_absent_component_is_zero_before(self):
+# {a:1} has b=0 implicitly, so it is BEFORE {a:1,b:1}. A compare that
+# only looks at shared keys would wrongly call this equal.
+self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
+
+def test_absent_component_is_zero_after(self):
+self.assertEqual(vclock.compare({"a": 1, "b": 1}, {"a": 1}), "after")
+
+def test_absent_component_is_zero_concurrent(self):
+# {a:1} (b=0) vs {b:1} (a=0): each leads on its own axis → concurrent.
+# A shared-keys-only impostor sees no shared keys and might say equal.
+self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
+
+def test_explicit_zero_equals_absent(self):
+# {a:1,b:0} must be treated identically to {a:1}
+self.assertEqual(vclock.compare({"a": 1, "b": 0}, {"a": 1}), "equal")
+
+def test_compare_is_antisymmetric(self):
+# if X before Y then Y after X, for a spread of shapes
+pairs = [
+({"a": 1}, {"a": 2}),
+({"a": 1}, {"a": 1, "b": 1}),
+({}, {"a": 1}),
+]
+for x, y in pairs:
+self.assertEqual(vclock.compare(x, y), "before")
+self.assertEqual(vclock.compare(y, x), "after")
+
+# ---------------------------------------------------------------------------
+# bump — increment one actor's component; absent starts at 1.
+# ---------------------------------------------------------------------------
+class TestBump(unittest.TestCase):
+def test_bump_existing(self):
+self.assertEqual(vclock.bump({"a": 1, "b": 2}, "a"), {"a": 2, "b": 2})
+
+def test_bump_absent_starts_at_one(self):
+self.assertEqual(vclock.bump({"a": 1}, "b"), {"a": 1, "b": 1})
+
+def test_bump_empty(self):
+self.assertEqual(vclock.bump({}, "a"), {"a": 1})
+
+def test_bump_does_not_mutate_input(self):
+original = {"a": 1}
+vclock.bump(original, "a")
+self.assertEqual(original, {"a": 1}) # pure — no in-place edit
+
+def test_bump_after_is_after(self):
+# a bumped clock is strictly AFTER the one it came from
+c0 = {"a": 1, "b": 2}
+c1 = vclock.bump(c0, "a")
+self.assertEqual(vclock.compare(c0, c1), "before")
+
+# ---------------------------------------------------------------------------
+# merge — component-wise max across clocks.
+# ---------------------------------------------------------------------------
+class TestMerge(unittest.TestCase):
+def test_merge_componentwise_max(self):
+self.assertEqual(
+vclock.merge({"a": 2, "b": 1}, {"a": 1, "b": 3}), {"a": 2, "b": 3}
+)
+
+def test_merge_disjoint(self):
+self.assertEqual(vclock.merge({"a": 1}, {"b": 1}), {"a": 1, "b": 1})
+
+def test_merge_absent_is_zero(self):
+self.assertEqual(vclock.merge({"a": 5}, {}), {"a": 5})
+
+def test_merge_dominates_both(self):
+# the merge is AFTER-or-equal to each of its inputs (never before/concurrent)
+x, y = {"a": 2, "b": 1}, {"a": 1, "b": 3}
+m = vclock.merge(x, y)
+self.assertIn(vclock.compare(x, m), ("before", "equal"))
+self.assertIn(vclock.compare(y, m), ("before", "equal"))
+
+def test_merge_of_concurrent_is_after_both(self):
+# merging two genuinely concurrent clocks yields their least upper bound
+x, y = {"a": 1}, {"b": 1}
+m = vclock.merge(x, y)
+self.assertEqual(vclock.compare(x, m), "before")
+self.assertEqual(vclock.compare(y, m), "before")
+
+# ---------------------------------------------------------------------------
+# CLI contract — JSON-lines in, JSON-lines out; matches the house shape.
+# ---------------------------------------------------------------------------
+def run_cli(args, stdin_text=""):
+proc = subprocess.run(
+[sys.executable, str(TOOL), *args],
+input=stdin_text,
+capture_output=True,
+text=True,
+)
+return proc.returncode, proc.stdout, proc.stderr
+
+class TestBumpCLI(unittest.TestCase):
+def test_bump_stream(self):
+records = [
+{"id": 1, "clock": {"a": 1}},
+{"id": 2, "clock": {"a": 2, "b": 1}},
+]
+stdin = "\n".join(json.dumps(r) for r in records) + "\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 0, err)
+got = [json.loads(line) for line in out.splitlines()]
+self.assertEqual(got[0]["clock"], {"a": 2})
+self.assertEqual(got[1]["clock"], {"a": 3, "b": 1})
+# non-clock fields preserved
+self.assertEqual(got[0]["id"], 1)
+
+def test_bump_record_without_clock_gets_one(self):
+stdin = json.dumps({"id": 1}) + "\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out)["clock"], {"a": 1})
+
+def test_emit_is_sorted_keys(self):
+stdin = json.dumps({"z": 1, "clock": {"a": 1}}) + "\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 0, err)
+# sort_keys=True → "clock" precedes "z" in the raw text
+self.assertLess(out.index('"clock"'), out.index('"z"'))
+
+class TestMergeCLI(unittest.TestCase):
+def test_merge_stream_to_one_clock(self):
+records = [
+{"clock": {"a": 2, "b": 1}},
+{"clock": {"a": 1, "b": 3}},
+{"clock": {"c": 1}},
+]
+stdin = "\n".join(json.dumps(r) for r in records) + "\n"
+rc, out, err = run_cli(["merge"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out), {"clock": {"a": 2, "b": 3, "c": 1}})
+
+def test_merge_empty_stream(self):
+rc, out, err = run_cli(["merge"], "")
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out), {"clock": {}})
+
+class TestCompareCLI(unittest.TestCase):
+def test_compare_two_records(self):
+records = [{"clock": {"a": 1}}, {"clock": {"b": 1}}]
+stdin = "\n".join(json.dumps(r) for r in records) + "\n"
+rc, out, err = run_cli(["compare"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out)["relation"], "concurrent")
+
+def test_compare_before(self):
+records = [{"clock": {"a": 1}}, {"clock": {"a": 2}}]
+stdin = "\n".join(json.dumps(r) for r in records) + "\n"
+rc, out, err = run_cli(["compare"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out)["relation"], "before")
+
+def test_compare_wrong_count_is_error(self):
+# compare needs exactly two records
+stdin = json.dumps({"clock": {"a": 1}}) + "\n"
+rc, out, err = run_cli(["compare"], stdin)
+self.assertEqual(rc, 3, "one record should be a usage error")
+
+class TestContract(unittest.TestCase):
+def test_no_subcommand_is_usage_error(self):
+rc, out, err = run_cli([])
+self.assertEqual(rc, 3)
+
+def test_bad_json_line_is_error(self):
+rc, out, err = run_cli(["bump", "--actor", "a"], "not json\n")
+self.assertEqual(rc, 2, "malformed input must not be trusted")
+
+def test_blank_lines_skipped(self):
+stdin = json.dumps({"clock": {"a": 1}}) + "\n\n\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(len([l for l in out.splitlines() if l]), 1)
+
+def test_non_integer_clock_component_is_error(self):
+stdin = json.dumps({"clock": {"a": "x"}}) + "\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 2, "a non-integer clock component is corrupt input")
+
+# ---------------------------------------------------------------------------
+# Mutation bites — prove the tests above are not vacuous. Each mutation is a
+# believable wrong implementation of a pure function; we assert that the real
+# suite would catch it. If a mutation survives (no test flips), the suite is
+# lying about its coverage and THIS meta-test fails loudly.
+# ---------------------------------------------------------------------------
+class TestMutationBites(unittest.TestCase):
+"""Each bite monkeypatches a pure fn with a plausible-wrong version and
+asserts at least one real assertion above would now fail."""
+
+def _suite_would_catch(self, cases):
+"""cases: list of (callable-returning-bool-that-should-be-True).
+Returns True if any case is now False (i.e. a test would go red)."""
+return any(not case() for case in cases)
+
+def test_bite_compare_ignores_absent_components(self):
+# WRONG: only compare shared keys. Would call {a:1} vs {a:1,b:1} 'equal'.
+def wrong_compare(x, y):
+shared = set(x) & set(y)
+lt = any(x.get(k, 0) < y.get(k, 0) for k in shared)
+gt = any(x.get(k, 0) > y.get(k, 0) for k in shared)
+if lt and gt:
+return "concurrent"
+if lt:
+return "before"
+if gt:
+return "after"
+return "equal"
+
+# under the real impl this is 'before'; the impostor says 'equal'
+self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
+self.assertEqual(wrong_compare({"a": 1}, {"a": 1, "b": 1}), "equal")
+self.assertNotEqual(
+vclock.compare({"a": 1}, {"a": 1, "b": 1}),
+wrong_compare({"a": 1}, {"a": 1, "b": 1}),
+"the absent-is-zero test must separate the real impl from the impostor",
+)
+
+def test_bite_compare_collapses_concurrent_to_before(self):
+# WRONG: no concurrent branch — anything not <= is 'after', anything
+# not >= is 'before'. Would call disjoint {a:1} vs {b:1} 'before'.
+def wrong_compare(x, y):
+keys = set(x) | set(y)
+if all(x.get(k, 0) <= y.get(k, 0) for k in keys):
+return "before" if x!= y else "equal"
+return "after" # NO concurrent branch
+
+self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
+self.assertNotEqual(wrong_compare({"a": 1}, {"b": 1}), "concurrent")
+
+def test_bite_bump_starts_absent_at_zero(self):
+# WRONG: absent actor bumped to 0 instead of 1 (off-by-one at creation)
+def wrong_bump(clock, actor):
+new = dict(clock)
+new[actor] = new.get(actor, -1) + 1 # absent → 0, not 1
+return new
+
+self.assertEqual(vclock.bump({}, "a"), {"a": 1})
+self.assertNotEqual(wrong_bump({}, "a"), {"a": 1})
+
+def test_bite_merge_uses_min_not_max(self):
+# WRONG: component-wise MIN instead of MAX
+def wrong_merge(x, y):
+keys = set(x) | set(y)
+return {k: min(x.get(k, 0), y.get(k, 0)) for k in keys}
+
+self.assertEqual(vclock.merge({"a": 2}, {"a": 1}), {"a": 2})
+self.assertNotEqual(wrong_merge({"a": 2}, {"a": 1}), {"a": 2})
+
+if __name__ == "__main__":
+verbosity = 1 if "-q" in sys.argv else 2
+argv = [a for a in sys.argv if a!= "-q"]
+unittest.main(argv=argv, verbosity=verbosity)
+
+Take the whole folder →
+MIT
+Python stdlib only
+
+---
