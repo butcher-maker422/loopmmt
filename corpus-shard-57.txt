@@ -2,7 +2,7 @@
 
 > Bundle 57 of 66 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/isvalidcsscolor/, /gifts/l21x-snapshot/, /gifts/loop21-component-factory/)
+Nodes in this shard: 4 (/gifts/isvalidcsscolor/, /gifts/l21x-snapshot/, /gifts/legible/, /gifts/loop21-component-factory/)
 
 ---
 
@@ -817,6 +817,428 @@ process.exit(fail === 0? 0: 1);
 Take the whole folder →
 MIT
 JavaScript, zero dependencies (Node + browser)
+
+---
+
+# Text Legibility Gauge — a Loop MMT gift
+https://loopmmt.com/gifts/legible/
+[coverage: optional · branch: gifts]
+
+Readable Text, or Machine Rubble? gauge ← all gifts
+
+Text Legibility Gauge
+
+Guess whether a string is human-readable text or machine-drawn rubble, and say how sure you are. A text extractor hands you a `.text` field and, by design, can't tell you whether it's readable — the classic failure is a subsetted CID font whose glyphs decode one byte at a time into control-character rubble that only looks like a populated string. assess(text) returns a label (readable / suspect / likely-binary / empty) with the raw score and signal counts exposed, scoring the density of characters human text almost never contains: C0 controls (minus tab/newline) plus U+FFFD, and nothing else. The load-bearing rule: it reports but never scores the C1 band, so legitimate multibyte-as-Latin1 (日本語, Cyrillic) never reads as binary — the CJK false-positive it refuses to make.
+
+The honest edge
+
+legible is a heuristic, not a verdict, and it detects control-character rubble — NOT wrong encoding. Mojibake (valid bytes, wrong charset) is still printable characters, so it reads `readable` even though no human can read it: a `readable` means “not control-char rubble,” never “correctly decoded.” It does not decode, validate, or understand the text, and never proves it correct or meaningful. It is a gauge you read, never a gate you route on.
+
+Run it
+
+node legible.js "some text"
+test_legible.js (20/20, hand-oracle drift-check + CID known-bad + CJK-as-Latin1 regression guard)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+legible.js 217 lines on GitHub →
+#!/usr/bin/env node
+/* legible.js — a pure, dependency-free, HONEST gauge that guesses whether a
+string is human-readable text or machine-drawn rubble, and says how sure it is.
+
+WHY THIS EXISTS. A text extractor (ratchet-pdf-text, ratchet-png-text,
+exif-parser, a MIME part decoder) hands you a `.text` field and, by design,
+cannot tell you whether that text is *readable*. The classic failure: a PDF
+whose glyphs are drawn through a subsetted CID font. The extractor pulls the
+string operands honestly, but each glyph is a 2-byte CID index, and decoded
+one-byte-at-a-time it comes back as control-character rubble that merely
+*looks* like a populated string. You get a confident `.text` that no human
+can read. `legible` reads the delta the extractor can't: it scores the string
+and returns readable / suspect / likely-binary / empty, with the raw score
+and the signal counts exposed so you can see exactly why.
+
+THE SIGNAL (the whole reason to trust it, and its whole limit). Human-readable
+text — in ANY script — almost never contains C0 control characters (0x00–0x1F,
+excluding the ordinary text whitespace tab/LF/CR/FF) or the Unicode
+replacement character U+FFFD. CID glyph indices decoded as Latin-1 land in
+exactly that band disproportionately (the high byte of a low subset index is
+0x00–0x1F, and half the bytes are often 0x00). So the SCORED gauge is the
+density of those "text-never-contains-this" characters — C0 controls plus
+U+FFFD, nothing else. This is deliberately NOT the printable-ratio: a UTF-8
+é / 안 / я decoded byte-wise lands in 0x80–0xFF, which OVERLAPS the C1-control
+band (0x80–0x9F) AND the UTF-8 continuation-byte band — so scoring C1 would
+flag legitimate multibyte text as binary (the CJK false-positive). We report
+C1/DEL and NUL counts as *signals* for your inspection, but we do NOT score
+them, precisely so multibyte-as-Latin1 does not read as rubble.
+
+WHAT IT DOES NOT DO (printed edge — present here and in the README):
+legible is a HEURISTIC, not a verdict, and it detects control-character
+rubble — NOT wrong encoding. Text decoded with the wrong charset (mojibake:
+UTF-8 read as Latin-1, æ—¥æœ¬èªž) is still printable characters, so it reads
+as `readable` even though no human can read it — a `readable` means "not
+control-char rubble," never "correctly decoded." It does not decode,
+validate, or understand the text, and never proves it correct, meaningful,
+or safe. It is a gauge you read, never a gate you route on.
+
+API
+legible(input[, options]) — dispatches on the shape of `input`:
+• a string -> assess(string) -> { label, score, signals}
+• a record with `.text` -> {...record, legibility: assess(record.text)}
+• an array of either -> input.map(legible)
+assess(text[, options]) -> { label, score, signals}
+label one of "readable" | "suspect" | "likely-binary" | "empty"
+score the binary-character ratio in [0,1], rounded to 4 places
+signals { length, control, c1, nul, replacement, binaryRatio}
+options.readableMax (default 0.05) score <= this => readable
+options.binaryMin (default 0.30) score >= this => likely-binary
+(between the two bounds => suspect)
+
+Pure function of its input. No dependencies, no randomness, no clock, no I/O
+in the core — the same input always yields the same output (the determinism
+lint is trivial). Same code in a browser (window.LoopGifts.legible) or Node
+(this CLI / require()).
+
+USAGE
+node legible.js "some text" # assess an argument, print JSON
+cat streams.jsonl | node legible.js # annotate each JSONL record's.text
+node legible.js --port # print this tool's port-verb (transform)
+node legible.js --help
+
+Released under MIT.
+*/
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.legible = api.legible;
+window.LoopGifts.assessLegibility = api.assess;
+}
+root.__legible = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
+
+var DEFAULTS = { readableMax: 0.05, binaryMin: 0.30};
+
+// The ordinary text whitespace inside the C0 band — legitimate in readable
+// text, so NOT counted as a binary signal.
+function isTextWhitespace(c) {
+return c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d;
+}
+// C0 control (0x00–0x1F) that is NOT text whitespace.
+function isC0Control(c) {
+return c >= 0x00 && c <= 0x1f &&!isTextWhitespace(c);
+}
+// DEL + C1 controls (0x7F, 0x80–0x9F). Reported as a signal but DELIBERATELY
+// NOT scored: 0x80–0x9F overlaps the UTF-8 continuation-byte band, so scoring
+// it would flag legitimate multibyte-as-Latin1 text as binary (the CJK
+// false-positive). Exposed for inspection; never drives the label.
+function isC1orDel(c) {
+return c === 0x7f || (c >= 0x80 && c <= 0x9f);
+}
+
+function assess(text, options) {
+var opt = options || {};
+var readableMax = typeof opt.readableMax === "number"? opt.readableMax: DEFAULTS.readableMax;
+var binaryMin = typeof opt.binaryMin === "number"? opt.binaryMin: DEFAULTS.binaryMin;
+
+// No signal to judge: null/undefined, empty, or whitespace-only.
+if (text === null || text === undefined) {
+return emptyResult();
+}
+var s = String(text);
+if (s.length === 0 || /^\s*$/.test(s)) {
+return emptyResult(s.length);
+}
+
+var control = 0, c1 = 0, nul = 0, replacement = 0;
+for (var i = 0; i < s.length; i++) {
+var c = s.charCodeAt(i);
+if (c === 0x00) nul++;
+if (c === 0xfffd) { replacement++; continue;}
+if (isC0Control(c)) { control++; continue;}
+if (isC1orDel(c)) { c1++; continue;}
+}
+var n = s.length;
+// SCORED signal: C0 controls + replacement only. c1/nul are reported below
+// for inspection but NOT scored (see isC1orDel — the CJK false-positive).
+var binaryRatio = (control + replacement) / n;
+var score = round4(binaryRatio);
+
+var label;
+if (score <= readableMax) label = "readable";
+else if (score >= binaryMin) label = "likely-binary";
+else label = "suspect";
+
+return {
+label: label,
+score: score,
+signals: {
+length: n,
+control: control, // C0 controls, excluding text whitespace
+c1: c1, // DEL + C1 controls
+nul: nul, // count of 0x00 (a strong binary tell)
+replacement: replacement, // U+FFFD (botched decode)
+binaryRatio: score
+}
+};
+}
+
+function emptyResult(length) {
+return {
+label: "empty",
+score: 0,
+signals: { length: length || 0, control: 0, c1: 0, nul: 0, replacement: 0, binaryRatio: 0}
+};
+}
+
+function round4(x) { return Math.round(x * 1e4) / 1e4;}
+
+// The composition joint: dispatch on the shape of the input.
+function legible(input, options) {
+if (Array.isArray(input)) {
+return input.map(function (x) { return legible(x, options);});
+}
+if (input && typeof input === "object") {
+// A record carrying a `.text` field (e.g. ratchet's.streams[] entries).
+var out = {};
+for (var k in input) if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
+out.legibility = assess(input.text, options);
+return out;
+}
+// A bare string (or anything String()-able).
+return assess(input, options);
+}
+
+return { legible: legible, assess: assess};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__legible;
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--port")!== -1) { process.stdout.write("transform\n"); return 0;}
+if (args.indexOf("--help")!== -1 || (args.length === 0 && process.stdin.isTTY)) {
+process.stdout.write(
+"legible — a heuristic gauge: is this string readable text or machine-drawn rubble?\n" +
+" node legible.js \"some text\" assess an argument, print JSON\n" +
+" cat streams.jsonl | node legible.js annotate each JSONL record's.text\n" +
+" node legible.js --port print the port-verb (transform)\n" +
+" node legible.js --help\n"
+);
+return 0;
+}
+// Argument form: assess the first non-flag argument.
+var textArg = null;
+for (var i = 0; i < args.length; i++) { if (args[i].indexOf("--")!== 0) { textArg = args[i]; break;}}
+if (textArg!== null) {
+process.stdout.write(JSON.stringify(api.assess(textArg)) + "\n");
+return 0;
+}
+// stdin JSONL form: one record (or raw line) per line -> annotate -> emit JSONL.
+var input = "";
+try { input = require("fs").readFileSync(0, "utf8");} catch (e) { input = "";}
+var lines = input.split("\n");
+for (var j = 0; j < lines.length; j++) {
+var line = lines[j];
+if (line === "" && j === lines.length - 1) continue; // trailing newline
+var rec;
+try {
+var parsed = JSON.parse(line);
+rec = api.legible(parsed);
+} catch (e) {
+// Not JSON — treat the raw line as a text string to assess.
+rec = { text: line, legibility: api.assess(line)};
+}
+process.stdout.write(JSON.stringify(rec) + "\n");
+}
+return 0;
+}
+
+process.exitCode = main(process.argv);
+}
+
+test_legible.js 173 lines on GitHub →
+#!/usr/bin/env node
+/* test_legible.js — known-answer battery for legible.
+
+The oracle is OUT OF BAND: every expected label/score below is a fact computed
+BY HAND from the definition (C0-control + U+FFFD density), never the output of
+a second scorer. The two load-bearing fixtures are drawn from real behaviour,
+not invented:
+• the KNOWN-BAD: a 2-byte CID glyph-index run decoded as Latin-1 — the exact
+shape ratchet-pdf-text surfaces for a subsetted CID font.
+• the REGRESSION GUARD: Japanese ("日本語") UTF-8 bytes read as Latin-1 — the
+CJK false-positive that a naive C1-inclusive score would mislabel; this
+test fails if anyone re-adds the C1 band (0x80–0x9F) to the score.
+
+Run: node test_legible.js (exit 0 = all pass, nonzero = failure)
+*/
+"use strict";
+var assert = require("assert");
+var cp = require("child_process");
+var path = require("path");
+var { legible, assess} = require("./legible.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+}
+function cc() { return String.fromCharCode.apply(null, arguments);}
+
+// --- readable ---------------------------------------------------------------
+ok("plain ASCII is readable, score 0", function () {
+var r = assess("Hello, world! This is plain readable text.");
+assert.strictEqual(r.label, "readable");
+assert.strictEqual(r.score, 0);
+assert.strictEqual(r.signals.control, 0);
+});
+
+ok("accented Latin-1 (single-byte é) stays readable", function () {
+// 0xE9 (é) is printable Latin-1, not a control char.
+var r = assess("caf" + cc(0xe9) + " au lait");
+assert.strictEqual(r.label, "readable");
+assert.strictEqual(r.signals.control, 0);
+});
+
+// --- empty (no signal) ------------------------------------------------------
+ok("empty string is empty, not readable", function () {
+assert.strictEqual(assess("").label, "empty");
+});
+ok("whitespace-only is empty", function () {
+assert.strictEqual(assess(" \n\t ").label, "empty");
+});
+ok("null text is empty (via record)", function () {
+var r = legible({ index: 0, text: null});
+assert.strictEqual(r.legibility.label, "empty");
+});
+ok("undefined text is empty", function () {
+assert.strictEqual(assess(undefined).label, "empty");
+});
+
+// --- likely-binary: the KNOWN-BAD (CID glyph indices as Latin-1) -------------
+ok("KNOWN-BAD: 2-byte CID index run is likely-binary, score 1.0", function () {
+// Low subset glyph indices 0x0001..0x0005 as bytes: every char is 0x00–0x1F.
+var cid = cc(0, 1, 0, 2, 0, 3, 0, 4, 0, 5);
+var r = assess(cid);
+assert.strictEqual(r.label, "likely-binary");
+assert.strictEqual(r.score, 1);
+assert.strictEqual(r.signals.nul, 5); // five 0x00 high bytes
+assert.strictEqual(r.signals.control, 10);
+});
+
+// --- the REGRESSION GUARD: CJK-as-Latin1 must NOT be likely-binary -----------
+ok("REGRESSION: Japanese UTF-8 bytes as Latin-1 read as readable (C1 not scored)", function () {
+// "日本語" UTF-8 = E6 97 A5 E6 9C AC E8 AA 9E. Bytes 0x97/0x9C/0x9E are C1
+// controls AND UTF-8 continuation bytes. If C1 were scored, this is 3/9=0.33
+// => likely-binary (the CJK false-positive). C0-only scoring => 0 => readable.
+var mojibake = cc(0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac, 0xe8, 0xaa, 0x9e);
+var r = assess(mojibake);
+assert.strictEqual(r.label, "readable", "CJK-as-Latin1 must not be flagged binary");
+assert.strictEqual(r.score, 0);
+assert.ok(r.signals.c1 >= 3, "c1 IS reported (just not scored)"); // 0x97,0x9C,0x9E
+});
+
+// --- suspect: the mixed stream (half readable, half rubble) ------------------
+ok("mixed readable + a little rubble is suspect", function () {
+// 15 readable chars + 2 control chars => 2/17 = 0.1176 -> suspect.
+var mixed = "Hello World Foo" + cc(1, 2);
+var r = assess(mixed);
+assert.strictEqual(r.label, "suspect");
+assert.ok(r.score > 0.05 && r.score < 0.30, "score " + r.score + " in suspect band");
+});
+
+ok("replacement chars (U+FFFD) count toward the score", function () {
+var r = assess("abc" + cc(0xfffd) + cc(0xfffd) + "d"); // 6 chars, 2 replacement = 0.3333
+assert.strictEqual(r.signals.replacement, 2);
+assert.strictEqual(r.label, "likely-binary"); // 0.3333 >= 0.30
+});
+
+// --- band boundaries (the thresholds are exact) -----------------------------
+ok("score exactly at readableMax (0.05) is readable (<=)", function () {
+// 1 control in 20 chars = 0.05.
+var r = assess("abcdefghijklmnopqrs" + cc(1));
+assert.strictEqual(r.score, 0.05);
+assert.strictEqual(r.label, "readable");
+});
+ok("score exactly at binaryMin (0.30) is likely-binary (>=)", function () {
+// 3 control in 10 chars = 0.30.
+var r = assess("abcdefg" + cc(1, 2, 3));
+assert.strictEqual(r.score, 0.3);
+assert.strictEqual(r.label, "likely-binary");
+});
+
+// --- options override -------------------------------------------------------
+ok("options can widen the readable band", function () {
+var s = "aa" + cc(1); // 1/3 = 0.3333
+assert.strictEqual(assess(s).label, "likely-binary");
+assert.strictEqual(assess(s, { readableMax: 0.5}).label, "readable");
+});
+
+// --- the composition joint --------------------------------------------------
+ok("record passthrough preserves fields and adds.legibility", function () {
+var rec = { index: 2, filter: "FlateDecode", text: "readable content"};
+var out = legible(rec);
+assert.strictEqual(out.index, 2);
+assert.strictEqual(out.filter, "FlateDecode");
+assert.strictEqual(out.text, "readable content");
+assert.strictEqual(out.legibility.label, "readable");
+});
+ok("array input maps element-wise", function () {
+var out = legible(["hello", cc(0, 1, 2, 3)]);
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].label, "readable");
+assert.strictEqual(out[1].label, "likely-binary");
+});
+ok("a ratchet.streams-shaped record annotates cleanly", function () {
+// Mirrors the real join: ratchet-pdf-text emits entries like this.
+var stream = { index: 0, filter: "FlateDecode", compressed: true, needsInflate: false, text: cc(0,1,0,2,0,3), rawLength: 6};
+var out = legible(stream);
+assert.strictEqual(out.legibility.label, "likely-binary");
+assert.strictEqual(out.rawLength, 6); // original fields intact
+});
+
+// --- determinism (the canonicalizer self-test) ------------------------------
+ok("determinism: same input yields byte-identical JSON across runs", function () {
+var inputs = ["Hello", cc(0,1,2), "日本語 as latin1: " + cc(0xe6,0x97,0xa5), "", " "];
+for (var i = 0; i < inputs.length; i++) {
+var a = JSON.stringify(assess(inputs[i]));
+var b = JSON.stringify(assess(inputs[i]));
+assert.strictEqual(a, b, "run 2 differs for input " + i);
+}
+});
+
+// --- the CLI contract -------------------------------------------------------
+ok("CLI --port prints the port-verb (transform)", function () {
+var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " --port").toString().trim();
+assert.strictEqual(out, "transform");
+});
+ok("CLI argument form prints the assessment JSON", function () {
+var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " 'plain text'").toString().trim();
+var r = JSON.parse(out);
+assert.strictEqual(r.label, "readable");
+});
+ok("CLI stdin JSONL form annotates each record", function () {
+var jsonl = JSON.stringify({ index: 0, text: "readable"}) + "\n" +
+JSON.stringify({ index: 1, text: cc(0,1,2,3)}) + "\n";
+var out = cp.execSync("node " + path.join(__dirname, "legible.js"), { input: jsonl}).toString().trim().split("\n");
+var a = JSON.parse(out[0]), b = JSON.parse(out[1]);
+assert.strictEqual(a.legibility.label, "readable");
+assert.strictEqual(b.legibility.label, "likely-binary");
+assert.strictEqual(b.index, 1);
+});
+
+// --- report -----------------------------------------------------------------
+console.log("\n" + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
 
 ---
 
