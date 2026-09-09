@@ -2,7 +2,1055 @@
 
 > Bundle 58 of 66 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/loop21-l21x-snapshot/, /gifts/loop21-verifyskin/, /gifts/map/)
+Nodes in this shard: 3 (/gifts/legible/, /gifts/loop21-component-factory/, /gifts/loop21-l21x-snapshot/)
+
+---
+
+# Text Legibility Gauge — a Loop MMT gift
+https://loopmmt.com/gifts/legible/
+[coverage: optional · branch: gifts]
+
+Readable Text, or Machine Rubble? gauge ← all gifts
+
+Text Legibility Gauge
+
+Guess whether a string is human-readable text or machine-drawn rubble, and say how sure you are. A text extractor hands you a `.text` field and, by design, can't tell you whether it's readable — the classic failure is a subsetted CID font whose glyphs decode one byte at a time into control-character rubble that only looks like a populated string. assess(text) returns a label (readable / suspect / likely-binary / empty) with the raw score and signal counts exposed, scoring the density of characters human text almost never contains: C0 controls (minus tab/newline) plus U+FFFD, and nothing else. The load-bearing rule: it reports but never scores the C1 band, so legitimate multibyte-as-Latin1 (日本語, Cyrillic) never reads as binary — the CJK false-positive it refuses to make.
+
+The honest edge
+
+legible is a heuristic, not a verdict, and it detects control-character rubble — NOT wrong encoding. Mojibake (valid bytes, wrong charset) is still printable characters, so it reads `readable` even though no human can read it: a `readable` means “not control-char rubble,” never “correctly decoded.” It does not decode, validate, or understand the text, and never proves it correct or meaningful. It is a gauge you read, never a gate you route on.
+
+Run it
+
+node legible.js "some text"
+test_legible.js (20/20, hand-oracle drift-check + CID known-bad + CJK-as-Latin1 regression guard)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+legible.js 217 lines on GitHub →
+#!/usr/bin/env node
+/* legible.js — a pure, dependency-free, HONEST gauge that guesses whether a
+string is human-readable text or machine-drawn rubble, and says how sure it is.
+
+WHY THIS EXISTS. A text extractor (ratchet-pdf-text, ratchet-png-text,
+exif-parser, a MIME part decoder) hands you a `.text` field and, by design,
+cannot tell you whether that text is *readable*. The classic failure: a PDF
+whose glyphs are drawn through a subsetted CID font. The extractor pulls the
+string operands honestly, but each glyph is a 2-byte CID index, and decoded
+one-byte-at-a-time it comes back as control-character rubble that merely
+*looks* like a populated string. You get a confident `.text` that no human
+can read. `legible` reads the delta the extractor can't: it scores the string
+and returns readable / suspect / likely-binary / empty, with the raw score
+and the signal counts exposed so you can see exactly why.
+
+THE SIGNAL (the whole reason to trust it, and its whole limit). Human-readable
+text — in ANY script — almost never contains C0 control characters (0x00–0x1F,
+excluding the ordinary text whitespace tab/LF/CR/FF) or the Unicode
+replacement character U+FFFD. CID glyph indices decoded as Latin-1 land in
+exactly that band disproportionately (the high byte of a low subset index is
+0x00–0x1F, and half the bytes are often 0x00). So the SCORED gauge is the
+density of those "text-never-contains-this" characters — C0 controls plus
+U+FFFD, nothing else. This is deliberately NOT the printable-ratio: a UTF-8
+é / 안 / я decoded byte-wise lands in 0x80–0xFF, which OVERLAPS the C1-control
+band (0x80–0x9F) AND the UTF-8 continuation-byte band — so scoring C1 would
+flag legitimate multibyte text as binary (the CJK false-positive). We report
+C1/DEL and NUL counts as *signals* for your inspection, but we do NOT score
+them, precisely so multibyte-as-Latin1 does not read as rubble.
+
+WHAT IT DOES NOT DO (printed edge — present here and in the README):
+legible is a HEURISTIC, not a verdict, and it detects control-character
+rubble — NOT wrong encoding. Text decoded with the wrong charset (mojibake:
+UTF-8 read as Latin-1, æ—¥æœ¬èªž) is still printable characters, so it reads
+as `readable` even though no human can read it — a `readable` means "not
+control-char rubble," never "correctly decoded." It does not decode,
+validate, or understand the text, and never proves it correct, meaningful,
+or safe. It is a gauge you read, never a gate you route on.
+
+API
+legible(input[, options]) — dispatches on the shape of `input`:
+• a string -> assess(string) -> { label, score, signals}
+• a record with `.text` -> {...record, legibility: assess(record.text)}
+• an array of either -> input.map(legible)
+assess(text[, options]) -> { label, score, signals}
+label one of "readable" | "suspect" | "likely-binary" | "empty"
+score the binary-character ratio in [0,1], rounded to 4 places
+signals { length, control, c1, nul, replacement, binaryRatio}
+options.readableMax (default 0.05) score <= this => readable
+options.binaryMin (default 0.30) score >= this => likely-binary
+(between the two bounds => suspect)
+
+Pure function of its input. No dependencies, no randomness, no clock, no I/O
+in the core — the same input always yields the same output (the determinism
+lint is trivial). Same code in a browser (window.LoopGifts.legible) or Node
+(this CLI / require()).
+
+USAGE
+node legible.js "some text" # assess an argument, print JSON
+cat streams.jsonl | node legible.js # annotate each JSONL record's.text
+node legible.js --port # print this tool's port-verb (transform)
+node legible.js --help
+
+Released under MIT.
+*/
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.legible = api.legible;
+window.LoopGifts.assessLegibility = api.assess;
+}
+root.__legible = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
+
+var DEFAULTS = { readableMax: 0.05, binaryMin: 0.30};
+
+// The ordinary text whitespace inside the C0 band — legitimate in readable
+// text, so NOT counted as a binary signal.
+function isTextWhitespace(c) {
+return c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d;
+}
+// C0 control (0x00–0x1F) that is NOT text whitespace.
+function isC0Control(c) {
+return c >= 0x00 && c <= 0x1f &&!isTextWhitespace(c);
+}
+// DEL + C1 controls (0x7F, 0x80–0x9F). Reported as a signal but DELIBERATELY
+// NOT scored: 0x80–0x9F overlaps the UTF-8 continuation-byte band, so scoring
+// it would flag legitimate multibyte-as-Latin1 text as binary (the CJK
+// false-positive). Exposed for inspection; never drives the label.
+function isC1orDel(c) {
+return c === 0x7f || (c >= 0x80 && c <= 0x9f);
+}
+
+function assess(text, options) {
+var opt = options || {};
+var readableMax = typeof opt.readableMax === "number"? opt.readableMax: DEFAULTS.readableMax;
+var binaryMin = typeof opt.binaryMin === "number"? opt.binaryMin: DEFAULTS.binaryMin;
+
+// No signal to judge: null/undefined, empty, or whitespace-only.
+if (text === null || text === undefined) {
+return emptyResult();
+}
+var s = String(text);
+if (s.length === 0 || /^\s*$/.test(s)) {
+return emptyResult(s.length);
+}
+
+var control = 0, c1 = 0, nul = 0, replacement = 0;
+for (var i = 0; i < s.length; i++) {
+var c = s.charCodeAt(i);
+if (c === 0x00) nul++;
+if (c === 0xfffd) { replacement++; continue;}
+if (isC0Control(c)) { control++; continue;}
+if (isC1orDel(c)) { c1++; continue;}
+}
+var n = s.length;
+// SCORED signal: C0 controls + replacement only. c1/nul are reported below
+// for inspection but NOT scored (see isC1orDel — the CJK false-positive).
+var binaryRatio = (control + replacement) / n;
+var score = round4(binaryRatio);
+
+var label;
+if (score <= readableMax) label = "readable";
+else if (score >= binaryMin) label = "likely-binary";
+else label = "suspect";
+
+return {
+label: label,
+score: score,
+signals: {
+length: n,
+control: control, // C0 controls, excluding text whitespace
+c1: c1, // DEL + C1 controls
+nul: nul, // count of 0x00 (a strong binary tell)
+replacement: replacement, // U+FFFD (botched decode)
+binaryRatio: score
+}
+};
+}
+
+function emptyResult(length) {
+return {
+label: "empty",
+score: 0,
+signals: { length: length || 0, control: 0, c1: 0, nul: 0, replacement: 0, binaryRatio: 0}
+};
+}
+
+function round4(x) { return Math.round(x * 1e4) / 1e4;}
+
+// The composition joint: dispatch on the shape of the input.
+function legible(input, options) {
+if (Array.isArray(input)) {
+return input.map(function (x) { return legible(x, options);});
+}
+if (input && typeof input === "object") {
+// A record carrying a `.text` field (e.g. ratchet's.streams[] entries).
+var out = {};
+for (var k in input) if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
+out.legibility = assess(input.text, options);
+return out;
+}
+// A bare string (or anything String()-able).
+return assess(input, options);
+}
+
+return { legible: legible, assess: assess};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__legible;
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--port")!== -1) { process.stdout.write("transform\n"); return 0;}
+if (args.indexOf("--help")!== -1 || (args.length === 0 && process.stdin.isTTY)) {
+process.stdout.write(
+"legible — a heuristic gauge: is this string readable text or machine-drawn rubble?\n" +
+" node legible.js \"some text\" assess an argument, print JSON\n" +
+" cat streams.jsonl | node legible.js annotate each JSONL record's.text\n" +
+" node legible.js --port print the port-verb (transform)\n" +
+" node legible.js --help\n"
+);
+return 0;
+}
+// Argument form: assess the first non-flag argument.
+var textArg = null;
+for (var i = 0; i < args.length; i++) { if (args[i].indexOf("--")!== 0) { textArg = args[i]; break;}}
+if (textArg!== null) {
+process.stdout.write(JSON.stringify(api.assess(textArg)) + "\n");
+return 0;
+}
+// stdin JSONL form: one record (or raw line) per line -> annotate -> emit JSONL.
+var input = "";
+try { input = require("fs").readFileSync(0, "utf8");} catch (e) { input = "";}
+var lines = input.split("\n");
+for (var j = 0; j < lines.length; j++) {
+var line = lines[j];
+if (line === "" && j === lines.length - 1) continue; // trailing newline
+var rec;
+try {
+var parsed = JSON.parse(line);
+rec = api.legible(parsed);
+} catch (e) {
+// Not JSON — treat the raw line as a text string to assess.
+rec = { text: line, legibility: api.assess(line)};
+}
+process.stdout.write(JSON.stringify(rec) + "\n");
+}
+return 0;
+}
+
+process.exitCode = main(process.argv);
+}
+
+test_legible.js 173 lines on GitHub →
+#!/usr/bin/env node
+/* test_legible.js — known-answer battery for legible.
+
+The oracle is OUT OF BAND: every expected label/score below is a fact computed
+BY HAND from the definition (C0-control + U+FFFD density), never the output of
+a second scorer. The two load-bearing fixtures are drawn from real behaviour,
+not invented:
+• the KNOWN-BAD: a 2-byte CID glyph-index run decoded as Latin-1 — the exact
+shape ratchet-pdf-text surfaces for a subsetted CID font.
+• the REGRESSION GUARD: Japanese ("日本語") UTF-8 bytes read as Latin-1 — the
+CJK false-positive that a naive C1-inclusive score would mislabel; this
+test fails if anyone re-adds the C1 band (0x80–0x9F) to the score.
+
+Run: node test_legible.js (exit 0 = all pass, nonzero = failure)
+*/
+"use strict";
+var assert = require("assert");
+var cp = require("child_process");
+var path = require("path");
+var { legible, assess} = require("./legible.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+}
+function cc() { return String.fromCharCode.apply(null, arguments);}
+
+// --- readable ---------------------------------------------------------------
+ok("plain ASCII is readable, score 0", function () {
+var r = assess("Hello, world! This is plain readable text.");
+assert.strictEqual(r.label, "readable");
+assert.strictEqual(r.score, 0);
+assert.strictEqual(r.signals.control, 0);
+});
+
+ok("accented Latin-1 (single-byte é) stays readable", function () {
+// 0xE9 (é) is printable Latin-1, not a control char.
+var r = assess("caf" + cc(0xe9) + " au lait");
+assert.strictEqual(r.label, "readable");
+assert.strictEqual(r.signals.control, 0);
+});
+
+// --- empty (no signal) ------------------------------------------------------
+ok("empty string is empty, not readable", function () {
+assert.strictEqual(assess("").label, "empty");
+});
+ok("whitespace-only is empty", function () {
+assert.strictEqual(assess(" \n\t ").label, "empty");
+});
+ok("null text is empty (via record)", function () {
+var r = legible({ index: 0, text: null});
+assert.strictEqual(r.legibility.label, "empty");
+});
+ok("undefined text is empty", function () {
+assert.strictEqual(assess(undefined).label, "empty");
+});
+
+// --- likely-binary: the KNOWN-BAD (CID glyph indices as Latin-1) -------------
+ok("KNOWN-BAD: 2-byte CID index run is likely-binary, score 1.0", function () {
+// Low subset glyph indices 0x0001..0x0005 as bytes: every char is 0x00–0x1F.
+var cid = cc(0, 1, 0, 2, 0, 3, 0, 4, 0, 5);
+var r = assess(cid);
+assert.strictEqual(r.label, "likely-binary");
+assert.strictEqual(r.score, 1);
+assert.strictEqual(r.signals.nul, 5); // five 0x00 high bytes
+assert.strictEqual(r.signals.control, 10);
+});
+
+// --- the REGRESSION GUARD: CJK-as-Latin1 must NOT be likely-binary -----------
+ok("REGRESSION: Japanese UTF-8 bytes as Latin-1 read as readable (C1 not scored)", function () {
+// "日本語" UTF-8 = E6 97 A5 E6 9C AC E8 AA 9E. Bytes 0x97/0x9C/0x9E are C1
+// controls AND UTF-8 continuation bytes. If C1 were scored, this is 3/9=0.33
+// => likely-binary (the CJK false-positive). C0-only scoring => 0 => readable.
+var mojibake = cc(0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac, 0xe8, 0xaa, 0x9e);
+var r = assess(mojibake);
+assert.strictEqual(r.label, "readable", "CJK-as-Latin1 must not be flagged binary");
+assert.strictEqual(r.score, 0);
+assert.ok(r.signals.c1 >= 3, "c1 IS reported (just not scored)"); // 0x97,0x9C,0x9E
+});
+
+// --- suspect: the mixed stream (half readable, half rubble) ------------------
+ok("mixed readable + a little rubble is suspect", function () {
+// 15 readable chars + 2 control chars => 2/17 = 0.1176 -> suspect.
+var mixed = "Hello World Foo" + cc(1, 2);
+var r = assess(mixed);
+assert.strictEqual(r.label, "suspect");
+assert.ok(r.score > 0.05 && r.score < 0.30, "score " + r.score + " in suspect band");
+});
+
+ok("replacement chars (U+FFFD) count toward the score", function () {
+var r = assess("abc" + cc(0xfffd) + cc(0xfffd) + "d"); // 6 chars, 2 replacement = 0.3333
+assert.strictEqual(r.signals.replacement, 2);
+assert.strictEqual(r.label, "likely-binary"); // 0.3333 >= 0.30
+});
+
+// --- band boundaries (the thresholds are exact) -----------------------------
+ok("score exactly at readableMax (0.05) is readable (<=)", function () {
+// 1 control in 20 chars = 0.05.
+var r = assess("abcdefghijklmnopqrs" + cc(1));
+assert.strictEqual(r.score, 0.05);
+assert.strictEqual(r.label, "readable");
+});
+ok("score exactly at binaryMin (0.30) is likely-binary (>=)", function () {
+// 3 control in 10 chars = 0.30.
+var r = assess("abcdefg" + cc(1, 2, 3));
+assert.strictEqual(r.score, 0.3);
+assert.strictEqual(r.label, "likely-binary");
+});
+
+// --- options override -------------------------------------------------------
+ok("options can widen the readable band", function () {
+var s = "aa" + cc(1); // 1/3 = 0.3333
+assert.strictEqual(assess(s).label, "likely-binary");
+assert.strictEqual(assess(s, { readableMax: 0.5}).label, "readable");
+});
+
+// --- the composition joint --------------------------------------------------
+ok("record passthrough preserves fields and adds.legibility", function () {
+var rec = { index: 2, filter: "FlateDecode", text: "readable content"};
+var out = legible(rec);
+assert.strictEqual(out.index, 2);
+assert.strictEqual(out.filter, "FlateDecode");
+assert.strictEqual(out.text, "readable content");
+assert.strictEqual(out.legibility.label, "readable");
+});
+ok("array input maps element-wise", function () {
+var out = legible(["hello", cc(0, 1, 2, 3)]);
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].label, "readable");
+assert.strictEqual(out[1].label, "likely-binary");
+});
+ok("a ratchet.streams-shaped record annotates cleanly", function () {
+// Mirrors the real join: ratchet-pdf-text emits entries like this.
+var stream = { index: 0, filter: "FlateDecode", compressed: true, needsInflate: false, text: cc(0,1,0,2,0,3), rawLength: 6};
+var out = legible(stream);
+assert.strictEqual(out.legibility.label, "likely-binary");
+assert.strictEqual(out.rawLength, 6); // original fields intact
+});
+
+// --- determinism (the canonicalizer self-test) ------------------------------
+ok("determinism: same input yields byte-identical JSON across runs", function () {
+var inputs = ["Hello", cc(0,1,2), "日本語 as latin1: " + cc(0xe6,0x97,0xa5), "", " "];
+for (var i = 0; i < inputs.length; i++) {
+var a = JSON.stringify(assess(inputs[i]));
+var b = JSON.stringify(assess(inputs[i]));
+assert.strictEqual(a, b, "run 2 differs for input " + i);
+}
+});
+
+// --- the CLI contract -------------------------------------------------------
+ok("CLI --port prints the port-verb (transform)", function () {
+var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " --port").toString().trim();
+assert.strictEqual(out, "transform");
+});
+ok("CLI argument form prints the assessment JSON", function () {
+var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " 'plain text'").toString().trim();
+var r = JSON.parse(out);
+assert.strictEqual(r.label, "readable");
+});
+ok("CLI stdin JSONL form annotates each record", function () {
+var jsonl = JSON.stringify({ index: 0, text: "readable"}) + "\n" +
+JSON.stringify({ index: 1, text: cc(0,1,2,3)}) + "\n";
+var out = cp.execSync("node " + path.join(__dirname, "legible.js"), { input: jsonl}).toString().trim().split("\n");
+var a = JSON.parse(out[0]), b = JSON.parse(out[1]);
+assert.strictEqual(a.legibility.label, "readable");
+assert.strictEqual(b.legibility.label, "likely-binary");
+assert.strictEqual(b.index, 1);
+});
+
+// --- report -----------------------------------------------------------------
+console.log("\n" + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# loop21:component-factory — a Loop MMT gift
+https://loopmmt.com/gifts/loop21-component-factory/
+[coverage: optional · branch: gifts]
+
+Logic Components as Composable Data source ← all gifts
+
+loop21:component-factory
+
+A factory for small logic components — a counter, a toggle, a clamp, an accumulator, a pattern-matcher — emitted not as live objects but as fully-specified JSONL specs one per line, so each component travels: you can pipe it, store it, diff it, hash it, or feed it to any consumer that knows the five built-in kinds. It is a source in the composition algebra (nothing in, JSONL out): the front door to a small, closed catalog of primitives. Every requested component is validated against its kind's parameter schema before a spec is emitted, so a missing required parameter, a bad type, or an out-of-range value is a reported error, never a silently emitted spec a downstream tool will choke on. Auto-generated names use a seeded counter, so --seed yields byte-identical JSONL on any machine, forever.
+
+The honest edge
+
+The factory declares components; it does not run them. An emitted spec is a validated description, not a live object — turning a spec into behavior is the consumer's job, and this tool makes no claim about whether any downstream runner implements a kind correctly. It guarantees the spec is well-formed and catalog-valid, not that anyone honors it.
+
+Run it
+
+python3 loop21-component-factory.py --demo
+test_loop21-component-factory.py (28 checks / 17 tests, mutation-bitten, pinned golden sha256 of a seeded batch)
+Python standard library only, deterministic under --seed, headless
+
+The code — every file that ships
+
+loop21-component-factory.py 408 lines on GitHub →
+#!/usr/bin/env python3
+"""loop21-component-factory — declare small logic components as composable data.
+
+A *source* in the composition algebra (∅ → JSONL): you name the logic
+primitives you want — a counter, a toggle, a clamp, an accumulator, a
+pattern-matcher — give each a small config, and the factory emits one
+fully-specified component **spec** per line of JSONL. Nothing is executed
+here; the factory's job is to *declare* components as portable data that a
+downstream transform, fold, or runner consumes.
+
+spec = {"component": "<kind>", "name": "<id>", "params": {...},
+"port": "transform"|"filter"|..., "spec_version": 1}
+
+WHY IT'S A FACTORY, NOT A LIBRARY
+
+A library hands you a function bound to the process that imported it. This
+hands you a *description* of a component — kind, name, parameters, and the
+composition port it fills — as a line of JSON. That description travels: you
+can pipe it, store it, diff it, hash it, or feed it to any consumer that
+knows the five built-in kinds. The factory is the front door to a small,
+closed catalog of logic primitives, emitted as a stream.
+
+WHY IT'S HONEST
+
+- **A closed, named catalog.** Five component kinds ship: `counter`,
+`toggle`, `clamp`, `accumulator`, `pattern-match`. Each has a declared
+parameter schema and a declared composition port. Ask for a kind that
+isn't in the catalog and the factory refuses loudly (it never emits a
+spec it can't stand behind).
+
+- **Deterministic by construction.** The emitted stream is a pure function
+of the requested specs. Auto-generated names use a seeded, reproducible
+counter, so `--seed 42` yields byte-identical JSONL on any machine,
+forever. Keys are sorted; there is no wall-clock, no RNG that isn't
+seeded, nothing that drifts between runs.
+
+- **Validated at the door.** Every requested component is checked against
+its kind's parameter schema *before* a spec is emitted. A missing
+required parameter, an out-of-range value, or an unknown parameter is a
+reported error (to stderr, non-zero exit) — never a silently emitted
+spec that a downstream consumer will choke on.
+
+- **The spec is the whole contract.** A consumer needs nothing from this
+tool but the JSONL. The `spec_version` field pins the shape so a consumer
+can reject a spec it doesn't understand rather than mis-read it.
+
+THE HONEST EDGE
+
+The factory *declares* components; it does not *run* them. An emitted spec
+is a validated description, not a live object — turning a spec into behavior
+is the consumer's job, and this tool makes no claim about whether any
+downstream runner implements a kind correctly. It guarantees the spec is
+well-formed and catalog-valid, not that anyone honors it.
+
+USAGE
+# one component from a kind + inline params
+python3 loop21-component-factory.py --make counter:start=0,step=2
+
+# several at once, one JSONL line each
+python3 loop21-component-factory.py \
+--make counter:start=0 --make toggle:initial=false \
+--make clamp:lo=0,hi=100
+
+# read a batch request from a JSON file ([{kind,name,params},...])
+python3 loop21-component-factory.py --batch request.json
+
+# list the catalog (kinds, params, ports) as JSONL and exit
+python3 loop21-component-factory.py --catalog
+
+# a short, reproducible demonstration
+python3 loop21-component-factory.py --demo
+
+MIT licensed. Python standard library only. Deterministic under --seed; headless.
+"""
+# SPDX-License-Identifier: MIT
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from typing import Any
+
+SPEC_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# The catalog — a closed, named set of logic-component kinds.
+#
+# Each kind declares:
+# port: the composition port the component fills (source/transform/
+# filter/fold/sink) — this is what a MAP tool reads.
+# params: {name: schema} where schema is
+# {"type": "int"|"number"|"bool"|"string",
+# "required": bool,
+# "default": <value>, # when not required
+# "min": <n>, "max": <n>} # optional bounds (numeric)
+# summary: one line, human-facing.
+# ---------------------------------------------------------------------------
+CATALOG: dict[str, dict[str, Any]] = {
+"counter": {
+"port": "transform",
+"summary": "advances a running integer by a fixed step each item",
+"params": {
+"start": {"type": "int", "required": False, "default": 0},
+"step": {"type": "int", "required": False, "default": 1},
+},
+},
+"toggle": {
+"port": "transform",
+"summary": "flips a boolean on each item, starting from an initial state",
+"params": {
+"initial": {"type": "bool", "required": False, "default": False},
+},
+},
+"clamp": {
+"port": "transform",
+"summary": "constrains a numeric field to an inclusive [lo, hi] range",
+"params": {
+"lo": {"type": "number", "required": True},
+"hi": {"type": "number", "required": True},
+},
+},
+"accumulator": {
+"port": "fold",
+"summary": "reduces a stream to a single running total under an operation",
+"params": {
+"op": {
+"type": "string",
+"required": False,
+"default": "sum",
+"choices": ["sum", "product", "min", "max", "count"],
+},
+"seed": {"type": "number", "required": False, "default": 0},
+},
+},
+"pattern-match": {
+"port": "filter",
+"summary": "passes items whose field matches a fixed literal or set",
+"params": {
+"field": {"type": "string", "required": True},
+"equals": {"type": "string", "required": False, "default": None},
+"in": {"type": "string", "required": False, "default": None},
+},
+},
+}
+
+class FactoryError(Exception):
+"""A requested component could not be produced (unknown kind or bad params)."""
+
+# ---------------------------------------------------------------------------
+# Parameter parsing + coercion
+# ---------------------------------------------------------------------------
+def _coerce(kind: str, pname: str, raw: Any, schema: dict[str, Any]) -> Any:
+"""Coerce a raw parameter value to its declared type, or raise FactoryError."""
+t = schema["type"]
+try:
+if t == "int":
+val = int(raw)
+elif t == "number":
+val = float(raw)
+if val.is_integer():
+val = int(val) # canonical: 3.0 -> 3, keeps JSONL stable
+elif t == "bool":
+if isinstance(raw, bool):
+val = raw
+else:
+s = str(raw).strip().lower()
+if s in ("true", "1", "yes", "on"):
+val = True
+elif s in ("false", "0", "no", "off"):
+val = False
+else:
+raise ValueError(s)
+elif t == "string":
+val = str(raw)
+else: # pragma: no cover - guarded by catalog authorship
+raise FactoryError(f"{kind}.{pname}: unknown schema type {t!r}")
+except (ValueError, TypeError):
+raise FactoryError(
+f"{kind}.{pname}: value {raw!r} is not a valid {t}"
+)
+
+if "choices" in schema and val not in schema["choices"]:
+raise FactoryError(
+f"{kind}.{pname}: {val!r} not in {schema['choices']}"
+)
+for bound, cmp_ok in (("min", lambda v, b: v >= b), ("max", lambda v, b: v <= b)):
+if bound in schema and not cmp_ok(val, schema[bound]):
+raise FactoryError(
+f"{kind}.{pname}: {val!r} violates {bound}={schema[bound]}"
+)
+return val
+
+def build_spec(kind: str, name: str, params: dict[str, Any]) -> dict[str, Any]:
+"""Validate a request against the catalog and return a component spec dict.
+
+Raises FactoryError on an unknown kind, an unknown param, a missing
+required param, or a value that fails coercion/bounds.
+"""
+if kind not in CATALOG:
+raise FactoryError(
+f"unknown component kind {kind!r}; catalog: {', '.join(sorted(CATALOG))}"
+)
+entry = CATALOG[kind]
+schema = entry["params"]
+
+unknown = set(params) - set(schema)
+if unknown:
+raise FactoryError(
+f"{kind}: unknown param(s) {', '.join(sorted(unknown))}; "
+f"allowed: {', '.join(sorted(schema)) or '(none)'}"
+)
+
+resolved: dict[str, Any] = {}
+for pname, pschema in schema.items():
+if pname in params:
+resolved[pname] = _coerce(kind, pname, params[pname], pschema)
+elif pschema.get("required"):
+raise FactoryError(f"{kind}: missing required param {pname!r}")
+else:
+resolved[pname] = pschema.get("default")
+
+if kind == "pattern-match" and resolved.get("equals") is None and resolved.get("in") is None:
+raise FactoryError("pattern-match: exactly one of 'equals' or 'in' is required")
+if kind == "pattern-match" and resolved.get("equals") is not None and resolved.get("in") is not None:
+raise FactoryError("pattern-match: give only one of 'equals' or 'in', not both")
+
+return {
+"component": kind,
+"name": name,
+"params": resolved,
+"port": entry["port"],
+"spec_version": SPEC_VERSION,
+}
+
+# ---------------------------------------------------------------------------
+# Request parsing
+# ---------------------------------------------------------------------------
+def parse_make(expr: str) -> tuple[str, dict[str, Any]]:
+"""Parse a --make expression 'kind:k=v,k2=v2' -> (kind, {params})."""
+if ":" in expr:
+kind, _, param_str = expr.partition(":")
+else:
+kind, param_str = expr, ""
+kind = kind.strip()
+params: dict[str, Any] = {}
+if param_str.strip():
+for pair in param_str.split(","):
+if "=" not in pair:
+raise FactoryError(f"bad param {pair!r} in {expr!r} (want k=v)")
+k, _, v = pair.partition("=")
+params[k.strip()] = v.strip()
+return kind, params
+
+def _auto_name(kind: str, ordinal: int) -> str:
+"""Deterministic auto-name: kind + zero-padded seeded ordinal."""
+return f"{kind}-{ordinal:04d}"
+
+def produce(
+requests: list[dict[str, Any]],
+*,
+seed: int = 0,
+) -> list[dict[str, Any]]:
+"""Turn a list of {kind, name?, params} requests into validated specs.
+
+Auto-generated names are deterministic: they use a per-kind ordinal that
+starts from `seed` and increments in request order, so the same requests
+under the same seed yield byte-identical specs.
+"""
+specs: list[dict[str, Any]] = []
+counters: dict[str, int] = {}
+for req in requests:
+kind = req["kind"]
+params = req.get("params", {})
+name = req.get("name")
+if not name:
+ordinal = counters.get(kind, seed)
+counters[kind] = ordinal + 1
+name = _auto_name(kind, ordinal)
+specs.append(build_spec(kind, name, params))
+return specs
+
+def catalog_lines() -> list[dict[str, Any]]:
+"""The catalog itself, as JSONL-emittable dicts (one per kind)."""
+out = []
+for kind in sorted(CATALOG):
+entry = CATALOG[kind]
+out.append(
+{
+"component": kind,
+"port": entry["port"],
+"summary": entry["summary"],
+"params": {
+p: {k: v for k, v in schema.items()}
+for p, schema in entry["params"].items()
+},
+}
+)
+return out
+
+# ---------------------------------------------------------------------------
+# Emit
+# ---------------------------------------------------------------------------
+def emit(objs: list[dict[str, Any]], stream=None) -> None:
+"""Write objects as JSONL — one per line, keys sorted (deterministic)."""
+stream = sys.stdout if stream is None else stream
+for obj in objs:
+stream.write(json.dumps(obj, sort_keys=True, ensure_ascii=False) + "\n")
+
+def demo(*, seed: int = 42) -> str:
+"""A short reproducible demonstration — returns the JSONL block as a string."""
+reqs = [
+{"kind": "counter", "params": {"start": "0", "step": "2"}},
+{"kind": "toggle", "params": {"initial": "false"}},
+{"kind": "clamp", "params": {"lo": "0", "hi": "100"}},
+{"kind": "accumulator", "params": {"op": "sum"}},
+{"kind": "pattern-match", "params": {"field": "status", "equals": "open"}},
+]
+specs = produce(reqs, seed=seed)
+return "\n".join(
+json.dumps(s, sort_keys=True, ensure_ascii=False) for s in specs
+)
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def _build_arg_parser() -> argparse.ArgumentParser:
+p = argparse.ArgumentParser(
+prog="loop21-component-factory",
+description="Declare small logic components as composable JSONL specs.",
+)
+p.add_argument(
+"--make",
+action="append",
+default=[],
+metavar="KIND:k=v,...",
+help="a component to emit (repeatable)",
+)
+p.add_argument(
+"--batch",
+metavar="FILE",
+help="a JSON file: [{kind, name?, params?},...]",
+)
+p.add_argument("--catalog", action="store_true", help="emit the catalog as JSONL and exit")
+p.add_argument("--demo", action="store_true", help="print a short reproducible demonstration")
+p.add_argument("--seed", type=int, default=0, help="seed for deterministic auto-names")
+return p
+
+def main(argv: list[str] | None = None) -> int:
+parser = _build_arg_parser()
+args = parser.parse_args(argv)
+
+if args.catalog:
+emit(catalog_lines())
+return 0
+
+if args.demo:
+sys.stdout.write(demo() + "\n")
+return 0
+
+requests: list[dict[str, Any]] = []
+try:
+if args.batch:
+with open(args.batch, encoding="utf-8") as fh:
+loaded = json.load(fh)
+if not isinstance(loaded, list):
+raise FactoryError("--batch file must be a JSON array of requests")
+for item in loaded:
+if not isinstance(item, dict) or "kind" not in item:
+raise FactoryError("each --batch item needs a 'kind' field")
+requests.append(
+{
+"kind": item["kind"],
+"name": item.get("name"),
+"params": item.get("params", {}),
+}
+)
+for expr in args.make:
+kind, params = parse_make(expr)
+requests.append({"kind": kind, "params": params})
+
+if not requests:
+parser.error("nothing to make: give --make, --batch, --catalog, or --demo")
+
+specs = produce(requests, seed=args.seed)
+except FactoryError as exc:
+sys.stderr.write(f"loop21-component-factory: {exc}\n")
+return 2
+except (OSError, json.JSONDecodeError) as exc:
+sys.stderr.write(f"loop21-component-factory: {exc}\n")
+return 2
+
+emit(specs)
+return 0
+
+if __name__ == "__main__":
+raise SystemExit(main())
+
+test_loop21-component-factory.py 219 lines on GitHub →
+#!/usr/bin/env python3
+"""test_loop21-component-factory.py — the certifying properties of the factory gift.
+
+Run: python3 test_loop21-component-factory.py (exit 0 = all pass, 1 = failure)
+
+MUTATION-BITTEN: each test is here because a plausible mutation of the tool makes
+it fail loud. The determinism test pins a GOLDEN sha256 of a seeded batch rather
+than checking self-equality — a weak self-equality test passes benign reorders
+(the Loop MMT sudoku lesson), a pinned golden does not.
+"""
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location(
+"lcf", os.path.join(_HERE, "loop21-component-factory.py")
+)
+lcf = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(lcf)
+
+# --- pinned goldens: regenerate ONLY on an intentional change ----------------
+DEMO_GOLDEN_SHA256 = "ba304b3fd40715875b8298b68dd6281d64844f641263bc7121ce27c35da00a08"
+BATCH_GOLDEN_SHA256 = "566171366bffaa9bcfd9001523666585fafe7547f11e3f2851b0cf36288680fe"
+CATALOG_KIND_COUNT = 5
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+def _sha(block: str) -> str:
+return hashlib.sha256(block.encode()).hexdigest()
+
+# --- determinism -------------------------------------------------------------
+def test_seeded_demo_reproduces_pinned_golden():
+"""The seeded demo output is byte-identical to a pinned sha256, forever."""
+block = lcf.demo(seed=42)
+check(_sha(block) == DEMO_GOLDEN_SHA256,
+f"demo golden drift: got {_sha(block)}")
+
+def test_seeded_batch_reproduces_pinned_golden():
+"""A seeded produce() batch is byte-identical to a pinned sha256."""
+reqs = [
+{"kind": "counter", "params": {"start": "5", "step": "3"}},
+{"kind": "accumulator", "params": {"op": "max", "seed": "0"}},
+{"kind": "clamp", "params": {"lo": "-10", "hi": "10"}},
+]
+specs = lcf.produce(reqs, seed=100)
+block = "\n".join(json.dumps(s, sort_keys=True, ensure_ascii=False) for s in specs)
+check(_sha(block) == BATCH_GOLDEN_SHA256,
+f"batch golden drift: got {_sha(block)}")
+
+def test_same_seed_twice_is_identical():
+"""Two runs with the same seed produce identical specs (self-consistency)."""
+reqs = [{"kind": "counter", "params": {}}, {"kind": "toggle", "params": {}}]
+a = lcf.produce(reqs, seed=7)
+b = lcf.produce(reqs, seed=7)
+check(a == b, "same-seed runs diverged")
+
+# --- catalog is a closed, named set ------------------------------------------
+def test_catalog_is_the_declared_five_kinds():
+"""The catalog holds exactly the five declared component kinds."""
+check(len(lcf.CATALOG) == CATALOG_KIND_COUNT,
+f"catalog size changed: {sorted(lcf.CATALOG)}")
+check(set(lcf.CATALOG) == {"counter", "toggle", "clamp", "accumulator", "pattern-match"},
+f"catalog kinds changed: {sorted(lcf.CATALOG)}")
+
+def test_every_catalog_kind_declares_a_valid_port():
+"""Every kind's port is one of the five composition-algebra verbs."""
+valid = {"source", "transform", "filter", "fold", "sink"}
+for kind, entry in lcf.CATALOG.items():
+check(entry["port"] in valid, f"{kind}: bad port {entry['port']!r}")
+
+# --- validation at the door --------------------------------------------------
+def test_unknown_kind_refuses():
+"""An unknown component kind raises FactoryError, never emits a spec."""
+try:
+lcf.build_spec("frobnicate", "x", {})
+check(False, "unknown kind did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_missing_required_param_refuses():
+"""A missing required param (clamp.hi) raises, never emits a spec."""
+try:
+lcf.build_spec("clamp", "c", {"lo": 0})
+check(False, "missing required param did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_unknown_param_refuses():
+"""An unknown param raises rather than being silently dropped or emitted."""
+try:
+lcf.build_spec("counter", "c", {"bogus": 5})
+check(False, "unknown param did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_bad_type_refuses():
+"""A non-int for an int param raises rather than coercing to garbage."""
+try:
+lcf.build_spec("counter", "c", {"step": "abc"})
+check(False, "bad-type param did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_out_of_choice_refuses():
+"""An accumulator op outside the declared choices raises."""
+try:
+lcf.build_spec("accumulator", "a", {"op": "divide"})
+check(False, "out-of-choice op did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_pattern_match_requires_exactly_one_selector():
+"""pattern-match with neither equals nor in raises; with both raises."""
+try:
+lcf.build_spec("pattern-match", "p", {"field": "s"})
+check(False, "pattern-match with no selector did not raise")
+except lcf.FactoryError:
+check(True, "")
+try:
+lcf.build_spec("pattern-match", "p", {"field": "s", "equals": "a", "in": "b"})
+check(False, "pattern-match with both selectors did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+# --- spec shape --------------------------------------------------------------
+def test_spec_carries_version_and_port():
+"""Every emitted spec pins spec_version and declares its port."""
+s = lcf.build_spec("counter", "c", {"start": 0})
+check(s["spec_version"] == lcf.SPEC_VERSION, "spec_version missing/wrong")
+check(s["port"] == "transform", "counter port wrong")
+check(s["component"] == "counter", "component field wrong")
+
+def test_number_type_canonicalizes_integer_floats():
+"""A number param given as 3.0 canonicalizes to 3 so JSONL stays stable."""
+s = lcf.build_spec("clamp", "c", {"lo": "0.0", "hi": "100"})
+check(s["params"]["lo"] == 0 and isinstance(s["params"]["lo"], int),
+f"number did not canonicalize: {s['params']['lo']!r}")
+
+def test_bool_coercion_accepts_words_and_refuses_garbage():
+"""bool params accept true/false words; garbage raises."""
+s = lcf.build_spec("toggle", "t", {"initial": "true"})
+check(s["params"]["initial"] is True, "bool 'true' not coerced")
+try:
+lcf.build_spec("toggle", "t", {"initial": "maybe"})
+check(False, "garbage bool did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+# --- CLI exit codes ----------------------------------------------------------
+def test_cli_bad_request_exits_2():
+"""The CLI returns 2 (not 0, not a traceback) on a bad request."""
+rc = lcf.main(["--make", "counter:step=abc"])
+check(rc == 2, f"bad CLI request returned {rc}, want 2")
+
+def test_cli_catalog_and_demo_exit_0():
+"""--catalog and --demo both succeed (exit 0)."""
+check(lcf.main(["--catalog"]) == 0, "--catalog did not exit 0")
+check(lcf.main(["--demo"]) == 0, "--demo did not exit 0")
+
+def test_auto_names_are_ordinal_and_seeded():
+"""Auto-generated names increment per-kind from the seed, deterministically."""
+specs = lcf.produce(
+[{"kind": "counter", "params": {}}, {"kind": "counter", "params": {}}],
+seed=10,
+)
+check(specs[0]["name"] == "counter-0010", f"first name {specs[0]['name']!r}")
+check(specs[1]["name"] == "counter-0011", f"second name {specs[1]['name']!r}")
+
+def _run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+try:
+t()
+except Exception as exc: # a test itself throwing is a failure
+_FAILURES.append(f"{t.__name__} raised {exc!r}")
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {_PASSES}/{total} checks passed; {len(_FAILURES)} failure(s):")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed across {len(tests)} tests.")
+return 0
+
+if __name__ == "__main__":
+raise SystemExit(_run())
+
+Take the whole folder →
+MIT
+Python standard library only, deterministic under --seed, headless
 
 ---
 
@@ -540,885 +1588,5 @@ process.exitCode = fail === 0? 0: 1;
 Take the whole folder →
 MIT
 Zero-dependency JavaScript (browser or Node)
-
----
-
-# Skin Config Validator — a Loop MMT gift
-https://loopmmt.com/gifts/loop21-verifyskin/
-[coverage: optional · branch: gifts]
-
-Is This User Config Safe To Apply? filter ← all gifts
-
-Skin Config Validator
-
-Validate a user-submitted skin/theme config object — colors, fonts, numbers, CSS custom properties — against a schema you declare, BEFORE you splice it into a stylesheet. verifySkin(config, schema) type-checks every field, allowlists CSS colors and cssvar values (rejecting url(), @import, javascript:, and; {} breakouts), and returns { ok, value, errors, warnings} — value carries only the fields that passed, safe to apply. It does not mutate or coerce; it reports. No dependencies, Node or browser.
-
-The honest edge
-
-It keeps 'wrong' and 'unknown' apart: a bad type/range/injection is an ERROR, an unknown field is a dropped WARNING (forward-compat), a missing optional field is silent. The `string` type is NOT stylesheet-sanitized — it type-checks and length-caps only; use `cssvar` (the type with the injection allowlist) for anything headed into a style surface. The named-color allowlist is conservative (unknown names rejected, not guessed) and the cssvar check is a safe-character GRAMMAR, not a full CSS value parser — it proves the value can't break out of a declaration, not that it is meaningful CSS. The schema is YOURS: a malformed schema throws (programmer error); only the config is treated as untrusted and reported-not-thrown.
-
-Run it
-
-node loop21-verifyskin.js config.json schema.json
-test_loop21-verifyskin.js (18/18: every type path, CSS-injection rejection, unknown-field drop+warn, required-missing error, non-object config reported-not-thrown, multi-error report, 2 ratchet-refusal cases)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-loop21-verifyskin.js 207 lines on GitHub →
-#!/usr/bin/env node
-/* loop21-verifyskin.js — a pure, dependency-free, STRICT validator for
-user-submitted "skin" config objects, before you apply them to a UI. Runs
-identically in a browser (window.LoopGifts.verifySkin) and in Node (require /
-this CLI). No DOM, no dependencies.
-
-WHY THIS EXISTS. A theming / skin feature lets a user hand you a small config
-object — colors, a font, a few numbers, some CSS custom properties — that you
-then splice into a stylesheet or inline style. That is untrusted input landing
-in your render surface. The usual answer is to trust it (and ship a CSS
-injection, or a broken layout from a typo'd number) or to hand-check a few
-fields and miss the rest. This validates the WHOLE object against a declared
-schema and tells you, honestly, what is wrong — before a single value is
-applied.
-
-WHAT "VERIFY" MEANS HERE. verifySkin does not mutate, coerce, or "fix" your
-config. It reads it against a schema and returns a verdict:
-{ ok, value, errors, warnings}
-`ok` is true only when there are zero errors. `value` is the subset of the
-input that passed (known, well-typed fields) — safe to apply. `errors` are
-hard failures (wrong type, out-of-range, a disallowed CSS value, a missing
-required field). `warnings` are soft (an unknown field that was dropped, a
-value clamped-in-spec-but-suspicious). A validator that silently drops the
-difference between "wrong" and "unknown" is lying about what it checked; this
-one keeps them apart.
-
-THE SCHEMA. A plain object mapping field name -> a small type spec:
-{ type: "color"} a CSS color: #rgb / #rrggbb / #rrggbbaa /
-rgb()/rgba()/hsl()/hsla() / a named-color from
-the allowlist. No url(), no expression, no;}
-{ type: "cssvar"} a CSS custom-property VALUE, allowlisted to a
-safe grammar (letters, digits, %, #, spaces,
-commas, dots, parens for the color fns above) —
-rejects; {} < > url( javascript: and @import.
-{ type: "number", min, max} a finite number, optionally range-checked.
-{ type: "integer", min, max} a number with no fractional part.
-{ type: "enum", values:[..]}one of a fixed set of strings.
-{ type: "boolean"} true / false.
-{ type: "string", maxLen} an arbitrary string, optionally length-capped
-(NOT applied to a stylesheet without your own
-escaping — see the README edge).
-Add `required: true` to make a missing field an error (default: optional).
-
-API
-verifySkin(config, schema) -> { ok, value, errors, warnings}
-`config` the untrusted object (anything; a non-object is one error).
-`schema` the field->spec map above (a non-object throws — the schema is
-YOURS, so a bad schema is a programmer error, not user input).
-`errors` / `warnings` are arrays of { field, message} (field null for
-whole-object problems). Never throws on bad `config` — that is the point;
-it reports. THROWS only on a malformed `schema`.
-
-Pure function of its inputs. Same code in a browser
-(window.LoopGifts.verifySkin) or Node (this CLI / require()).
-
-USAGE
-node loop21-verifyskin.js config.json schema.json # prints the verdict JSON
-node loop21-verifyskin.js --help
-*/
-(function (root, factory) {
-var api = factory();
-if (typeof module === "object" && module.exports) module.exports = api;
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.verifySkin = api.verifySkin;
-}
-root.__loop21VerifySkin = api;
-})(typeof globalThis!== "undefined"? globalThis: this, function () {
-"use strict";
-
-// A conservative named-color allowlist — the common CSS keywords. Not
-// exhaustive by design: an unknown name is rejected, not guessed.
-var NAMED_COLORS = {
-black:1, silver:1, gray:1, grey:1, white:1, maroon:1, red:1, purple:1,
-fuchsia:1, green:1, lime:1, olive:1, yellow:1, navy:1, blue:1, teal:1,
-aqua:1, cyan:1, magenta:1, orange:1, pink:1, brown:1, gold:1, coral:1,
-salmon:1, khaki:1, violet:1, indigo:1, turquoise:1, tan:1, beige:1,
-ivory:1, crimson:1, chocolate:1, transparent:1
-};
-
-var HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
-// rgb/rgba/hsl/hsla with only numbers, %, commas, spaces, dots inside.
-var COLOR_FN = /^(?:rgb|rgba|hsl|hsla)\(\s*[-0-9.%,\s\/]+\)$/;
-// A safe cssvar value: letters, digits, whitespace, and a small punctuation set.
-// Explicitly excludes; {} < > and the url(/@import/expression/javascript vectors.
-var SAFE_CSSVAR = /^[A-Za-z0-9#%.,()\-_ \/]*$/;
-var DANGER = /(url\s*\(|@import|expression\s*\(|javascript:|[;{}<>])/i;
-
-function isColor(v) {
-if (typeof v!== "string") return false;
-var s = v.trim();
-if (HEX.test(s)) return true;
-if (COLOR_FN.test(s)) return true;
-if (Object.prototype.hasOwnProperty.call(NAMED_COLORS, s.toLowerCase())) return true;
-return false;
-}
-function isSafeCssVar(v) {
-if (typeof v!== "string") return false;
-if (DANGER.test(v)) return false;
-return SAFE_CSSVAR.test(v);
-}
-
-function verifySkin(config, schema) {
-if (schema === null || typeof schema!== "object" || Array.isArray(schema))
-throw new Error("loop21-verifyskin: schema must be a plain object of field specs");
-
-var errors = [], warnings = [], value = {};
-
-if (config === null || typeof config!== "object" || Array.isArray(config)) {
-errors.push({ field: null, message: "config must be a plain object"});
-return { ok: false, value: {}, errors: errors, warnings: warnings};
-}
-
-var schemaFields = Object.keys(schema);
-
-// 1. unknown fields -> dropped, warned (not an error: forward-compat)
-Object.keys(config).forEach(function (k) {
-if (schemaFields.indexOf(k) === -1)
-warnings.push({ field: k, message: "unknown field dropped (not in schema)"});
-});
-
-// 2. each schema field
-schemaFields.forEach(function (field) {
-var spec = schema[field];
-if (spec === null || typeof spec!== "object")
-throw new Error("loop21-verifyskin: schema field '" + field + "' has a non-object spec");
-var present = Object.prototype.hasOwnProperty.call(config, field);
-var v = config[field];
-
-if (!present) {
-if (spec.required) errors.push({ field: field, message: "required field missing"});
-return;
-}
-
-switch (spec.type) {
-case "color":
-if (isColor(v)) value[field] = v;
-else errors.push({ field: field, message: "not a valid/allowlisted CSS color"});
-break;
-case "cssvar":
-if (isSafeCssVar(v)) value[field] = v;
-else errors.push({ field: field, message: "cssvar value contains a disallowed character or vector"});
-break;
-case "number":
-if (typeof v!== "number" ||!isFinite(v)) { errors.push({ field: field, message: "not a finite number"}); break;}
-if (typeof spec.min === "number" && v < spec.min) { errors.push({ field: field, message: "below min " + spec.min}); break;}
-if (typeof spec.max === "number" && v > spec.max) { errors.push({ field: field, message: "above max " + spec.max}); break;}
-value[field] = v;
-break;
-case "integer":
-if (typeof v!== "number" ||!isFinite(v) || Math.floor(v)!== v) { errors.push({ field: field, message: "not an integer"}); break;}
-if (typeof spec.min === "number" && v < spec.min) { errors.push({ field: field, message: "below min " + spec.min}); break;}
-if (typeof spec.max === "number" && v > spec.max) { errors.push({ field: field, message: "above max " + spec.max}); break;}
-value[field] = v;
-break;
-case "enum":
-if (!Array.isArray(spec.values)) throw new Error("loop21-verifyskin: enum field '" + field + "' needs a values array");
-if (spec.values.indexOf(v)!== -1) value[field] = v;
-else errors.push({ field: field, message: "not one of the allowed values"});
-break;
-case "boolean":
-if (typeof v === "boolean") value[field] = v;
-else errors.push({ field: field, message: "not a boolean"});
-break;
-case "string":
-if (typeof v!== "string") { errors.push({ field: field, message: "not a string"}); break;}
-if (typeof spec.maxLen === "number" && v.length > spec.maxLen) { errors.push({ field: field, message: "exceeds maxLen " + spec.maxLen}); break;}
-value[field] = v;
-break;
-default:
-throw new Error("loop21-verifyskin: unknown spec type '" + spec.type + "' for field '" + field + "'");
-}
-});
-
-return { ok: errors.length === 0, value: value, errors: errors, warnings: warnings};
-}
-
-return { verifySkin: verifySkin, isColor: isColor, isSafeCssVar: isSafeCssVar};
-});
-
-// ---- CLI (Node only) ------------------------------------------------------
-if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
-var api = (typeof globalThis!== "undefined"? globalThis: this).__loop21VerifySkin;
-var args = process.argv.slice(2);
-if (!args.length || args.indexOf("--help")!== -1) {
-process.stdout.write(
-"loop21-verifyskin — strict, zero-dep validator for user skin config\n" +
-" node loop21-verifyskin.js config.json schema.json print the verdict JSON\n" +
-" node loop21-verifyskin.js --help\n"
-);
-process.exit(0);
-}
-try {
-var fs = require("fs");
-if (args.length < 2) throw new Error("need a config.json and a schema.json");
-var config = JSON.parse(fs.readFileSync(args[0], "utf8"));
-var schema = JSON.parse(fs.readFileSync(args[1], "utf8"));
-var res = api.verifySkin(config, schema);
-process.stdout.write(JSON.stringify(res, null, 2) + "\n");
-process.exit(res.ok? 0: 2); // nonzero when the config is rejected
-} catch (e) {
-var msg = e && e.message? e.message: String(e);
-if (msg.indexOf("loop21-verifyskin:")!== 0) msg = "loop21-verifyskin: " + msg;
-process.stderr.write(msg + "\n");
-process.exit(1);
-}
-}
-
-test_loop21-verifyskin.js 174 lines on GitHub →
-#!/usr/bin/env node
-/* test_loop21-verifyskin.js — known-answer battery for loop21-verifyskin.
-
-The oracle is OUT OF BAND: every expected verdict below is a literal fact
-written by hand, never the output of a second validator. Each case constructs
-a config + schema whose correct { ok, value, errors, warnings} is known by
-construction.
-
-Run: node test_loop21-verifyskin.js (exit 0 = all pass)
-*/
-"use strict";
-var assert = require("assert");
-var { verifySkin, isColor, isSafeCssVar} = require("./loop21-verifyskin.js");
-
-var pass = 0, fail = 0;
-function ok(name, fn) {
-try { fn(); pass++; console.log(" ok " + name);}
-catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
-}
-
-// ---- 1. a fully-valid config passes, value echoes the typed fields --------
-ok("1 valid config -> ok:true, value carries typed fields", function () {
-var schema = {
-bg: { type: "color"},
-accent: { type: "color"},
-radius: { type: "integer", min: 0, max: 32},
-opacity: { type: "number", min: 0, max: 1},
-theme: { type: "enum", values: ["light", "dark"]},
-dense: { type: "boolean"}
-};
-var config = { bg: "#101820", accent: "gold", radius: 8, opacity: 0.9, theme: "dark", dense: true};
-var r = verifySkin(config, schema);
-assert.strictEqual(r.ok, true); // ORACLE
-assert.strictEqual(r.errors.length, 0);
-assert.deepStrictEqual(r.value, config); // all fields passed
-});
-
-// ---- 2. hex-color forms all accepted ------------------------------------
-ok("2 #rgb / #rrggbb / #rrggbbaa colors accepted", function () {
-["#fff", "#ffffff", "#ffffffff", "#1A2b3C"].forEach(function (c) {
-assert.strictEqual(isColor(c), true, c); // ORACLE
-});
-});
-
-// ---- 3. rgb()/rgba()/hsl() color functions accepted ---------------------
-ok("3 rgb/rgba/hsl functions accepted", function () {
-["rgb(10, 20, 30)", "rgba(0,0,0,0.5)", "hsl(210, 50%, 40%)"].forEach(function (c) {
-assert.strictEqual(isColor(c), true, c); // ORACLE
-});
-});
-
-// ---- 4. CSS injection in a color is rejected ----------------------------
-ok("4 injection color 'red;} body{...' rejected", function () {
-assert.strictEqual(isColor("red;} body{display:none}"), false); // ORACLE
-var r = verifySkin({ bg: "red;} body{}"}, { bg: { type: "color"}});
-assert.strictEqual(r.ok, false);
-assert.strictEqual(r.errors[0].field, "bg");
-});
-
-// ---- 5. url() and javascript: rejected as cssvar ------------------------
-ok("5 cssvar url()/javascript:/@import rejected", function () {
-assert.strictEqual(isSafeCssVar("url(evil.png)"), false); // ORACLE
-assert.strictEqual(isSafeCssVar("javascript:alert(1)"), false);
-assert.strictEqual(isSafeCssVar("@import 'x'"), false);
-assert.strictEqual(isSafeCssVar("a; color: red"), false); // semicolon
-});
-
-// ---- 6. a benign cssvar value accepted ----------------------------------
-ok("6 benign cssvar 'clamp(1rem, 2vw, 2rem)'-ish accepted", function () {
-assert.strictEqual(isSafeCssVar("1.5 2px 10%"), true); // ORACLE
-assert.strictEqual(isSafeCssVar("rgba(0,0,0,0.2)"), true);
-var r = verifySkin({ shadow: "0 1px 3px"}, { shadow: { type: "cssvar"}});
-assert.strictEqual(r.ok, true);
-assert.strictEqual(r.value.shadow, "0 1px 3px");
-});
-
-// ---- 7. number range enforced -------------------------------------------
-ok("7 number out of range is an error", function () {
-var schema = { opacity: { type: "number", min: 0, max: 1}};
-assert.strictEqual(verifySkin({ opacity: 1.5}, schema).ok, false); // ORACLE above max
-assert.strictEqual(verifySkin({ opacity: -0.1}, schema).ok, false); // below min
-assert.strictEqual(verifySkin({ opacity: 0.4}, schema).ok, true); // in range
-});
-
-// ---- 8. integer rejects a fractional value ------------------------------
-ok("8 integer field rejects 8.5", function () {
-var schema = { radius: { type: "integer"}};
-assert.strictEqual(verifySkin({ radius: 8.5}, schema).ok, false); // ORACLE
-assert.strictEqual(verifySkin({ radius: 8}, schema).ok, true);
-});
-
-// ---- 9. enum enforces the allowed set -----------------------------------
-ok("9 enum rejects an off-list value", function () {
-var schema = { theme: { type: "enum", values: ["light", "dark"]}};
-assert.strictEqual(verifySkin({ theme: "neon"}, schema).ok, false); // ORACLE
-assert.strictEqual(verifySkin({ theme: "light"}, schema).ok, true);
-});
-
-// ---- 10. boolean type-checked -------------------------------------------
-ok("10 boolean field rejects the string 'true'", function () {
-var schema = { dense: { type: "boolean"}};
-assert.strictEqual(verifySkin({ dense: "true"}, schema).ok, false); // ORACLE: string!= bool
-assert.strictEqual(verifySkin({ dense: false}, schema).ok, true);
-});
-
-// ---- 11. unknown field -> dropped + warned, NOT an error ----------------
-ok("11 unknown field dropped with a warning, ok stays true", function () {
-var schema = { bg: { type: "color"}};
-var r = verifySkin({ bg: "#000", evilField: "x"}, schema);
-assert.strictEqual(r.ok, true); // ORACLE: unknown!= error
-assert.strictEqual(r.warnings.length, 1);
-assert.strictEqual(r.warnings[0].field, "evilField");
-assert.strictEqual("evilField" in r.value, false); // dropped from safe value
-});
-
-// ---- 12. required field missing -> error --------------------------------
-ok("12 required-but-missing field is an error", function () {
-var schema = { bg: { type: "color", required: true}};
-var r = verifySkin({}, schema);
-assert.strictEqual(r.ok, false); // ORACLE
-assert.strictEqual(r.errors[0].message, "required field missing");
-});
-
-// ---- 13. optional missing field is silent -------------------------------
-ok("13 optional missing field is neither error nor warning", function () {
-var schema = { bg: { type: "color"}};
-var r = verifySkin({}, schema);
-assert.strictEqual(r.ok, true); // ORACLE
-assert.strictEqual(r.errors.length, 0);
-assert.strictEqual(r.warnings.length, 0);
-});
-
-// ---- 14. non-object config -> one whole-object error, never throws ------
-ok("14 non-object config reported, not thrown", function () {
-["a string", 42, null, [1, 2]].forEach(function (bad) {
-var r = verifySkin(bad, { bg: { type: "color"}});
-assert.strictEqual(r.ok, false); // ORACLE
-assert.strictEqual(r.errors[0].field, null);
-});
-});
-
-// ---- 15. multiple errors all reported (not just the first) --------------
-ok("15 several bad fields all reported", function () {
-var schema = {
-bg: { type: "color"},
-radius: { type: "integer"},
-theme: { type: "enum", values: ["a"]}
-};
-var r = verifySkin({ bg: "not-a-color", radius: 1.2, theme: "z"}, schema);
-assert.strictEqual(r.ok, false);
-assert.strictEqual(r.errors.length, 3); // ORACLE: all three
-});
-
-// ---- 16. RATCHET: bad schema (non-object) throws ------------------------
-ok("16 ratchet: non-object schema throws", function () {
-assert.throws(function () { verifySkin({}, "not a schema");}, /schema must be/); // ORACLE
-});
-
-// ---- 17. RATCHET: unknown spec type throws ------------------------------
-ok("17 ratchet: unknown spec type throws (programmer error)", function () {
-assert.throws(function () { verifySkin({ x: 1}, { x: { type: "widget"}});}, /unknown spec type/);
-});
-
-// ---- 18. value carries ONLY passing fields (a rejected field is absent) --
-ok("18 rejected field absent from value, valid sibling present", function () {
-var schema = { good: { type: "color"}, bad: { type: "integer"}};
-var r = verifySkin({ good: "#abc", bad: 1.5}, schema);
-assert.strictEqual(r.ok, false);
-assert.strictEqual(r.value.good, "#abc"); // ORACLE: good survives
-assert.strictEqual("bad" in r.value, false); // bad excluded
-});
-
-console.log("\nloop21-verifyskin: " + pass + " passed, " + fail + " failed");
-process.exit(fail? 1: 0);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# map — a Loop MMT gift
-https://loopmmt.com/gifts/map/
-[coverage: optional · branch: gifts]
-
-Composition Map show ← all gifts
-
-map
-
-Point it at a folder of small JSONL tools that each declare a port-verb, and map folds the whole set into a composition map — who can feed whom, how densely the set composes, and which tools light up the most pipelines. It reads each tool's declared port-verb (never guesses one) and reports any undeclared tool by name, excluded from the map.
-
-The honest edge
-
-It renders the TYPE-level map — whether the ports agree so the pipe can carry data at all — not whether the RECORDS fit. A transform emitting {event} records maps clean into a filter expecting {file} records and fails at runtime; map flags that semantic layer as unproven and never asserts it.
-
-Run it
-
-python3 map.py text --manifest gifts-manifest.json
-test_map.py (16/16, mutation-bitten)
-Python 3, standard library only
-
-The code — every file that ships
-
-map.py 283 lines on GitHub →
-#!/usr/bin/env python3
-"""map — show what-composes-with-what across a set of small JSONL tools.
-
-You have a folder of little tools that each read JSON-lines on stdin and write
-JSON-lines on stdout. Which ones can you pipe together? `map` answers that. Point
-it at a manifest where each tool DECLARES its port-verb (the type-level shape of
-its stdin/stdout contract), and `map` folds the whole set into a composition map:
-who can feed whom, how densely the set composes, and which tools light up the most
-pipelines.
-
-THE MODEL. Five port-verbs on the shared JSON-lines interface, and only five:
-
-source: nothing -> JSONL (emits; no meaningful stdin)
-transform: JSONL -> JSONL (record in, record out)
-filter: JSONL -> JSONL' (record in, subset out; output type <= input)
-fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
-sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
-
-THE TYPE GATE (mechanical, decidable):
-
-A can feed B iff A EMITS jsonl (A.verb!= sink) AND B ACCEPTS jsonl (B.verb!= source)
-
-That is the whole composition rule at the type level. `map` counts every ordered
-pair (A, B), A!= B, that passes it, and reports the density.
-
-WHY IT READS DECLARATIONS, NOT GUESSES. Before the `port` gift, a map like this
-kept its own hardcoded roster of which tool had which verb — a list inside one
-program's source that drifts the moment a tool changes or a new one ships. `map`
-does not guess and does not keep a private roster: it READS each tool's declared
-`port_verb` from the manifest (the same field `port` reads and checks). A tool that
-declares no port-verb is reported as UNDECLARED and excluded from the map with a
-count, never silently assigned a verb. The map is only ever as honest as the
-declarations under it — and it says so.
-
-HONEST CEILING (carried, not hidden). `map` renders the TYPE-level answer: can the
-pipe carry data at all. It does NOT assert that the RECORDS fit — a `transform`
-that emits `{event}` records typechecks clean into a `filter` that expects `{file}`
-records and fails at runtime. That finer, record-shape question the uniform JSONL
-type cannot settle, and `map` never claims it can. The map shows what the ports
-permit; it flags the semantic layer as unproven.
-
-map's own port-verb is `fold`: a set of gift declarations in, one aggregate
-composition-map record out.
-
-No dependencies beyond the Python standard library. MIT licensed.
-
-USAGE
-map read --manifest FILE
-Read the composition map from a manifest of tools that declare port_verb.
-Emits JSON-lines: one {"kind":"pair",...} per composable ordered pair,
-then one {"kind":"summary",...} record with density, census, fan-out/fan-in,
-the closed-form check, and the undeclared count. Its port-verb is fold.
-
-map summary --manifest FILE
-Emit only the single summary record (the aggregate), no per-pair lines.
-
-map text --manifest FILE
-Human-readable rendering of the same map (density, census, top fan-out/in,
-the semantic-unproven flag). Not JSONL — for reading, not piping.
-
-map --port
-Print map's own port-verb (fold) as one JSON-line and exit.
-"""
-import argparse
-import json
-import sys
-
-VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
-
-def EMITS(v):
-"""A tool produces pipeable stdout iff it is not a sink."""
-return v!= "sink"
-
-def ACCEPTS(v):
-"""A tool consumes stdin iff it is not a source."""
-return v!= "source"
-
-def load_declared(path):
-"""Return (declared, undeclared) from a manifest.
-
-declared: list of (slug, port_verb) for every entry with a valid port_verb
-undeclared: list of slugs with no (or invalid) port_verb — flagged, never guessed
-
-Accepts a bare JSON list of entries or an object with a 'gifts'/'tools'/'entries'
-list. Raises ValueError if no entry list can be found — never guesses the shape.
-"""
-with open(path) as f:
-data = json.load(f)
-if isinstance(data, list):
-entries = data
-elif isinstance(data, dict):
-entries = None
-for k in ("gifts", "tools", "entries"):
-if isinstance(data.get(k), list):
-entries = data[k]
-break
-if entries is None:
-raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
-else:
-raise ValueError(f"{path}: not a JSON list or object")
-
-declared, undeclared = [], []
-for e in entries:
-slug = e.get("slug")
-pv = e.get("port_verb")
-if pv in VALID_VERBS:
-declared.append((slug, pv))
-else:
-undeclared.append(slug)
-return declared, undeclared
-
-def compose_map(declared):
-"""The fold: (slug, verb) list -> composition-map dict.
-
-Preserves the ancestor's compute core exactly (the byte-checked math):
-ordered-pair count over emitters x acceptors, closed-form
-|E|*|A| - |E∩A|, plus fan-out / fan-in per tool.
-"""
-gifts = sorted(declared)
-n = len(gifts)
-pairs = []
-by_first, by_second = {}, {}
-for i, (sa, va) in enumerate(gifts):
-for j, (sb, vb) in enumerate(gifts):
-if i == j:
-continue
-if EMITS(va) and ACCEPTS(vb):
-pairs.append((sa, sb))
-by_first[sa] = by_first.get(sa, 0) + 1
-by_second[sb] = by_second.get(sb, 0) + 1
-
-total_ordered = n * (n - 1)
-emitters = [g for g in gifts if EMITS(g[1])]
-acceptors = [g for g in gifts if ACCEPTS(g[1])]
-both = [g for g in gifts if EMITS(g[1]) and ACCEPTS(g[1])]
-closed_form = len(emitters) * len(acceptors) - len(both)
-
-from collections import Counter
-census = dict(Counter(v for _, v in gifts))
-
-return {
-"gifts": gifts,
-"n": n,
-"pairs": pairs,
-"total_ordered": total_ordered,
-"density": (len(pairs) / total_ordered) if total_ordered else 0.0,
-"census": census,
-"emitters": len(emitters),
-"acceptors": len(acceptors),
-"both_ports": len(both),
-"closed_form": closed_form,
-"closed_form_matches": closed_form == len(pairs),
-"fan_out": by_first,
-"fan_in": by_second,
-}
-
-def summary_record(cm, undeclared):
-"""The single aggregate record — map's fold output."""
-return {
-"kind": "summary",
-"n": cm["n"],
-"composable_pairs": len(cm["pairs"]),
-"total_ordered": cm["total_ordered"],
-"density": round(cm["density"], 4),
-"census": cm["census"],
-"emitters": cm["emitters"],
-"acceptors": cm["acceptors"],
-"closed_form_check": cm["closed_form_matches"],
-"undeclared": undeclared,
-"undeclared_count": len(undeclared),
-"semantic_layer": "UNPROVEN — map shows the TYPE gate (can the pipe carry "
-"data); it does not assert the RECORDS fit. That is a finer "
-"question the uniform JSONL type cannot settle.",
-}
-
-def emit_read(cm, undeclared, out):
-for sa, sb in cm["pairs"]:
-out.write(json.dumps({"kind": "pair", "from": sa, "to": sb}) + "\n")
-out.write(json.dumps(summary_record(cm, undeclared)) + "\n")
-
-def emit_text(cm, undeclared, out):
-out.write(f"Composition map — {cm['n']} tool(s) with a declared port-verb\n")
-out.write("=" * 56 + "\n")
-out.write(f"composable ordered pairs (A can feed B): {len(cm['pairs'])} / {cm['total_ordered']}\n")
-out.write(f"composition density: {cm['density']:.1%}\n")
-out.write(f"closed-form check |E|*|A|-|E∩A| = {cm['closed_form']} (matches: {cm['closed_form_matches']})\n")
-out.write(f"verb census: {cm['census']}\n")
-out.write(f"emitters (not sink): {cm['emitters']} acceptors (not source): {cm['acceptors']}\n\n")
-fo = sorted(cm["fan_out"].items(), key=lambda kv: -kv[1])[:8]
-out.write("top fan-out (feeds the most tools):\n")
-for s, c in fo:
-out.write(f" {s:32s} feeds {c}\n")
-fi = sorted(cm["fan_in"].items(), key=lambda kv: -kv[1])[:8]
-out.write("\ntop fan-in (fed by the most tools):\n")
-for s, c in fi:
-out.write(f" {s:32s} fed-by {c}\n")
-if undeclared:
-out.write(f"\nUNDECLARED ({len(undeclared)}) — excluded from the map, not guessed:\n")
-out.write(" " + ", ".join(str(s) for s in undeclared) + "\n")
-out.write("\nNOTE: this is the TYPE-level map. Semantic record-shape fit is UNPROVEN —\n")
-out.write("a composable pair means the ports agree, not that the records fit.\n")
-
-def main(argv=None):
-ap = argparse.ArgumentParser(description="Fold a set of port-declared tools into a composition map.")
-ap.add_argument("--port", action="store_true", help="print map's own port-verb (fold) and exit")
-sub = ap.add_subparsers(dest="cmd")
-for name in ("read", "summary", "text"):
-p = sub.add_parser(name)
-p.add_argument("--manifest", required=True)
-ap.add_argument("--selftest", action="store_true")
-args = ap.parse_args(argv)
-
-if args.port:
-print(json.dumps({"slug": "map", "port_verb": "fold"}))
-return 0
-if args.selftest:
-return _selftest()
-if not args.cmd:
-ap.print_help()
-return 2
-
-declared, undeclared = load_declared(args.manifest)
-cm = compose_map(declared)
-
-if args.cmd == "read":
-emit_read(cm, undeclared, sys.stdout)
-elif args.cmd == "summary":
-sys.stdout.write(json.dumps(summary_record(cm, undeclared)) + "\n")
-elif args.cmd == "text":
-emit_text(cm, undeclared, sys.stdout)
-return 0
-
-def _selftest():
-"""Mutation-honest selftest over a tiny known set with a hand-computed answer."""
-# 4 tools: 1 source, 1 transform, 1 filter, 1 sink.
-# emitters = {source, transform, filter} (3) (not sink)
-# acceptors = {transform, filter, sink} (3) (not source)
-# both = {transform, filter} (2)
-# composable pairs = |E|*|A| - |E∩A| = 3*3 - 2 = 7
-decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
-cm = compose_map(decl)
-assert cm["n"] == 4, cm["n"]
-assert len(cm["pairs"]) == 7, f"expected 7 pairs, got {len(cm['pairs'])}"
-assert cm["closed_form"] == 7 and cm["closed_form_matches"], "closed form wrong"
-assert cm["emitters"] == 3 and cm["acceptors"] == 3, "emit/accept wrong"
-# source feeds all 3 acceptors, is fed by nobody
-assert cm["fan_out"].get("s") == 3, cm["fan_out"]
-assert "s" not in cm["fan_in"], "source should have 0 fan-in"
-# sink fed by all 3 emitters, feeds nobody
-assert cm["fan_in"].get("k") == 3, cm["fan_in"]
-assert "k" not in cm["fan_out"], "sink should have 0 fan-out"
-# MUTATION BITE 1: if EMITS wrongly included sink, pairs would jump.
-# With EMITS==(always True): emitters=4, pairs = 4*3 - 2 = 10!= 7
-def _bad_emits(v):
-return True
-saved = globals()["EMITS"]
-try:
-globals()["EMITS"] = _bad_emits
-bad = compose_map(decl)
-assert len(bad["pairs"])!= 7, "mutation not detected — EMITS bite failed"
-finally:
-globals()["EMITS"] = saved
-# re-run clean to confirm restoration
-assert len(compose_map(decl)["pairs"]) == 7, "restore failed"
-# undeclared handling: an invalid verb is excluded + flagged, not guessed
-decl2 = decl + [("bad", "nonsense")]
-d2, u2 = [x for x in decl2 if x[1] in VALID_VERBS], [x[0] for x in decl2 if x[1] not in VALID_VERBS]
-assert u2 == ["bad"] and len(d2) == 4, "undeclared not isolated"
-print("selftest: 6/6 OK (n, pairs=7, closed-form, fan-out/in endpoints, EMITS mutation bite, undeclared-excluded)")
-return 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_map.py 170 lines on GitHub →
-#!/usr/bin/env python3
-"""Mutation-bitten tests for map.py.
-
-Each test asserts a specific behavior; the suite is proven to go RED under a
-planted mutation (see test_mutation_is_detected) so a no-op test can't pass green.
-Run: python3 test_map.py
-"""
-import io
-import json
-import os
-import sys
-import tempfile
-import unittest
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import map as M # noqa: E402
-
-def _manifest(entries):
-fd, path = tempfile.mkstemp(suffix=".json")
-with os.fdopen(fd, "w") as f:
-json.dump({"gifts": entries}, f)
-return path
-
-class TestPortGate(unittest.TestCase):
-def test_emits_gate(self):
-# everything but sink emits
-self.assertTrue(M.EMITS("source"))
-self.assertTrue(M.EMITS("transform"))
-self.assertTrue(M.EMITS("filter"))
-self.assertTrue(M.EMITS("fold"))
-self.assertFalse(M.EMITS("sink"))
-
-def test_accepts_gate(self):
-# everything but source accepts
-self.assertFalse(M.ACCEPTS("source"))
-self.assertTrue(M.ACCEPTS("transform"))
-self.assertTrue(M.ACCEPTS("filter"))
-self.assertTrue(M.ACCEPTS("fold"))
-self.assertTrue(M.ACCEPTS("sink"))
-
-class TestComposeMap(unittest.TestCase):
-def setUp(self):
-# 1 of each of 4 verbs; hand-computed answer = 7 composable ordered pairs
-self.decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
-
-def test_pair_count_hand_computed(self):
-cm = M.compose_map(self.decl)
-self.assertEqual(len(cm["pairs"]), 7)
-
-def test_closed_form_matches_enumeration(self):
-cm = M.compose_map(self.decl)
-self.assertEqual(cm["closed_form"], len(cm["pairs"]))
-self.assertTrue(cm["closed_form_matches"])
-
-def test_source_feeds_all_acceptors_no_fan_in(self):
-cm = M.compose_map(self.decl)
-self.assertEqual(cm["fan_out"]["s"], 3) # feeds t, f, k
-self.assertNotIn("s", cm["fan_in"]) # source is fed by nobody
-
-def test_sink_fed_by_all_emitters_no_fan_out(self):
-cm = M.compose_map(self.decl)
-self.assertEqual(cm["fan_in"]["k"], 3) # fed by s, t, f
-self.assertNotIn("k", cm["fan_out"]) # sink feeds nobody
-
-def test_no_self_pairs(self):
-cm = M.compose_map(self.decl)
-for a, b in cm["pairs"]:
-self.assertNotEqual(a, b)
-
-def test_density(self):
-cm = M.compose_map(self.decl)
-# 7 composable / 12 ordered = 0.5833...
-self.assertAlmostEqual(cm["density"], 7 / 12, places=4)
-
-class TestDeclarationHonesty(unittest.TestCase):
-def test_undeclared_excluded_not_guessed(self):
-path = _manifest([
-{"slug": "a", "port_verb": "source"},
-{"slug": "b"}, # no port_verb
-{"slug": "c", "port_verb": "bogus"}, # invalid
-])
-declared, undeclared = M.load_declared(path)
-os.unlink(path)
-self.assertEqual([d[0] for d in declared], ["a"])
-self.assertEqual(set(undeclared), {"b", "c"})
-
-def test_summary_reports_undeclared_count(self):
-path = _manifest([
-{"slug": "a", "port_verb": "source"},
-{"slug": "b"},
-])
-declared, undeclared = M.load_declared(path)
-os.unlink(path)
-cm = M.compose_map(declared)
-rec = M.summary_record(cm, undeclared)
-self.assertEqual(rec["undeclared_count"], 1)
-self.assertIn("b", rec["undeclared"])
-
-def test_summary_carries_semantic_unproven_flag(self):
-cm = M.compose_map([("a", "source"), ("b", "sink")])
-rec = M.summary_record(cm, [])
-self.assertIn("UNPROVEN", rec["semantic_layer"])
-
-class TestReadEmitsJSONL(unittest.TestCase):
-def test_read_emits_pairs_then_summary(self):
-cm = M.compose_map([("s", "source"), ("k", "sink")])
-buf = io.StringIO()
-M.emit_read(cm, [], buf)
-lines = [json.loads(x) for x in buf.getvalue().strip().split("\n")]
-self.assertEqual(lines[0]["kind"], "pair")
-self.assertEqual(lines[0]["from"], "s")
-self.assertEqual(lines[0]["to"], "k")
-self.assertEqual(lines[-1]["kind"], "summary")
-
-def test_own_port_is_fold(self):
-out = io.StringIO()
-saved = sys.stdout
-try:
-sys.stdout = out
-M.main(["--port"])
-finally:
-sys.stdout = saved
-self.assertEqual(json.loads(out.getvalue())["port_verb"], "fold")
-
-class TestManifestShapes(unittest.TestCase):
-def test_bare_list_manifest(self):
-fd, path = tempfile.mkstemp(suffix=".json")
-with os.fdopen(fd, "w") as f:
-json.dump([{"slug": "a", "port_verb": "source"}], f)
-declared, _ = M.load_declared(path)
-os.unlink(path)
-self.assertEqual(declared, [("a", "source")])
-
-def test_no_entry_list_raises(self):
-fd, path = tempfile.mkstemp(suffix=".json")
-with os.fdopen(fd, "w") as f:
-json.dump({"nope": 1}, f)
-with self.assertRaises(ValueError):
-M.load_declared(path)
-os.unlink(path)
-
-class TestMutationIsDetected(unittest.TestCase):
-"""Prove the suite is not a no-op: a planted mutation must break a test."""
-def test_mutation_is_detected(self):
-decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
-# Mutate EMITS to always-True (sink wrongly counted as an emitter).
-saved = M.EMITS
-try:
-M.EMITS = lambda v: True
-cm = M.compose_map(decl)
-# Under always-True EMITS: emitters=4, acceptors=3, both={t,f,k}=3,
-# so pairs = |E|*|A| - |E∩A| = 4*3 - 3 = 9, NOT the correct 7.
-self.assertNotEqual(len(cm["pairs"]), 7,
-"mutation did not change the result — suite is a no-op")
-self.assertEqual(len(cm["pairs"]), 9)
-finally:
-M.EMITS = saved
-# Confirm restoration: the real function gives 7 again.
-self.assertEqual(len(M.compose_map(decl)["pairs"]), 7)
-
-if __name__ == "__main__":
-unittest.main(verbosity=2)
-
-Take the whole folder →
-MIT
-Python 3, standard library only
 
 ---

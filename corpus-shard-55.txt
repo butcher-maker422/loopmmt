@@ -2,7 +2,7 @@
 
 > Bundle 55 of 66 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/excavation/, /gifts/exif-parser/, /gifts/forest-title-fit/)
+Nodes in this shard: 3 (/gifts/excavation/, /gifts/exif-parser/, /gifts/fanout/)
 
 ---
 
@@ -1296,299 +1296,400 @@ Node / browser, no dependencies
 
 ---
 
-# forest-title-fit — a Loop MMT gift
-https://loopmmt.com/gifts/forest-title-fit/
+# Branch Splitter — a Loop MMT gift
+https://loopmmt.com/gifts/fanout/
 [coverage: optional · branch: gifts]
 
-Never-Clip Title Sizing fit ← all gifts
+How Do You Split One Input Into Declared Branches? split ← all gifts
 
-forest-title-fit
+Branch Splitter
 
-Pick the largest font size at which a title still fits a fixed width — and never clip, never ellipsize: if it can't fit even at the floor, it wraps on spaces instead. A general shrink-to-fit UI primitive with the font-measuring step injected as a seam, so the fitting logic is pure and testable without a browser.
+Split one payload into a fixed, declared, closed set of named branches — one labeled JSONL record per declared branch, in declared order. It is the open half of a parallel-independent compose (the ⊗ product): fanout splits, its pair junction merges, so fanout | junction round-trips. Zero dependencies, pure function — same payload plus the same branch list yield byte-identical output every run. It fails closed (non-zero exit, offending branch named) on an empty, whitespace, duplicate, or charset-invalid branch, and has no default branch: it emits only to branches you declared, never to one it inferred. Runs in Node or the browser (window.ForestGifts.fanout).
 
 The honest edge
 
-It sizes to the measure() you inject — only as accurate as your measurer (a webfont still loading measures as its fallback). It searches integer sizes and breaks on whitespace, not hyphens; a single word wider than the box overflows visibly, by design. It computes sizes and lines; the caller renders.
+fanout splits one input into declared branches; it does not run them, order them by any policy but declared order, or judge whether a branch name is meaningful — it only refuses an undeclared, empty, duplicate, or ill-formed branch.
 
 Run it
 
-node forest-title-fit.js --demo
-test_forest-title-fit.js (23/23)
-JavaScript, zero dependencies (Node + browser)
+node fanout.js --branches a,b,c "the prompt"
+test_fanout.js (17/17, golden corpus + determinism + non-vacuity); braid test_braid.js 65/65 proves fanout | junction round-trips
+Node / browser, no dependencies
 
 The code — every file that ships
 
-forest-title-fit.js 172 lines on GitHub →
+fanout.js 237 lines on GitHub →
 #!/usr/bin/env node
-// SPDX-License-Identifier: MIT
+/* fanout.js — split one input into a fixed, DECLARED set of named branches.
+
+WHY THIS EXISTS. When one base prompt (or any payload) must go to several
+named destinations — models, variants, personas, test conditions — the set
+of destinations should be EXPLICIT and CLOSED, decided up front, not
+discovered at runtime. The usual ad-hoc answer builds the branch list on the
+fly from whatever keys happen to be present, and the day a typo or an
+unhandled case introduces a branch nobody declared, the payload fans to a
+destination no one signed off on — silently. fanout refuses that. You declare
+the branches; it emits exactly one labeled record per declared branch, in
+declared order, and it FAILS CLOSED the instant it is asked to emit to a
+branch that was not declared, is empty, is duplicated, or is ill-formed.
+
+It is the OPEN half of a parallel-independent compose (the ⊗ product): fanout
+splits, its pair `junction` merges. Together they give a pipeline the
+parallel product to sit beside sequential (`|`) composition.
+
+THE ONE DISCIPLINE (the whole reason to trust it). It emits ONLY to branches
+you declared (the ⊢ rule: claim only what you can prove). There is no default
+branch and no inferred branch. An undeclared, empty, duplicate, or
+charset-invalid branch is not a warning to absorb — it is a non-zero exit with
+the offending branch named. That refusal is the feature.
+
+Pure function of its inputs. No dependencies. Same input + same branch list
+-> byte-identical JSONL, every run, every seed. Order is DECLARED order,
+never hash/set order. Runs in a browser (attach fanout to your namespace) or
+on Node (this CLI / require()).
+
+USAGE
+node fanout.js --branches a,b,c "the prompt" # payload as argument
+echo -n "the prompt" | node fanout.js --branches a,b,c # payload from stdin (exact bytes)
+node fanout.js --branches-file branches.txt "the prompt" # one branch per line
+node fanout.js --help
+
+OUTPUT (JSONL, one record per declared branch, in declared order):
+{"branch":"a","input":"the prompt","seq":0,"of":3}
+{"branch":"b","input":"the prompt","seq":1,"of":3}
+{"branch":"c","input":"the prompt","seq":2,"of":3}
+
+Released under MIT. Its edge is printed in the README: fanout splits one
+input into declared branches; it does not RUN them, order them by any policy
+but declared order, or judge whether a branch NAME is meaningful — it only
+refuses an undeclared, empty, duplicate, or ill-formed branch.
+*/
+
 "use strict";
-/* forest-title-fit.js — shrink-to-fit-never-clip title sizing.
 
-The sign-painter's problem: a title must fit a fixed width, at the largest size
-that still fits, and it must NEVER clip and NEVER get an ellipsis — if it can't
-fit on one line even at the floor size, it wraps or the caller is told, but a
-character is never silently cut. This is a general UI primitive: a card title, a
-nav label, a chart caption, a poster headline.
+// The one charset rule: a branch name is a non-empty token of [A-Za-z0-9._-].
+// (The callsign-safe alphabet — reuse the charset rule, do not re-invent it.)
+var BRANCH_RE = /^[A-Za-z0-9._-]+$/;
 
-THE SEAM. Measuring rendered text needs a font engine, which lives in the DOM
-(`canvas.getContext('2d').measureText`). To keep this primitive PURE and testable
-without a browser, the measuring function is INJECTED, not imported: every entry
-point takes a `measure(text, fontSize) -> width` callback. In a browser you pass
-a one-line canvas-backed measurer (see makeCanvasMeasure below, guarded so it is
-defined only when a DOM exists); in a test you pass a deterministic stub. The
-fitting LOGIC — the binary search for the largest fitting size, the floor, the
-never-clip guarantee — is the same pure function in both worlds.
-
-No DOM access in the core, no filesystem, no network. Node (module.exports) or
-browser (window.LoopGifts.titleFit). */
-
-/* fitFontSize(text, width, opts) -> {fontSize, fits, width: measuredWidth, floored}
-Find the largest integer font size in [min, max] whose single-line measured width
-is <= the available width.
-text: the string to fit
-width: available width in the same unit measure() returns
-opts.measure: REQUIRED (text, fontSize) -> width. The seam.
-opts.min: floor font size (default 8). Never returns below this.
-opts.max: ceiling font size (default 96).
-Return:
-fontSize: the chosen size (>= min always — never clips by shrinking past floor)
-fits: true iff the text fits at the returned size (false => it overflows
-even at the floor; the caller decides to wrap — see wrapToWidth)
-width: measured width at the returned size
-floored: true iff the search bottomed out at min without fitting */
-function fitFontSize(text, width, opts) {
-opts = opts || {};
-var measure = opts.measure;
-if (typeof measure!== "function")
-throw new Error("fitFontSize: opts.measure(text, fontSize) is required (the seam)");
-var min = (opts.min === undefined)? 8: opts.min;
-var max = (opts.max === undefined)? 96: opts.max;
-if (min > max) throw new Error("fitFontSize: min > max");
-if (typeof width!== "number" || width <= 0) throw new Error("fitFontSize: width must be > 0");
-
-// Largest size whose width <= available. Binary search over integer sizes.
-var lo = min, hi = max, best = null;
-while (lo <= hi) {
-var mid = Math.floor((lo + hi) / 2);
-var w = measure(text, mid);
-if (w <= width) { best = mid; lo = mid + 1;} // fits — try bigger
-else { hi = mid - 1;} // too wide — go smaller
-}
-if (best!== null) {
-return { fontSize: best, fits: true, width: measure(text, best), floored: false};
-}
-// Nothing fit, not even min. Never clip: return the floor and report!fits.
-return { fontSize: min, fits: false, width: measure(text, min), floored: true};
+// A structured refusal. The CLI turns this into a non-zero exit with the
+// message; require() callers get a thrown Error they can catch.
+function FanoutError(message) {
+var e = new Error(message);
+e.name = "FanoutError";
+return e;
 }
 
-/* wrapToWidth(text, width, fontSize, measure) -> [line, line,...]
-Greedy word-wrap so no line's measured width exceeds `width` at `fontSize`.
-The never-clip fallback when fitFontSize reports!fits: instead of cutting or
-ellipsizing, break on spaces. A single word wider than `width` is placed on its
-own line intact (still never clipped — overflow is visible, not hidden). */
-function wrapToWidth(text, width, fontSize, measure) {
-if (typeof measure!== "function")
-throw new Error("wrapToWidth: measure(text, fontSize) is required");
-if (typeof width!== "number" || width <= 0) throw new Error("wrapToWidth: width must be > 0");
-var words = String(text).split(/\s+/).filter(function (w) { return w.length > 0;});
-var lines = [], cur = "";
-for (var i = 0; i < words.length; i++) {
-var candidate = cur? (cur + " " + words[i]): words[i];
-if (measure(candidate, fontSize) <= width || cur === "") {
-// fits, OR the line is empty (a too-long single word goes on its own line intact)
-if (measure(candidate, fontSize) <= width) { cur = candidate;}
-else { lines.push(words[i]); cur = "";} // lone oversized word: own line
-} else {
-lines.push(cur); cur = words[i];
+/* parseBranches(spec) -> array of validated branch names, in declared order.
+`spec` is an array of raw tokens (already split from a CSV or a file). Fails
+closed on: empty list, an empty/whitespace token, a duplicate, a
+charset-invalid token. The offending branch is always named. */
+function parseBranches(spec) {
+if (!Array.isArray(spec)) {
+throw FanoutError("branches: expected a list of branch names");
 }
+var branches = [];
+var seen = Object.create(null);
+for (var i = 0; i < spec.length; i++) {
+var raw = spec[i];
+var name = (typeof raw === "string")? raw.trim(): String(raw).trim();
+if (name.length === 0) {
+throw FanoutError("branches: empty branch name at position " + i +
+" (an undeclared/blank destination is exactly what fanout refuses)");
 }
-if (cur) lines.push(cur);
-return lines.length? lines: [""];
+if (!BRANCH_RE.test(name)) {
+throw FanoutError("branches: ill-formed branch name " + JSON.stringify(name) +
+" (allowed: letters, digits, dot, underscore, hyphen)");
 }
-
-/* fitTitle(text, width, opts) -> {fontSize, lines, fits, floored}
-The convenience entry: try to fit on ONE line at the largest size; if it can't
-fit even at the floor, keep the floor size and WRAP (never clip, never ellipsize).
-Returns the chosen size and the line array to render. */
-function fitTitle(text, width, opts) {
-var f = fitFontSize(text, width, opts);
-if (f.fits) return { fontSize: f.fontSize, lines: [String(text)], fits: true, floored: false};
-var measure = (opts || {}).measure;
-return {
-fontSize: f.fontSize,
-lines: wrapToWidth(text, width, f.fontSize, measure),
-fits: false,
-floored: f.floored
-};
+if (seen[name]) {
+throw FanoutError("branches: duplicate branch name " + JSON.stringify(name) +
+" (an ambiguous fan is refused; each declared branch must be unique)");
+}
+seen[name] = true;
+branches.push(name);
+}
+if (branches.length === 0) {
+throw FanoutError("branches: no branches declared " +
+"(fanout has no default branch — declare at least one)");
+}
+return branches;
 }
 
-/* makeCanvasMeasure(fontFamily) -> measure(text, fontSize) using a real canvas.
-Defined only in a browser (guarded); this is the DOM half kept OUT of the pure
-core. In Node it is a no-op that throws if called, so the seam stays explicit. */
-function makeCanvasMeasure(fontFamily) {
-fontFamily = fontFamily || "sans-serif";
-if (typeof document === "undefined")
-return function () { throw new Error("makeCanvasMeasure: no DOM (pass your own measure in Node)");};
-var ctx = document.createElement("canvas").getContext("2d");
-return function (text, fontSize) {
-ctx.font = fontSize + "px " + fontFamily;
-return ctx.measureText(String(text)).width;
-};
+/* fanout(input, branches) -> array of records, one per declared branch, in
+declared order. Pure: no I/O, no clock, no randomness. `input` is coerced via
+String() exactly like the shipped sha256 gift, so a caller passing a number
+or boolean gets deterministic behavior rather than a surprise. */
+function fanout(input, branches) {
+var validated = parseBranches(branches);
+var payload = (typeof input === "string")? input: String(input);
+var of = validated.length;
+var records = [];
+for (var i = 0; i < of; i++) {
+records.push({ branch: validated[i], input: payload, seq: i, of: of});
+}
+return records;
 }
 
-// ---- dual-runtime export ---------------------------------------------------
+/* fanoutJSONL(input, branches) -> the canonical serialized form: one JSON
+object per line, keys in fixed order (branch,input,seq,of), in declared
+branch order, terminated by a single trailing newline. This string IS the
+gift's canonical output — same input + same branches yields byte-identical
+text every run. */
+function fanoutJSONL(input, branches) {
+var records = fanout(input, branches);
+var lines = [];
+for (var i = 0; i < records.length; i++) {
+var r = records[i];
+// Fixed key order, JSON.stringify per-field to get correct escaping.
+lines.push(
+"{" +
+"\"branch\":" + JSON.stringify(r.branch) + "," +
+"\"input\":" + JSON.stringify(r.input) + "," +
+"\"seq\":" + r.seq + "," +
+"\"of\":" + r.of +
+"}"
+);
+}
+return lines.join("\n") + "\n";
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
 if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.titleFit = {
-fitFontSize: fitFontSize, wrapToWidth: wrapToWidth,
-fitTitle: fitTitle, makeCanvasMeasure: makeCanvasMeasure
-};
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.fanout = fanout;
+window.ForestGifts.fanoutJSONL = fanoutJSONL;
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = {
-fitFontSize: fitFontSize, wrapToWidth: wrapToWidth,
-fitTitle: fitTitle, makeCanvasMeasure: makeCanvasMeasure
-};
+module.exports = { fanout: fanout, fanoutJSONL: fanoutJSONL, parseBranches: parseBranches};
 }
 
-// ---- CLI (value-arg + --demo; reads NO files) ------------------------------
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function readBranchesArg(args) {
+var iCsv = args.indexOf("--branches");
+var iFile = args.indexOf("--branches-file");
+if (iCsv!== -1 && iFile!== -1) {
+throw FanoutError("choose one of --branches or --branches-file, not both");
+}
+if (iCsv!== -1) {
+var csv = args[iCsv + 1];
+if (csv === undefined) throw FanoutError("--branches needs a comma-separated value");
+return csv.split(",");
+}
+if (iFile!== -1) {
+var path = args[iFile + 1];
+if (path === undefined) throw FanoutError("--branches-file needs a path");
+var fs = require("fs");
+var text = fs.readFileSync(path, "utf8");
+// One branch per line; blank lines are dropped before validation so a
+// trailing newline in the file is not itself an "empty branch".
+return text.split("\n").map(function (s) { return s.replace(/\r$/, "");})
+.filter(function (s) { return s.trim().length > 0;});
+}
+throw FanoutError("no branches declared: pass --branches a,b,c or --branches-file <path>");
+}
+
+function positionalPayload(args) {
+// The payload is the first argument that is not a flag and not a flag's value.
+var flagsWithValue = { "--branches": true, "--branches-file": true};
+for (var i = 0; i < args.length; i++) {
+var a = args[i];
+if (a.charAt(0) === "-") { // a flag; skip it and its value if it takes one
+if (flagsWithValue[a]) i++;
+continue;
+}
+return a;
+}
+return null; // no positional -> read stdin
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"fanout.js — split one input into a fixed, DECLARED set of named branches.\n\n" +
+" node fanout.js --branches a,b,c \"the prompt\" payload as argument\n" +
+" echo -n \"the prompt\" | node fanout.js --branches a,b,c payload from stdin (exact bytes)\n" +
+" node fanout.js --branches-file branches.txt \"the prompt\" one branch per line\n" +
+" node fanout.js --help\n\n" +
+"Emits one JSONL record per DECLARED branch, in declared order. Fails closed\n" +
+"(non-zero exit, branch named) on an undeclared, empty, duplicate, or ill-formed\n" +
+"branch. There is no default branch.\n\n" +
+"Edge: fanout SPLITS; it does not run the branches, order them by any policy but\n" +
+"declared order, or judge whether a branch name is meaningful.\n"
+);
+return 0;
+}
+
+var branchSpec;
+try {
+branchSpec = readBranchesArg(args);
+} catch (e) {
+process.stderr.write("fanout: " + e.message + "\n");
+return 2;
+}
+
+var payload = positionalPayload(args);
+
+function emit(input) {
+try {
+process.stdout.write(fanoutJSONL(input, branchSpec));
+return 0;
+} catch (e) {
+process.stderr.write("fanout: " + e.message + "\n");
+return 2;
+}
+}
+
+if (payload!== null) {
+return emit(payload);
+}
+
+// stdin: use the exact bytes received (no trailing-newline munging).
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var buf = Buffer.concat(chunks);
+process.exitCode = emit(buf.toString("utf8"));
+});
+return 0;
+}
+
 if (typeof require!== "undefined" && require.main === module) {
-var args = process.argv.slice(2);
-// A deterministic demo measurer: width = chars * fontSize * 0.6 (a monospace-ish model).
-function demoMeasure(text, fontSize) { return String(text).length * fontSize * 0.6;}
-
-function printDemo() {
-var width = 300;
-var cases = ["OK", "A Longer Title Here", "SupercalifragilisticexpialidociousUnbreakableWord"];
-process.stdout.write("# forest-title-fit demo (available width = " + width + ", monospace-ish model)\n");
-for (var i = 0; i < cases.length; i++) {
-var r = fitTitle(cases[i], width, { measure: demoMeasure, min: 8, max: 72});
-process.stdout.write(
-JSON.stringify(cases[i]) + " -> size " + r.fontSize +
-", " + r.lines.length + " line(s), fits=" + r.fits +
-(r.floored? " (floored)": "") + "\n");
-for (var k = 0; k < r.lines.length; k++)
-process.stdout.write(" | " + r.lines[k] + "\n");
-}
-process.exit(0);
+process.exitCode = main(process.argv);
 }
 
-if (args[0] === "--help" || args[0] === "-h") {
-process.stdout.write(
-"forest-title-fit — shrink-to-fit-never-clip title sizing\n\n" +
-" node forest-title-fit.js --demo fit a few sample titles to a fixed width\n" +
-" node forest-title-fit.js '<title>' [width] fit one title (uses a monospace-ish model)\n\n" +
-"Library: fitFontSize / fitTitle / wrapToWidth, each taking an injected\n" +
-"measure(text, fontSize) seam. makeCanvasMeasure() supplies the browser one.\n" +
-"Pure — no DOM in the core, no files, no network. Exit 0.\n");
-process.exit(0);
-}
-if (args[0] === "--demo" || args.length === 0) { printDemo();}
-else {
-var w = args[1]? parseInt(args[1], 10): 300;
-var res = fitTitle(args[0], w, { measure: demoMeasure, min: 8, max: 72});
-process.stdout.write(JSON.stringify(res, null, 2) + "\n");
-process.exit(0);
-}
-}
-
-test_forest-title-fit.js 93 lines on GitHub →
+test_fanout.js 129 lines on GitHub →
 #!/usr/bin/env node
-// SPDX-License-Identifier: MIT
-/* test_forest-title-fit.js — proves the title-fit primitive implements its contract.
+/* test_fanout.js — the golden corpus + determinism self-test + non-vacuity bite
+for the fanout gift. Zero dependencies (Node assert only). This file IS the
+canonicalizer self-test the Plumb cites (Gift-Works Procedure v1 §2): a gift
+whose output is byte-identical across repeated evaluation has proven its
+canonical form is idempotent and order-faithful.
 
-THE ORACLE. There is no stdlib that says "is this the largest font that fits?" —
-so the oracle is CURATED VECTORS against a DETERMINISTIC injected measurer
-(width = chars * fontSize * k), which makes the expected size exactly computable:
-the largest integer size s with len*s*k <= width is floor(width/(len*k)). We
-assert: (1) fitFontSize returns exactly that size and reports fits=true; (2) it
-picks the LARGEST fitting size (size+1 would overflow); (3) when nothing fits even
-at the floor it returns the floor with fits=false and floored=true — it NEVER
-returns below min (never clips by shrinking past the floor); (4) wrapToWidth never
-emits a line wider than width, breaks on spaces, and keeps a too-long single word
-intact on its own line (never clips); (5) fitTitle wraps at the floor instead of
-ellipsizing. Plus determinism and a mutation-bite (a constant-size core fails).
-Exit 0 = all pass; exit 1 = failure. stdlib only. */
+Run: node test_fanout.js # exit 0 GREEN / non-zero RED
+*/
 "use strict";
-var m = require("./forest-title-fit.js");
+var assert = require("assert");
+var F = require("./fanout.js");
 
 var pass = 0, fail = 0;
-function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
-function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
-function threw(label, fn) { var d = false; try { fn();} catch (e) { d = true;} ok(label + " (throws)", d);}
+function check(name, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL: " + name + " — " + e.message);}
+}
 
-// deterministic measurer: width = chars * fontSize * k
-var K = 0.6;
-function measure(text, fontSize) { return String(text).length * fontSize * K;}
-function largestFit(len, width) { return Math.floor(width / (len * K));}
+// ---- GOLDEN CORPUS: the known-good half -----------------------------------
+// Each vector is (payload, branches, expected JSONL). Expected is written out
+// literally so the corpus is a fixed oracle, not a re-derivation of the code.
+var GOLDEN = [
+{
+name: "single branch",
+input: "p", branches: ["a"],
+expect: '{"branch":"a","input":"p","seq":0,"of":1}\n'
+},
+{
+name: "three branches, declared order preserved",
+input: "the prompt", branches: ["a", "b", "c"],
+expect:
+'{"branch":"a","input":"the prompt","seq":0,"of":3}\n' +
+'{"branch":"b","input":"the prompt","seq":1,"of":3}\n' +
+'{"branch":"c","input":"the prompt","seq":2,"of":3}\n'
+},
+{
+name: "declared order is NOT sorted (z before a)",
+input: "x", branches: ["z", "a"],
+expect:
+'{"branch":"z","input":"x","seq":0,"of":2}\n' +
+'{"branch":"a","input":"x","seq":1,"of":2}\n'
+},
+{
+name: "multibyte payload fidelity (accents, emoji, non-latin)",
+input: "café🦌日本語", branches: ["m"],
+expect: '{"branch":"m","input":"café🦌日本語","seq":0,"of":1}\n'
+},
+{
+name: "payload with quotes/newlines/tabs is JSON-escaped",
+input: 'line1\nline2\t"q"', branches: ["e"],
+expect: '{"branch":"e","input":"line1\\nline2\\t\\"q\\"","seq":0,"of":1}\n'
+},
+{
+name: "charset-legal names: dot, underscore, hyphen, digits",
+input: "p", branches: ["a.1", "b_2", "c-3"],
+expect:
+'{"branch":"a.1","input":"p","seq":0,"of":3}\n' +
+'{"branch":"b_2","input":"p","seq":1,"of":3}\n' +
+'{"branch":"c-3","input":"p","seq":2,"of":3}\n'
+},
+{
+name: "String() coercion parity: number payload",
+input: 42, branches: ["n"],
+expect: '{"branch":"n","input":"42","seq":0,"of":1}\n'
+}
+];
 
-// ---- 1. fitFontSize returns exactly the largest fitting size ---------------
-var r1 = m.fitFontSize("ABCD", 300, { measure: measure, min: 8, max: 96});
-var expect1 = largestFit(4, 300); // floor(300/2.4) = 125 -> capped at max 96
-expect1 = Math.min(expect1, 96);
-eq("largest fitting size (capped at max)", r1.fontSize, expect1);
-ok("reports fits", r1.fits === true);
+GOLDEN.forEach(function (v) {
+check("golden: " + v.name, function () {
+assert.strictEqual(F.fanoutJSONL(v.input, v.branches), v.expect);
+});
+});
 
-// a case where the true optimum is below the cap
-var r2 = m.fitFontSize("ABCDEFGHIJ", 300, { measure: measure, min: 8, max: 96});
-var expect2 = largestFit(10, 300); // floor(300/6) = 50
-eq("largest fitting size (uncapped)", r2.fontSize, expect2);
-// and prove it's the LARGEST: size+1 overflows
-ok("size+1 overflows (it's truly largest)", measure("ABCDEFGHIJ", r2.fontSize + 1) > 300);
-ok("chosen size fits", measure("ABCDEFGHIJ", r2.fontSize) <= 300);
+// ---- FAIL-CLOSED: the known-bad half (real defects, not author-invented) ---
+// Each is a branch declaration fanout MUST refuse. A refusal that does not
+// throw is a silent fan to an undeclared/ambiguous destination — the exact
+// fault this gift exists to prevent.
+var BAD = [
+{ name: "empty branch list", branches: [], match: /no branches declared/},
+{ name: "empty branch token", branches: ["a", ""], match: /empty branch name/},
+{ name: "whitespace-only token", branches: ["a", " "], match: /empty branch name/},
+{ name: "duplicate branch", branches: ["a", "a"], match: /duplicate branch name/},
+{ name: "charset-invalid (space)", branches: ["a", "b c"], match: /ill-formed branch name/},
+{ name: "charset-invalid (slash)", branches: ["a/b"], match: /ill-formed branch name/}
+];
 
-// ---- 2. never clips: floor when nothing fits -------------------------------
-var r3 = m.fitFontSize("aVeryLongUnbreakableTitleString", 30, { measure: measure, min: 8, max: 96});
-ok("floored size == min", r3.fontSize === 8);
-ok("reports!fits when even floor overflows", r3.fits === false);
-ok("reports floored", r3.floored === true);
-ok("NEVER returns below min", r3.fontSize >= 8);
+BAD.forEach(function (v) {
+check("fail-closed: " + v.name, function () {
+assert.throws(function () { F.fanoutJSONL("p", v.branches);}, v.match,
+"expected refusal for " + v.name);
+});
+});
 
-// ---- 3. input guards -------------------------------------------------------
-threw("requires measure seam", function () { m.fitFontSize("x", 100, {});});
-threw("rejects non-positive width", function () { m.fitFontSize("x", 0, { measure: measure});});
-threw("rejects min > max", function () { m.fitFontSize("x", 100, { measure: measure, min: 50, max: 10});});
+// ---- NON-VACUITY MUTATION BITE --------------------------------------------
+// A suite that cannot reject a wrong answer proves nothing. Assert that a
+// deliberately-wrong expectation is CAUGHT (the negation must fail).
+check("mutation bite: wrong output is rejected", function () {
+var wrong = '{"branch":"a","input":"p","seq":9,"of":1}\n'; // seq tampered
+assert.notStrictEqual(F.fanoutJSONL("p", ["a"]), wrong,
+"the corpus must distinguish a wrong (tampered seq) output");
+});
+check("mutation bite: a refused case must actually throw", function () {
+var threw = false;
+try { F.fanoutJSONL("p", ["a", "a"]);} catch (e) { threw = true;}
+assert.strictEqual(threw, true, "duplicate must throw — a non-throwing refuser has no teeth");
+});
 
-// ---- 4. wrapToWidth: never a line wider than width, never clips -------------
-var lines = m.wrapToWidth("one two three four five six", 60, 10, measure); // each word small
-for (var i = 0; i < lines.length; i++)
-ok("wrap line " + i + " within width", measure(lines[i], 10) <= 60 || lines[i].split(/\s+/).length === 1);
-ok("wrap breaks into multiple lines", lines.length > 1);
-ok("wrap preserves all words", lines.join(" ").split(/\s+/).sort().join(",") ===
-"five,four,one,six,three,two");
+// ---- DETERMINISM SELF-TEST (the canonicalizer self-test, Gift-Works §2) ----
+// Evaluate the same input N times; the output must be byte-identical every
+// time. This proves the canonical form is idempotent and order-faithful on the
+// gift's own output — the property the Plumb's canonicalizer self-test names.
+check("determinism: byte-identical across 25 evaluations", function () {
+var first = F.fanoutJSONL("det prompt 🦌", ["one", "two", "three"]);
+for (var i = 0; i < 25; i++) {
+assert.strictEqual(F.fanoutJSONL("det prompt 🦌", ["one", "two", "three"]), first,
+"evaluation " + i + " diverged — output is not deterministic");
+}
+});
+// Order-faithfulness: a permuted branch list yields a permuted output (order is
+// carried, never normalized away).
+check("determinism: order-faithful (permutation changes output)", function () {
+var ab = F.fanoutJSONL("p", ["a", "b"]);
+var ba = F.fanoutJSONL("p", ["b", "a"]);
+assert.notStrictEqual(ab, ba, "declared order must be faithful, not normalized");
+});
 
-// a single oversized word goes on its own line, intact (never clipped)
-var wl = m.wrapToWidth("tiny enormouslylongwordthatcannotfit tiny", 40, 10, measure);
-ok("oversized word kept intact", wl.indexOf("enormouslylongwordthatcannotfit")!== -1);
-
-// ---- 5. fitTitle: wraps at floor instead of ellipsizing --------------------
-var t1 = m.fitTitle("Short", 300, { measure: measure, min: 8, max: 72});
-ok("short title fits on one line", t1.fits === true && t1.lines.length === 1);
-var t2 = m.fitTitle("several words that will not fit on one single line here", 60,
-{ measure: measure, min: 8, max: 72});
-ok("overflowing title wraps, does not ellipsize", t2.lines.length > 1);
-ok("no ellipsis introduced", t2.lines.join(" ").indexOf("\u2026") === -1 &&
-t2.lines.join(" ").indexOf("...") === -1);
-
-// ---- 6. determinism --------------------------------------------------------
-ok("fitFontSize is deterministic",
-m.fitFontSize("ABCDE", 200, { measure: measure}).fontSize ===
-m.fitFontSize("ABCDE", 200, { measure: measure}).fontSize);
-
-// ---- 7. mutation-bite ------------------------------------------------------
-// A degenerate core that returned a constant size regardless of text/width would
-// give the same size for a short title in a wide box and a long title in a narrow
-// box. Prove they DIFFER.
-var wide = m.fitFontSize("Hi", 400, { measure: measure, min: 8, max: 96}).fontSize;
-var narrow = m.fitFontSize("A much longer title", 80, { measure: measure, min: 8, max: 96}).fontSize;
-ok("MUTATION-BITE: size responds to text length and width", wide!== narrow && wide > narrow);
-
-// ---- report ----------------------------------------------------------------
-console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
-process.exit(fail === 0? 0: 1);
+console.log((fail === 0? "GREEN": "RED") + ": " + pass + " passed, " + fail + " failed");
+process.exitCode = fail === 0? 0: 3;
 
 Take the whole folder →
 MIT
-JavaScript, zero dependencies (Node + browser)
+Node / browser, no dependencies
 
 ---
