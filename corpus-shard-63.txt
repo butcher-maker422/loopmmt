@@ -1,1730 +1,1424 @@
-# Loop MMT — corpus shard 63/66
+# Loop MMT — corpus shard 63/73
 
-> Bundle 63 of 66 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 63 of 73 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/timeline/, /gifts/timesheet/, /gifts/tracebus/)
-
----
-
-# timeline — a Loop MMT gift
-https://loopmmt.com/gifts/timeline/
-[coverage: optional · branch: gifts]
-
-Timeline Artifact Validator validate ← all gifts
-
-timeline
-
-Validate a timeline artifact before you render it. Given {frame, events}, timeline runs eight decidable soundness checks on the DECLARATION — no cycle in the happened-before edges, an explicitly declared measurement scale (Stevens level), operations legal for that scale, no two events colliding on one track at one instant, and a deterministic sort key — and returns a verdict naming exactly which rule each event breaks. It catches the fault at the data, before a single pixel is drawn. A pure function: the same artifact always yields a byte-identical verdict.
-
-The honest edge
-
-it is a PRESENCE checker, not a CORRECTNESS oracle: it confirms a scale is declared and self-consistent with the ops used, never that the declared level is the right one, and it does not prove your renderer is a pure fold — that runtime property stays yours to prove.
-
-Run it
-
-node timeline.js artifact.json # or: cat artifact.json | node timeline.js
-test_timeline.js (22 checks incl. C0-C8 + determinism proof + mutation bite, all green)
-Node.js / browser, standard library only (zero dependencies)
-
-The code — every file that ships
-
-timeline.js 390 lines on GitHub →
-// SPDX-License-Identifier: MIT
-// timeline.js — a standalone, zero-dependency validator for a timeline artifact.
-//
-// WHAT THIS IS
-// ------------
-// You have events you want to place on a timeline — a project history, a log, a
-// story, a schedule. Before you RENDER them, this checks the DECLARATION is
-// sound: no cycle in the "happened-before" edges, the axis names its scale, the
-// operations you use are legal for that scale, no two events collide on one
-// track at one instant, and the sort key is deterministic. It reads one JSON
-// object and returns a verdict. It is a pure function: the same artifact always
-// yields the same verdict.
-//
-// THE ARTIFACT (the shape it checks):
-// {
-// "frame": { "scale": "nominal"|"ordinal"|"interval"|"ratio", // REQUIRED
-// "grain": <ms|null>,
-// "topology": "S1"|null, "period": <number>, // optional circular axis
-// "foliation": { "key": <field|"t">, "dir": "asc"|"desc"}},
-// "events": [ { "id": <str>, "t": <ms int>, "parents": [<id>...],
-// "track": <str>, "kind": <str>, "duration": <ms>,
-// "label": <str>},...]
-//}
-//
-// THE CHECKS (each decidable from the declaration alone):
-// C0 well-formed.... every event is an object with an `id`.
-// C1 real-order..... parent edges form a DAG and resolve (no cycle, no dangling edge).
-// C2 scale-declared. frame.scale is an explicit Stevens level — no implicit gauge.
-// C3 stevens-legal.. ops used are legal for the level (ordering needs ordinal+;
-// a `duration` needs interval+, a difference of points).
-// C4 instant/dur.... a `duration` with no anchoring instant is a length, not a point.
-// C5 no-collision... two events on the same track at the same instant break the
-// overlay obligation (unless a non-`t` foliation orders them).
-// C6 fold-safety.... the foliation key is a real declared field (or "t"), never a
-// nondeterministic sentinel ("now"/"random"/"index"/...).
-// C7 leak-safety.... no event bakes a shared day bucket ("dayKey"/"day"/...);
-// day buckets are render-derived per frame, not authored.
-// C8 cyclic-topology a DECLARED circular axis (S1 + period) has its coordinates
-// reduced into one period (mod the period).
-//
-// THE PRINTED EDGE (what this is NOT):
-// This is a PRESENCE checker, not a CORRECTNESS oracle. C2 checks a scale is
-// DECLARED and self-consistent with the ops used — never that the declared
-// level is the RIGHT one. It does not prove your renderer is a pure fold; that
-// is a runtime property this static check cannot reach. It reports the
-// trajectory; choosing the true scale, and proving the render pure, stay yours.
-//
-// USAGE
-// node timeline.js artifact.json # lint a file
-// cat artifact.json | node timeline.js # lint stdin
-// node timeline.js --help
-// In a browser: window.ForestGifts.timelineLint(artifactObject)
-// In Node code: require('./timeline.js').timelineLint(artifactObject)
-//
-// Exit: 0 CLEAN | 3 FLAG | 2 USAGE (malformed input).
-
-'use strict';
-
-// Stevens' levels as a strict tower — each a superset of the one below.
-var STEVENS = { nominal: 0, ordinal: 1, interval: 2, ratio: 3};
-
-// Foliation keys that are NOT a real, replayable field — a sort on any of these
-// makes the render depend on WHEN it ran, breaking folds-twice-identical.
-var NONDETERMINISTIC_KEYS = {
-'now': 1, 'random': 1, 'rand': 1, 'index': 1, 'render-order': 1,
-'renderorder': 1, 'time()': 1, 'date.now': 1, 'uuid': 1, 'order-of-arrival': 1
-};
-
-// Baked day-bucket field names: a per-event day column is a frame-independent
-// bucket authored into the data — exactly the cross-frame leak the render must
-// derive per-frame instead.
-var BAKED_DAY_FIELDS = { 'daykey': 1, 'day': 1, 'datebucket': 1, 'date_bucket': 1};
-
-function finding(check, eventId, msg) {
-return { check: check, event: eventId, msg: msg};
-}
-
-function has(obj, key) {
-return Object.prototype.hasOwnProperty.call(obj, key);
-}
-
-// --- C1: axis is a real order (DAG + resolvable parents) --------------------
-function checkOrder(events, ids, findings) {
-// dangling parent
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var parents = ev.parents || [];
-for (var j = 0; j < parents.length; j++) {
-if (!ids[String(parents[j])]) {
-findings.push(finding('C1-real-order', ev.id,
-"parent '" + parents[j] + "' resolves to no event (dangling edge)"));
-}
-}
-}
-// cycle (iterative DFS with colouring: 0 unseen, 1 on-stack, 2 done)
-var byId = {};
-for (var k = 0; k < events.length; k++) byId[String(events[k].id)] = events[k];
-var color = {};
-
-function visit(start) {
-var stack = [{ node: start, parents: (byId[start] && byId[start].parents) || [], pos: 0}];
-color[start] = 1;
-while (stack.length) {
-var top = stack[stack.length - 1];
-var advanced = false;
-while (top.pos < top.parents.length) {
-var p = String(top.parents[top.pos]);
-top.pos++;
-if (!has(byId, p)) continue; // dangling already reported above
-var c = color[p] || 0;
-if (c === 1) {
-findings.push(finding('C1-real-order', top.node,
-"parent edge to '" + p + "' closes a cycle (axis is not a poset)"));
-continue;
-}
-if (c === 0) {
-color[p] = 1;
-stack.push({ node: p, parents: (byId[p] && byId[p].parents) || [], pos: 0});
-advanced = true;
-break;
-}
-}
-if (!advanced) {
-color[top.node] = 2;
-stack.pop();
-}
-}
-}
-
-for (var m = 0; m < events.length; m++) {
-var id = String(events[m].id);
-if ((color[id] || 0) === 0) visit(id);
-}
-}
-
-// --- C2: scale is declared (an explicit Stevens level; no implicit gauge) ---
-function checkScaleDeclared(frame, findings) {
-var scale = has(frame, 'scale')? frame.scale: null;
-if (scale === null || scale === undefined) {
-findings.push(finding('C2-scale-declared', null,
-'frame declares no scale -- an implicit gauge is forbidden'));
-return null;
-}
-if (!has(STEVENS, scale)) {
-findings.push(finding('C2-scale-declared', null,
-"frame.scale '" + scale + "' is not a Stevens level (nominal|ordinal|interval|ratio)"));
-return null;
-}
-return scale;
-}
-
-// --- C3: Stevens-legal ops for the declared level ---------------------------
-function checkStevensLegal(scale, frame, events, findings) {
-if (scale === null) return; // C2 already flagged
-var rank = STEVENS[scale];
-var fol = frame.foliation || {};
-var folKey = has(fol, 'key')? fol.key: 't';
-if (rank < STEVENS.ordinal) {
-if (folKey!== null && folKey!== undefined && folKey!== 't') {
-findings.push(finding('C3-stevens-legal', null,
-"foliation orders by '" + folKey + "' but a nominal axis has no order"));
-}
-for (var i = 0; i < events.length; i++) {
-if (events[i].parents && events[i].parents.length) {
-findings.push(finding('C3-stevens-legal', events[i].id,
-'event declares a causal order on a nominal axis'));
-}
-}
-}
-if (rank < STEVENS.interval) {
-for (var j = 0; j < events.length; j++) {
-if (has(events[j], 'duration')) {
-findings.push(finding('C3-stevens-legal', events[j].id,
-'a `duration` needs an interval+ axis (difference of points is undefined at ' + scale + ')'));
-}
-}
-}
-}
-
-// --- C4: Instant / Duration not confused ------------------------------------
-function checkInstantDuration(events, findings) {
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var hasDur = has(ev, 'duration');
-var hasAnchor = (ev.t!== null && ev.t!== undefined) ||
-(ev.start!== null && ev.start!== undefined);
-if (hasDur &&!hasAnchor) {
-findings.push(finding('C4-instant-duration', ev.id,
-'a `duration` with no anchoring instant is a length, not a point'));
-}
-if (ev.t_type === 'duration') {
-findings.push(finding('C4-instant-duration', ev.id,
-'`t` is typed a duration -- the axis coordinate must be an Instant'));
-}
-}
-}
-
-// --- C5: overlay tracks don't collide on a shared instant -------------------
-function checkNoCollision(frame, events, findings) {
-var fol = (frame || {}).foliation || {};
-var folKey = has(fol, 'key')? fol.key: 't';
-var resolves = folKey!== null && folKey!== undefined && String(folKey)!== 't';
-var seen = {}; // "track\x00t" -> array of {id, fv}
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var t = ev.t;
-if (t === null || t === undefined) continue;
-var track = has(ev, 'track')? ev.track: '_default';
-var fv = resolves? (has(ev, folKey)? ev[folKey]: undefined): null;
-var key = String(track) + '\x00' + String(t);
-var bucket = seen[key];
-if (bucket) {
-var unresolved = (!resolves) || (fv === null || fv === undefined);
-if (!unresolved) {
-for (var b = 0; b < bucket.length; b++) {
-var pv = bucket[b].fv;
-if (pv === null || pv === undefined || pv === fv) { unresolved = true; break;}
-}
-}
-if (unresolved) {
-findings.push(finding('C5-no-collision', ev.id,
-"collides with '" + bucket[0].id + "' on track '" + track + "' at instant " + t +
-' (overlay X obligation broken)'));
-}
-bucket.push({ id: ev.id, fv: fv});
-} else {
-seen[key] = [{ id: ev.id, fv: fv}];
-}
-}
-}
-
-// --- C6: fold-safety (static proxy for "render is a pure fold") -------------
-function checkFoldSafety(frame, events, findings) {
-var fol = frame.foliation || {};
-var key = has(fol, 'key')? fol.key: 't';
-if (key === null || key === undefined) return;
-if (NONDETERMINISTIC_KEYS[String(key).trim().toLowerCase()]) {
-findings.push(finding('C6-fold-safety', null,
-"foliation key '" + key + "' is nondeterministic -- breaks folds-twice-identical (the Ink Law)"));
-return;
-}
-if (key!== 't') {
-var carried = false;
-for (var i = 0; i < events.length; i++) {
-if (has(events[i], key)) { carried = true; break;}
-}
-if (!carried) {
-findings.push(finding('C6-fold-safety', null,
-"foliation key '" + key + "' is carried by no event (the declared sort would silently fall back to `t`)"));
-}
-}
-}
-
-// --- C7: leak-safety (static proxy for "no cross-frame day-leak") -----------
-function checkLeakSafety(events, findings) {
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var keys = Object.keys(ev);
-for (var j = 0; j < keys.length; j++) {
-if (BAKED_DAY_FIELDS[String(keys[j]).trim().toLowerCase()]) {
-findings.push(finding('C7-leak-safety', ev.id,
-"event bakes a day bucket ('" + keys[j] + "') -- day buckets are render-derived per-frame, not authored (cross-frame leak)"));
-break;
-}
-}
-}
-}
-
-// --- C8: cyclic-topology (a DECLARED circular axis is reduced mod period) ---
-function checkCyclicTopology(frame, events, findings) {
-var topo = has(frame, 'topology')? frame.topology: null;
-if (topo === null || topo === undefined) return;
-if (topo!== 'S1') {
-findings.push(finding('C8-cyclic-topology', null,
-"frame.topology '" + topo + "' is not a recognized axis topology (S1 = a periodic circle)"));
-return;
-}
-var period = frame.period;
-if (typeof period!== 'number' || period <= 0 || period!== period) {
-findings.push(finding('C8-cyclic-topology', null,
-'an S1 topology needs a positive numeric `period` (the wrap modulus, e.g. 1440 minutes)'));
-return;
-}
-for (var i = 0; i < events.length; i++) {
-var t = events[i].t;
-if (t === null || t === undefined) continue;
-if (!(t >= 0 && t < period)) {
-findings.push(finding('C8-cyclic-topology', events[i].id,
-'instant ' + t + ' is not reduced into [0,' + period + ') -- a circular coordinate must be taken mod the period'));
-}
-}
-}
-
-// --- the lint ---------------------------------------------------------------
-function timelineLint(artifact) {
-if (artifact === null || typeof artifact!== 'object' || Array.isArray(artifact)) {
-return { verdict: 'USAGE', error: 'artifact is not a JSON object'};
-}
-var frame = artifact.frame;
-var events = artifact.events;
-if (frame === null || typeof frame!== 'object' || Array.isArray(frame) ||!Array.isArray(events)) {
-return { verdict: 'USAGE', error: 'artifact needs a `frame` object and an `events` list'};
-}
-
-var findings = [];
-var valid = [];
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-if (ev === null || typeof ev!== 'object' || Array.isArray(ev) ||
-ev.id === null || ev.id === undefined) {
-findings.push(finding('C0-well-formed', 'index ' + i, 'event is not an object with an `id`'));
-} else {
-valid.push(ev);
-}
-}
-var ids = {};
-for (var v = 0; v < valid.length; v++) ids[String(valid[v].id)] = 1;
-
-var scale = checkScaleDeclared(frame, findings);
-checkOrder(valid, ids, findings);
-checkStevensLegal(scale, frame, valid, findings);
-checkInstantDuration(valid, findings);
-checkNoCollision(frame, valid, findings);
-checkFoldSafety(frame, valid, findings);
-checkLeakSafety(valid, findings);
-checkCyclicTopology(frame, valid, findings);
-
-var checksRun = ['C0-well-formed', 'C1-real-order', 'C2-scale-declared',
-'C3-stevens-legal', 'C4-instant-duration', 'C5-no-collision',
-'C6-fold-safety', 'C7-leak-safety', 'C8-cyclic-topology'];
-return {
-verdict: findings.length? 'FLAG': 'CLEAN',
-checks: checksRun,
-findings: findings,
-runtime_owned_by_renderer: ['render-is-a-pure-fold', 'no-cross-frame-day-leak']
-};
-}
-
-var HELP = [
-'timeline.js — validate a timeline artifact before you render it.',
-'',
-'Usage:',
-' node timeline.js artifact.json lint a file',
-' cat artifact.json | node timeline.js lint stdin',
-' node timeline.js --help',
-'',
-'Reads one JSON object {frame, events}; prints a verdict; exits',
-' 0 CLEAN · 3 FLAG · 2 USAGE.',
-'',
-'Edge: this is a PRESENCE checker, not a CORRECTNESS oracle. It confirms a',
-'scale is declared and self-consistent with the ops used — never that the',
-'declared level is the right one, and it does not prove your renderer is pure.'
-].join('\n');
-
-// --- surfaces: browser attach, Node require, Node CLI -----------------------
-if (typeof window!== 'undefined') {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.timelineLint = timelineLint;
-}
-
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { timelineLint: timelineLint};
-}
-
-if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-var argv = process.argv.slice(2);
-if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) {
-process.stdout.write(HELP + '\n');
-process.exit(0);
-}
-var readInput = function (cb) {
-if (argv[0]) {
-try { cb(require('fs').readFileSync(argv[0], 'utf8'));}
-catch (e) { process.stdout.write(JSON.stringify({ verdict: 'USAGE', error: String(e.message || e)}) + '\n'); process.exit(2);}
-} else {
-var chunks = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { chunks += d;});
-process.stdin.on('end', function () { cb(chunks);});
-}
-};
-readInput(function (raw) {
-var artifact;
-try { artifact = JSON.parse(raw);}
-catch (e) { process.stdout.write(JSON.stringify({ verdict: 'USAGE', error: String(e.message || e)}) + '\n'); process.exit(2);}
-var out = timelineLint(artifact);
-process.stdout.write(JSON.stringify(out, null, 2) + '\n');
-process.exit(out.verdict === 'USAGE'? 2: (out.verdict === 'FLAG'? 3: 0));
-});
-}
-
-test_timeline.js 165 lines on GitHub →
-// SPDX-License-Identifier: MIT
-// test_timeline.js — self-test + determinism proof for the timeline gift.
-//
-// node test_timeline.js
-//
-// Exit 0 = all pass. Exit 3 = a check failed. This is the gift's canonicalizer
-// self-test (Gift-Works B7): the determinism assertion IS the proof the render
-// is a pure fold — same artifact in, byte-identical verdict out.
-
-'use strict';
-
-var timelineLint = require('./timeline.js').timelineLint;
-
-var failures = 0;
-function ok(name, cond) {
-if (!cond) { console.error('FAIL: ' + name); failures++;}
-else { console.log('pass: ' + name);}
-}
-
-// helper: does the verdict contain a finding of the given check code?
-function hasCheck(v, code) {
-if (!v.findings) return false;
-for (var i = 0; i < v.findings.length; i++) {
-if (String(v.findings[i].check).indexOf(code) === 0) return true;
-}
-return false;
-}
-
-// --- a known-GOOD artifact: passes clean --------------------------------------
-var GOOD = {
-frame: { scale: 'interval', grain: null, foliation: { key: 't', dir: 'asc'}},
-events: [
-{ id: 'a', t: 0, track: 'main', label: 'start'},
-{ id: 'b', t: 100, parents: ['a'], track: 'main', duration: 50, label: 'work'},
-{ id: 'c', t: 200, parents: ['b'], track: 'main', label: 'end'}
-]
-};
-ok('C-good CLEAN verdict', timelineLint(GOOD).verdict === 'CLEAN');
-
-// --- C0: an event that is not an object with an id ----------------------------
-ok('C0 fires on a junk event', hasCheck(
-timelineLint({ frame: { scale: 'ordinal'}, events: [{ id: 'a', t: 0}, 42]}), 'C0'));
-
-// --- C1: a cycle in the parent edges (real defect: circular happened-before) --
-ok('C1 fires on a cycle', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [
-{ id: 'a', t: 0, parents: ['b']},
-{ id: 'b', t: 1, parents: ['a']}
-]
-}), 'C1'));
-// C1: a dangling parent edge
-ok('C1 fires on a dangling edge', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [{ id: 'a', t: 0, parents: ['ghost']}]
-}), 'C1'));
-
-// --- C2: no scale declared (implicit gauge) -----------------------------------
-ok('C2 fires on undeclared scale', hasCheck(timelineLint({
-frame: { grain: null},
-events: [{ id: 'a', t: 0}]
-}), 'C2'));
-// C2: a non-Stevens scale string
-ok('C2 fires on a bogus scale', hasCheck(timelineLint({
-frame: { scale: 'vibes'},
-events: [{ id: 'a', t: 0}]
-}), 'C2'));
-
-// --- C3: a causal order declared on a nominal (unordered) axis -----------------
-ok('C3 fires on order over a nominal axis', hasCheck(timelineLint({
-frame: { scale: 'nominal'},
-events: [{ id: 'a', t: 0}, { id: 'b', t: 1, parents: ['a']}]
-}), 'C3'));
-// C3: a duration on an ordinal axis (difference of points undefined below interval)
-ok('C3 fires on duration below interval', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [{ id: 'a', t: 0, duration: 10}]
-}), 'C3'));
-
-// --- C4: a duration with no anchoring instant ---------------------------------
-ok('C4 fires on unanchored duration', hasCheck(timelineLint({
-frame: { scale: 'interval'},
-events: [{ id: 'a', duration: 30}]
-}), 'C4'));
-
-// --- C5: two events, same track, same instant, no resolving foliation ---------
-ok('C5 fires on a same-track same-instant collision', hasCheck(timelineLint({
-frame: { scale: 'interval', foliation: { key: 't'}},
-events: [
-{ id: 'a', t: 100, track: 'main'},
-{ id: 'b', t: 100, track: 'main'}
-]
-}), 'C5'));
-// C5: the same collision RESOLVED by a non-t foliation is CLEAN for C5
-ok('C5 clear when a seq foliation resolves the pair',!hasCheck(timelineLint({
-frame: { scale: 'interval', foliation: { key: 'seq'}},
-events: [
-{ id: 'a', t: 100, track: 'main', seq: 1},
-{ id: 'b', t: 100, track: 'main', seq: 2}
-]
-}), 'C5'));
-
-// --- C6: a nondeterministic foliation key -------------------------------------
-ok('C6 fires on a nondeterministic key', hasCheck(timelineLint({
-frame: { scale: 'ordinal', foliation: { key: 'random'}},
-events: [{ id: 'a', t: 0}]
-}), 'C6'));
-// C6: a foliation key carried by no event (silent fallback to t)
-ok('C6 fires on a key no event carries', hasCheck(timelineLint({
-frame: { scale: 'ordinal', foliation: { key: 'seq'}},
-events: [{ id: 'a', t: 0}]
-}), 'C6'));
-
-// --- C7: a baked day bucket ---------------------------------------------------
-ok('C7 fires on a baked dayKey', hasCheck(timelineLint({
-frame: { scale: 'interval'},
-events: [{ id: 'a', t: 0, dayKey: '2026-08-31'}]
-}), 'C7'));
-
-// --- C8: a circular axis with an unreduced coordinate -------------------------
-ok('C8 fires on an unreduced circular coord', hasCheck(timelineLint({
-frame: { scale: 'interval', topology: 'S1', period: 1440},
-events: [{ id: 'a', t: 1500}]
-}), 'C8'));
-// C8: a valid circular axis is CLEAN
-ok('C8 clear on a reduced circular coord', timelineLint({
-frame: { scale: 'interval', topology: 'S1', period: 1440},
-events: [{ id: 'a', t: 30}, { id: 'b', t: 720}]
-}).verdict === 'CLEAN');
-
-// --- USAGE verdicts -----------------------------------------------------------
-ok('USAGE on a non-object', timelineLint(42).verdict === 'USAGE');
-ok('USAGE on a missing frame', timelineLint({ events: []}).verdict === 'USAGE');
-ok('USAGE on a missing events list', timelineLint({ frame: {}}).verdict === 'USAGE');
-
-// --- DETERMINISM: the canonicalizer self-test (Gift-Works B7) -----------------
-// Same artifact -> byte-identical serialized verdict, twice. This is the proof
-// the lint is a pure fold (folds-twice-identical).
-var samples = [GOOD, {
-frame: { scale: 'interval', topology: 'S1', period: 1440, foliation: { key: 't'}},
-events: [
-{ id: 'x', t: 100, track: 'a', parents: []},
-{ id: 'y', t: 100, track: 'a', duration: 5, dayKey: 'z'},
-{ id: 'z', t: 200, parents: ['x', 'ghost']}
-]
-}];
-for (var s = 0; s < samples.length; s++) {
-var a = JSON.stringify(timelineLint(samples[s]));
-var b = JSON.stringify(timelineLint(samples[s]));
-ok('determinism: sample ' + s + ' byte-identical across two runs', a === b);
-}
-
-// --- MUTATION BITE: prove the test is non-vacuous -----------------------------
-// If the lint were a no-op returning CLEAN always, C1 (cycle) would not fire.
-// The C1 assertion above already bites that mutation; assert it explicitly here.
-ok('mutation bite: a real cycle is NOT reported CLEAN',
-timelineLint({ frame: { scale: 'ordinal'}, events: [
-{ id: 'a', parents: ['b']}, { id: 'b', parents: ['a']}]}).verdict === 'FLAG');
-
-if (failures) {
-console.error('\nTIMELINE GIFT SELFTEST FAIL: ' + failures + ' failure(s)');
-process.exit(3);
-}
-console.log('\nTIMELINE GIFT SELFTEST PASS: all checks green, determinism proven');
-process.exit(0);
-
-Take the whole folder →
-MIT
-Node.js / browser, standard library only (zero dependencies)
+Nodes in this shard: 3 (/gifts/loop21-l21x-snapshot/, /gifts/loop21-verifyskin/, /gifts/map/)
 
 ---
 
-# Timesheet — a Loop MMT gift
-https://loopmmt.com/gifts/timesheet/
+# loop21:l21x-snapshot — a Loop MMT gift
+https://loopmmt.com/gifts/loop21-l21x-snapshot/
 [coverage: optional · branch: gifts]
 
-How Many Hours Did That Actually Take? fold ← all gifts
+Portable Browser Document Persistence persist ← all gifts
 
-Timesheet
+loop21:l21x-snapshot
 
-Pipe a git log in, get an honest effort estimate out. worked(day) = sum over consecutive commits of min(gap, break-gap) — the day's span minus every gap longer than a break threshold. Floor-biased so it under-counts rather than inflates, deterministic (same input → byte-identical report), and zero-dependency: it folds a piped stdin stream, so it needs no git subprocess and no repo.
+A dependency-free layer for the three things every small browser app ends up needing: turn a document into a portable snapshot string, keep a named catalog of them in the browser, and export or import the whole catalog as one file. Snapshots are deterministic — the encoder sorts keys at every level, so the same document always makes the same base64 string, which means a snapshot is diffable, hashable, and cache-keyable, and two snapshots are equal iff the documents are. Round-trips are exact, including multibyte text (accented names, emoji, non-Latin scripts), because the encoder goes through the UTF-8 byte stream and never char codes. The catalog store is injected, so the logic is pure and testable off-browser; the archive export/import validates its envelope and every entry name and rejects a malformed or foreign archive loudly rather than half-restoring.
 
 The honest edge
 
-Commit timestamps BOUND work, they do not MEASURE it — a floor-biased model output (⊢), never a measured truth (⊨). It under-counts on purpose (isolated commit = 0, invisible thinking = 0). NOT a timeclock: do not bill a client to the minute or adjudicate hours with it. The --break-gap assumption is printed in every report.
+It persists and moves documents — it does not encrypt them and it does not resolve merge conflicts. A snapshot is plaintext base64: anyone who has the string has the document. And if two devices edit the same catalog entry independently, the last save wins; this layer has no notion of a conflict, only of the most recent write.
 
 Run it
 
-git log --format='%H %at %s' | node timesheet.js
-test_timesheet.js (20/20, hand-computed arithmetic oracle + overnight-gap floor-bias tripwire)
-Node, no dependencies
+node l21x-snapshot.js --help
+test_l21x-snapshot.js (29/29)
+Zero-dependency JavaScript (browser or Node)
 
 The code — every file that ships
 
-timesheet.js 220 lines on GitHub →
+l21x-snapshot.js 315 lines on GitHub →
 #!/usr/bin/env node
-/*
-* timesheet — a floor-biased time-worked report folded from git commit timestamps.
-* MIT · zero-dependency · standalone gift stripped from Loop MMT's The Timesheet.
-*
-* THE PRINTED EDGE (read before trusting a number):
-* Commit timestamps BOUND work; they do NOT MEASURE it. "Hours worked" here is a
-* MODEL OUTPUT, not a measured truth:
-* worked(day) = Σ over consecutive commits of min(gap, breakGap)
-* i.e. day-span minus every inter-commit gap longer than the break threshold.
-* It is FLOOR-BIASED on purpose: a gap over the threshold counts as a break worth
-* zero, and an isolated commit contributes zero span — so it UNDER-counts real time
-* rather than inflating it. It is a derivation (⊢), never a measured truth (⊨). It
-* is NOT a timeclock: do not bill a client to the minute or adjudicate hours with it.
-* The one judgment call, --break-gap (default 30 min), is printed in every report so
-* the number always carries its own assumption.
-*
-* USAGE:
-* git log --format='%H %at %s' | node timesheet.js
-* git log --format='%H %at %s' | node timesheet.js --break-gap 45 --tz America/New_York
-* node timesheet.js --help
-*
-* INPUT: one commit per line on stdin: "<sha> <author-epoch-seconds> <subject...>".
-* %at is the AUTHOR epoch (integer seconds, timezone-independent). committer-date
-* (%ct) works too but author-date is the conventional "when the work happened".
-*
-* DETERMINISM: the output is a pure function of (input lines, --break-gap, --tz). No
-* wall-clock is read; the report stamps the commit range, not a generation time — so
-* the same input always produces byte-identical output.
+/* l21x-snapshot.js — a dependency-free browser document-persistence layer:
+turn any JSON-able document into a portable snapshot string, keep a named
+catalog of them in the browser, and export/import the whole catalog as one
+file. Same code runs in a browser (attach L21X to your namespace) or on Node
+(this CLI / require()).
+
+WHY THIS EXISTS. Every small browser app eventually needs the same three
+things and rewrites them badly each time: (1) serialize the current document
+to a string you can put in a URL, a text field, or a file; (2) keep a few of
+them around under names the user picked; (3) get all of that OUT — a backup,
+a transfer to another machine, a copy to a friend — as one portable blob.
+Done casually this is a pile of localStorage calls with no validation, no
+determinism, and no way to move the data. This is that layer, done once,
+zero-dependency, and honest about its edges.
+
+THE THREE VERBS.
+SNAPSHOT — encodeSnapshot(doc) -> base64 string; decodeSnapshot(b64) -> doc.
+A snapshot is a self-contained, portable string. It round-trips exactly:
+decodeSnapshot(encodeSnapshot(x)) deep-equals x, including multibyte text
+(accented names, emoji, non-Latin scripts) — the encoder goes through the
+UTF-8 byte stream, never char codes, so nothing corrupts silently.
+CATALOG — a named store of documents in the browser (localStorage), with
+save / load / remove / list / sortBy and name validation. The store is
+INJECTED (a tiny {getItem,setItem,removeItem} object), so the logic is
+pure and testable off-browser; in a browser you pass window.localStorage.
+ARCHIVE — archiveExport(catalog) -> one string; archiveImport(str) -> catalog.
+The whole catalog as a single portable file: back it up, move it, restore
+it. Import validates every entry name and rejects a malformed archive
+loudly rather than half-restoring.
+
+THE ONE FIDELITY RULE (the whole reason to trust it). A snapshot is
+DETERMINISTIC: encodeSnapshot sorts object keys at every level before
+encoding, so the same document always produces the same base64 string — which
+means two snapshots are equal iff the documents are equal, and a snapshot is
+diffable, hashable, and cache-keyable. Break the key-sort and equal documents
+would encode differently; the test battery carries a key-order vector
+precisely to catch that.
+
+USAGE (CLI — operates on snapshot strings via stdin/args)
+echo '{"b":2,"a":1}' | node l21x-snapshot.js encode # doc (JSON) -> snapshot
+node l21x-snapshot.js decode <base64> # snapshot -> doc (JSON)
+node l21x-snapshot.js roundtrip '{"a":1}' # prove decode(encode(x)) == x
+node l21x-snapshot.js --help
+
+Released under MIT. Its edge is printed in the README: this PERSISTS and MOVES
+documents; it does not encrypt them and it does not resolve merge conflicts.
+A snapshot is plaintext base64 — anyone who has the string has the document.
 */
-'use strict';
-
-const SEC = 1000; // this file works in SECONDS throughout; epochs are integer seconds.
-const DEFAULT_BREAK_GAP_MIN = 30;
-const DEFAULT_TZ = 'UTC';
-
-// ---- core fold (the whole gift; pure, exported for require) --------------------
-function computeTimesheet(commits, opts) {
-// commits: [{ sha, epoch (int seconds), subject}]
-// opts: { breakGapMin, tz}
-const breakGap = (opts.breakGapMin!= null? opts.breakGapMin: DEFAULT_BREAK_GAP_MIN) * 60; // seconds
-const tz = opts.tz || DEFAULT_TZ;
-
-// sort by epoch ascending (stable, deterministic)
-const cs = commits.slice().sort((a, b) => a.epoch - b.epoch || (a.sha < b.sha? -1: a.sha > b.sha? 1: 0));
-
-// bucket by calendar day IN the report timezone
-const byDay = new Map();
-for (const c of cs) {
-const day = dayKey(c.epoch, tz);
-if (!byDay.has(day)) byDay.set(day, []);
-byDay.get(day).push(c);
-}
-
-const days = [];
-for (const day of Array.from(byDay.keys()).sort()) {
-const dcs = byDay.get(day); // already epoch-ascending (built from sorted cs)
-let worked = 0, brk = 0, runs = 1;
-for (let i = 0; i + 1 < dcs.length; i++) {
-const gap = dcs[i + 1].epoch - dcs[i].epoch;
-if (gap > breakGap) { brk += gap; runs += 1;}
-else { worked += gap;}
-}
-days.push({
-date: day,
-startEpoch: dcs[0].epoch,
-endEpoch: dcs[dcs.length - 1].epoch,
-worked, breakTime: brk, runs, nCommits: dcs.length,
-});
-}
-
-const totalWorked = days.reduce((s, d) => s + d.worked, 0);
-const totalCommits = days.reduce((s, d) => s + d.nCommits, 0);
-
-return {
-days,
-totalWorked, // seconds
-totalCommits,
-nDays: days.length,
-breakGapMin: breakGap / 60,
-tz,
-firstSha: cs.length? cs[0].sha: null,
-lastSha: cs.length? cs[cs.length - 1].sha: null,
-byWeek: rollup(days, weekKey),
-byMonth: rollup(days, d => d.date.slice(0, 7)),
-};
-}
-
-function rollup(days, keyfn) {
-const buckets = new Map();
-const order = [];
-for (const d of days) {
-const k = keyfn(d);
-if (!buckets.has(k)) { buckets.set(k, { label: k, worked: 0, nCommits: 0, nDays: 0}); order.push(k);}
-const b = buckets.get(k);
-b.worked += d.worked; b.nCommits += d.nCommits; b.nDays += 1;
-}
-return order.map(k => buckets.get(k));
-}
-
-// ---- timezone-aware day + ISO-week keys, stdlib Intl only (no deps) -------------
-function dayKey(epochSec, tz) {
-// Format the epoch in the target tz as YYYY-MM-DD, deterministically.
-const d = new Date(epochSec * SEC);
-const parts = new Intl.DateTimeFormat('en-CA', {
-timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-}).formatToParts(d);
-const g = t => parts.find(p => p.type === t).value;
-return `${g('year')}-${g('month')}-${g('day')}`;
-}
-
-function weekKey(dayRec) {
-// ISO week from the day's YYYY-MM-DD (tz already applied when the day was bucketed).
-const [y, m, dd] = dayRec.date.split('-').map(Number);
-const dt = new Date(Date.UTC(y, m - 1, dd));
-const dayNum = (dt.getUTCDay() + 6) % 7; // Mon=0..Sun=6
-dt.setUTCDate(dt.getUTCDate() - dayNum + 3); // Thursday of this week
-const firstThu = new Date(Date.UTC(dt.getUTCFullYear(), 0, 4));
-const week = 1 + Math.round(((dt - firstThu) / (7 * 24 * 3600 * SEC)));
-return `${dt.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
-}
-
-// ---- render (plain text, deterministic) ----------------------------------------
-function fmtHM(sec) {
-const t = Math.floor(sec);
-const h = Math.floor(t / 3600);
-const m = Math.floor((t % 3600) / 60);
-return `${h}h ${String(m).padStart(2, '0')}m`;
-}
-function hours(sec) { return Math.round((sec / 3600) * 100) / 100;}
-function grp(n) { return typeof n === 'number' && Number.isInteger(n)? n.toLocaleString('en-US'): String(n);}
-
-function render(ts) {
-if (ts.nDays === 0) return 'Work Timesheet\n\nNo commits in input.\n';
-const L = [];
-L.push('Work Timesheet');
-L.push('');
-L.push(`Span: ${ts.days[0].date}.. ${ts.days[ts.nDays - 1].date} · Days worked: ${grp(ts.nDays)} · Commits: ${grp(ts.totalCommits)}`);
-L.push(`Total time (model): ${fmtHM(ts.totalWorked)} (${hours(ts.totalWorked)} h)`);
-L.push(`Timezone: ${ts.tz} · Break threshold: ${ts.breakGapMin} min · Range: ${ts.firstSha}..${ts.lastSha}`);
-L.push('');
-L.push('What this measures: time bracketed by commits, not time at the keyboard.');
-L.push('worked = day-span − every gap longer than the break threshold. Floor-biased:');
-L.push('it under-counts (isolated commit = 0, invisible thinking = 0), never inflates.');
-L.push('A derivation (⊢), not a truth (⊨). Not a timeclock.');
-L.push('');
-L.push('By month');
-for (const b of ts.byMonth) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
-L.push('');
-L.push('By week');
-for (const b of ts.byWeek) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
-L.push('');
-L.push('By day');
-for (const d of ts.days) L.push(` ${d.date} · ${fmtHM(d.worked)} · ${grp(d.nCommits)} commit(s) · ${d.runs} run(s)`);
-L.push('');
-return L.join('\n') + '\n';
-}
-
-// ---- parse stdin lines ----------------------------------------------------------
-function parseLines(text) {
-const commits = [];
-for (const raw of text.split('\n')) {
-const line = raw.trim();
-if (!line) continue;
-const m = line.match(/^(\S+)\s+(\d+)\s?(.*)$/);
-if (!m) continue;
-commits.push({ sha: m[1], epoch: parseInt(m[2], 10), subject: m[3] || ''});
-}
-return commits;
-}
-
-// ---- CLI ------------------------------------------------------------------------
-function parseArgs(argv) {
-const o = { breakGapMin: DEFAULT_BREAK_GAP_MIN, tz: DEFAULT_TZ, help: false};
-for (let i = 0; i < argv.length; i++) {
-const a = argv[i];
-if (a === '--help' || a === '-h') o.help = true;
-else if (a === '--break-gap') o.breakGapMin = parseInt(argv[++i], 10);
-else if (a === '--tz') o.tz = argv[++i];
-}
-return o;
-}
-
-const HELP = `timesheet — floor-biased time-worked report from git commit timestamps (MIT, zero-dep)
-
-git log --format='%H %at %s' | node timesheet.js [--break-gap MIN] [--tz ZONE]
-
---break-gap MIN gap over MIN minutes counts as a break worth zero (default 30)
---tz ZONE IANA timezone for day bucketing (default UTC)
---help this text
-
-EDGE: commit timestamps BOUND work, they do not MEASURE it. This is a floor-biased
-model output (⊢), never a measured truth (⊨) — it under-counts on purpose. Not a
-timeclock; do not bill or adjudicate hours with it. The --break-gap assumption is
-printed in every report.
-`;
-
-function main() {
-const opts = parseArgs(process.argv.slice(2));
-if (opts.help) { process.stdout.write(HELP); return;}
-let input = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', d => { input += d;});
-process.stdin.on('end', () => {
-const commits = parseLines(input);
-const ts = computeTimesheet(commits, opts);
-process.stdout.write(render(ts));
-});
-}
-
-if (typeof window!== 'undefined') {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.timesheet = { computeTimesheet, render, parseLines};
-}
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { computeTimesheet, render, parseLines, fmtHM, weekKey, dayKey};
-}
-if (typeof require!== 'undefined' && require.main === module) {
-main();
-}
-
-test_timesheet.js 109 lines on GitHub →
-#!/usr/bin/env node
-/*
-* test_timesheet — drift-check battery for the timesheet gift.
-* MIT · zero-dependency · stdlib-only.
-*
-* THE ORACLE RULE: the oracle here is HAND-COMPUTED ARITHMETIC. The model
-* worked(day) = Σ min(gap, breakGap) over consecutive commits
-* is simple enough that a human computes the expected number independently of the
-* implementation — a stronger out-of-band oracle than a second code path. Each
-* fixture below carries its hand-computed expected value and the arithmetic.
-*/
-'use strict';
-const { computeTimesheet} = require('./timesheet.js');
-
-let pass = 0, fail = 0;
-function eq(got, want, msg) {
-if (got === want) { pass++;}
-else { fail++; console.error(`FAIL: ${msg}\n got: ${got}\n want: ${want}`);}
-}
-function ok(cond, msg) { if (cond) pass++; else { fail++; console.error(`FAIL: ${msg}`);}}
-
-// helper: build commits at given UTC times on one day (2026-01-05, a Monday)
-const BASE = Math.floor(Date.UTC(2026, 0, 5, 0, 0, 0) / 1000); // 2026-01-05 00:00:00Z
-const at = (hh, mm) => BASE + hh * 3600 + mm * 60;
-const C = (n, epoch) => ({ sha: `sha${n}`.padEnd(7, '0'), epoch, subject: `commit ${n}`});
-
-// ---- 1. Fixed model anchors (hand-computed) -----------------------------------
-// Two commits 10 min apart, same day. gap=600s <= break(1800s) -> worked=600.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 600, 'anchor A: two commits 10min apart -> worked=600s');
-eq(ts.nDays, 1, 'anchor A: one day');
-eq(ts.totalCommits, 2, 'anchor A: two commits');
-}
-// Two commits 90 min apart with break-gap 30. gap=5400s > 1800 -> break, worked=0.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(10, 30))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 0, 'anchor B: 90min gap > 30min break -> worked=0 (clamped)');
-}
-// A lone commit in a day -> worked=0 (no neighbor).
-{
-const ts = computeTimesheet([C(1, at(14, 0))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 0, 'anchor C: isolated commit -> worked=0');
-eq(ts.nDays, 1, 'anchor C: still one day recorded');
-}
-// Three commits: 9:00, 9:20, 9:35 (gaps 20m, 15m; both <=30) -> worked=35m=2100s.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 20)), C(3, at(9, 35))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 2100, 'anchor D: 20m+15m consecutive -> worked=2100s');
-eq(ts.days[0].runs, 1, 'anchor D: one run (no break)');
-}
-
-// ---- 2. Floor-bias tripwire (the known-bad vector) ----------------------------
-// A day with an overnight-shaped 3h gap in the middle. Naive first-to-last span
-// would count the whole ~3h20m as work; the model must clamp the 3h gap to a break.
-// Commits: 9:00, 9:10 (gap 10m -> worked 600), 12:15 (gap 3h05m=11100s > 1800 ->
-// BREAK, worked +0), 12:25 (gap 10m -> worked +600). Hand-computed worked = 1200s.
-// Naive span = 12:25 - 9:00 = 3h25m = 12300s. The gap between them is the test.
-{
-const ts = computeTimesheet(
-[C(1, at(9, 0)), C(2, at(9, 10)), C(3, at(12, 15)), C(4, at(12, 25))],
-{ breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 1200, 'TRIPWIRE: floor-biased worked=1200s (not the 12300s naive span)');
-ok(ts.totalWorked < 12300, 'TRIPWIRE: model under-counts the naive first-to-last span');
-eq(ts.days[0].runs, 2, 'TRIPWIRE: the 3h gap splits the day into 2 runs');
-}
-
-// ---- 3. Determinism: same input twice -> identical result ----------------------
-{
-const input = [C(1, at(9, 0)), C(2, at(9, 25)), C(3, at(11, 0))];
-const a = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
-const b = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
-eq(a, b, 'determinism: same input -> byte-identical fold');
-}
-
-// ---- 4. Break-gap sensitivity (the assumption is live) -------------------------
-// Commits 9:00 and 9:40 (gap 40m=2400s). At break-gap 30 -> break (worked 0).
-// At break-gap 45 -> within threshold (worked 2400). The number moves with --break-gap.
-{
-const input = [C(1, at(9, 0)), C(2, at(9, 40))];
-const at30 = computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'});
-const at45 = computeTimesheet(input, { breakGapMin: 45, tz: 'UTC'});
-eq(at30.totalWorked, 0, 'sensitivity: 40m gap at break-gap 30 -> worked=0');
-eq(at45.totalWorked, 2400, 'sensitivity: 40m gap at break-gap 45 -> worked=2400s');
-}
-
-// ---- 5. Mutation bite: a deliberately-wrong expectation MUST be caught ----------
-// (Proves the harness is not a no-op: assert the RIGHT value is NOT the wrong one.)
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
-ok(ts.totalWorked!== 999, 'mutation-bite: harness rejects a wrong expected value (worked!== 999)');
-ok(ts.totalWorked === 600, 'mutation-bite: harness confirms the right value (worked === 600)');
-}
-
-// ---- 6. Multi-day rollup + week/month keys -------------------------------------
-{
-const day2 = BASE + 24 * 3600; // 2026-01-06
-const ts = computeTimesheet(
-[C(1, at(9, 0)), C(2, at(9, 15)), { sha: 'sha3000', epoch: day2 + 10 * 3600, subject: 'd2'},
-{ sha: 'sha4000', epoch: day2 + 10 * 3600 + 600, subject: 'd2b'}],
-{ breakGapMin: 30, tz: 'UTC'});
-eq(ts.nDays, 2, 'rollup: two distinct days');
-eq(ts.totalWorked, 900 + 600, 'rollup: day1 15m + day2 10m = 1500s total');
-eq(ts.byMonth.length, 1, 'rollup: both days in one month bucket');
-eq(ts.byMonth[0].label, '2026-01', 'rollup: month key = 2026-01');
-}
-
-console.log(`\ntimesheet drift-check: ${pass} passed, ${fail} failed`);
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node, no dependencies
-
----
-
-# Tracebus — a Loop MMT gift
-https://loopmmt.com/gifts/tracebus/
-[coverage: optional · branch: gifts]
-
-Nothing Moves Without a Receipt route ← all gifts
-
-Tracebus
-
-A publish/subscribe bus with two rules most buses skip: every legal path is declared up front, and every emission is written to an append-only ledger you can replay by trace id. A packet can only reach a subscriber the routing table permits — an unrouted packet is refused, not silently dropped — and a subscriber that throws is caught, recorded, and stepped over so one bad listener can never take the bus down. Thread one traceId through a chain and read the whole journey back out of the ledger, hop by hop.
-
-The honest edge
-
-It enforces the topology you declare and records every hop; it does NOT invent routes for you (an unrouted packet is a fault, by design) and its ids are v4-shaped for correlation, not cryptographic (Math.random). request/response is opt-in per bus via { requestResponse: true} — the bus name carries no special meaning.
-
-Run it
-
-node tracebus.js --demo
-test_tracebus.js (72/72, mutation-bitten)
-Zero-dependency JavaScript, Node or browser
-
-The code — every file that ships
-
-tracebus.js 475 lines on GitHub →
-/*
-* tracebus — a traced, routing-enforced message bus.
-*
-* A publish/subscribe bus where every legal path is declared up front and
-* every emission is written to an append-only ledger you can replay by
-* trace id. A packet can only reach a subscriber the routing table permits;
-* an unrouted packet is refused, not silently dropped. Nothing is delivered
-* without leaving a receipt.
-*
-* The shape: packet ──emit(source)──▶ routingTable.resolve ──▶ subscribers
-* │ │
-* └────────▶ ledger.record ◀─────┘
-*
-* Zero dependencies. Runs in Node or the browser. No I/O, no globals, no
-* clock you can't control (timestamps are ISO strings; ids are v4-shaped).
-*
-* Properties this file holds (see test_tracebus.js):
-* 1. No delivery without a receipt. Every emit() — delivered, partial,
-* rejected, or errored — appends exactly one ledger record.
-* 2. No path that wasn't declared. resolve() throws on an unrouted
-* (packetType, source) pair; emit() records the rejection and rethrows.
-* 3. A wrong-bus packet is refused. A packet routed to bus A cannot be
-* emitted on bus B, even if a subscriber is listening.
-* 4. A subscriber that throws cannot break the emitter. Handler errors are
-* caught, recorded against that destination, and delivery continues.
-* 5. Routing entries are frozen. A registered route cannot be mutated
-* after the fact (deepFreeze), so the declared topology stays declared.
-* 6. A trace is reconstructable. queryByTraceId returns every hop a
-* packet took, in emission order.
-*
-* Origin: stripped from a shipped order-management constellation's internal
-* message fabric (the "one bus, many loops, every packet traced" core) and
-* generalized — the request/response capability, which was hardwired to a
-* single bus name in the original, is now a per-bus flag.
-*
-* MIT licensed. Use it for anything.
-*/
-
-'use strict';
-
-// ────────────────────────────────────────────────────────────────────
-// Primitives (inlined so the file has no dependencies).
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* A v4-shaped identifier: 8-4-4-4-12 hex with the version nibble pinned
-* to 4 and the variant nibble in {8,9,a,b}. Uses Math.random — this is an
-* identifier for correlating log records, NOT a cryptographic token.
-*/
-function generateId() {
-const hex = '0123456789abcdef';
-let id = '';
-for (let i = 0; i < 36; i++) {
-if (i === 8 || i === 13 || i === 18 || i === 23) {
-id += '-';
-} else if (i === 14) {
-id += '4';
-} else if (i === 19) {
-id += hex[(Math.floor(Math.random() * 16) & 0x3) | 0x8];
-} else {
-id += hex[Math.floor(Math.random() * 16)];
-}
-}
-return id;
-}
-
-/** Current time as an ISO-8601 string. The one place time enters. */
-function now() {
-return new Date().toISOString();
-}
-
-/**
-* Recursively freeze an object and everything it owns. A registered
-* routing entry is frozen so the declared topology cannot be edited
-* after registration.
-*/
-function deepFreeze(obj) {
-Object.freeze(obj);
-for (const key of Object.keys(obj)) {
-const val = obj[key];
-if (val && typeof val === 'object' &&!Object.isFrozen(val)) {
-deepFreeze(val);
-}
-}
-return obj;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Packet — the traceable envelope.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a packet: a typed payload wrapped in a header that carries a
-* unique packetId, a traceId (shared across a causal chain — pass it in
-* opts to thread a conversation), a timestamp, and an optional source.
-*
-* @param {string} packetType - a non-empty type string, e.g. 'user.created'
-* @param {object} payload - the packet's data (must be an object)
-* @param {object} [opts] - { traceId?, source?} overrides
-* @returns {object} { packetId, packetType, timestamp, traceId, source, payload}
-*/
-function createPacket(packetType, payload, opts) {
-if (!packetType || typeof packetType!== 'string') {
-throw new Error('[tracebus] Cannot create packet: packetType is required and must be a non-empty string');
-}
-if (!payload || typeof payload!== 'object') {
-throw new Error(`[tracebus] Cannot create packet ${packetType}: payload must be an object`);
-}
-
-return {
-packetId: generateId(),
-packetType: packetType,
-timestamp: now(),
-traceId: (opts && opts.traceId) || generateId(),
-source: (opts && opts.source) || null,
-payload: payload
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Ledger — the append-only receipt log.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create an append-only ledger. Every bus emission is recorded here.
-* Nothing is ever removed; queries are pure reads.
-*/
-function createLedger() {
-const entries = [];
-
-return {
-/**
-* Record one emission.
-* @param {object} record - { bus, packet, source, destinations?, status?}
-*/
-record(record) {
-if (!record ||!record.packet ||!record.packet.packetId) {
-throw new Error('[tracebus] Cannot record: a record needs a packet with a packetId');
-}
-entries.push({
-ledgerId: generateId(),
-recordedAt: now(),
-bus: record.bus,
-packetId: record.packet.packetId,
-packetType: record.packet.packetType,
-traceId: record.packet.traceId,
-source: record.source,
-destinations: record.destinations || [],
-status: record.status || 'delivered'
-});
-},
-
-/**
-* Every record for one traceId, in emission order — a packet's journey.
-* @param {string} traceId
-* @returns {object[]}
-*/
-queryByTraceId(traceId) {
-return entries.filter(e => e.traceId === traceId);
-},
-
-/**
-* Every record of one packetType.
-* @param {string} packetType
-* @returns {object[]}
-*/
-queryByPacketType(packetType) {
-return entries.filter(e => e.packetType === packetType);
-},
-
-/** Total records (diagnostic). */
-count() {
-return entries.length;
-},
-
-/** A copy of every record (diagnostic — the ledger stays private). */
-all() {
-return entries.slice();
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Routing table — the declared topology.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a routing table. Every legal (packetType, source) → destinations
-* path must be registered before a packet can travel it. Registered entries
-* are frozen.
-*/
-function createRoutingTable() {
-// key = `${packetType}:${source}` → array of frozen entries
-const routes = new Map();
-
-return {
-/**
-* Register a legal path.
-* @param {object} entry - { packetType, source, bus, destinations[],
-* entryNumber?, mode?, priority?}
-*/
-register(entry) {
-if (!entry ||!entry.packetType ||!entry.source ||!entry.bus) {
-throw new Error('[tracebus] Cannot register route: packetType, source, and bus are required');
-}
-if (!entry.destinations ||!Array.isArray(entry.destinations) || entry.destinations.length === 0) {
-throw new Error(`[tracebus] Cannot register route ${entry.packetType} from ${entry.source}: destinations must be a non-empty array`);
-}
-
-const key = `${entry.packetType}:${entry.source}`;
-if (!routes.has(key)) {
-routes.set(key, []);
-}
-routes.get(key).push(deepFreeze({
-entryNumber: entry.entryNumber!== undefined? entry.entryNumber: null,
-packetType: entry.packetType,
-source: entry.source,
-bus: entry.bus,
-destinations: entry.destinations.slice(),
-mode: entry.mode || 'push',
-priority: entry.priority || 'standard'
-}));
-},
-
-/**
-* Resolve the routes for a (packetType, source) pair.
-* @throws if no route is registered — an unrouted packet is a fault.
-* @returns {object[]} matching frozen entries
-*/
-resolve(packetType, source) {
-const key = `${packetType}:${source}`;
-const matched = routes.get(key);
-if (!matched || matched.length === 0) {
-throw new Error(`[tracebus] Unrouted packet: ${packetType} from ${source}. No matching routing entry.`);
-}
-return matched;
-},
-
-/** Non-throwing existence check. */
-has(packetType, source) {
-const key = `${packetType}:${source}`;
-const matched = routes.get(key);
-return!!(matched && matched.length > 0);
-},
-
-/** Total registered entries (diagnostic). */
-count() {
-let total = 0;
-for (const list of routes.values()) {
-total += list.length;
-}
-return total;
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Bus — publish/subscribe with enforced routing and a receipt per emit.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a bus.
-* @param {string} name - this bus's name (matched against a route's `bus`)
-* @param {object} routingTable - a shared routing table (createRoutingTable())
-* @param {object} ledger - a shared ledger (createLedger())
-* @param {object} [opts] - { requestResponse?: boolean} — enable request()
-* on this bus. Default false.
-*/
-function createBus(name, routingTable, ledger, opts) {
-if (!name || typeof name!== 'string') {
-throw new Error('[tracebus] Cannot create bus: name is required and must be a non-empty string');
-}
-if (!routingTable || typeof routingTable.resolve!== 'function') {
-throw new Error(`[tracebus] Cannot create bus ${name}: a routing table is required`);
-}
-if (!ledger || typeof ledger.record!== 'function') {
-throw new Error(`[tracebus] Cannot create bus ${name}: a ledger is required`);
-}
-
-const requestResponse =!!(opts && opts.requestResponse);
-const subscribers = new Map(); // destination name → handler
-
-return {
-name: name,
-
-/**
-* Subscribe a named destination to this bus.
-* @param {string} destination - the name routing entries deliver to
-* @param {function} handler - receives (packet)
-*/
-subscribe(destination, handler) {
-if (!destination || typeof destination!== 'string') {
-throw new Error(`[tracebus:${name}] Cannot subscribe: destination must be a non-empty string`);
-}
-if (typeof handler!== 'function') {
-throw new Error(`[tracebus:${name}] Cannot subscribe ${destination}: handler must be a function`);
-}
-subscribers.set(destination, handler);
-},
-
-/**
-* Emit a packet from a source. Routing decides destinations; a receipt
-* is always recorded. Returns { delivered, missing} — destinations that
-* received the packet and declared destinations with no live subscriber.
-* @param {string} source - the emitter
-* @param {object} packet - from createPacket()
-*/
-emit(source, packet) {
-if (!packet ||!packet.packetType) {
-throw new Error(`[tracebus:${name}] Cannot emit from ${source}: invalid packet (missing packetType)`);
-}
-
-let routeEntries;
-try {
-routeEntries = routingTable.resolve(packet.packetType, source);
-} catch (err) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:unrouted'});
-throw err;
-}
-
-const entry = routeEntries[0];
-if (entry.bus!== name) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:wrong_bus'});
-throw new Error(`[tracebus:${name}] Cannot emit ${packet.packetType} from ${source}: packet is routed to bus ${entry.bus}, not ${name}`);
-}
-
-const delivered = [];
-const missing = [];
-
-for (const re of routeEntries) {
-for (const dest of re.destinations) {
-const handler = subscribers.get(dest);
-if (handler) {
-try {
-handler(packet);
-delivered.push(dest);
-} catch (handlerErr) {
-ledger.record({
-bus: name, packet, source,
-destinations: [dest],
-status: `error:subscriber:${handlerErr.message}`
-});
-delivered.push(dest); // a thrown handler still received the packet
-}
-} else {
-missing.push(dest);
-}
-}
-}
-
-ledger.record({
-bus: name, packet, source,
-destinations: delivered,
-status: missing.length > 0
-? `delivered:partial (missing: ${missing.join(', ')})`
-: 'delivered'
-});
-
-return { delivered, missing};
-},
-
-/**
-* Request/response: emit to a single destination and return its handler's
-* return value. Only available when the bus was created with
-* { requestResponse: true}.
-* @param {string} source
-* @param {object} packet
-* @returns {*} the handler's return value
-*/
-request(source, packet) {
-if (!requestResponse) {
-throw new Error(`[tracebus:${name}] request() is not enabled on this bus (create it with { requestResponse: true})`);
-}
-if (!packet ||!packet.packetType) {
-throw new Error(`[tracebus:${name}] Cannot request from ${source}: invalid packet`);
-}
-
-let routeEntries;
-try {
-routeEntries = routingTable.resolve(packet.packetType, source);
-} catch (err) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:unrouted'});
-throw err;
-}
-
-const entry = routeEntries[0];
-if (entry.bus!== name) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:wrong_bus'});
-throw new Error(`[tracebus:${name}] Cannot request ${packet.packetType}: routed to bus ${entry.bus}`);
-}
-
-const dest = entry.destinations[0];
-const handler = subscribers.get(dest);
-if (!handler) {
-ledger.record({ bus: name, packet, source, destinations: [dest], status: 'error:destination_not_registered'});
-throw new Error(`[tracebus:${name}] Cannot request ${packet.packetType} from ${source}: destination ${dest} is not registered`);
-}
-
-let result;
-try {
-result = handler(packet);
-} catch (handlerErr) {
-ledger.record({ bus: name, packet, source, destinations: [dest], status: `error:handler:${handlerErr.message}`});
-throw handlerErr;
-}
-
-ledger.record({ bus: name, packet, source, destinations: [dest], status: 'delivered:request_response'});
-return result;
-},
-
-/** Is a destination subscribed? (diagnostic) */
-hasSubscriber(destination) {
-return subscribers.has(destination);
-},
-
-/** Subscriber count (diagnostic). */
-subscriberCount() {
-return subscribers.size;
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Exports — CommonJS for Node, global for the browser.
-// ────────────────────────────────────────────────────────────────────
-
-const tracebus = {
-generateId,
-createPacket,
-createLedger,
-createRoutingTable,
-createBus,
-deepFreeze
-};
-
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = tracebus;
-}
-if (typeof window!== 'undefined') {
-window.tracebus = tracebus;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Runnable demo: node tracebus.js --demo
-// Wires a tiny two-subscriber bus, emits one packet, and prints the
-// ledger — so `run` shows the receipt trail with no code to write.
-// ────────────────────────────────────────────────────────────────────
-if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-var arg = process.argv[2];
-if (arg === '--demo' || arg === undefined) {
-var routing = createRoutingTable();
-var ledger = createLedger();
-var bus = createBus('DATA', routing, ledger);
-
-routing.register({ packetType: 'order.placed', source: 'checkout', bus: 'DATA', destinations: ['fulfillment', 'email']});
-bus.subscribe('fulfillment', function (p) { console.log(' fulfillment got order', p.payload.id);});
-bus.subscribe('email', function (p) { console.log(' email got order', p.payload.id);});
-
-console.log('emit order.placed from checkout:');
-var result = bus.emit('checkout', createPacket('order.placed', { id: 1001}, { source: 'checkout'}));
-console.log(' delivered:', result.delivered.join(', '), '| missing:', result.missing.join(', ') || '(none)');
-
-console.log('\nledger (the receipt trail):');
-ledger.all().forEach(function (e) {
-console.log(' ' + e.packetType + ' bus=' + e.bus + ' status=' + e.status + ' ->[' + e.destinations.join(', ') + ']');
-});
-
-console.log('\ntry an unrouted packet (refused, but still recorded):');
-try { bus.emit('checkout', createPacket('order.cancelled', { id: 1001}));}
-catch (e) { console.log(' refused: ' + e.message);}
-console.log(' ledger now has ' + ledger.count() + ' records — nothing moved without a receipt.');
-} else {
-console.log('usage: node tracebus.js --demo');
-}
-}
-
-test_tracebus.js 268 lines on GitHub →
-#!/usr/bin/env node
-/* test_tracebus.js — proves the bus is honest: nothing moves without a receipt,
-no path travels that wasn't declared, and a bad subscriber can't take the bus down.
-
-The six properties that ARE the tool:
-1. No delivery without a receipt — every emit() appends exactly one ledger record.
-2. No undeclared path — an unrouted packet is refused (and the refusal is recorded).
-3. A wrong-bus packet is refused — routed to A, cannot be emitted on B.
-4. A throwing subscriber can't break the emitter — error caught, recorded, delivery continues.
-5. Registered routes are frozen — the declared topology stays declared.
-6. A trace is reconstructable — queryByTraceId returns every hop in order.
-Plus the generalizations this strip added over its origin (tested hardest, per the
-"a ported core gets its OWN validation" rule): request() gated by a per-bus flag,
-not a hardcoded bus name. Ends with a mutation bite so a vacuous green fails loud.
-stdlib only, no dependencies. Exit 0 = all pass, exit 1 = a failure (loud). */
 "use strict";
-var tb = require("./tracebus.js");
+
+/* ---------- UTF-8-safe base64 (browser btoa/atob choke on multibyte) -------- */
+
+function _utf8ToBytes(str) {
+// Deterministic UTF-8 encoding, no dependencies.
+if (typeof TextEncoder!== "undefined") return new TextEncoder().encode(str);
+// Node / older-runtime fallback.
+if (typeof Buffer!== "undefined") return new Uint8Array(Buffer.from(str, "utf8"));
+// Minimal hand-rolled UTF-8 (last resort).
+var out = [];
+for (var i = 0; i < str.length; i++) {
+var c = str.charCodeAt(i);
+if (c < 0x80) out.push(c);
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) {
+var c2 = str.charCodeAt(++i);
+var cp = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
+out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
+0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
+}
+return new Uint8Array(out);
+}
+
+function _bytesToUtf8(bytes) {
+if (typeof TextDecoder!== "undefined") return new TextDecoder("utf-8").decode(bytes);
+if (typeof Buffer!== "undefined") return Buffer.from(bytes).toString("utf8");
+var s = "", i = 0;
+while (i < bytes.length) {
+var b = bytes[i++];
+if (b < 0x80) s += String.fromCharCode(b);
+else if (b < 0xe0) s += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));
+else if (b < 0xf0) s += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f));
+else {
+var cp = ((b & 0x07) << 18) | ((bytes[i++] & 0x3f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f);
+cp -= 0x10000;
+s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+}
+}
+return s;
+}
+
+var _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function _bytesToB64(bytes) {
+if (typeof Buffer!== "undefined") return Buffer.from(bytes).toString("base64");
+var out = "", i;
+for (i = 0; i + 2 < bytes.length; i += 3) {
+var n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+out += _B64[(n >> 18) & 63] + _B64[(n >> 12) & 63] + _B64[(n >> 6) & 63] + _B64[n & 63];
+}
+var rem = bytes.length - i;
+if (rem === 1) {
+var n1 = bytes[i] << 16;
+out += _B64[(n1 >> 18) & 63] + _B64[(n1 >> 12) & 63] + "==";
+} else if (rem === 2) {
+var n2 = (bytes[i] << 16) | (bytes[i + 1] << 8);
+out += _B64[(n2 >> 18) & 63] + _B64[(n2 >> 12) & 63] + _B64[(n2 >> 6) & 63] + "=";
+}
+return out;
+}
+
+function _b64ToBytes(b64) {
+if (typeof Buffer!== "undefined") return new Uint8Array(Buffer.from(b64, "base64"));
+var lookup = {}; for (var k = 0; k < _B64.length; k++) lookup[_B64[k]] = k;
+var clean = b64.replace(/[^A-Za-z0-9+/]/g, "");
+var bytes = [], i;
+for (i = 0; i + 3 < clean.length; i += 4) {
+var n = (lookup[clean[i]] << 18) | (lookup[clean[i + 1]] << 12) |
+(lookup[clean[i + 2]] << 6) | lookup[clean[i + 3]];
+bytes.push((n >> 16) & 255, (n >> 8) & 255, n & 255);
+}
+var rem = clean.length - i;
+if (rem === 2) { var a = (lookup[clean[i]] << 18) | (lookup[clean[i + 1]] << 12); bytes.push((a >> 16) & 255);}
+else if (rem === 3) { var b = (lookup[clean[i]] << 18) | (lookup[clean[i + 1]] << 12) | (lookup[clean[i + 2]] << 6); bytes.push((b >> 16) & 255, (b >> 8) & 255);}
+return new Uint8Array(bytes);
+}
+
+/* ---------- deterministic canonical JSON (sorted keys, every level) --------- */
+
+function _canonical(value) {
+if (value === null || typeof value!== "object") return JSON.stringify(value);
+if (Array.isArray(value)) return "[" + value.map(_canonical).join(",") + "]";
+var keys = Object.keys(value).sort();
+var parts = [];
+for (var i = 0; i < keys.length; i++) {
+parts.push(JSON.stringify(keys[i]) + ":" + _canonical(value[keys[i]]));
+}
+return "{" + parts.join(",") + "}";
+}
+
+/* ---------- SNAPSHOT --------------------------------------------------------- */
+
+// Encode a JSON-able document as a deterministic, portable base64 snapshot.
+function encodeSnapshot(doc) {
+var json = _canonical(doc); // sorted keys -> same doc, same string
+return _bytesToB64(_utf8ToBytes(json));
+}
+
+// Decode a base64 snapshot back into the document. Throws on a malformed string.
+function decodeSnapshot(b64) {
+if (typeof b64!== "string" || b64.length === 0) {
+throw new Error("decodeSnapshot: expected a non-empty base64 string");
+}
+var json = _bytesToUtf8(_b64ToBytes(b64));
+return JSON.parse(json);
+}
+
+/* ---------- CATALOG (store is injected: {getItem,setItem,removeItem}) -------- */
+
+var NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+// Validate a catalog entry name (allowed chars, length). Returns {valid,error}.
+function validateName(name) {
+if (typeof name!== "string" ||!NAME_RE.test(name)) {
+return { valid: false, error: "Invalid name — A-Z a-z 0-9 - _ only, 1-64 chars"};
+}
+return { valid: true, error: null};
+}
+
+function _readCatalog(store, key) {
+try { var raw = store.getItem(key); return raw? JSON.parse(raw): {};}
+catch (e) { return {};}
+}
+function _writeCatalog(store, key, catalog) {
+store.setItem(key, JSON.stringify(catalog));
+}
+
+// Save a document under a name. Stores {snapshot, savedAt}. Throws on bad name.
+function catalogSave(store, key, name, doc, now) {
+var v = validateName(name);
+if (!v.valid) throw new Error(v.error);
+var catalog = _readCatalog(store, key);
+catalog[name] = { snapshot: encodeSnapshot(doc), savedAt: (now == null? 0: now)};
+_writeCatalog(store, key, catalog);
+return catalog[name];
+}
+
+// Load a document by name, or null if absent.
+function catalogLoad(store, key, name) {
+var catalog = _readCatalog(store, key);
+var entry = catalog[name];
+return entry? decodeSnapshot(entry.snapshot): null;
+}
+
+// Remove a document by name. Returns true if it existed.
+function catalogRemove(store, key, name) {
+var catalog = _readCatalog(store, key);
+if (!(name in catalog)) return false;
+delete catalog[name];
+_writeCatalog(store, key, catalog);
+return true;
+}
+
+// List entry names, sorted by "name" (default) or "time" (savedAt), asc/desc.
+function catalogList(store, key, sortKey, ascending) {
+var catalog = _readCatalog(store, key);
+var names = Object.keys(catalog);
+var asc = ascending!== false;
+names.sort(function (a, b) {
+var av, bv;
+if (sortKey === "time") { av = catalog[a].savedAt || 0; bv = catalog[b].savedAt || 0;}
+else { av = a; bv = b;}
+if (av < bv) return asc? -1: 1;
+if (av > bv) return asc? 1: -1;
+// stable tiebreak by name so the order is fully deterministic
+return a < b? -1: a > b? 1: 0;
+});
+return names;
+}
+
+/* ---------- ARCHIVE (the whole catalog as one portable string) -------------- */
+
+var ARCHIVE_MAGIC = "L21X-ARCHIVE-1";
+
+// Export a whole catalog object as one portable, deterministic string.
+function archiveExport(catalog) {
+return encodeSnapshot({ magic: ARCHIVE_MAGIC, entries: catalog || {}});
+}
+
+// Import an archive string back into a catalog object. Validates the envelope
+// and every entry name; throws loudly on a malformed or foreign archive.
+function archiveImport(str) {
+var obj;
+try { obj = decodeSnapshot(str);}
+catch (e) { throw new Error("archiveImport: not a valid archive (decode failed)");}
+if (!obj || obj.magic!== ARCHIVE_MAGIC || typeof obj.entries!== "object" || obj.entries === null) {
+throw new Error("archiveImport: not an l21x archive (bad envelope)");
+}
+var names = Object.keys(obj.entries);
+for (var i = 0; i < names.length; i++) {
+if (!validateName(names[i]).valid) {
+throw new Error("archiveImport: archive contains an invalid entry name: " + names[i]);
+}
+}
+return obj.entries;
+}
+
+/* ---------- exports (browser namespace OR node require) ---------------------- */
+
+var L21X = {
+encodeSnapshot: encodeSnapshot,
+decodeSnapshot: decodeSnapshot,
+validateName: validateName,
+catalogSave: catalogSave,
+catalogLoad: catalogLoad,
+catalogRemove: catalogRemove,
+catalogList: catalogList,
+archiveExport: archiveExport,
+archiveImport: archiveImport,
+ARCHIVE_MAGIC: ARCHIVE_MAGIC
+};
+
+if (typeof module!== "undefined" && module.exports) module.exports = L21X;
+if (typeof window!== "undefined") window.L21X = L21X;
+
+/* ---------- CLI ------------------------------------------------------------- */
+
+function _cli(argv) {
+var args = argv.slice(2);
+var cmd = args[0];
+if (!cmd || cmd === "--help" || cmd === "-h") {
+process.stdout.write(
+"l21x-snapshot — portable browser document persistence\n\n" +
+" echo '<json>' | node l21x-snapshot.js encode doc (JSON) -> snapshot (base64)\n" +
+" node l21x-snapshot.js decode <base64> snapshot -> doc (JSON)\n" +
+" node l21x-snapshot.js roundtrip '<json>' prove decode(encode(x)) deep-equals x\n" +
+" node l21x-snapshot.js --help\n"
+);
+return 0;
+}
+function readStdin(cb) {
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () { cb(Buffer.concat(chunks).toString("utf8"));});
+}
+if (cmd === "encode") {
+readStdin(function (input) {
+try { process.stdout.write(encodeSnapshot(JSON.parse(input)) + "\n");}
+catch (e) { process.stderr.write("encode: invalid JSON on stdin\n"); process.exitCode = 1;}
+});
+return 0;
+}
+if (cmd === "decode") {
+if (!args[1]) { process.stderr.write("decode: need a base64 argument\n"); return 1;}
+try { process.stdout.write(JSON.stringify(decodeSnapshot(args[1])) + "\n"); return 0;}
+catch (e) { process.stderr.write("decode: " + e.message + "\n"); return 1;}
+}
+if (cmd === "roundtrip") {
+if (!args[1]) { process.stderr.write("roundtrip: need a JSON argument\n"); return 1;}
+try {
+var doc = JSON.parse(args[1]);
+var back = decodeSnapshot(encodeSnapshot(doc));
+var ok = _canonical(doc) === _canonical(back);
+process.stdout.write((ok? "OK round-trip: ": "FAIL round-trip: ") + JSON.stringify(back) + "\n");
+return ok? 0: 1;
+} catch (e) { process.stderr.write("roundtrip: " + e.message + "\n"); return 1;}
+}
+process.stderr.write("unknown command: " + cmd + " (try --help)\n");
+return 1;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = _cli(process.argv);
+}
+
+test_l21x-snapshot.js 190 lines on GitHub →
+#!/usr/bin/env node
+/* test_l21x-snapshot.js — proves the three verbs hold their contracts.
+
+THE ORACLES (honest proofs, not "matches a string I typed"):
+1. ROUND-TRIP: decodeSnapshot(encodeSnapshot(x)) deep-equals x, for a
+battery that includes multibyte text, nesting, arrays, and edge values.
+2. DETERMINISM: two documents that are equal-but-key-reordered encode to the
+SAME base64 string (the fidelity rule). This is what makes a snapshot
+diffable/hashable; break the key-sort and this vector fails.
+3. CATALOG: save/load/remove/list over an injected in-memory store behave,
+and list is deterministically ordered by name and by time.
+4. ARCHIVE: export then import round-trips a whole catalog, and a foreign or
+malformed archive is rejected loudly.
+
+Also mutation-bites the core so a no-op test can't pass green. Exit 0 = all
+pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var assert = require("assert");
+var L = require("./l21x-snapshot.js");
 
 var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;} else { fail++; console.error("FAIL " + name);}
+function check(name, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL " + name + "\n " + (e && e.message));}
 }
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
+// Deep, ORDER-INDEPENDENT equality. The encoder is deterministic (it sorts
+// keys), so a round-tripped object is content-equal but may be key-reordered
+// relative to the input — which is correct. Compare by content, not by the
+// insertion order JSON.stringify happens to preserve.
+function eq(a, b) {
+if (a === b) return true;
+if (a === null || b === null || typeof a!== "object" || typeof b!== "object") return a === b;
+if (Array.isArray(a)!== Array.isArray(b)) return false;
+if (Array.isArray(a)) {
+if (a.length!== b.length) return false;
+for (var i = 0; i < a.length; i++) if (!eq(a[i], b[i])) return false;
+return true;
 }
-function threws(fn) { try { fn(); return false;} catch (e) { return true;}}
-
-// A fresh, wired-up bus system for a test to use.
-function fixture(busOpts) {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-var bus = tb.createBus("DATA", routing, ledger, busOpts);
-return { routing: routing, ledger: ledger, bus: bus};
+var ka = Object.keys(a).sort(), kb = Object.keys(b).sort();
+if (ka.length!== kb.length) return false;
+for (var j = 0; j < ka.length; j++) { if (ka[j]!== kb[j]) return false; if (!eq(a[ka[j]], b[ka[j]])) return false;}
+return true;
 }
 
-// ── createPacket: shape + validation ─────────────────────────────────────────
-(function () {
-var p = tb.createPacket("user.created", { id: 7});
-ok("packet has packetId", typeof p.packetId === "string" && p.packetId.length === 36);
-ok("packet has traceId", typeof p.traceId === "string" && p.traceId.length === 36);
-ok("packet keeps type", p.packetType === "user.created");
-ok("packet keeps payload", p.payload.id === 7);
-ok("packet source defaults null", p.source === null);
-ok("packetId!== traceId by default", p.packetId!== p.traceId);
+/* 1. ROUND-TRIP battery -------------------------------------------------------*/
+var vectors = [
+{},
+{ a: 1},
+{ a: 1, b: [1, 2, 3], c: { d: true, e: null}},
+[1, "two", 3.5, false, null],
+"a bare string",
+42,
+true,
+null,
+{ name: "café", emoji: "🌲🔧", cyrillic: "Привет", cjk: "日本語"}, // multibyte
+{ nested: { deep: { deeper: { x: [ { y: 1}]}}}},
+{ "keys-with-dashes_and_1": "ok", "unicode-key-café": 1}
+];
+vectors.forEach(function (v, i) {
+check("roundtrip[" + i + "]", function () {
+var back = L.decodeSnapshot(L.encodeSnapshot(v));
+assert.ok(eq(v, back), "round-trip changed the document: " + JSON.stringify(back));
+});
+});
 
-var threaded = tb.createPacket("user.updated", { id: 7}, { traceId: "trace-abc", source: "svc"});
-ok("traceId threads through opts", threaded.traceId === "trace-abc");
-ok("source threads through opts", threaded.source === "svc");
+/* 1b. PINNED GOLDEN — a fixed doc must encode to this exact string, forever.
+Content round-trip alone would miss an encoding drift that still decodes
+(e.g. a base64-alphabet swap). This pins the wire format. */
+check("pinned golden snapshot is byte-stable", function () {
+var doc = { a: 1, b: "café", c: [3, 2, 1], d: { z: true, y: null}};
+var GOLDEN = "eyJhIjoxLCJiIjoiY2Fmw6kiLCJjIjpbMywyLDFdLCJkIjp7InkiOm51bGwsInoiOnRydWV9fQ==";
+assert.strictEqual(L.encodeSnapshot(doc), GOLDEN, "wire format drifted from the pinned golden");
+assert.ok(eq(L.decodeSnapshot(GOLDEN), doc), "golden does not decode back to the doc");
+});
 
-ok("empty packetType throws", threws(function () { tb.createPacket("", {});}));
-ok("non-string packetType throws", threws(function () { tb.createPacket(42, {});}));
-ok("null payload throws", threws(function () { tb.createPacket("t", null);}));
-ok("non-object payload throws", threws(function () { tb.createPacket("t", "nope");}));
-})();
+/* 2. DETERMINISM (the fidelity rule) -----------------------------------------*/
+check("determinism: key order does not change the snapshot", function () {
+var s1 = L.encodeSnapshot({ a: 1, b: 2, c: 3});
+var s2 = L.encodeSnapshot({ c: 3, b: 2, a: 1});
+assert.strictEqual(s1, s2, "equal docs with different key order encoded differently");
+});
+check("determinism: nested key order too", function () {
+var s1 = L.encodeSnapshot({ outer: { z: 1, a: 2}, arr: [ { q: 1, p: 2}]});
+var s2 = L.encodeSnapshot({ arr: [ { p: 2, q: 1}], outer: { a: 2, z: 1}});
+assert.strictEqual(s1, s2, "nested key order leaked into the snapshot");
+});
+check("determinism: same doc encodes identically twice", function () {
+var d = { x: [1, 2, { y: "café"}]};
+assert.strictEqual(L.encodeSnapshot(d), L.encodeSnapshot(d));
+});
+check("decode rejects garbage loudly", function () {
+assert.throws(function () { L.decodeSnapshot("");});
+});
 
-// ── generateId: v4 shape + uniqueness ────────────────────────────────────────
-(function () {
-var a = tb.generateId(), b = tb.generateId();
-ok("id is 36 chars", a.length === 36);
-ok("id version nibble is 4", a[14] === "4");
-ok("id variant nibble in 8,9,a,b", /[89ab]/.test(a[19]));
-ok("dashes at 8,13,18,23", a[8] === "-" && a[13] === "-" && a[18] === "-" && a[23] === "-");
-ok("ids are unique", a!== b);
-// 500 draws, no collision
-var seen = {}, collision = false;
-for (var i = 0; i < 500; i++) { var id = tb.generateId(); if (seen[id]) collision = true; seen[id] = 1;}
-ok("500 ids, no collision",!collision);
-})();
+/* 3. CATALOG (injected in-memory store) --------------------------------------*/
+function memStore() {
+var m = {};
+return {
+getItem: function (k) { return k in m? m[k]: null;},
+setItem: function (k, v) { m[k] = v;},
+removeItem: function (k) { delete m[k];}
+};
+}
+var KEY = "cat";
 
-// ── PROPERTY 1: no delivery without a receipt ────────────────────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "e", source: "src", bus: "DATA", destinations: ["sink"]});
-f.bus.subscribe("sink", function () {});
-ok("ledger starts empty", f.ledger.count() === 0);
-f.bus.emit("src", tb.createPacket("e", { n: 1}));
-ok("one emit -> one record", f.ledger.count() === 1);
-f.bus.emit("src", tb.createPacket("e", { n: 2}));
-ok("two emits -> two records", f.ledger.count() === 2);
-ok("delivered status recorded", f.ledger.all()[0].status === "delivered");
+check("catalog save/load round-trips a document", function () {
+var s = memStore();
+L.catalogSave(s, KEY, "draft", { title: "hello", body: "café ☕"}, 100);
+var got = L.catalogLoad(s, KEY, "draft");
+assert.ok(eq(got, { title: "hello", body: "café ☕"}), "catalog changed the doc");
+});
+check("catalog load of absent name is null", function () {
+var s = memStore();
+assert.strictEqual(L.catalogLoad(s, KEY, "nope"), null);
+});
+check("catalog remove reports existence", function () {
+var s = memStore();
+L.catalogSave(s, KEY, "a", { v: 1}, 1);
+assert.strictEqual(L.catalogRemove(s, KEY, "a"), true);
+assert.strictEqual(L.catalogRemove(s, KEY, "a"), false);
+assert.strictEqual(L.catalogLoad(s, KEY, "a"), null);
+});
+check("catalog list sorts by name asc/desc deterministically", function () {
+var s = memStore();
+L.catalogSave(s, KEY, "banana", { v: 1}, 3);
+L.catalogSave(s, KEY, "apple", { v: 1}, 1);
+L.catalogSave(s, KEY, "cherry", { v: 1}, 2);
+assert.ok(eq(L.catalogList(s, KEY, "name", true), ["apple", "banana", "cherry"]));
+assert.ok(eq(L.catalogList(s, KEY, "name", false), ["cherry", "banana", "apple"]));
+});
+check("catalog list sorts by time", function () {
+var s = memStore();
+L.catalogSave(s, KEY, "banana", { v: 1}, 3);
+L.catalogSave(s, KEY, "apple", { v: 1}, 1);
+L.catalogSave(s, KEY, "cherry", { v: 1}, 2);
+assert.ok(eq(L.catalogList(s, KEY, "time", true), ["apple", "cherry", "banana"]));
+});
+check("catalog rejects invalid names", function () {
+var s = memStore();
+assert.throws(function () { L.catalogSave(s, KEY, "has space", {}, 0);});
+assert.throws(function () { L.catalogSave(s, KEY, "", {}, 0);});
+assert.throws(function () { L.catalogSave(s, KEY, "x".repeat(65), {}, 0);});
+});
+check("validateName accepts good, rejects bad", function () {
+assert.strictEqual(L.validateName("good_Name-1").valid, true);
+assert.strictEqual(L.validateName("bad name").valid, false);
+});
 
-// even a REJECTED emit leaves exactly one record
-var g = fixture();
-var before = g.ledger.count();
-threws(function () { g.bus.emit("nobody", tb.createPacket("unrouted", {}));});
-ok("rejected emit still records once", g.ledger.count() === before + 1);
-ok("rejection status is unrouted", g.ledger.all()[0].status === "rejected:unrouted");
-})();
+/* 4. ARCHIVE (whole catalog as one portable string) --------------------------*/
+check("archive export/import round-trips a catalog", function () {
+var s = memStore();
+L.catalogSave(s, KEY, "one", { a: 1}, 1);
+L.catalogSave(s, KEY, "two", { b: 2, deep: { x: "café"}}, 2);
+var raw = JSON.parse(s.getItem(KEY));
+var archive = L.archiveExport(raw);
+var back = L.archiveImport(archive);
+assert.ok(eq(back, raw), "archive changed the catalog");
+});
+check("archive of empty catalog round-trips", function () {
+assert.ok(eq(L.archiveImport(L.archiveExport({})), {}));
+});
+check("archive import rejects a foreign envelope", function () {
+var foreign = L.encodeSnapshot({ magic: "SOMETHING-ELSE", entries: {}});
+assert.throws(function () { L.archiveImport(foreign);});
+});
+check("archive import rejects garbage", function () {
+assert.throws(function () { L.archiveImport("not base64 @#$");});
+});
+check("archive import rejects an invalid entry name", function () {
+var bad = L.encodeSnapshot({ magic: L.ARCHIVE_MAGIC, entries: { "bad name": { snapshot: "x", savedAt: 0}}});
+assert.throws(function () { L.archiveImport(bad);});
+});
 
-// ── PROPERTY 2: no undeclared path ───────────────────────────────────────────
-(function () {
-var f = fixture();
-ok("unrouted resolve throws", threws(function () { f.routing.resolve("x", "y");}));
-ok("has() is false before register", f.routing.has("x", "y") === false);
-f.routing.register({ packetType: "x", source: "y", bus: "DATA", destinations: ["d"]});
-ok("has() is true after register", f.routing.has("x", "y") === true);
-ok("emit of unrouted throws", threws(function () { f.bus.emit("z", tb.createPacket("x", {}));}));
-// register validation
-ok("register without bus throws", threws(function () { f.routing.register({ packetType: "a", source: "b", destinations: ["d"]});}));
-ok("register with empty destinations throws", threws(function () { f.routing.register({ packetType: "a", source: "b", bus: "DATA", destinations: []});}));
-ok("register with non-array destinations throws", threws(function () { f.routing.register({ packetType: "a", source: "b", bus: "DATA", destinations: "d"});}));
-})();
+/* 5. MUTATION BITE — a no-op test cannot pass green --------------------------*/
+/* If the encoder stopped being deterministic (key-sort removed), test 2 fails.
+We ALSO directly assert the bite: prove the oracle has teeth by confirming a
+known non-deterministic encode WOULD be caught. Encode a doc, then encode a
+key-shuffled twin; require equality. If someone deletes _canonical's sort,
+these differ and the suite goes red — demonstrated here as a live guard. */
+check("mutation-bite: determinism guard has teeth", function () {
+var a = L.encodeSnapshot({ m: 1, z: 2, a: 3, k: 4});
+var b = L.encodeSnapshot({ z: 2, k: 4, a: 3, m: 1});
+assert.strictEqual(a, b, "determinism guard would not catch a key-sort regression");
+// and a genuinely different doc MUST encode differently (no trivial-pass):
+assert.notStrictEqual(a, L.encodeSnapshot({ m: 1, z: 2, a: 3, k: 5}));
+});
 
-// ── PROPERTY 3: a wrong-bus packet is refused ────────────────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-var dataBus = tb.createBus("DATA", routing, ledger);
-var ctrlBus = tb.createBus("CONTROL", routing, ledger);
-// route says this packet belongs on CONTROL
-routing.register({ packetType: "cmd", source: "op", bus: "CONTROL", destinations: ["worker"]});
-var landed = false;
-dataBus.subscribe("worker", function () { landed = true;});
-ok("emit on wrong bus throws", threws(function () { dataBus.emit("op", tb.createPacket("cmd", {}));}));
-ok("wrong-bus packet not delivered", landed === false);
-ok("wrong-bus rejection recorded", ledger.all().some(function (e) { return e.status === "rejected:wrong_bus";}));
-})();
-
-// ── PROPERTY 4: a throwing subscriber can't break the emitter ────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "fan", source: "src", bus: "DATA", destinations: ["good", "bad", "also"]});
-var goodHits = 0, alsoHits = 0;
-f.bus.subscribe("good", function () { goodHits++;});
-f.bus.subscribe("bad", function () { throw new Error("boom");});
-f.bus.subscribe("also", function () { alsoHits++;});
-var result;
-ok("emit with a throwing subscriber does not throw",!threws(function () {
-result = f.bus.emit("src", tb.createPacket("fan", {}));
-}));
-ok("good subscriber ran", goodHits === 1);
-ok("subscriber AFTER the thrower still ran", alsoHits === 1);
-ok("throwing dest counted as delivered", result.delivered.indexOf("bad")!== -1);
-ok("subscriber error recorded", f.ledger.all().some(function (e) { return /error:subscriber/.test(e.status);}));
-
-// a declared destination with NO subscriber -> reported missing, not an error
-var g = fixture();
-g.routing.register({ packetType: "e", source: "s", bus: "DATA", destinations: ["present", "absent"]});
-g.bus.subscribe("present", function () {});
-var r2 = g.bus.emit("s", tb.createPacket("e", {}));
-ok("present delivered", r2.delivered.indexOf("present")!== -1);
-ok("absent reported missing", r2.missing.indexOf("absent")!== -1);
-ok("partial status recorded", g.ledger.all().some(function (e) { return /delivered:partial/.test(e.status);}));
-})();
-
-// ── PROPERTY 5: registered routes are frozen ─────────────────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-routing.register({ packetType: "e", source: "s", bus: "DATA", destinations: ["d"]});
-var entry = routing.resolve("e", "s")[0];
-ok("resolved entry is frozen", Object.isFrozen(entry));
-ok("entry.destinations is frozen", Object.isFrozen(entry.destinations));
-// mutating a frozen entry is a silent no-op in non-strict, throws in strict — either way it must not change
-var beforeBus = entry.bus;
-try { entry.bus = "HACKED";} catch (e) { /* strict-mode throw is fine */}
-ok("frozen entry.bus unchanged", entry.bus === beforeBus);
-try { entry.destinations.push("injected");} catch (e) { /* fine */}
-ok("frozen destinations unchanged", entry.destinations.length === 1);
-
-// deepFreeze on a nested object
-var nested = tb.deepFreeze({ a: { b: { c: 1}}});
-ok("deepFreeze freezes root", Object.isFrozen(nested));
-ok("deepFreeze freezes nested", Object.isFrozen(nested.a.b));
-})();
-
-// ── PROPERTY 6: a trace is reconstructable ───────────────────────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "step1", source: "a", bus: "DATA", destinations: ["b"]});
-f.routing.register({ packetType: "step2", source: "a", bus: "DATA", destinations: ["b"]});
-f.bus.subscribe("b", function () {});
-var trace = "journey-1";
-f.bus.emit("a", tb.createPacket("step1", {}, { traceId: trace}));
-f.bus.emit("a", tb.createPacket("step2", {}, { traceId: trace}));
-f.bus.emit("a", tb.createPacket("step1", {}, { traceId: "other"}));
-var hops = f.ledger.queryByTraceId(trace);
-ok("trace has exactly its two hops", hops.length === 2);
-ok("trace hops in emission order", hops[0].packetType === "step1" && hops[1].packetType === "step2");
-ok("other trace excluded", hops.every(function (h) { return h.traceId === trace;}));
-// query by packetType
-ok("queryByPacketType finds all step1", f.ledger.queryByPacketType("step1").length === 2);
-})();
-
-// ── THE GENERALIZATION (tested hardest — the ported core's OWN validation) ────
-// In the origin, request() was hardwired to a bus literally named 'VAULT'. The strip
-// replaced that with a per-bus { requestResponse} flag. These prove the new gate.
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-routing.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-
-// a bus WITHOUT the flag refuses request(), regardless of its name
-var plain = tb.createBus("RPC", routing, ledger); // note: named RPC, not VAULT — name must NOT matter
-plain.subscribe("answerer", function () { return 99;});
-ok("request refused without flag (name irrelevant)", threws(function () {
-plain.request("asker", tb.createPacket("q", {}));
-}));
-
-// a bus WITH the flag answers — and the answer is the handler's return value
-var routing2 = tb.createRoutingTable();
-var ledger2 = tb.createLedger();
-routing2.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-var rpc = tb.createBus("RPC", routing2, ledger2, { requestResponse: true});
-rpc.subscribe("answerer", function (pkt) { return pkt.payload.a + pkt.payload.b;});
-var answer = rpc.request("asker", tb.createPacket("q", { a: 2, b: 3}));
-ok("request returns handler value", answer === 5);
-ok("request_response status recorded", ledger2.all().some(function (e) { return /request_response/.test(e.status);}));
-
-// request to an unregistered destination -> error, recorded
-var routing3 = tb.createRoutingTable();
-var ledger3 = tb.createLedger();
-routing3.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["ghost"]});
-var rpc3 = tb.createBus("RPC", routing3, ledger3, { requestResponse: true});
-ok("request to unregistered dest throws", threws(function () { rpc3.request("asker", tb.createPacket("q", {}));}));
-ok("unregistered-dest error recorded", ledger3.all().some(function (e) { return /destination_not_registered/.test(e.status);}));
-
-// a throwing request handler propagates (unlike emit) but still records
-var routing4 = tb.createRoutingTable();
-var ledger4 = tb.createLedger();
-routing4.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-var rpc4 = tb.createBus("RPC", routing4, ledger4, { requestResponse: true});
-rpc4.subscribe("answerer", function () { throw new Error("handler failed");});
-ok("request handler error propagates", threws(function () { rpc4.request("asker", tb.createPacket("q", {}));}));
-ok("request handler error recorded", ledger4.all().some(function (e) { return /error:handler/.test(e.status);}));
-})();
-
-// ── constructor validation (the ported core's own guards) ────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-ok("createBus without name throws", threws(function () { tb.createBus("", routing, ledger);}));
-ok("createBus without routing throws", threws(function () { tb.createBus("B", null, ledger);}));
-ok("createBus without ledger throws", threws(function () { tb.createBus("B", routing, null);}));
-ok("createBus with non-table routing throws", threws(function () { tb.createBus("B", {}, ledger);}));
-
-var f = fixture();
-ok("subscribe non-function throws", threws(function () { f.bus.subscribe("d", "not a fn");}));
-ok("subscribe empty dest throws", threws(function () { f.bus.subscribe("", function () {});}));
-ok("ledger.record without packet throws", threws(function () { f.ledger.record({ bus: "DATA"});}));
-
-// diagnostics
-f.bus.subscribe("x", function () {});
-ok("hasSubscriber true for x", f.bus.hasSubscriber("x") === true);
-ok("hasSubscriber false for y", f.bus.hasSubscriber("y") === false);
-ok("subscriberCount is 1", f.bus.subscriberCount() === 1);
-})();
-
-// ── MUTATION BITE: prove the receipt invariant is not vacuously green ─────────
-// If the ledger silently dropped records, property 1's counts would still be
-// "consistent" at zero. This bite asserts the ledger actually grows AND that a
-// real emit produces a record whose fields tie back to the packet — so a no-op
-// record() (the plausible mutation) fails loud here.
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "bite", source: "s", bus: "DATA", destinations: ["d"]});
-f.bus.subscribe("d", function () {});
-var pkt = tb.createPacket("bite", { proof: true});
-f.bus.emit("s", pkt);
-var rec = f.ledger.all()[0];
-ok("mutation bite: ledger actually grew", f.ledger.count() === 1);
-ok("mutation bite: record ties to the packet", rec && rec.packetId === pkt.packetId && rec.traceId === pkt.traceId);
-ok("mutation bite: record carries real status", rec && typeof rec.status === "string" && rec.status.length > 0);
-})();
-
+/* ---------------------------------------------------------------------------*/
 console.log((fail === 0? "PASS": "FAIL") + " — " + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
+process.exitCode = fail === 0? 0: 1;
 
 Take the whole folder →
 MIT
-Zero-dependency JavaScript, Node or browser
+Zero-dependency JavaScript (browser or Node)
+
+---
+
+# Skin Config Validator — a Loop MMT gift
+https://loopmmt.com/gifts/loop21-verifyskin/
+[coverage: optional · branch: gifts]
+
+Is This User Config Safe To Apply? filter ← all gifts
+
+Skin Config Validator
+
+Validate a user-submitted skin/theme config object — colors, fonts, numbers, CSS custom properties — against a schema you declare, BEFORE you splice it into a stylesheet. verifySkin(config, schema) type-checks every field, allowlists CSS colors and cssvar values (rejecting url(), @import, javascript:, and; {} breakouts), and returns { ok, value, errors, warnings} — value carries only the fields that passed, safe to apply. It does not mutate or coerce; it reports. No dependencies, Node or browser.
+
+The honest edge
+
+It keeps 'wrong' and 'unknown' apart: a bad type/range/injection is an ERROR, an unknown field is a dropped WARNING (forward-compat), a missing optional field is silent. The `string` type is NOT stylesheet-sanitized — it type-checks and length-caps only; use `cssvar` (the type with the injection allowlist) for anything headed into a style surface. The named-color allowlist is conservative (unknown names rejected, not guessed) and the cssvar check is a safe-character GRAMMAR, not a full CSS value parser — it proves the value can't break out of a declaration, not that it is meaningful CSS. The schema is YOURS: a malformed schema throws (programmer error); only the config is treated as untrusted and reported-not-thrown.
+
+Run it
+
+node loop21-verifyskin.js config.json schema.json
+test_loop21-verifyskin.js (18/18: every type path, CSS-injection rejection, unknown-field drop+warn, required-missing error, non-object config reported-not-thrown, multi-error report, 2 ratchet-refusal cases)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+loop21-verifyskin.js 207 lines on GitHub →
+#!/usr/bin/env node
+/* loop21-verifyskin.js — a pure, dependency-free, STRICT validator for
+user-submitted "skin" config objects, before you apply them to a UI. Runs
+identically in a browser (window.LoopGifts.verifySkin) and in Node (require /
+this CLI). No DOM, no dependencies.
+
+WHY THIS EXISTS. A theming / skin feature lets a user hand you a small config
+object — colors, a font, a few numbers, some CSS custom properties — that you
+then splice into a stylesheet or inline style. That is untrusted input landing
+in your render surface. The usual answer is to trust it (and ship a CSS
+injection, or a broken layout from a typo'd number) or to hand-check a few
+fields and miss the rest. This validates the WHOLE object against a declared
+schema and tells you, honestly, what is wrong — before a single value is
+applied.
+
+WHAT "VERIFY" MEANS HERE. verifySkin does not mutate, coerce, or "fix" your
+config. It reads it against a schema and returns a verdict:
+{ ok, value, errors, warnings}
+`ok` is true only when there are zero errors. `value` is the subset of the
+input that passed (known, well-typed fields) — safe to apply. `errors` are
+hard failures (wrong type, out-of-range, a disallowed CSS value, a missing
+required field). `warnings` are soft (an unknown field that was dropped, a
+value clamped-in-spec-but-suspicious). A validator that silently drops the
+difference between "wrong" and "unknown" is lying about what it checked; this
+one keeps them apart.
+
+THE SCHEMA. A plain object mapping field name -> a small type spec:
+{ type: "color"} a CSS color: #rgb / #rrggbb / #rrggbbaa /
+rgb()/rgba()/hsl()/hsla() / a named-color from
+the allowlist. No url(), no expression, no;}
+{ type: "cssvar"} a CSS custom-property VALUE, allowlisted to a
+safe grammar (letters, digits, %, #, spaces,
+commas, dots, parens for the color fns above) —
+rejects; {} < > url( javascript: and @import.
+{ type: "number", min, max} a finite number, optionally range-checked.
+{ type: "integer", min, max} a number with no fractional part.
+{ type: "enum", values:[..]}one of a fixed set of strings.
+{ type: "boolean"} true / false.
+{ type: "string", maxLen} an arbitrary string, optionally length-capped
+(NOT applied to a stylesheet without your own
+escaping — see the README edge).
+Add `required: true` to make a missing field an error (default: optional).
+
+API
+verifySkin(config, schema) -> { ok, value, errors, warnings}
+`config` the untrusted object (anything; a non-object is one error).
+`schema` the field->spec map above (a non-object throws — the schema is
+YOURS, so a bad schema is a programmer error, not user input).
+`errors` / `warnings` are arrays of { field, message} (field null for
+whole-object problems). Never throws on bad `config` — that is the point;
+it reports. THROWS only on a malformed `schema`.
+
+Pure function of its inputs. Same code in a browser
+(window.LoopGifts.verifySkin) or Node (this CLI / require()).
+
+USAGE
+node loop21-verifyskin.js config.json schema.json # prints the verdict JSON
+node loop21-verifyskin.js --help
+*/
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.verifySkin = api.verifySkin;
+}
+root.__loop21VerifySkin = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
+
+// A conservative named-color allowlist — the common CSS keywords. Not
+// exhaustive by design: an unknown name is rejected, not guessed.
+var NAMED_COLORS = {
+black:1, silver:1, gray:1, grey:1, white:1, maroon:1, red:1, purple:1,
+fuchsia:1, green:1, lime:1, olive:1, yellow:1, navy:1, blue:1, teal:1,
+aqua:1, cyan:1, magenta:1, orange:1, pink:1, brown:1, gold:1, coral:1,
+salmon:1, khaki:1, violet:1, indigo:1, turquoise:1, tan:1, beige:1,
+ivory:1, crimson:1, chocolate:1, transparent:1
+};
+
+var HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+// rgb/rgba/hsl/hsla with only numbers, %, commas, spaces, dots inside.
+var COLOR_FN = /^(?:rgb|rgba|hsl|hsla)\(\s*[-0-9.%,\s\/]+\)$/;
+// A safe cssvar value: letters, digits, whitespace, and a small punctuation set.
+// Explicitly excludes; {} < > and the url(/@import/expression/javascript vectors.
+var SAFE_CSSVAR = /^[A-Za-z0-9#%.,()\-_ \/]*$/;
+var DANGER = /(url\s*\(|@import|expression\s*\(|javascript:|[;{}<>])/i;
+
+function isColor(v) {
+if (typeof v!== "string") return false;
+var s = v.trim();
+if (HEX.test(s)) return true;
+if (COLOR_FN.test(s)) return true;
+if (Object.prototype.hasOwnProperty.call(NAMED_COLORS, s.toLowerCase())) return true;
+return false;
+}
+function isSafeCssVar(v) {
+if (typeof v!== "string") return false;
+if (DANGER.test(v)) return false;
+return SAFE_CSSVAR.test(v);
+}
+
+function verifySkin(config, schema) {
+if (schema === null || typeof schema!== "object" || Array.isArray(schema))
+throw new Error("loop21-verifyskin: schema must be a plain object of field specs");
+
+var errors = [], warnings = [], value = {};
+
+if (config === null || typeof config!== "object" || Array.isArray(config)) {
+errors.push({ field: null, message: "config must be a plain object"});
+return { ok: false, value: {}, errors: errors, warnings: warnings};
+}
+
+var schemaFields = Object.keys(schema);
+
+// 1. unknown fields -> dropped, warned (not an error: forward-compat)
+Object.keys(config).forEach(function (k) {
+if (schemaFields.indexOf(k) === -1)
+warnings.push({ field: k, message: "unknown field dropped (not in schema)"});
+});
+
+// 2. each schema field
+schemaFields.forEach(function (field) {
+var spec = schema[field];
+if (spec === null || typeof spec!== "object")
+throw new Error("loop21-verifyskin: schema field '" + field + "' has a non-object spec");
+var present = Object.prototype.hasOwnProperty.call(config, field);
+var v = config[field];
+
+if (!present) {
+if (spec.required) errors.push({ field: field, message: "required field missing"});
+return;
+}
+
+switch (spec.type) {
+case "color":
+if (isColor(v)) value[field] = v;
+else errors.push({ field: field, message: "not a valid/allowlisted CSS color"});
+break;
+case "cssvar":
+if (isSafeCssVar(v)) value[field] = v;
+else errors.push({ field: field, message: "cssvar value contains a disallowed character or vector"});
+break;
+case "number":
+if (typeof v!== "number" ||!isFinite(v)) { errors.push({ field: field, message: "not a finite number"}); break;}
+if (typeof spec.min === "number" && v < spec.min) { errors.push({ field: field, message: "below min " + spec.min}); break;}
+if (typeof spec.max === "number" && v > spec.max) { errors.push({ field: field, message: "above max " + spec.max}); break;}
+value[field] = v;
+break;
+case "integer":
+if (typeof v!== "number" ||!isFinite(v) || Math.floor(v)!== v) { errors.push({ field: field, message: "not an integer"}); break;}
+if (typeof spec.min === "number" && v < spec.min) { errors.push({ field: field, message: "below min " + spec.min}); break;}
+if (typeof spec.max === "number" && v > spec.max) { errors.push({ field: field, message: "above max " + spec.max}); break;}
+value[field] = v;
+break;
+case "enum":
+if (!Array.isArray(spec.values)) throw new Error("loop21-verifyskin: enum field '" + field + "' needs a values array");
+if (spec.values.indexOf(v)!== -1) value[field] = v;
+else errors.push({ field: field, message: "not one of the allowed values"});
+break;
+case "boolean":
+if (typeof v === "boolean") value[field] = v;
+else errors.push({ field: field, message: "not a boolean"});
+break;
+case "string":
+if (typeof v!== "string") { errors.push({ field: field, message: "not a string"}); break;}
+if (typeof spec.maxLen === "number" && v.length > spec.maxLen) { errors.push({ field: field, message: "exceeds maxLen " + spec.maxLen}); break;}
+value[field] = v;
+break;
+default:
+throw new Error("loop21-verifyskin: unknown spec type '" + spec.type + "' for field '" + field + "'");
+}
+});
+
+return { ok: errors.length === 0, value: value, errors: errors, warnings: warnings};
+}
+
+return { verifySkin: verifySkin, isColor: isColor, isSafeCssVar: isSafeCssVar};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__loop21VerifySkin;
+var args = process.argv.slice(2);
+if (!args.length || args.indexOf("--help")!== -1) {
+process.stdout.write(
+"loop21-verifyskin — strict, zero-dep validator for user skin config\n" +
+" node loop21-verifyskin.js config.json schema.json print the verdict JSON\n" +
+" node loop21-verifyskin.js --help\n"
+);
+process.exit(0);
+}
+try {
+var fs = require("fs");
+if (args.length < 2) throw new Error("need a config.json and a schema.json");
+var config = JSON.parse(fs.readFileSync(args[0], "utf8"));
+var schema = JSON.parse(fs.readFileSync(args[1], "utf8"));
+var res = api.verifySkin(config, schema);
+process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+process.exit(res.ok? 0: 2); // nonzero when the config is rejected
+} catch (e) {
+var msg = e && e.message? e.message: String(e);
+if (msg.indexOf("loop21-verifyskin:")!== 0) msg = "loop21-verifyskin: " + msg;
+process.stderr.write(msg + "\n");
+process.exit(1);
+}
+}
+
+test_loop21-verifyskin.js 174 lines on GitHub →
+#!/usr/bin/env node
+/* test_loop21-verifyskin.js — known-answer battery for loop21-verifyskin.
+
+The oracle is OUT OF BAND: every expected verdict below is a literal fact
+written by hand, never the output of a second validator. Each case constructs
+a config + schema whose correct { ok, value, errors, warnings} is known by
+construction.
+
+Run: node test_loop21-verifyskin.js (exit 0 = all pass)
+*/
+"use strict";
+var assert = require("assert");
+var { verifySkin, isColor, isSafeCssVar} = require("./loop21-verifyskin.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+}
+
+// ---- 1. a fully-valid config passes, value echoes the typed fields --------
+ok("1 valid config -> ok:true, value carries typed fields", function () {
+var schema = {
+bg: { type: "color"},
+accent: { type: "color"},
+radius: { type: "integer", min: 0, max: 32},
+opacity: { type: "number", min: 0, max: 1},
+theme: { type: "enum", values: ["light", "dark"]},
+dense: { type: "boolean"}
+};
+var config = { bg: "#101820", accent: "gold", radius: 8, opacity: 0.9, theme: "dark", dense: true};
+var r = verifySkin(config, schema);
+assert.strictEqual(r.ok, true); // ORACLE
+assert.strictEqual(r.errors.length, 0);
+assert.deepStrictEqual(r.value, config); // all fields passed
+});
+
+// ---- 2. hex-color forms all accepted ------------------------------------
+ok("2 #rgb / #rrggbb / #rrggbbaa colors accepted", function () {
+["#fff", "#ffffff", "#ffffffff", "#1A2b3C"].forEach(function (c) {
+assert.strictEqual(isColor(c), true, c); // ORACLE
+});
+});
+
+// ---- 3. rgb()/rgba()/hsl() color functions accepted ---------------------
+ok("3 rgb/rgba/hsl functions accepted", function () {
+["rgb(10, 20, 30)", "rgba(0,0,0,0.5)", "hsl(210, 50%, 40%)"].forEach(function (c) {
+assert.strictEqual(isColor(c), true, c); // ORACLE
+});
+});
+
+// ---- 4. CSS injection in a color is rejected ----------------------------
+ok("4 injection color 'red;} body{...' rejected", function () {
+assert.strictEqual(isColor("red;} body{display:none}"), false); // ORACLE
+var r = verifySkin({ bg: "red;} body{}"}, { bg: { type: "color"}});
+assert.strictEqual(r.ok, false);
+assert.strictEqual(r.errors[0].field, "bg");
+});
+
+// ---- 5. url() and javascript: rejected as cssvar ------------------------
+ok("5 cssvar url()/javascript:/@import rejected", function () {
+assert.strictEqual(isSafeCssVar("url(evil.png)"), false); // ORACLE
+assert.strictEqual(isSafeCssVar("javascript:alert(1)"), false);
+assert.strictEqual(isSafeCssVar("@import 'x'"), false);
+assert.strictEqual(isSafeCssVar("a; color: red"), false); // semicolon
+});
+
+// ---- 6. a benign cssvar value accepted ----------------------------------
+ok("6 benign cssvar 'clamp(1rem, 2vw, 2rem)'-ish accepted", function () {
+assert.strictEqual(isSafeCssVar("1.5 2px 10%"), true); // ORACLE
+assert.strictEqual(isSafeCssVar("rgba(0,0,0,0.2)"), true);
+var r = verifySkin({ shadow: "0 1px 3px"}, { shadow: { type: "cssvar"}});
+assert.strictEqual(r.ok, true);
+assert.strictEqual(r.value.shadow, "0 1px 3px");
+});
+
+// ---- 7. number range enforced -------------------------------------------
+ok("7 number out of range is an error", function () {
+var schema = { opacity: { type: "number", min: 0, max: 1}};
+assert.strictEqual(verifySkin({ opacity: 1.5}, schema).ok, false); // ORACLE above max
+assert.strictEqual(verifySkin({ opacity: -0.1}, schema).ok, false); // below min
+assert.strictEqual(verifySkin({ opacity: 0.4}, schema).ok, true); // in range
+});
+
+// ---- 8. integer rejects a fractional value ------------------------------
+ok("8 integer field rejects 8.5", function () {
+var schema = { radius: { type: "integer"}};
+assert.strictEqual(verifySkin({ radius: 8.5}, schema).ok, false); // ORACLE
+assert.strictEqual(verifySkin({ radius: 8}, schema).ok, true);
+});
+
+// ---- 9. enum enforces the allowed set -----------------------------------
+ok("9 enum rejects an off-list value", function () {
+var schema = { theme: { type: "enum", values: ["light", "dark"]}};
+assert.strictEqual(verifySkin({ theme: "neon"}, schema).ok, false); // ORACLE
+assert.strictEqual(verifySkin({ theme: "light"}, schema).ok, true);
+});
+
+// ---- 10. boolean type-checked -------------------------------------------
+ok("10 boolean field rejects the string 'true'", function () {
+var schema = { dense: { type: "boolean"}};
+assert.strictEqual(verifySkin({ dense: "true"}, schema).ok, false); // ORACLE: string!= bool
+assert.strictEqual(verifySkin({ dense: false}, schema).ok, true);
+});
+
+// ---- 11. unknown field -> dropped + warned, NOT an error ----------------
+ok("11 unknown field dropped with a warning, ok stays true", function () {
+var schema = { bg: { type: "color"}};
+var r = verifySkin({ bg: "#000", evilField: "x"}, schema);
+assert.strictEqual(r.ok, true); // ORACLE: unknown!= error
+assert.strictEqual(r.warnings.length, 1);
+assert.strictEqual(r.warnings[0].field, "evilField");
+assert.strictEqual("evilField" in r.value, false); // dropped from safe value
+});
+
+// ---- 12. required field missing -> error --------------------------------
+ok("12 required-but-missing field is an error", function () {
+var schema = { bg: { type: "color", required: true}};
+var r = verifySkin({}, schema);
+assert.strictEqual(r.ok, false); // ORACLE
+assert.strictEqual(r.errors[0].message, "required field missing");
+});
+
+// ---- 13. optional missing field is silent -------------------------------
+ok("13 optional missing field is neither error nor warning", function () {
+var schema = { bg: { type: "color"}};
+var r = verifySkin({}, schema);
+assert.strictEqual(r.ok, true); // ORACLE
+assert.strictEqual(r.errors.length, 0);
+assert.strictEqual(r.warnings.length, 0);
+});
+
+// ---- 14. non-object config -> one whole-object error, never throws ------
+ok("14 non-object config reported, not thrown", function () {
+["a string", 42, null, [1, 2]].forEach(function (bad) {
+var r = verifySkin(bad, { bg: { type: "color"}});
+assert.strictEqual(r.ok, false); // ORACLE
+assert.strictEqual(r.errors[0].field, null);
+});
+});
+
+// ---- 15. multiple errors all reported (not just the first) --------------
+ok("15 several bad fields all reported", function () {
+var schema = {
+bg: { type: "color"},
+radius: { type: "integer"},
+theme: { type: "enum", values: ["a"]}
+};
+var r = verifySkin({ bg: "not-a-color", radius: 1.2, theme: "z"}, schema);
+assert.strictEqual(r.ok, false);
+assert.strictEqual(r.errors.length, 3); // ORACLE: all three
+});
+
+// ---- 16. RATCHET: bad schema (non-object) throws ------------------------
+ok("16 ratchet: non-object schema throws", function () {
+assert.throws(function () { verifySkin({}, "not a schema");}, /schema must be/); // ORACLE
+});
+
+// ---- 17. RATCHET: unknown spec type throws ------------------------------
+ok("17 ratchet: unknown spec type throws (programmer error)", function () {
+assert.throws(function () { verifySkin({ x: 1}, { x: { type: "widget"}});}, /unknown spec type/);
+});
+
+// ---- 18. value carries ONLY passing fields (a rejected field is absent) --
+ok("18 rejected field absent from value, valid sibling present", function () {
+var schema = { good: { type: "color"}, bad: { type: "integer"}};
+var r = verifySkin({ good: "#abc", bad: 1.5}, schema);
+assert.strictEqual(r.ok, false);
+assert.strictEqual(r.value.good, "#abc"); // ORACLE: good survives
+assert.strictEqual("bad" in r.value, false); // bad excluded
+});
+
+console.log("\nloop21-verifyskin: " + pass + " passed, " + fail + " failed");
+process.exit(fail? 1: 0);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# map — a Loop MMT gift
+https://loopmmt.com/gifts/map/
+[coverage: optional · branch: gifts]
+
+Composition Map show ← all gifts
+
+map
+
+Point it at a folder of small JSONL tools that each declare a port-verb, and map folds the whole set into a composition map — who can feed whom, how densely the set composes, and which tools light up the most pipelines. It reads each tool's declared port-verb (never guesses one) and reports any undeclared tool by name, excluded from the map.
+
+The honest edge
+
+It renders the TYPE-level map — whether the ports agree so the pipe can carry data at all — not whether the RECORDS fit. A transform emitting {event} records maps clean into a filter expecting {file} records and fails at runtime; map flags that semantic layer as unproven and never asserts it.
+
+Run it
+
+python3 map.py text --manifest gifts-manifest.json
+test_map.py (16/16, mutation-bitten)
+Python 3, standard library only
+
+The code — every file that ships
+
+map.py 283 lines on GitHub →
+#!/usr/bin/env python3
+"""map — show what-composes-with-what across a set of small JSONL tools.
+
+You have a folder of little tools that each read JSON-lines on stdin and write
+JSON-lines on stdout. Which ones can you pipe together? `map` answers that. Point
+it at a manifest where each tool DECLARES its port-verb (the type-level shape of
+its stdin/stdout contract), and `map` folds the whole set into a composition map:
+who can feed whom, how densely the set composes, and which tools light up the most
+pipelines.
+
+THE MODEL. Five port-verbs on the shared JSON-lines interface, and only five:
+
+source: nothing -> JSONL (emits; no meaningful stdin)
+transform: JSONL -> JSONL (record in, record out)
+filter: JSONL -> JSONL' (record in, subset out; output type <= input)
+fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
+sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
+
+THE TYPE GATE (mechanical, decidable):
+
+A can feed B iff A EMITS jsonl (A.verb!= sink) AND B ACCEPTS jsonl (B.verb!= source)
+
+That is the whole composition rule at the type level. `map` counts every ordered
+pair (A, B), A!= B, that passes it, and reports the density.
+
+WHY IT READS DECLARATIONS, NOT GUESSES. Before the `port` gift, a map like this
+kept its own hardcoded roster of which tool had which verb — a list inside one
+program's source that drifts the moment a tool changes or a new one ships. `map`
+does not guess and does not keep a private roster: it READS each tool's declared
+`port_verb` from the manifest (the same field `port` reads and checks). A tool that
+declares no port-verb is reported as UNDECLARED and excluded from the map with a
+count, never silently assigned a verb. The map is only ever as honest as the
+declarations under it — and it says so.
+
+HONEST CEILING (carried, not hidden). `map` renders the TYPE-level answer: can the
+pipe carry data at all. It does NOT assert that the RECORDS fit — a `transform`
+that emits `{event}` records typechecks clean into a `filter` that expects `{file}`
+records and fails at runtime. That finer, record-shape question the uniform JSONL
+type cannot settle, and `map` never claims it can. The map shows what the ports
+permit; it flags the semantic layer as unproven.
+
+map's own port-verb is `fold`: a set of gift declarations in, one aggregate
+composition-map record out.
+
+No dependencies beyond the Python standard library. MIT licensed.
+
+USAGE
+map read --manifest FILE
+Read the composition map from a manifest of tools that declare port_verb.
+Emits JSON-lines: one {"kind":"pair",...} per composable ordered pair,
+then one {"kind":"summary",...} record with density, census, fan-out/fan-in,
+the closed-form check, and the undeclared count. Its port-verb is fold.
+
+map summary --manifest FILE
+Emit only the single summary record (the aggregate), no per-pair lines.
+
+map text --manifest FILE
+Human-readable rendering of the same map (density, census, top fan-out/in,
+the semantic-unproven flag). Not JSONL — for reading, not piping.
+
+map --port
+Print map's own port-verb (fold) as one JSON-line and exit.
+"""
+import argparse
+import json
+import sys
+
+VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
+
+def EMITS(v):
+"""A tool produces pipeable stdout iff it is not a sink."""
+return v!= "sink"
+
+def ACCEPTS(v):
+"""A tool consumes stdin iff it is not a source."""
+return v!= "source"
+
+def load_declared(path):
+"""Return (declared, undeclared) from a manifest.
+
+declared: list of (slug, port_verb) for every entry with a valid port_verb
+undeclared: list of slugs with no (or invalid) port_verb — flagged, never guessed
+
+Accepts a bare JSON list of entries or an object with a 'gifts'/'tools'/'entries'
+list. Raises ValueError if no entry list can be found — never guesses the shape.
+"""
+with open(path) as f:
+data = json.load(f)
+if isinstance(data, list):
+entries = data
+elif isinstance(data, dict):
+entries = None
+for k in ("gifts", "tools", "entries"):
+if isinstance(data.get(k), list):
+entries = data[k]
+break
+if entries is None:
+raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
+else:
+raise ValueError(f"{path}: not a JSON list or object")
+
+declared, undeclared = [], []
+for e in entries:
+slug = e.get("slug")
+pv = e.get("port_verb")
+if pv in VALID_VERBS:
+declared.append((slug, pv))
+else:
+undeclared.append(slug)
+return declared, undeclared
+
+def compose_map(declared):
+"""The fold: (slug, verb) list -> composition-map dict.
+
+Preserves the ancestor's compute core exactly (the byte-checked math):
+ordered-pair count over emitters x acceptors, closed-form
+|E|*|A| - |E∩A|, plus fan-out / fan-in per tool.
+"""
+gifts = sorted(declared)
+n = len(gifts)
+pairs = []
+by_first, by_second = {}, {}
+for i, (sa, va) in enumerate(gifts):
+for j, (sb, vb) in enumerate(gifts):
+if i == j:
+continue
+if EMITS(va) and ACCEPTS(vb):
+pairs.append((sa, sb))
+by_first[sa] = by_first.get(sa, 0) + 1
+by_second[sb] = by_second.get(sb, 0) + 1
+
+total_ordered = n * (n - 1)
+emitters = [g for g in gifts if EMITS(g[1])]
+acceptors = [g for g in gifts if ACCEPTS(g[1])]
+both = [g for g in gifts if EMITS(g[1]) and ACCEPTS(g[1])]
+closed_form = len(emitters) * len(acceptors) - len(both)
+
+from collections import Counter
+census = dict(Counter(v for _, v in gifts))
+
+return {
+"gifts": gifts,
+"n": n,
+"pairs": pairs,
+"total_ordered": total_ordered,
+"density": (len(pairs) / total_ordered) if total_ordered else 0.0,
+"census": census,
+"emitters": len(emitters),
+"acceptors": len(acceptors),
+"both_ports": len(both),
+"closed_form": closed_form,
+"closed_form_matches": closed_form == len(pairs),
+"fan_out": by_first,
+"fan_in": by_second,
+}
+
+def summary_record(cm, undeclared):
+"""The single aggregate record — map's fold output."""
+return {
+"kind": "summary",
+"n": cm["n"],
+"composable_pairs": len(cm["pairs"]),
+"total_ordered": cm["total_ordered"],
+"density": round(cm["density"], 4),
+"census": cm["census"],
+"emitters": cm["emitters"],
+"acceptors": cm["acceptors"],
+"closed_form_check": cm["closed_form_matches"],
+"undeclared": undeclared,
+"undeclared_count": len(undeclared),
+"semantic_layer": "UNPROVEN — map shows the TYPE gate (can the pipe carry "
+"data); it does not assert the RECORDS fit. That is a finer "
+"question the uniform JSONL type cannot settle.",
+}
+
+def emit_read(cm, undeclared, out):
+for sa, sb in cm["pairs"]:
+out.write(json.dumps({"kind": "pair", "from": sa, "to": sb}) + "\n")
+out.write(json.dumps(summary_record(cm, undeclared)) + "\n")
+
+def emit_text(cm, undeclared, out):
+out.write(f"Composition map — {cm['n']} tool(s) with a declared port-verb\n")
+out.write("=" * 56 + "\n")
+out.write(f"composable ordered pairs (A can feed B): {len(cm['pairs'])} / {cm['total_ordered']}\n")
+out.write(f"composition density: {cm['density']:.1%}\n")
+out.write(f"closed-form check |E|*|A|-|E∩A| = {cm['closed_form']} (matches: {cm['closed_form_matches']})\n")
+out.write(f"verb census: {cm['census']}\n")
+out.write(f"emitters (not sink): {cm['emitters']} acceptors (not source): {cm['acceptors']}\n\n")
+fo = sorted(cm["fan_out"].items(), key=lambda kv: -kv[1])[:8]
+out.write("top fan-out (feeds the most tools):\n")
+for s, c in fo:
+out.write(f" {s:32s} feeds {c}\n")
+fi = sorted(cm["fan_in"].items(), key=lambda kv: -kv[1])[:8]
+out.write("\ntop fan-in (fed by the most tools):\n")
+for s, c in fi:
+out.write(f" {s:32s} fed-by {c}\n")
+if undeclared:
+out.write(f"\nUNDECLARED ({len(undeclared)}) — excluded from the map, not guessed:\n")
+out.write(" " + ", ".join(str(s) for s in undeclared) + "\n")
+out.write("\nNOTE: this is the TYPE-level map. Semantic record-shape fit is UNPROVEN —\n")
+out.write("a composable pair means the ports agree, not that the records fit.\n")
+
+def main(argv=None):
+ap = argparse.ArgumentParser(description="Fold a set of port-declared tools into a composition map.")
+ap.add_argument("--port", action="store_true", help="print map's own port-verb (fold) and exit")
+sub = ap.add_subparsers(dest="cmd")
+for name in ("read", "summary", "text"):
+p = sub.add_parser(name)
+p.add_argument("--manifest", required=True)
+ap.add_argument("--selftest", action="store_true")
+args = ap.parse_args(argv)
+
+if args.port:
+print(json.dumps({"slug": "map", "port_verb": "fold"}))
+return 0
+if args.selftest:
+return _selftest()
+if not args.cmd:
+ap.print_help()
+return 2
+
+declared, undeclared = load_declared(args.manifest)
+cm = compose_map(declared)
+
+if args.cmd == "read":
+emit_read(cm, undeclared, sys.stdout)
+elif args.cmd == "summary":
+sys.stdout.write(json.dumps(summary_record(cm, undeclared)) + "\n")
+elif args.cmd == "text":
+emit_text(cm, undeclared, sys.stdout)
+return 0
+
+def _selftest():
+"""Mutation-honest selftest over a tiny known set with a hand-computed answer."""
+# 4 tools: 1 source, 1 transform, 1 filter, 1 sink.
+# emitters = {source, transform, filter} (3) (not sink)
+# acceptors = {transform, filter, sink} (3) (not source)
+# both = {transform, filter} (2)
+# composable pairs = |E|*|A| - |E∩A| = 3*3 - 2 = 7
+decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
+cm = compose_map(decl)
+assert cm["n"] == 4, cm["n"]
+assert len(cm["pairs"]) == 7, f"expected 7 pairs, got {len(cm['pairs'])}"
+assert cm["closed_form"] == 7 and cm["closed_form_matches"], "closed form wrong"
+assert cm["emitters"] == 3 and cm["acceptors"] == 3, "emit/accept wrong"
+# source feeds all 3 acceptors, is fed by nobody
+assert cm["fan_out"].get("s") == 3, cm["fan_out"]
+assert "s" not in cm["fan_in"], "source should have 0 fan-in"
+# sink fed by all 3 emitters, feeds nobody
+assert cm["fan_in"].get("k") == 3, cm["fan_in"]
+assert "k" not in cm["fan_out"], "sink should have 0 fan-out"
+# MUTATION BITE 1: if EMITS wrongly included sink, pairs would jump.
+# With EMITS==(always True): emitters=4, pairs = 4*3 - 2 = 10!= 7
+def _bad_emits(v):
+return True
+saved = globals()["EMITS"]
+try:
+globals()["EMITS"] = _bad_emits
+bad = compose_map(decl)
+assert len(bad["pairs"])!= 7, "mutation not detected — EMITS bite failed"
+finally:
+globals()["EMITS"] = saved
+# re-run clean to confirm restoration
+assert len(compose_map(decl)["pairs"]) == 7, "restore failed"
+# undeclared handling: an invalid verb is excluded + flagged, not guessed
+decl2 = decl + [("bad", "nonsense")]
+d2, u2 = [x for x in decl2 if x[1] in VALID_VERBS], [x[0] for x in decl2 if x[1] not in VALID_VERBS]
+assert u2 == ["bad"] and len(d2) == 4, "undeclared not isolated"
+print("selftest: 6/6 OK (n, pairs=7, closed-form, fan-out/in endpoints, EMITS mutation bite, undeclared-excluded)")
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_map.py 170 lines on GitHub →
+#!/usr/bin/env python3
+"""Mutation-bitten tests for map.py.
+
+Each test asserts a specific behavior; the suite is proven to go RED under a
+planted mutation (see test_mutation_is_detected) so a no-op test can't pass green.
+Run: python3 test_map.py
+"""
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import map as M # noqa: E402
+
+def _manifest(entries):
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump({"gifts": entries}, f)
+return path
+
+class TestPortGate(unittest.TestCase):
+def test_emits_gate(self):
+# everything but sink emits
+self.assertTrue(M.EMITS("source"))
+self.assertTrue(M.EMITS("transform"))
+self.assertTrue(M.EMITS("filter"))
+self.assertTrue(M.EMITS("fold"))
+self.assertFalse(M.EMITS("sink"))
+
+def test_accepts_gate(self):
+# everything but source accepts
+self.assertFalse(M.ACCEPTS("source"))
+self.assertTrue(M.ACCEPTS("transform"))
+self.assertTrue(M.ACCEPTS("filter"))
+self.assertTrue(M.ACCEPTS("fold"))
+self.assertTrue(M.ACCEPTS("sink"))
+
+class TestComposeMap(unittest.TestCase):
+def setUp(self):
+# 1 of each of 4 verbs; hand-computed answer = 7 composable ordered pairs
+self.decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
+
+def test_pair_count_hand_computed(self):
+cm = M.compose_map(self.decl)
+self.assertEqual(len(cm["pairs"]), 7)
+
+def test_closed_form_matches_enumeration(self):
+cm = M.compose_map(self.decl)
+self.assertEqual(cm["closed_form"], len(cm["pairs"]))
+self.assertTrue(cm["closed_form_matches"])
+
+def test_source_feeds_all_acceptors_no_fan_in(self):
+cm = M.compose_map(self.decl)
+self.assertEqual(cm["fan_out"]["s"], 3) # feeds t, f, k
+self.assertNotIn("s", cm["fan_in"]) # source is fed by nobody
+
+def test_sink_fed_by_all_emitters_no_fan_out(self):
+cm = M.compose_map(self.decl)
+self.assertEqual(cm["fan_in"]["k"], 3) # fed by s, t, f
+self.assertNotIn("k", cm["fan_out"]) # sink feeds nobody
+
+def test_no_self_pairs(self):
+cm = M.compose_map(self.decl)
+for a, b in cm["pairs"]:
+self.assertNotEqual(a, b)
+
+def test_density(self):
+cm = M.compose_map(self.decl)
+# 7 composable / 12 ordered = 0.5833...
+self.assertAlmostEqual(cm["density"], 7 / 12, places=4)
+
+class TestDeclarationHonesty(unittest.TestCase):
+def test_undeclared_excluded_not_guessed(self):
+path = _manifest([
+{"slug": "a", "port_verb": "source"},
+{"slug": "b"}, # no port_verb
+{"slug": "c", "port_verb": "bogus"}, # invalid
+])
+declared, undeclared = M.load_declared(path)
+os.unlink(path)
+self.assertEqual([d[0] for d in declared], ["a"])
+self.assertEqual(set(undeclared), {"b", "c"})
+
+def test_summary_reports_undeclared_count(self):
+path = _manifest([
+{"slug": "a", "port_verb": "source"},
+{"slug": "b"},
+])
+declared, undeclared = M.load_declared(path)
+os.unlink(path)
+cm = M.compose_map(declared)
+rec = M.summary_record(cm, undeclared)
+self.assertEqual(rec["undeclared_count"], 1)
+self.assertIn("b", rec["undeclared"])
+
+def test_summary_carries_semantic_unproven_flag(self):
+cm = M.compose_map([("a", "source"), ("b", "sink")])
+rec = M.summary_record(cm, [])
+self.assertIn("UNPROVEN", rec["semantic_layer"])
+
+class TestReadEmitsJSONL(unittest.TestCase):
+def test_read_emits_pairs_then_summary(self):
+cm = M.compose_map([("s", "source"), ("k", "sink")])
+buf = io.StringIO()
+M.emit_read(cm, [], buf)
+lines = [json.loads(x) for x in buf.getvalue().strip().split("\n")]
+self.assertEqual(lines[0]["kind"], "pair")
+self.assertEqual(lines[0]["from"], "s")
+self.assertEqual(lines[0]["to"], "k")
+self.assertEqual(lines[-1]["kind"], "summary")
+
+def test_own_port_is_fold(self):
+out = io.StringIO()
+saved = sys.stdout
+try:
+sys.stdout = out
+M.main(["--port"])
+finally:
+sys.stdout = saved
+self.assertEqual(json.loads(out.getvalue())["port_verb"], "fold")
+
+class TestManifestShapes(unittest.TestCase):
+def test_bare_list_manifest(self):
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump([{"slug": "a", "port_verb": "source"}], f)
+declared, _ = M.load_declared(path)
+os.unlink(path)
+self.assertEqual(declared, [("a", "source")])
+
+def test_no_entry_list_raises(self):
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump({"nope": 1}, f)
+with self.assertRaises(ValueError):
+M.load_declared(path)
+os.unlink(path)
+
+class TestMutationIsDetected(unittest.TestCase):
+"""Prove the suite is not a no-op: a planted mutation must break a test."""
+def test_mutation_is_detected(self):
+decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
+# Mutate EMITS to always-True (sink wrongly counted as an emitter).
+saved = M.EMITS
+try:
+M.EMITS = lambda v: True
+cm = M.compose_map(decl)
+# Under always-True EMITS: emitters=4, acceptors=3, both={t,f,k}=3,
+# so pairs = |E|*|A| - |E∩A| = 4*3 - 3 = 9, NOT the correct 7.
+self.assertNotEqual(len(cm["pairs"]), 7,
+"mutation did not change the result — suite is a no-op")
+self.assertEqual(len(cm["pairs"]), 9)
+finally:
+M.EMITS = saved
+# Confirm restoration: the real function gives 7 again.
+self.assertEqual(len(M.compose_map(decl)["pairs"]), 7)
+
+if __name__ == "__main__":
+unittest.main(verbosity=2)
+
+Take the whole folder →
+MIT
+Python 3, standard library only
 
 ---

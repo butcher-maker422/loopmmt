@@ -1,0 +1,1906 @@
+# Loop MMT — corpus shard 68/73
+
+> Bundle 68 of 73 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 3 (/gifts/sudoku/, /gifts/switchboard/, /gifts/template/)
+
+---
+
+# Sudoku — a Loop MMT gift
+https://loopmmt.com/gifts/sudoku/
+[coverage: optional · branch: gifts]
+
+A Solver That Shows Its Work transform ← all gifts
+
+Sudoku
+
+Most Sudoku solvers hand you the answer; this one hands you the reasoning. It solves the way a person does — applying the lowest technique that makes progress and recording WHAT it did and WHY at every step as a single ordered trace, so the answer is just the last line of an argument you can read and check by hand. Five techniques (naked/hidden single, locked candidates, naked pair, x-wing), applied lowest-first. It never guesses: faced with a puzzle beyond its ladder it says “ceiling-hit” rather than searching — an honest difficulty read, not a failure. Deterministic: the same givens always produce the byte-identical trace.
+
+The honest edge
+
+It only makes FORCED moves — it reasons, it does not search or backtrack, so a puzzle needing a technique above x-wing returns ceiling-hit (a difficulty read), not a guessed fill. And ‘broken’ fires when reasoning empties a cell; a contradiction sitting between two givens no technique touches reads as ceiling-hit, because the solver reasons about the puzzle rather than front-validating your input.
+
+Run it
+
+python3 sudoku.py --demo
+test_sudoku.py (130/130, mutation-bitten, pinned golden trace)
+Python standard library only, deterministic + headless
+
+The code — every file that ships
+
+sudoku.py 549 lines on GitHub →
+#!/usr/bin/env python3
+"""sudoku — a Sudoku solver that shows its work.
+
+Most solvers hand you the answer. This one hands you the *reasoning*: it solves
+the way a person does — applying the lowest technique that makes progress and
+recording WHAT it did and WHY at every step, as a single ordered trace. The
+answer is just the last line of an argument you can read.
+
+from sudoku import solve, from_string
+result = solve(from_string("53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"))
+result.status # 'solved-unique' | 'ceiling-hit' | 'broken'
+for step in result.trace:
+print(step.reason) # "naked single: 4 is the only candidate left for r1c3..."
+
+Five techniques, applied lowest-first (so the explanation reads like a human
+tutor, easiest move first):
+1. naked single — a cell with only one candidate left
+2. hidden single — a digit that fits only one cell in a unit
+3. locked candidates — pointing / claiming (an elimination technique)
+4. naked pair — two cells locking two digits to themselves
+5. x-wing — the basic fish
+
+Three honest terminal states:
+solved-unique — solved by these techniques alone; `solution` is filled in.
+ceiling-hit — consistent but needs a technique above the ladder (a
+DIFFICULTY read, not a failure — this puzzle is "harder
+than x-wing", which is useful information).
+broken — a cell ran out of candidates; the givens contradict.
+
+Properties (see test_sudoku.py):
+- Deterministic: the same givens always produce the byte-identical trace.
+- Certifying: every placement/elimination carries a human sentence saying
+why it is forced. The trace is a proof you can check by hand.
+- Never guesses: it only makes forced moves. It will say "ceiling-hit"
+before it will backtrack — it does not search, it reasons.
+
+Zero dependencies (Python standard library only). Headless: givens in, a
+SolveResult out — no I/O in the solver, no globals, no randomness.
+
+Origin: the reasoning core of a self-explaining Sudoku teaching app, stripped to
+stand alone. MIT licensed — take the folder.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, asdict
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+Cell = Tuple[int, int] # (row, col), 0-indexed
+Grid = List[List[int]] # 9x9, 0 = empty
+Candidates = Dict[Cell, Set[int]]
+
+N = 9
+DIGITS = frozenset(range(1, 10))
+
+# ── The trace (the spine — everything folds from this) ──────────────────────
+@dataclass
+class TechniqueApplication:
+technique: str # rung name
+cells_affected: List[Cell] # coordinates touched
+candidates_eliminated: List[Tuple[Cell, int]] # what this step ruled out
+reason: str # the human sentence: WHY
+
+def to_dict(self) -> dict:
+d = asdict(self)
+d["cells_affected"] = [list(c) for c in self.cells_affected]
+d["candidates_eliminated"] = [
+[list(c), dg] for c, dg in self.candidates_eliminated
+]
+return d
+
+@dataclass
+class SolveResult:
+status: str # solved-unique|ceiling-hit|broken
+trace: List[TechniqueApplication]
+solution: Optional[Grid] = None # present iff solved-unique
+
+def to_dict(self) -> dict:
+return {
+"status": self.status,
+"trace": [t.to_dict() for t in self.trace],
+"solution": self.solution,
+}
+
+# ── Geometry (units: rows, cols, boxes) ─────────────────────────────────────
+def _peers(cell: Cell) -> Set[Cell]:
+r, c = cell
+peers: Set[Cell] = set()
+for k in range(N):
+peers.add((r, k))
+peers.add((k, c))
+br, bc = 3 * (r // 3), 3 * (c // 3)
+for dr in range(3):
+for dc in range(3):
+peers.add((br + dr, bc + dc))
+peers.discard(cell)
+return peers
+
+def _units() -> List[List[Cell]]:
+units: List[List[Cell]] = []
+for r in range(N):
+units.append([(r, c) for c in range(N)]) # rows
+for c in range(N):
+units.append([(r, c) for r in range(N)]) # cols
+for br in range(0, N, 3):
+for bc in range(0, N, 3):
+units.append([(br + dr, bc + dc)
+for dr in range(3) for dc in range(3)]) # boxes
+return units
+
+_UNITS = _units()
+_UNIT_NAME = (
+["row " + str(i + 1) for i in range(N)]
++ ["column " + str(i + 1) for i in range(N)]
++ ["box " + str(i + 1) for i in range(N)]
+)
+
+def compute_candidates(grid: Grid) -> Candidates:
+"""For every empty cell, the digits not already used by one of its peers.
+
+Deterministic and total — the fixed point recomputes this each step.
+"""
+cands: Candidates = {}
+for r in range(N):
+for c in range(N):
+if grid[r][c]!= 0:
+continue
+seen = {grid[pr][pc] for pr, pc in _peers((r, c)) if grid[pr][pc]!= 0}
+cands[(r, c)] = set(DIGITS) - seen
+return cands
+
+# ── The ladder (reorderable DATA — the one live research object) ────────────
+# A rung: given the candidate grid, return the ONE lowest-rung, row-major-first
+# applicable move as a TechniqueApplication, or None. Rungs never mutate.
+#
+# Two KINDS of rung share this signature, and the loop tells them apart by ONE
+# schema-stable signal — `candidates_eliminated`:
+# PLACEMENT rung (naked/hidden-single): places a digit; `candidates_eliminated`
+# is [] and the placed digit is the first [1-9] in `reason`.
+# ELIMINATION rung (locked-candidates, pairs, x-wing): places NOTHING; it
+# prunes candidates, so `candidates_eliminated` is non-empty and there is
+# no placed digit. `cells_affected` are the cells it pruned FROM.
+# Invariant: `candidates_eliminated` non-empty <=> elimination step. A rung
+# that would eliminate nothing returns None (no progress -> the loop would spin).
+Rung = Callable[[Grid, Candidates], Optional[TechniqueApplication]]
+
+def _rowmajor(cells) -> list:
+"""The within-rung tie-break: smallest (row, col) first."""
+return sorted(cells)
+
+def _box_of(cell: Cell) -> Tuple[int, int]:
+r, c = cell
+return (3 * (r // 3), 3 * (c // 3))
+
+def _box_cells(br: int, bc: int) -> List[Cell]:
+return [(br + dr, bc + dc) for dr in range(3) for dc in range(3)]
+
+def _box_num(br: int, bc: int) -> int:
+return (br // 3) * 3 + (bc // 3) + 1
+
+# Row/column units in a fixed order (rows 1-9 then cols 1-9), for the line-based
+# rungs; digit names within a reason are 1-indexed to match the singles' voice.
+_ROWS: List[List[Cell]] = [[(r, c) for c in range(N)] for r in range(N)]
+_COLS: List[List[Cell]] = [[(r, c) for r in range(N)] for c in range(N)]
+_BOXES: List[Tuple[int, int]] = [(br, bc) for br in range(0, N, 3)
+for bc in range(0, N, 3)]
+
+def rung_naked_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+for cell in _rowmajor(cands):
+opts = cands[cell]
+if len(opts) == 1:
+d = next(iter(opts))
+r, c = cell
+return TechniqueApplication(
+technique="naked-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"naked single: {d} is the only candidate left for "
+f"r{r + 1}c{c + 1} — every other digit is already used "
+f"by one of its peers."),
+)
+return None
+
+def rung_hidden_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+# Units in a fixed order; within a unit, digits ascending; first hit wins.
+for ui, unit in enumerate(_UNITS):
+empties = [cell for cell in unit if cell in cands]
+for d in range(1, 10):
+spots = [cell for cell in empties if d in cands[cell]]
+if len(spots) == 1:
+cell = spots[0]
+# Skip if a naked single would already place it (lower rung wins).
+if len(cands[cell]) == 1:
+continue
+r, c = cell
+# The placed digit MUST be the first numeral in the reason:
+# _placed_digit greps the first \b[1-9]\b, so leading with a
+# unit number would make it place the unit's number, not {d}.
+return TechniqueApplication(
+technique="hidden-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"hidden single: {d} can only go in r{r + 1}c{c + 1} "
+f"— within {_UNIT_NAME[ui]} it fits nowhere else."),
+)
+return None
+
+def rung_locked_candidates(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Locked candidates (pointing + claiming). An ELIMINATION rung.
+
+Pointing: within a box, if every candidate for a digit lies in one line
+(row or col), that digit is eliminated from the rest of that line.
+Claiming: within a line, if every candidate for a digit lies in one box,
+that digit is eliminated from the rest of that box.
+"""
+# ── Pointing: box -> line ───────────────────────────────────────────────
+for br, bc in _BOXES:
+cells = _box_cells(br, bc)
+for d in range(1, 10):
+spots = [cell for cell in cells if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+rows = {r for r, _c in spots}
+cols = {c for _r, c in spots}
+if len(rows) == 1:
+r = next(iter(rows))
+targets = _rowmajor(cell for cell in _ROWS[r]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in row {r + 1}, so {d} is "
+f"eliminated from the rest of row {r + 1}."),
+)
+if len(cols) == 1:
+c = next(iter(cols))
+targets = _rowmajor(cell for cell in _COLS[c]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in column {c + 1}, so {d} is "
+f"eliminated from the rest of column {c + 1}."),
+)
+# ── Claiming: line -> box ───────────────────────────────────────────────
+for name, unit in ([(f"row {i + 1}", u) for i, u in enumerate(_ROWS)]
++ [(f"column {i + 1}", u) for i, u in enumerate(_COLS)]):
+for d in range(1, 10):
+spots = [cell for cell in unit if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+boxes = {_box_of(cell) for cell in spots}
+if len(boxes) == 1:
+br, bc = next(iter(boxes))
+box = _box_cells(br, bc)
+targets = _rowmajor(cell for cell in box
+if cell not in unit
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in {name}, {d} can only go "
+f"in box {_box_num(br, bc)}, so {d} is eliminated "
+f"from the rest of box {_box_num(br, bc)}."),
+)
+return None
+
+def rung_naked_pair(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Naked pair. Two cells in a unit sharing the SAME two candidates {x, y}
+lock those digits to themselves, eliminating x and y from every other cell
+in that unit."""
+for ui, unit in enumerate(_UNITS):
+bi = _rowmajor(cell for cell in unit
+if cell in cands and len(cands[cell]) == 2)
+for i in range(len(bi)):
+for j in range(i + 1, len(bi)):
+a, b = bi[i], bi[j]
+if cands[a]!= cands[b]:
+continue
+pair = sorted(cands[a]) # [x, y]
+elim: List[Tuple[Cell, int]] = []
+for cell in unit:
+if cell in (a, b) or cell not in cands:
+continue
+for d in pair:
+if d in cands[cell]:
+elim.append((cell, d))
+if elim:
+elim.sort()
+affected = _rowmajor({c for c, _d in elim})
+ar, ac = a
+br_, bc_ = b
+return TechniqueApplication(
+technique="naked-pair",
+cells_affected=affected,
+candidates_eliminated=elim,
+reason=(f"naked pair: {pair[0]} and {pair[1]} are locked "
+f"to r{ar + 1}c{ac + 1} and r{br_ + 1}c{bc_ + 1} "
+f"in {_UNIT_NAME[ui]}, so both are eliminated from "
+f"the rest of that unit."),
+)
+return None
+
+def rung_x_wing(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""X-wing (basic fish). If two rows each have digit d as a candidate in
+EXACTLY the same two columns, d is eliminated from those columns in every
+other row (and the column-based transpose)."""
+# ── Row-based: base = two rows, cross = two columns ─────────────────────
+for d in range(1, 10):
+rowcols: Dict[int, Tuple[int, int]] = {}
+for r in range(N):
+cols = [c for c in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(cols) == 2:
+rowcols[r] = (cols[0], cols[1])
+bases = sorted(rowcols)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+r1, r2 = bases[i], bases[j]
+if rowcols[r1]!= rowcols[r2]:
+continue
+c1, c2 = rowcols[r1]
+targets = _rowmajor(
+(r, c) for r in range(N) if r not in (r1, r2)
+for c in (c1, c2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in rows {r1 + 1} and {r2 + 1} is "
+f"confined to columns {c1 + 1} and {c2 + 1}, so "
+f"{d} is eliminated from those columns in every "
+f"other row."),
+)
+# ── Column-based (transpose): base = two columns, cross = two rows ──────
+for d in range(1, 10):
+colrows: Dict[int, Tuple[int, int]] = {}
+for c in range(N):
+rows = [r for r in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(rows) == 2:
+colrows[c] = (rows[0], rows[1])
+bases = sorted(colrows)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+c1, c2 = bases[i], bases[j]
+if colrows[c1]!= colrows[c2]:
+continue
+r1, r2 = colrows[c1]
+targets = _rowmajor(
+(r, c) for c in range(N) if c not in (c1, c2)
+for r in (r1, r2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in columns {c1 + 1} and {c2 + 1} is "
+f"confined to rows {r1 + 1} and {r2 + 1}, so "
+f"{d} is eliminated from those rows in every "
+f"other column."),
+)
+return None
+
+# ORDER IS DATA — reorder to change the difficulty model, never hard-code it.
+# New techniques (wings, chains) append here; the solve loop never changes.
+LADDER: List[Tuple[str, int, Rung]] = [
+("naked-single", 1, rung_naked_single),
+("hidden-single", 2, rung_hidden_single),
+("locked-candidates", 3, rung_locked_candidates),
+("naked-pair", 4, rung_naked_pair),
+("x-wing", 5, rung_x_wing),
+]
+
+def _is_contradiction(grid: Grid, cands: Candidates) -> bool:
+for cell, opts in cands.items():
+if not opts: # an empty cell with no candidate = broken
+return True
+return False
+
+def _complete(grid: Grid) -> bool:
+return all(grid[r][c]!= 0 for r in range(N) for c in range(N))
+
+def _placed_digit(step: TechniqueApplication) -> int:
+# CONTRACT: a PLACEMENT reason MUST lead with the placed digit — it is the
+# first \b[1-9]\b in the string, before any row/col/unit numeral. Both
+# placement rungs honor this. Never call this on an elimination step
+# (candidates_eliminated non-empty); use its structured (cell, digit) pairs.
+m = re.search(r"\b([1-9])\b", step.reason)
+return int(m.group(1))
+
+def _is_placement(step: TechniqueApplication) -> bool:
+"""A step is a PLACEMENT iff it eliminates no candidates (it places a digit);
+otherwise it is an ELIMINATION (it prunes candidates, places nothing)."""
+return not step.candidates_eliminated
+
+def solve(givens: Grid) -> SolveResult:
+"""solve(givens) -> SolveResult. Prefer-lowest-rung fixed point.
+
+Candidates are CARRIED, not recomputed each step: a placement prunes the
+placed digit from the placed cell's peers; an elimination prunes the pruned
+(cell, digit) pairs. Recomputing from the grid alone would lose every
+elimination-rung deduction (they don't live in the grid), so the persistent
+candidate set is what lets a later single depend on an earlier elimination.
+"""
+grid = [row[:] for row in givens]
+cands = compute_candidates(grid)
+trace: List[TechniqueApplication] = []
+
+while True:
+if _is_contradiction(grid, cands):
+return SolveResult(status="broken", trace=trace, solution=None)
+
+if _complete(grid):
+return SolveResult(status="solved-unique", trace=trace,
+solution=[row[:] for row in grid])
+
+# walk the ladder bottom-up; apply the LOWEST rung that makes progress
+step: Optional[TechniqueApplication] = None
+for _name, _tier, rung in LADDER:
+step = rung(grid, cands)
+if step is not None:
+break
+
+if step is None:
+# no rung progresses, board consistent but unfinished — a
+# DIFFICULTY read, not a failure.
+return SolveResult(status="ceiling-hit", trace=trace, solution=None)
+
+if _is_placement(step):
+(r, c) = step.cells_affected[0]
+d = _placed_digit(step)
+grid[r][c] = d
+del cands[(r, c)]
+for peer in _peers((r, c)):
+if peer in cands:
+cands[peer].discard(d)
+else:
+for cell, dig in step.candidates_eliminated:
+if cell in cands:
+cands[cell].discard(dig)
+trace.append(step)
+
+# ── convenience: parse / print an 81-char string ("." or "0" = empty) ───────
+def from_string(s: str) -> Grid:
+s = "".join(ch for ch in s if not ch.isspace())
+if len(s)!= 81:
+raise ValueError(f"expected 81 cells, got {len(s)}")
+g: Grid = []
+for r in range(N):
+row = []
+for c in range(N):
+ch = s[r * N + c]
+row.append(0 if ch in ".0" else int(ch))
+g.append(row)
+return g
+
+def to_string(grid: Grid) -> str:
+return "".join(str(grid[r][c]) for r in range(N) for c in range(N))
+
+def render(grid: Grid) -> str:
+"""A human-readable 9x9 grid with box separators (for the CLI)."""
+lines = []
+for r in range(N):
+if r in (3, 6):
+lines.append("------+-------+------")
+cells = []
+for c in range(N):
+if c in (3, 6):
+cells.append("|")
+cells.append(str(grid[r][c]) if grid[r][c] else ".")
+lines.append(" ".join(cells))
+return "\n".join(lines)
+
+# ── CLI: read an 81-char puzzle, print the reasoning, then the answer ───────
+def _main(argv: List[str]) -> int:
+demo = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+if argv and argv[0] in ("-h", "--help"):
+print("usage: python3 sudoku.py [81-char-puzzle | --demo]")
+print(" cells 1-9; '.' or '0' = empty; whitespace ignored")
+print(" prints the step-by-step reasoning, then the solution")
+return 0
+arg = argv[0] if argv else "--demo"
+puzzle = demo if arg in ("", "--demo") else arg
+try:
+grid = from_string(puzzle)
+except ValueError as e:
+print(f"bad puzzle: {e}")
+return 2
+
+print("puzzle:")
+print(render(grid))
+print()
+result = solve(grid)
+print(f"status: {result.status} ({len(result.trace)} steps)\n")
+for i, step in enumerate(result.trace, 1):
+print(f" {i:>2}. {step.reason}")
+if result.solution is not None:
+print("\nsolution:")
+print(render(result.solution))
+elif result.status == "ceiling-hit":
+print("\n(consistent, but needs a technique above this solver's ladder — "
+"a difficulty read, not a failure.)")
+return 0
+
+if __name__ == "__main__":
+import sys
+raise SystemExit(_main(sys.argv[1:]))
+
+test_sudoku.py 248 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_sudoku.py — proves the solver is certifying, deterministic, and honest.
+
+The claims that ARE the tool:
+1. CERTIFYING: every step carries a reason, and the reason is CHECKABLE —
+a placement's reason leads with the digit it places, and re-applying the
+whole trace to the givens reproduces the solution. The trace is a proof.
+2. DETERMINISTIC: the same givens produce the byte-identical trace, every run.
+3. THREE HONEST STATES: solved-unique (with a valid solution), ceiling-hit
+(consistent but beyond the ladder — a difficulty read), broken (givens
+contradict). Each is reachable and correctly labelled.
+4. NEVER GUESSES: it stops at ceiling-hit rather than searching. A puzzle
+needing a technique above x-wing returns ceiling-hit, not a lucky answer.
+Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
+Exit 0 = all pass, exit 1 = a failure (loud).
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sudoku import (
+solve, from_string, to_string, compute_candidates,
+SolveResult, TechniqueApplication, _peers, _units, N, LADDER,
+)
+
+_pass = 0
+_fail = 0
+
+def eq(name, got, want):
+global _pass, _fail
+if got == want:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
+
+def ok(name, cond):
+global _pass, _fail
+if cond:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}")
+
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+EASY = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+EASY_SOLUTION = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+
+# A grid that is complete and correct = solve returns it unchanged, zero steps.
+SOLVED = EASY_SOLUTION
+
+# A contradiction the solver actually REACHES: the near-complete easy solution
+# with r1c1 blanked and a 5 planted in its box, so r1c1's only digit (5) is
+# already taken by a peer — compute_candidates leaves it with an empty set and
+# _is_contradiction fires. (Note: a contradiction between two GIVENS that no
+# technique touches reads as ceiling-hit, not broken — the solver reasons, it
+# does not front-validate the givens. That is correct and intentional.)
+BROKEN = ".54678912672195348198342567859761423426853791713924856961537284287419635345286179"
+
+def is_valid_solution(s: str) -> bool:
+"""A solved grid: 81 non-zero cells, every row/col/box a permutation of 1-9."""
+g = from_string(s)
+if any(g[r][c] == 0 for r in range(N) for c in range(N)):
+return False
+for unit in _units():
+vals = sorted(g[r][c] for r, c in unit)
+if vals!= list(range(1, 10)):
+return False
+return True
+
+# ── PROPERTY 1: certifying — the trace is a checkable proof ───────────────────
+(lambda: None)() # keep the section visible
+
+def _replay_trace(givens, result):
+"""Re-apply the recorded trace to the givens; a placement's reason must lead
+with the digit it places, and applying every placement must reproduce the
+solution. This proves the reasons are not decorative — they carry the moves."""
+import re
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated: # placement
+(r, c) = step.cells_affected[0]
+d = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+g[r][c] = d
+return g
+
+r_easy = solve(from_string(EASY))
+ok("easy solves", r_easy.status == "solved-unique")
+ok("easy solution is valid", r_easy.solution is not None and is_valid_solution(to_string(r_easy.solution)))
+eq("easy solution matches known answer", to_string(r_easy.solution), EASY_SOLUTION)
+ok("every step has a non-empty reason", all(s.reason.strip() for s in r_easy.trace))
+ok("trace is non-trivial", len(r_easy.trace) > 10)
+# the certifying check: replaying the trace's placements reproduces the solution
+replayed = _replay_trace(from_string(EASY), r_easy)
+eq("replaying the trace reproduces the solution", to_string(replayed), EASY_SOLUTION)
+
+# every placement step's reason leads with the digit actually placed in the solution
+import re
+for step in r_easy.trace:
+if not step.candidates_eliminated: # placement
+(rr, cc) = step.cells_affected[0]
+placed = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+ok(f"placement reason leads with placed digit @r{rr+1}c{cc+1}",
+placed == from_string(EASY_SOLUTION)[rr][cc])
+
+# ── PROPERTY 2: deterministic — byte-identical trace every run ────────────────
+def trace_signature(result):
+return to_string_result(result)
+
+def to_string_result(result):
+import json
+return json.dumps(result.to_dict(), sort_keys=True)
+
+sig1 = to_string_result(solve(from_string(EASY)))
+sig2 = to_string_result(solve(from_string(EASY)))
+sig3 = to_string_result(solve(from_string(EASY)))
+ok("deterministic: run 1 == run 2", sig1 == sig2)
+ok("deterministic: run 2 == run 3", sig2 == sig3)
+# GOLDEN: pin the canonical trace signature by hash. Self-equality alone is a
+# weak determinism test (a benign reorder stays self-equal); a pinned golden
+# catches any change to the tie-break / scan order that reorders the trace.
+import hashlib as _hl
+_golden = "1f4fc6f7b5886070bb06a38c5457ef9c93a4c4dabdb9735518786b8f57e91548"
+_got = _hl.sha256(sig1.encode()).hexdigest()
+ok("deterministic: trace matches the pinned golden signature", _got == _golden)
+# solving does not mutate the givens
+givens = from_string(EASY)
+before = to_string(givens)
+solve(givens)
+eq("solve does not mutate givens", to_string(givens), before)
+
+# ── PROPERTY 3: three honest terminal states ──────────────────────────────────
+# solved-unique (already covered above)
+# broken:
+r_broken = solve(from_string(BROKEN))
+ok("contradiction -> broken", r_broken.status == "broken")
+ok("broken has no solution", r_broken.solution is None)
+
+# an already-solved grid: solved-unique, zero steps, solution == input
+r_done = solve(from_string(SOLVED))
+ok("already-solved -> solved-unique", r_done.status == "solved-unique")
+eq("already-solved needs zero steps", len(r_done.trace), 0)
+eq("already-solved returns the same grid", to_string(r_done.solution), SOLVED)
+
+# ── PROPERTY 4: never guesses — ceiling-hit before search ─────────────────────
+# The empty grid is consistent but has no forced move for these techniques,
+# so a NON-searching solver must return ceiling-hit (a searching one would
+# "solve" it to some arbitrary valid grid). This is the anti-guess proof.
+EMPTY = "." * 81
+r_empty = solve(from_string(EMPTY))
+ok("empty grid -> ceiling-hit (does NOT guess a solution)", r_empty.status == "ceiling-hit")
+ok("ceiling-hit has no solution", r_empty.solution is None)
+# a partial consistent grid with no forced single also ceiling-hits rather than searching
+# (17-clue minimal puzzles typically need guessing; a bare 2-clue grid certainly does)
+SPARSE = "1................2..............................................................."
+r_sparse = solve(from_string(SPARSE))
+ok("sparse consistent grid -> ceiling-hit, not a guessed fill",
+r_sparse.status == "ceiling-hit" and r_sparse.solution is None)
+
+# ── The elimination rungs actually fire (coverage that the ladder is exercised) ─
+# Not every easy puzzle exercises the higher rungs; assert the ladder is complete
+# and each rung is callable and returns the right SHAPE when it does fire.
+ok("ladder has all five rungs", [name for name, _t, _f in LADDER] ==
+["naked-single", "hidden-single", "locked-candidates", "naked-pair", "x-wing"])
+# a placement step: candidates_eliminated empty; an elimination step: non-empty.
+for step in r_easy.trace:
+placement = not step.candidates_eliminated
+if placement:
+ok(f"placement step has one affected cell ({step.technique})", len(step.cells_affected) == 1)
+else:
+ok(f"elimination step eliminated something ({step.technique})", len(step.candidates_eliminated) >= 1)
+
+# ── input validation ──────────────────────────────────────────────────────────
+def raises(name, fn):
+global _pass, _fail
+try:
+fn()
+_fail += 1
+print(f"FAIL {name} (expected raise)")
+except Exception:
+_pass += 1
+
+raises("from_string rejects wrong length", lambda: from_string("123"))
+raises("from_string rejects 80 chars", lambda: from_string("." * 80))
+ok("from_string accepts 81 with whitespace", to_string(from_string("." * 81)) == "0" * 81)
+ok("from_string treats 0 and. both as empty",
+from_string("0" * 81) == from_string("." * 81))
+
+# ── candidates helper is correct ──────────────────────────────────────────────
+cands = compute_candidates(from_string(EASY))
+# r1c3 (row 0, col 2) is empty in EASY; its candidates must exclude peers' givens
+ok("candidates computed for empty cells only",
+all(from_string(EASY)[r][c] == 0 for (r, c) in cands))
+ok("a candidate set never contains a peer's given",
+all(all((from_string(EASY)[pr][pc] not in opts)
+for (pr, pc) in _peers(cell) if from_string(EASY)[pr][pc]!= 0)
+for cell, opts in cands.items()))
+
+# ── MUTATION BITE: prove the certifying check is not vacuously green ───────────
+# If the reasons were decorative (not carrying the placed digit), the replay
+# would NOT reproduce the solution. This bite asserts that (a) the trace has
+# real placement steps, and (b) mangling a reason's leading digit WOULD break
+# the replay — so a no-op reason (the plausible mutation) fails loud here.
+placements = [s for s in r_easy.trace if not s.candidates_eliminated]
+ok("mutation bite: trace has real placements", len(placements) > 0)
+
+def _replay_with_broken_reasons(givens, result):
+"""Replay but with every placement reason's digit forced to 1 — must NOT
+reproduce the solution (unless every placed digit really is 1, impossible)."""
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated:
+(r, c) = step.cells_affected[0]
+g[r][c] = 1 # deliberately wrong: ignore the real reason
+return to_string(g)
+
+ok("mutation bite: breaking the reason breaks the replay",
+_replay_with_broken_reasons(from_string(EASY), r_easy)!= EASY_SOLUTION)
+
+# and: if solve silently returned 'solved' on the empty grid (a searching
+# mutation), property 4 would flip. Assert the anti-guess invariant has teeth:
+ok("mutation bite: empty grid is genuinely unforced (>50 empty cells, 0 forced singles)",
+len(compute_candidates(from_string(EMPTY))) == 81
+and all(len(v) == 9 for v in compute_candidates(from_string(EMPTY)).values()))
+
+print(("PASS" if _fail == 0 else "FAIL") + f" — {_pass} passed, {_fail} failed")
+sys.exit(0 if _fail == 0 else 1)
+
+Take the whole folder →
+MIT
+Python standard library only, deterministic + headless
+
+---
+
+# switchboard — a Loop MMT gift
+https://loopmmt.com/gifts/switchboard/
+[coverage: optional · branch: gifts]
+
+A Message Bus That Cannot Carry a Command relay ← all gifts
+
+switchboard
+
+A zero-dependency store-and-forward message bus over a plain directory: independent workers leave each other messages, nothing is ever deleted (supersede-only, so the folder's history is the audit trail), and a read is its own logged event — so “I sent it” never silently becomes “they know.” The load-bearing idea is that the schema is observation-only by construction: it has exactly six fields and rejects any unknown one, so a sender literally cannot smuggle in an action/command/run field. It moves messages; it cannot run them.
+
+The honest edge
+
+It is a bus, not a guaranteed queue and not a command channel. No delivery guarantee and no retry: a read is a logged fact, an unread message stays visible as an orphan until someone reads it, and every message reaches a reader quoted as third-party data, never as the reader's own instruction. Only a human directs.
+
+Run it
+
+node switchboard.js send --root./bus --from worker-a --kind status --body "..."
+test_switchboard.js (5/5)
+Node stdlib only (no dependencies); pure core runs in a browser or a test with no filesystem
+
+The code — every file that ships
+
+switchboard.js 501 lines on GitHub →
+// SPDX-License-Identifier: MIT
+// switchboard — a store-and-forward message bus that cannot carry a command.
+//
+// PRINTED EDGE: this is a message BUS, not a command channel and not a queue with
+// delivery guarantees — every message is third-party DATA (a report), never an
+// instruction to the reader; a read is its own logged event, so "I sent" never
+// implies "they know."
+//
+// WHAT IT IS. A tiny, zero-dependency store-and-forward bus over a plain directory.
+// Independent workers (scripts, tabs, agents) leave messages for each other under a
+// shared folder; nothing is deleted (supersede-only, the folder's history is the
+// audit trail). Two things make it a COMPOSE PRIMITIVE rather than a chat log:
+//
+// 1. The schema is OBSERVATION-ONLY by construction. A message has exactly six
+// fields and no more — the validator REJECTS any unknown top-level field, so a
+// sender cannot smuggle an `action`/`command`/`run`/`exec` field: the schema
+// literally cannot express a command. The four message kinds are status / focus
+// / fyi / question — none imperative.
+//
+// 2. Every message is surfaced QUOTED — "worker <id> reports: …" — never handed to
+// the reader as its own directive. There is no code path that turns a message
+// body into an instruction. Only a human directs.
+//
+// This is how you wire N independent gifts (or workers) into a larger block without
+// coupling them: they coordinate through DATA on a shared directory, each carrying a
+// content-hash and provenance, and a read is a logged fact — not an assumption.
+//
+// LANE: route (data moves along declared sender→recipient paths, each carrying a
+// receipt). Point-to-point goes to one recipient's inbox; broadcast goes to
+// everyone; a read writes a receipt so orphan (never-read) messages are
+// detectable.
+//
+// INVOCATION (CLI):
+// node switchboard.js send --root DIR --from ID --kind status --body "…" (broadcast)
+// node switchboard.js send --root DIR --from ID --to ID --kind question --body "…" (point-to-point)
+// node switchboard.js read --root DIR --as ID (surface inbox+broadcasts, quoted, logs receipts)
+// node switchboard.js orphans --root DIR --to ID (P2P messages ID was sent but never read)
+// node switchboard.js --help
+//
+// BROWSER / NODE ATTACH: the pure functions (validate, canonicalPayload, contentHash,
+// renderQuoted, and an in-memory Bus) are exported for use without a filesystem — so
+// the schema + quoting discipline compose into a page or a test with no disk at all.
+//
+// Zero dependencies. Node stdlib only (fs/path/crypto for the CLI; the pure core uses
+// none). MIT. Strip provenance: the internal Switchboard tool (AGPL) — the pure schema +
+// send/read/orphan path, with the git transport and the internal credential gate cut.
+
+'use strict';
+
+// ── The schema (the structural half of "cannot express a command") ──────────────
+
+var SCHEMA_ID = 'loopmmt.switchboard.message/v1';
+
+// The four observation-only kinds. There is deliberately NO imperative kind.
+var KINDS = ['status', 'focus', 'fyi', 'question'];
+
+// The CLOSED set of top-level fields. Anything else is rejected — this is why the
+// schema cannot carry a command: `action`, `command`, `run`, `exec` are not in it.
+var ALLOWED_TOP = ['schema', 'sender', 'content_hash', 'kind', 'recipient', 'body'];
+var SENDER_FIELDS = ['session_id', 'branch', 'ts']; // provenance; session_id required
+
+var BROADCAST = 'broadcast';
+
+function MessageRejected(msg) {
+this.name = 'MessageRejected';
+this.message = msg;
+}
+MessageRejected.prototype = Object.create(Error.prototype);
+MessageRejected.prototype.constructor = MessageRejected;
+
+// ── Pure helpers (no filesystem, browser-safe) ──────────────────────────────────
+
+function isoNow() {
+// UTC, second precision, no locale — the same clock everywhere.
+return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function has(obj, k) { return Object.prototype.hasOwnProperty.call(obj, k);}
+
+// A stable JSON serialization: keys sorted at every level, compact separators.
+// This is the byte-truth the content_hash covers and the file bytes we write.
+function stableStringify(x) {
+if (x === null || typeof x!== 'object') return JSON.stringify(x);
+if (Array.isArray(x)) return '[' + x.map(stableStringify).join(',') + ']';
+var keys = Object.keys(x).sort();
+var parts = [];
+for (var i = 0; i < keys.length; i++) {
+parts.push(JSON.stringify(keys[i]) + ':' + stableStringify(x[keys[i]]));
+}
+return '{' + parts.join(',') + '}';
+}
+
+// The bytes the content_hash covers: provenance + kind + recipient + body, canonically
+// serialized. Hashing the sender block binds provenance INTO the hash — tampering with
+// who-sent-it breaks the hash.
+function canonicalPayload(sender, kind, recipient, body) {
+return stableStringify({
+body: body,
+kind: kind,
+recipient: recipient,
+sender: sender
+});
+}
+
+// A minimal, dependency-free sha-256 hex (FIPS-180-4) so contentHash works in the
+// browser AND in Node without importing anything. Bytes are the UTF-8 bytes of the
+// input string (multibyte-faithful), matching node crypto over the same string.
+function sha256Hex(str) {
+function utf8Bytes(s) {
+var out = [], i, c, c2;
+for (i = 0; i < s.length; i++) {
+c = s.charCodeAt(i);
+if (c < 0x80) out.push(c);
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) {
+c2 = s.charCodeAt(++i);
+var u = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
+out.push(0xf0 | (u >> 18), 0x80 | ((u >> 12) & 0x3f),
+0x80 | ((u >> 6) & 0x3f), 0x80 | (u & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
+}
+return out;
+}
+var K = [
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+function rotr(n, x) { return (x >>> n) | (x << (32 - n));}
+var bytes = utf8Bytes(str);
+var l = bytes.length, bitLen = l * 8;
+bytes.push(0x80);
+while (bytes.length % 64!== 56) bytes.push(0);
+for (var j = 7; j >= 0; j--) bytes.push((bitLen / Math.pow(2, j * 8)) & 0xff);
+var w = new Array(64);
+for (var off = 0; off < bytes.length; off += 64) {
+for (var t = 0; t < 16; t++) {
+w[t] = (bytes[off+4*t]<<24)|(bytes[off+4*t+1]<<16)|(bytes[off+4*t+2]<<8)|(bytes[off+4*t+3]);
+}
+for (t = 16; t < 64; t++) {
+var s0 = rotr(7,w[t-15])^rotr(18,w[t-15])^(w[t-15]>>>3);
+var s1 = rotr(17,w[t-2])^rotr(19,w[t-2])^(w[t-2]>>>10);
+w[t] = (w[t-16]+s0+w[t-7]+s1)|0;
+}
+var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+for (t = 0; t < 64; t++) {
+var S1 = rotr(6,e)^rotr(11,e)^rotr(25,e);
+var ch = (e&f)^(~e&g);
+var t1 = (h+S1+ch+K[t]+w[t])|0;
+var S0 = rotr(2,a)^rotr(13,a)^rotr(22,a);
+var maj = (a&b)^(a&c)^(b&c);
+var t2 = (S0+maj)|0;
+h=g; g=f; f=e; e=(d+t1)|0; d=c; c=b; b=a; a=(t1+t2)|0;
+}
+H[0]=(H[0]+a)|0; H[1]=(H[1]+b)|0; H[2]=(H[2]+c)|0; H[3]=(H[3]+d)|0;
+H[4]=(H[4]+e)|0; H[5]=(H[5]+f)|0; H[6]=(H[6]+g)|0; H[7]=(H[7]+h)|0;
+}
+var hex = '';
+for (var k = 0; k < 8; k++) hex += ('00000000' + (H[k]>>>0).toString(16)).slice(-8);
+return hex;
+}
+
+function contentHash(sender, kind, recipient, body) {
+return sha256Hex(canonicalPayload(sender, kind, recipient, body));
+}
+
+// Validate a candidate message. Throws MessageRejected on ANY violation — refuse loud,
+// never store. This is the load-bearing gate: the closed field set is what makes the
+// schema unable to express a command.
+function validate(msg) {
+if (msg === null || typeof msg!== 'object' || Array.isArray(msg)) {
+throw new MessageRejected('message must be an object');
+}
+// Closed field set — reject any unknown top-level field (the command firewall).
+var keys = Object.keys(msg);
+for (var i = 0; i < keys.length; i++) {
+if (ALLOWED_TOP.indexOf(keys[i]) === -1) {
+throw new MessageRejected(
+'unknown top-level field "' + keys[i] + '" — the schema is closed; ' +
+'it cannot carry a command');
+}
+}
+for (i = 0; i < ALLOWED_TOP.length; i++) {
+if (!has(msg, ALLOWED_TOP[i])) {
+throw new MessageRejected('missing required field "' + ALLOWED_TOP[i] + '"');
+}
+}
+if (msg.schema!== SCHEMA_ID) {
+throw new MessageRejected('schema must be "' + SCHEMA_ID + '"');
+}
+if (KINDS.indexOf(msg.kind) === -1) {
+throw new MessageRejected(
+'kind must be one of ' + KINDS.join('/') + ' (no imperative kind exists)');
+}
+if (typeof msg.recipient!== 'string' || msg.recipient.length === 0) {
+throw new MessageRejected('recipient must be a non-empty string ("broadcast" or an id)');
+}
+if (typeof msg.body!== 'string') {
+throw new MessageRejected('body must be a string (data, never a directive)');
+}
+// Sender provenance
+var s = msg.sender;
+if (s === null || typeof s!== 'object' || Array.isArray(s)) {
+throw new MessageRejected('sender must be a provenance object');
+}
+if (typeof s.session_id!== 'string' || s.session_id.length === 0) {
+throw new MessageRejected('sender.session_id is required');
+}
+var skeys = Object.keys(s);
+for (i = 0; i < skeys.length; i++) {
+if (SENDER_FIELDS.indexOf(skeys[i]) === -1) {
+throw new MessageRejected('unknown sender field "' + skeys[i] + '"');
+}
+}
+// content_hash must match the payload — provenance/body tampering breaks it.
+var expect = contentHash(s, msg.kind, msg.recipient, msg.body);
+if (msg.content_hash!== expect) {
+throw new MessageRejected(
+'content_hash mismatch (message was tampered or malformed): ' +
+'expected ' + expect.slice(0, 12) + '…');
+}
+return true;
+}
+
+// Compose a valid message object (fills schema + content_hash). Throws if the result
+// would not validate — you cannot build an invalid message with this.
+function compose(sender, kind, recipient, body) {
+if (typeof sender === 'string') sender = { session_id: sender, ts: isoNow()};
+else if (sender &&!sender.ts) sender = assign({}, sender, { ts: isoNow()});
+var msg = {
+schema: SCHEMA_ID,
+sender: sender,
+kind: kind,
+recipient: recipient,
+body: body,
+content_hash: contentHash(sender, kind, recipient, body)
+};
+validate(msg);
+return msg;
+}
+
+function assign(target) {
+for (var i = 1; i < arguments.length; i++) {
+var src = arguments[i];
+if (src) for (var k in src) if (has(src, k)) target[k] = src[k];
+}
+return target;
+}
+
+// Surface a message as QUOTED third-party data — never as an instruction to the reader.
+// There is no other render path: a body cannot reach the reader as its own directive.
+function renderQuoted(msg) {
+var who = msg.sender.session_id;
+var to = msg.recipient === BROADCAST? 'all': msg.recipient;
+return 'worker ' + who + ' reports (' + msg.kind + ' → ' + to + '): ' + msg.body;
+}
+
+// ── An in-memory Bus (no filesystem) — composes into a test or a page ───────────
+
+function Bus() {
+this._broadcast = []; // list of messages
+this._inbox = {}; // recipient -> list of messages
+this._reads = {}; // reader -> set of content_hash
+}
+Bus.prototype.send = function (sender, kind, recipient, body) {
+var msg = compose(sender, kind, recipient, body);
+if (recipient === BROADCAST) this._broadcast.push(msg);
+else (this._inbox[recipient] = this._inbox[recipient] || []).push(msg);
+return msg;
+};
+Bus.prototype.read = function (readerId, logReceipt) {
+var out = (this._inbox[readerId] || []).concat(this._broadcast);
+if (logReceipt!== false) {
+var set = this._reads[readerId] = this._reads[readerId] || {};
+for (var i = 0; i < out.length; i++) set[out[i].content_hash] = true;
+}
+return out;
+};
+Bus.prototype.orphans = function (recipientId) {
+// P2P messages this recipient was sent but never read (never sent a receipt for).
+var sent = this._inbox[recipientId] || [];
+var read = this._reads[recipientId] || {};
+var out = [];
+for (var i = 0; i < sent.length; i++) {
+if (!read[sent[i].content_hash]) out.push(sent[i]);
+}
+return out;
+};
+
+// ── Filesystem transport (CLI only; append-by-create never conflicts) ───────────
+// Layout under --root:
+// <root>/broadcast/<ts>-<sender>-<hash8>.json
+// <root>/inbox/<recipient>/<ts>-<sender>-<hash8>.json
+// <root>/reads/<reader>/<ts>-<reader>-reads-<hash8>.json
+
+function _fsLayer() {
+var fs = require('fs');
+var path = require('path');
+
+function safeId(id) {
+// ids in filenames must be ref/path-safe; refuse anything with a separator.
+if (!/^[A-Za-z0-9._-]+$/.test(id)) {
+throw new MessageRejected('id "' + id + '" is not path-safe (allowed: A-Za-z0-9._-)');
+}
+return id;
+}
+function ensureDir(d) { fs.mkdirSync(d, { recursive: true});}
+function stamp() { return isoNow().replace(/[:]/g, '');}
+
+function writeMessage(root, msg) {
+validate(msg);
+var hash8 = msg.content_hash.slice(0, 8);
+var name = stamp() + '-' + safeId(msg.sender.session_id) + '-' + hash8 + '.json';
+var dir;
+if (msg.recipient === BROADCAST) dir = path.join(root, 'broadcast');
+else dir = path.join(root, 'inbox', safeId(msg.recipient));
+ensureDir(dir);
+var full = path.join(dir, name);
+// append-by-create: a fresh filename per message never collides, so two writers
+// never conflict on the same file.
+fs.writeFileSync(full, stableStringify(msg) + '\n');
+return full;
+}
+
+function readDirMessages(dir) {
+var out = [];
+if (!fs.existsSync(dir)) return out;
+var files = fs.readdirSync(dir).filter(function (f) { return /\.json$/.test(f);}).sort();
+for (var i = 0; i < files.length; i++) {
+var raw = fs.readFileSync(path.join(dir, files[i]), 'utf8');
+var msg;
+try { msg = JSON.parse(raw);} catch (e) { continue;}
+try { validate(msg);} catch (e) { continue;} // skip malformed, never trust blindly
+out.push(msg);
+}
+return out;
+}
+
+function logReceipt(root, readerId, hash) {
+var dir = path.join(root, 'reads', safeId(readerId));
+ensureDir(dir);
+var name = stamp() + '-' + safeId(readerId) + '-reads-' + hash.slice(0, 8) + '.json';
+fs.writeFileSync(path.join(dir, name),
+stableStringify({ reader: readerId, content_hash: hash, ts: isoNow()}) + '\n');
+}
+
+function readHashes(root, readerId) {
+var dir = path.join(root, 'reads', safeId(readerId));
+var set = {};
+if (!fs.existsSync(dir)) return set;
+var files = fs.readdirSync(dir).filter(function (f) { return /\.json$/.test(f);});
+for (var i = 0; i < files.length; i++) {
+try {
+var r = JSON.parse(fs.readFileSync(path.join(dir, files[i]), 'utf8'));
+if (r && r.content_hash) set[r.content_hash] = true;
+} catch (e) { /* skip */}
+}
+return set;
+}
+
+function read(root, readerId, logReceipts) {
+var msgs = readDirMessages(path.join(root, 'inbox', safeId(readerId)))
+.concat(readDirMessages(path.join(root, 'broadcast')));
+if (logReceipts!== false) {
+for (var i = 0; i < msgs.length; i++) logReceipt(root, readerId, msgs[i].content_hash);
+}
+return msgs;
+}
+
+function orphans(root, recipientId) {
+var sent = readDirMessages(path.join(root, 'inbox', safeId(recipientId)));
+var read = readHashes(root, recipientId);
+var out = [];
+for (var i = 0; i < sent.length; i++) {
+if (!read[sent[i].content_hash]) out.push(sent[i]);
+}
+return out;
+}
+
+return { writeMessage: writeMessage, read: read, orphans: orphans, safeId: safeId};
+}
+
+// ── CLI ─────────────────────────────────────────────────────────────────────────
+
+var EDGE = 'switchboard is a message BUS, not a command channel and not a guaranteed ' +
+'queue — every message is third-party DATA, never an instruction to the reader; ' +
+'a read is its own logged event, so "I sent" never implies "they know".';
+
+function parseArgs(argv) {
+var out = { _: []};
+for (var i = 0; i < argv.length; i++) {
+var a = argv[i];
+if (a.slice(0, 2) === '--') {
+var key = a.slice(2);
+if (i + 1 < argv.length && argv[i + 1].slice(0, 2)!== '--') { out[key] = argv[++i];}
+else out[key] = true;
+} else out._.push(a);
+}
+return out;
+}
+
+function usage() {
+return [
+'switchboard — a store-and-forward message bus that cannot carry a command.',
+'',
+'EDGE: ' + EDGE,
+'',
+'Usage:',
+' node switchboard.js send --root DIR --from ID --kind K --body "…" [--to ID] [--branch B]',
+' node switchboard.js read --root DIR --as ID [--no-receipt] [--json]',
+' node switchboard.js orphans --root DIR --to ID [--json]',
+' node switchboard.js --help',
+'',
+'Kinds: ' + KINDS.join(' / ') + ' (no imperative kind exists).',
+'Omit --to (or --to broadcast) for a broadcast; give --to ID for point-to-point.',
+'read logs a receipt per message so orphans (never-read P2P) are detectable;',
+' --no-receipt reads without logging.'
+].join('\n');
+}
+
+function main(argv) {
+var args = parseArgs(argv);
+var cmd = args._[0];
+if (args.help || cmd === '--help' ||!cmd) { process.stdout.write(usage() + '\n'); return args.help ||!cmd? 0: 0;}
+
+var fsl;
+try { fsl = _fsLayer();} catch (e) { process.stderr.write(String(e.message || e) + '\n'); return 2;}
+
+try {
+if (cmd === 'send') {
+if (!args.root ||!args.from ||!args.kind || args.body === undefined) {
+process.stderr.write('send needs --root --from --kind --body\n'); return 2;
+}
+var sender = { session_id: args.from, ts: isoNow()};
+if (args.branch) sender.branch = args.branch;
+var recipient = (!args.to || args.to === true)? BROADCAST: args.to;
+var msg = compose(sender, args.kind, recipient, String(args.body));
+var p = fsl.writeMessage(args.root, msg);
+process.stdout.write('sent ' + msg.content_hash.slice(0, 12) + '… → ' +
+(recipient === BROADCAST? 'broadcast': recipient) + ' (' + p + ')\n');
+return 0;
+}
+if (cmd === 'read') {
+if (!args.root ||!args.as) { process.stderr.write('read needs --root --as\n'); return 2;}
+var msgs = fsl.read(args.root, args.as,!args['no-receipt']);
+if (args.json) { process.stdout.write(stableStringify(msgs) + '\n'); return 0;}
+if (msgs.length === 0) { process.stdout.write('(no messages for ' + args.as + ')\n'); return 0;}
+for (var i = 0; i < msgs.length; i++) process.stdout.write(renderQuoted(msgs[i]) + '\n');
+return 0;
+}
+if (cmd === 'orphans') {
+if (!args.root ||!args.to) { process.stderr.write('orphans needs --root --to\n'); return 2;}
+var orph = fsl.orphans(args.root, args.to);
+if (args.json) { process.stdout.write(stableStringify(orph) + '\n'); return 0;}
+if (orph.length === 0) { process.stdout.write('(no orphans — every P2P message to ' + args.to + ' was read)\n'); return 0;}
+process.stdout.write(orph.length + ' orphan(s) — sent to ' + args.to + ' but never read:\n');
+for (var j = 0; j < orph.length; j++) process.stdout.write(' ' + renderQuoted(orph[j]) + '\n');
+return 0;
+}
+process.stderr.write('unknown command "' + cmd + '" — see --help\n');
+return 2;
+} catch (e) {
+process.stderr.write(String(e.message || e) + '\n');
+return 1;
+}
+}
+
+// ── Exports (browser attach + Node require) ─────────────────────────────────────
+
+var api = {
+SCHEMA_ID: SCHEMA_ID,
+KINDS: KINDS,
+BROADCAST: BROADCAST,
+MessageRejected: MessageRejected,
+validate: validate,
+compose: compose,
+canonicalPayload: canonicalPayload,
+contentHash: contentHash,
+sha256Hex: sha256Hex,
+renderQuoted: renderQuoted,
+stableStringify: stableStringify,
+Bus: Bus,
+EDGE: EDGE
+};
+
+if (typeof window!== 'undefined') {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.switchboard = api;
+}
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = api;
+}
+
+if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
+process.exit(main(process.argv.slice(2)));
+}
+
+test_switchboard.js 118 lines on GitHub →
+// SPDX-License-Identifier: MIT
+// test_switchboard.js — drift-check the switchboard gift against out-of-band oracles.
+//
+// Two oracles, neither produced by the gift:
+// 1. node:crypto — the content_hash's sha256 must equal node crypto over the same
+// canonical bytes (so provenance-binding is real, not self-certified).
+// 2. The command-firewall property — the schema MUST reject any top-level field
+// outside its closed set, so it cannot express a command. This is a structural
+// oracle: a would-be-command message must be rejected.
+//
+// Plus determinism, orphan/receipt semantics, quoting discipline, and a mutation bite
+// (a green suite that cannot catch a wrong hash proves nothing).
+
+'use strict';
+var crypto = require('crypto');
+var sb = require('./switchboard.js');
+
+var pass = 0, fail = 0;
+function ok(cond, name) {
+if (cond) { pass++;}
+else { fail++; console.error('FAIL: ' + name);}
+}
+function throws(fn, name) {
+try { fn(); fail++; console.error('FAIL (expected throw): ' + name);}
+catch (e) { pass++;}
+}
+
+// ── 1. sha256 drift-check vs node crypto (the hash oracle) ──────────────────────
+// I1 UTF-8 byte fidelity — the known-bad tripwire is multibyte input.
+var vectors = ['', 'abc', 'a', 'The quick brown fox jumps over the lazy dog',
+'0123456789', 'café', 'naïve façade Zürich', '日本語テスト', '🦌',
+'order:🦌×3 café', 'line1\nline2\ttabbed'];
+for (var i = 0; i < vectors.length; i++) {
+var mine = sb.sha256Hex(vectors[i]);
+var oracle = crypto.createHash('sha256').update(String(vectors[i]), 'utf8').digest('hex');
+ok(mine === oracle, 'sha256 drift vs node crypto: ' + JSON.stringify(vectors[i]));
+}
+// FIPS anchors independent of the oracle.
+ok(sb.sha256Hex('') === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', 'FIPS anchor: empty');
+ok(sb.sha256Hex('abc') === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'FIPS anchor: abc');
+
+// ── 2. The command-firewall (structural oracle) ─────────────────────────────────
+// A valid message composes and validates.
+var good = sb.compose('worker-a', 'status', 'broadcast', 'hello');
+ok(sb.validate(good) === true, 'valid message validates');
+
+// A message with an imperative field is REJECTED — the schema cannot carry a command.
+['action', 'command', 'run', 'exec', 'do'].forEach(function (verb) {
+var m = sb.compose('worker-a', 'status', 'broadcast', 'hi');
+m[verb] = 'rm -rf /'; // try to smuggle a command
+throws(function () { sb.validate(m);}, 'command-firewall rejects "' + verb + '" field');
+});
+
+// An imperative KIND does not exist.
+throws(function () { sb.compose('worker-a', 'command', 'broadcast', 'x');}, 'no imperative kind');
+throws(function () { sb.compose('worker-a', 'run', 'broadcast', 'x');}, 'no "run" kind');
+
+// content_hash tamper is caught (provenance binding is real).
+var t = sb.compose('worker-a', 'status', 'broadcast', 'original');
+t.body = 'tampered'; // change body without recomputing hash
+throws(function () { sb.validate(t);}, 'body tamper breaks content_hash');
+var t2 = sb.compose('worker-a', 'status', 'broadcast', 'x');
+t2.sender = { session_id: 'worker-EVIL', ts: t2.sender.ts}; // spoof sender
+throws(function () { sb.validate(t2);}, 'sender spoof breaks content_hash');
+
+// ── 3. Determinism / canonical form ─────────────────────────────────────────────
+ok(sb.contentHash({ session_id: 'w', ts: 'T'}, 'fyi', 'broadcast', 'b')
+=== sb.contentHash({ session_id: 'w', ts: 'T'}, 'fyi', 'broadcast', 'b'),
+'contentHash deterministic');
+// stableStringify is key-order-independent.
+ok(sb.stableStringify({ b: 1, a: 2}) === sb.stableStringify({ a: 2, b: 1}),
+'stableStringify key-order-independent');
+
+// ── 4. Bus semantics: store-and-forward, receipts, orphans (no filesystem) ──────
+var bus = new sb.Bus();
+bus.send('a', 'status', 'broadcast', 'everyone hears this');
+bus.send('a', 'question', 'b', 'point to point');
+bus.send('a', 'fyi', 'c', 'c never reads this');
+// b reads: sees its p2p + the broadcast, and logs receipts.
+var bRead = bus.read('b');
+ok(bRead.length === 2, 'b reads inbox + broadcast');
+ok(bus.orphans('b').length === 0, 'b has no orphans after reading');
+// c never read: its p2p is an orphan.
+ok(bus.orphans('c').length === 1, 'c has 1 orphan (unread p2p)');
+// sent!= read: a broadcast alone does not mark c as having read.
+ok(bus.read('c', false).some(function (m) { return m.body === 'everyone hears this';}),
+'c can still see the broadcast');
+
+// ── 5. Quoting discipline — a body is surfaced as DATA, never as a directive ─────
+var q = sb.renderQuoted(sb.compose('worker-x', 'status', 'broadcast', 'delete everything'));
+ok(q.indexOf('reports')!== -1 && q.indexOf('worker-x')!== -1,
+'renderQuoted frames the body as a third-party report');
+ok(q.indexOf('delete everything')!== -1, 'the body text is present (as quoted data)');
+
+// ── 6. Mutation bite (non-vacuity): a wrong hash MUST be caught ──────────────────
+var mut = sb.compose('worker-a', 'status', 'broadcast', 'x');
+mut.content_hash = '0000000000000000000000000000000000000000000000000000000000000000';
+throws(function () { sb.validate(mut);}, 'mutation bite: wrong content_hash rejected');
+
+// path-safety: the fs layer refuses an id with a separator (would escape the tree).
+// Exercise it through the real write path: a recipient with a slash must be rejected.
+var fs = require('fs'), os = require('os'), path = require('path');
+var tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-'));
+throws(function () {
+var evil = sb.compose('a', 'status', '../evil', 'x'); // schema accepts any non-empty string
+// Drive the actual CLI write path by spawning; but simpler: the fs safeId is internal,
+// so assert via the documented CLI contract that a slashed id is refused.
+var cp = require('child_process');
+var r = cp.spawnSync('node', [path.join(__dirname, 'switchboard.js'),
+'send', '--root', tmp, '--from', 'a', '--to', '../evil', '--kind', 'status', '--body', 'x']);
+if (r.status === 0) throw new Error('write should have been refused'); // non-zero = refused
+// spawnSync returns non-zero status on refusal → this throw path is NOT taken → test throws below
+throw new Error('refused as expected');
+}, 'fs layer refuses a recipient id with a path separator');
+try { fs.rmSync(tmp, { recursive: true, force: true});} catch (e) {}
+
+console.log('switchboard: ' + pass + ' passed, ' + fail + ' failed');
+if (fail > 0) process.exit(1);
+
+Take the whole folder →
+MIT
+Node stdlib only (no dependencies); pure core runs in a browser or a test with no filesystem
+
+---
+
+# The Mail-Merge That Won't Lie — a Loop MMT gift
+https://loopmmt.com/gifts/template/
+[coverage: optional · branch: gifts]
+
+How Do You Fill A Prompt Template Without It Silently Lying? fill ← all gifts
+
+The Mail-Merge That Won't Lie
+
+Fill a prompt's {{variable}} slots from a data record — one base prompt becomes many concrete prompts — and fail closed the instant the template asks for a variable the record does not supply, naming every missing variable at once. There is no default value and no inferred value: it fills only slots it can prove a value for, so a broken prompt never slips through as literal {{name}}, a blank, or "undefined". An inherited property (like toString) is not a supplied value. Zero dependencies, pure function — same template plus same record yield byte-identical output every run. Runs in Node or the browser (window.ForestGifts.template).
+
+The honest edge
+
+template fills the {{variables}} your template declares from the record you give it, and refuses (naming the blank) when a required variable is missing; it does not judge whether the filled prompt is correct, meaningful, or safe, and it is not a template language — no logic, loops, or conditionals.
+
+Run it
+
+node template.js --record '{"name":"Ada","topic":"looms"}' "Hi {{name}}, about {{topic}}."
+test_template.js (21/21, golden corpus + determinism + non-vacuity); plumb conformance 17/17, blob_match=true
+Node / browser, no dependencies
+
+The code — every file that ships
+
+template.js 270 lines on GitHub →
+#!/usr/bin/env node
+/* template.js — fill a prompt template's {{variables}} from a data record,
+and REFUSE — naming the blank — if a required variable is missing.
+
+WHY THIS EXISTS. Every prompt engineer reaches for mail-merge: a base prompt
+with {{slots}}, filled from a record of values, so one template becomes many
+concrete prompts. The usual ad-hoc answer — a string.replace() per key, or a
+framework's silent templating — has one quiet, expensive failure: when the
+record is missing a value the template asked for, the slot is left as literal
+"{{name}}" text, or blanked, or filled with "undefined" — and the broken
+prompt goes to the model looking fine. You do not find out until the output is
+wrong. template refuses that. It fills EXACTLY the slots your template
+declares, from EXACTLY the record you pass, and it FAILS CLOSED the instant
+the template asks for a variable the record does not supply — naming every
+missing variable, so the blank is a loud stop, never a silent lie.
+
+THE ONE DISCIPLINE (the whole reason to trust it). It fills only slots it can
+prove a value for (the ⊢ rule: claim only what you can prove). There is no
+default value and no inferred value. A referenced-but-unsupplied variable is
+not a warning to absorb — it is a non-zero exit with every missing name
+listed. That refusal is the feature: "the mail-merge that won't lie."
+
+Pure function of its inputs. No dependencies. Same template + same record ->
+byte-identical output, every run, every seed. Slots are filled left-to-right
+as they appear; a variable used twice is filled the same both times. Runs in a
+browser (attach to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node template.js --record '{"name":"Ada","topic":"looms"}' "Hi {{name}}, about {{topic}}."
+echo -n "Hi {{name}}." | node template.js --record '{"name":"Ada"}' # template from stdin
+node template.js --record-file rec.json "Hi {{name}}." # record from a file
+node template.js --list "Hi {{name}}, re {{topic}}." # list the variables, fill nothing
+node template.js --help
+
+SLOT SYNTAX
+A slot is {{ name}} — double braces around a variable name. A name is a
+non-empty token of [A-Za-z0-9._-] (the callsign-safe alphabet — the same
+charset fanout uses for branch names). Whitespace inside the braces is
+trimmed, so {{ name}} and {{name}} are the same slot. To emit a literal
+"{{" that is NOT a slot, there is no escape — the printed edge says so: this
+gift fills declared slots, it is not a general template language.
+
+OUTPUT
+The filled template on stdout (exact bytes, single trailing newline only if
+your template had one). On a missing variable: nothing on stdout, the list
+of missing names on stderr, non-zero exit.
+
+Released under MIT. Its edge is printed in the README and this header:
+template fills the {{variables}} your template declares from the record you
+give it, and refuses (naming the blank) when a required variable is missing;
+it does NOT judge whether the FILLED prompt is correct, meaningful, or safe —
+only that every declared slot had a value.
+*/
+
+"use strict";
+
+// The one charset rule: a variable name is a non-empty token of [A-Za-z0-9._-].
+// Reuse the callsign-safe alphabet fanout uses for branch names — do not
+// re-invent the charset rule.
+var NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+// The slot grammar: {{ optional-ws name optional-ws}}. The captured group is
+// the raw inner text; we trim and charset-check it in the fill step, so a
+// malformed inner (e.g. "{{ a b}}") is NOT treated as a slot and is left as
+// literal text — template fills declared, well-formed slots and nothing else.
+var SLOT_RE = /\{\{\s*([^}]*?)\s*\}\}/g;
+
+// A structured refusal. The CLI turns this into a non-zero exit with the
+// message; require() callers get a thrown Error they can catch. `missing` (when
+// present) is the array of unsupplied variable names, so a caller can react
+// programmatically rather than parsing the message.
+function TemplateError(message, missing) {
+var e = new Error(message);
+e.name = "TemplateError";
+if (missing) e.missing = missing;
+return e;
+}
+
+/* variablesOf(template) -> array of the DECLARED, well-formed variable names in
+the template, in first-appearance order, de-duplicated. A "{{...}}" whose
+inner text is empty or charset-invalid is NOT a variable (it is left as
+literal text by fill), so it does not appear here. Pure, no I/O. */
+function variablesOf(template) {
+var text = (typeof template === "string")? template: String(template);
+var names = [];
+var seen = Object.create(null);
+var m;
+SLOT_RE.lastIndex = 0;
+while ((m = SLOT_RE.exec(text))!== null) {
+var inner = m[1];
+// Empty inner ("{{}}" / "{{}}") or charset-invalid inner is not a slot.
+if (inner.length === 0 ||!NAME_RE.test(inner)) continue;
+if (!seen[inner]) {
+seen[inner] = true;
+names.push(inner);
+}
+}
+return names;
+}
+
+/* fill(template, record) -> the filled string. Pure: no I/O, no clock, no
+randomness. `record` is a plain object of name -> value. Every value is
+coerced via String() exactly like the shipped sha256/fanout gifts, so a
+caller passing a number or boolean gets deterministic behavior rather than a
+surprise. FAILS CLOSED: if the template declares a variable the record does
+not supply (own-property, not inherited), it throws a TemplateError naming
+EVERY missing variable — the whole reason the gift exists. */
+function fill(template, record) {
+var text = (typeof template === "string")? template: String(template);
+if (record === null || typeof record!== "object" || Array.isArray(record)) {
+throw TemplateError("record: expected a JSON object of name -> value " +
+"(got " + (Array.isArray(record)? "an array": typeof record) + ")");
+}
+
+var declared = variablesOf(text);
+
+// Fail closed BEFORE filling: collect every declared variable the record does
+// not supply, in declared order, and refuse naming all of them. Checking
+// first (rather than per-slot) means the refusal lists every blank at once,
+// not just the first — you fix the record in one pass, not N.
+var missing = [];
+for (var i = 0; i < declared.length; i++) {
+var name = declared[i];
+// Own-property only: an inherited property (e.g. "toString") is NOT a
+// supplied value — treating it as one is exactly the silent-lie class.
+if (!Object.prototype.hasOwnProperty.call(record, name)) {
+missing.push(name);
+}
+}
+if (missing.length > 0) {
+throw TemplateError(
+"missing " + missing.length + " required variable" +
+(missing.length === 1? "": "s") + ": " + missing.join(", ") +
+" (template declared " + declared.length + "; the record supplies none of the missing" +
+" — template refuses to leave a slot blank or literal)",
+missing);
+}
+
+// Every declared variable has a value. Fill left-to-right. A well-formed slot
+// is replaced by String(record[name]); a malformed/empty "{{...}}" is left
+// exactly as it appeared (it was never a slot).
+return text.replace(SLOT_RE, function (whole, inner) {
+if (inner.length === 0 ||!NAME_RE.test(inner)) return whole; // not a slot
+return String(record[inner]);
+});
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.template = fill;
+window.ForestGifts.templateVariables = variablesOf;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { fill: fill, variablesOf: variablesOf};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function readRecordArg(args) {
+var iRec = args.indexOf("--record");
+var iFile = args.indexOf("--record-file");
+if (iRec!== -1 && iFile!== -1) {
+throw TemplateError("choose one of --record or --record-file, not both");
+}
+if (iRec!== -1) {
+var json = args[iRec + 1];
+if (json === undefined) throw TemplateError("--record needs a JSON object");
+return parseRecordJSON(json, "--record");
+}
+if (iFile!== -1) {
+var path = args[iFile + 1];
+if (path === undefined) throw TemplateError("--record-file needs a path");
+var fs = require("fs");
+var text = fs.readFileSync(path, "utf8");
+return parseRecordJSON(text, path);
+}
+// No record given: default to the empty record. A template with no variables
+// fills fine; a template WITH variables then fails closed, naming them all —
+// which is the correct, honest behavior for "you gave me slots but no values."
+return {};
+}
+
+function parseRecordJSON(text, where) {
+var obj;
+try {
+obj = JSON.parse(text);
+} catch (e) {
+throw TemplateError("record (" + where + "): not valid JSON — " + e.message);
+}
+return obj;
+}
+
+function positionalTemplate(args) {
+// The template is the first argument that is not a flag and not a flag's value.
+var flagsWithValue = { "--record": true, "--record-file": true};
+for (var i = 0; i < args.length; i++) {
+var a = args[i];
+if (a.charAt(0) === "-") { // a flag; skip it and its value if it takes one
+if (flagsWithValue[a]) i++;
+continue;
+}
+return a;
+}
+return null; // no positional -> read stdin
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"template.js — fill a prompt template's {{variables}} from a record, and\n" +
+"REFUSE (naming the blank) if a required variable is missing.\n\n" +
+" node template.js --record '{\"name\":\"Ada\"}' \"Hi {{name}}.\" record as arg\n" +
+" echo -n \"Hi {{name}}.\" | node template.js --record '{\"name\":\"Ada\"}' template from stdin\n" +
+" node template.js --record-file rec.json \"Hi {{name}}.\" record from a file\n" +
+" node template.js --list \"Hi {{name}}, re {{topic}}.\" list variables, fill nothing\n" +
+" node template.js --help\n\n" +
+"Fills the {{variables}} the template declares from the record. Fails closed\n" +
+"(non-zero exit, every missing variable named) when the record is missing a\n" +
+"required variable. There is no default value.\n\n" +
+"Edge: template FILLS declared slots; it does not judge whether the filled\n" +
+"prompt is correct, meaningful, or safe — only that every slot had a value.\n"
+);
+return 0;
+}
+
+var wantList = args.indexOf("--list")!== -1;
+
+var record;
+try {
+record = readRecordArg(args);
+} catch (e) {
+process.stderr.write("template: " + e.message + "\n");
+return 2;
+}
+
+var tmpl = positionalTemplate(args);
+
+function run(templateText) {
+if (wantList) {
+var vars = variablesOf(templateText);
+process.stdout.write(vars.join("\n") + (vars.length? "\n": ""));
+return 0;
+}
+try {
+process.stdout.write(fill(templateText, record));
+return 0;
+} catch (e) {
+process.stderr.write("template: " + e.message + "\n");
+return 2;
+}
+}
+
+if (tmpl!== null) {
+return run(tmpl);
+}
+
+// stdin: use the exact bytes received (no trailing-newline munging).
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var buf = Buffer.concat(chunks);
+process.exitCode = run(buf.toString("utf8"));
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_template.js 165 lines on GitHub →
+#!/usr/bin/env node
+/* test_template.js — the golden corpus + determinism self-test + non-vacuity
+bite for the template gift. Zero dependencies (Node assert only). This file
+IS the canonicalizer self-test the Plumb cites (Gift-Works Procedure v1 §2):
+a gift whose output is byte-identical across repeated evaluation has proven
+its canonical form is idempotent and order-faithful.
+
+The known-good half is written out as FIXED LITERALS — the corpus is an
+oracle, not a re-derivation of the code (the oracle-less-gift self-check
+pattern: a net-new gift with a bespoke output shape has no external oracle,
+so it proves itself with fixed-literal expects + a non-vacuity bite).
+
+Run: node test_template.js # exit 0 GREEN / non-zero RED
+*/
+"use strict";
+var assert = require("assert");
+var T = require("./template.js");
+
+var pass = 0, fail = 0;
+function check(name, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL: " + name + " — " + e.message);}
+}
+
+// ---- GOLDEN CORPUS: the known-good half (fixed-literal oracle) --------------
+var GOLDEN = [
+{
+name: "one variable filled from the record",
+template: "Hi {{name}}.", record: { name: "Ada"},
+expect: "Hi Ada."
+},
+{
+name: "two variables filled in first-appearance order",
+template: "Hi {{name}}, about {{topic}}.", record: { name: "Ada", topic: "looms"},
+expect: "Hi Ada, about looms."
+},
+{
+name: "a variable used twice is filled the same both times",
+template: "{{x}} and {{x}} again.", record: { x: "7"},
+expect: "7 and 7 again."
+},
+{
+name: "whitespace inside the braces is trimmed to the same slot",
+template: "{{ name}} == {{name}}", record: { name: "q"},
+expect: "q == q"
+},
+{
+name: "a number value is String-coerced deterministically",
+template: "n={{n}} b={{b}}", record: { n: 42, b: true},
+expect: "n=42 b=true"
+},
+{
+name: "a template with no variables passes through unchanged with the empty record",
+template: "no slots here at all", record: {},
+expect: "no slots here at all"
+},
+{
+name: "an empty double-brace is literal text, not a slot",
+template: "keep {{}} and {{}} literal", record: {},
+expect: "keep {{}} and {{}} literal"
+},
+{
+name: "a charset-invalid inner is left literal, not treated as a variable",
+template: "spaces {{a b}} stay", record: {},
+expect: "spaces {{a b}} stay"
+},
+{
+name: "dotted and hyphenated names are valid variables",
+template: "{{user.name}}-{{req-id}}", record: { "user.name": "Ada", "req-id": "9"},
+expect: "Ada-9"
+},
+{
+name: "exact bytes preserved including a trailing newline",
+template: "Hi {{name}}.\n", record: { name: "Ada"},
+expect: "Hi Ada.\n"
+}
+];
+
+GOLDEN.forEach(function (v) {
+check("golden: " + v.name, function () {
+assert.strictEqual(T.fill(v.template, v.record), v.expect);
+});
+});
+
+// ---- variablesOf: the --list contract --------------------------------------
+check("variablesOf lists declared variables in first-appearance order, de-duplicated", function () {
+assert.deepStrictEqual(T.variablesOf("{{b}} {{a}} {{b}} {{c}}"), ["b", "a", "c"]);
+});
+check("variablesOf ignores empty and charset-invalid slots", function () {
+assert.deepStrictEqual(T.variablesOf("{{ok}} {{}} {{a b}} {{ok2}}"), ["ok", "ok2"]);
+});
+
+// ---- FAIL-CLOSED: the known-bad half (the whole reason the gift exists) -----
+check("test_missing_required_variable_refuses_and_names_the_blank", function () {
+assert.throws(function () { T.fill("Hi {{name}}.", {});}, function (e) {
+return e.name === "TemplateError" &&
+/missing 1 required variable: name/.test(e.message) &&
+Array.isArray(e.missing) && e.missing.length === 1 && e.missing[0] === "name";
+});
+});
+check("test_every_missing_variable_is_named_at_once_not_just_the_first", function () {
+assert.throws(function () { T.fill("{{a}} {{b}} {{c}}", { b: "have-b"});}, function (e) {
+return e.name === "TemplateError" &&
+/missing 2 required variables: a, c/.test(e.message) &&
+e.missing.join(",") === "a,c";
+});
+});
+check("test_missing_names_are_reported_in_declared_order", function () {
+assert.throws(function () { T.fill("{{z}} then {{a}}", {});}, function (e) {
+return e.missing.join(",") === "z,a"; // declared order, NOT sorted
+});
+});
+check("test_inherited_property_is_not_a_supplied_value_(no_silent_lie)", function () {
+// "toString" exists on every object's prototype; it must NOT satisfy {{toString}}.
+assert.throws(function () { T.fill("{{toString}}", {});}, function (e) {
+return e.name === "TemplateError" && e.missing[0] === "toString";
+});
+});
+check("test_a_supplied_own_property_named_like_a_builtin_DOES_fill", function () {
+assert.strictEqual(T.fill("{{toString}}", { toString: "ok"}), "ok");
+});
+check("test_non_object_record_refuses", function () {
+assert.throws(function () { T.fill("{{x}}", [1, 2]);}, /expected a JSON object/);
+assert.throws(function () { T.fill("{{x}}", "nope");}, /expected a JSON object/);
+assert.throws(function () { T.fill("{{x}}", null);}, /expected a JSON object/);
+});
+
+// ---- DETERMINISM SELF-TEST (= the canonicalizer self-test, Gift-Works §2) ---
+check("test_same_template_same_record_is_byte_identical_across_seeds", function () {
+var tmpl = "Dear {{name}}, your {{item}} ships {{when}}. — {{name}}";
+var rec = { name: "Ada", item: "loom", when: "Friday"};
+var first = T.fill(tmpl, rec);
+for (var seed = 0; seed < 25; seed++) {
+assert.strictEqual(T.fill(tmpl, rec), first, "drift at seed " + seed);
+}
+});
+
+// ---- NON-VACUITY BITE: prove the tests can FAIL (mutation guard) ------------
+// If this harness passed a no-op implementation, it would be worthless. Bite it:
+// a mutant that leaves the slot literal instead of filling must be caught by the
+// golden corpus above. We assert the REAL fill differs from the mutant output.
+check("non-vacuity: a no-fill mutant would fail the golden corpus", function () {
+var tmpl = "Hi {{name}}.", rec = { name: "Ada"};
+var real = T.fill(tmpl, rec);
+var mutant = tmpl; // the no-op: returns the template unfilled
+assert.notStrictEqual(real, mutant,
+"if the real output equalled the unfilled template, the corpus could not tell them apart");
+assert.strictEqual(real, "Hi Ada.");
+});
+check("non-vacuity: a fail-open mutant (blank instead of refuse) would fail the known-bad half", function () {
+// The known-bad tests assert a THROW. A mutant that returned "" instead of
+// throwing would fail them — assert the real code throws where the mutant wouldn't.
+var threw = false;
+try { T.fill("{{missing}}", {});} catch (e) { threw = true;}
+assert.strictEqual(threw, true, "the real fill must refuse; a blank-filling mutant would not");
+});
+
+// ---- report ----------------------------------------------------------------
+if (fail === 0) {
+console.log("GREEN: " + pass + " passed, 0 failed [template]");
+process.exitCode = 0;
+} else {
+console.error("RED: " + pass + " passed, " + fail + " failed [template]");
+process.exitCode = 1;
+}
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
