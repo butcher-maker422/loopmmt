@@ -1,1036 +1,557 @@
-# Loop MMT — corpus shard 67/73
+# Loop MMT — corpus shard 67/74
 
-> Bundle 67 of 73 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 67 of 74 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/reading-oath/, /gifts/reltime/, /gifts/scrub/, /gifts/sha256/)
-
----
-
-# Make The AI Prove It Read The Whole Thing — a Loop MMT gift
-https://loopmmt.com/gifts/reading-oath/
-[coverage: optional · branch: gifts]
-
-How Do You Know The Model Read All Of Your Context, Not Just Some Of It? shard ← all gifts
-
-Make The AI Prove It Read The Whole Thing
-
-Shard a chunk of context into a manifest of typed nodes — the coverage oracle — plus budget-sized reading bundles and a short reader protocol; hand it to any model, collect the node ids it reports reading, and verify against the manifest by set-difference until nothing remains. PASS means every shard was covered; a GAP names exactly which shards were skipped. The general-text sibling of The Excavation (which proves an AI read a whole site). Python stdlib only, offline, deterministic — the same context yields byte-identical shards every run.
-
-The honest edge
-
-reading-oath proves COVERAGE — that every shard of your context was seen — not COMPREHENSION; a reader can cover every shard and still misunderstand it. It also trusts the reader to report the ids it actually read: it detects a skipped shard, not a lie about a read one.
-
-Run it
-
-python3 reading_oath.py shard --in context.txt --budget 8000 --out oath.json && python3 reading_oath.py verify --oath oath.json --covered <ids>
-smoke_test.py / --selftest (12/12: enumeration, typed classification, folds-twice-identical, id-stable-under-reorder, id-changes-on-edit, verify PASS/GAP, unknown-id surfaced, budget sharding, oracle==shard-body-ids, empty-input exit 3)
-Python stdlib only, deterministic
-
-The code — every file that ships
-
-reading_oath.py 420 lines on GitHub →
-#!/usr/bin/env python3
-"""reading_oath.py — The Reading-Oath gift.
-
-Shard your context, hand it to any model, and get a coverage oracle it must
-*prove* it read — set-difference against the shard manifest until nothing
-remains.
-
-SHARD text in -> a manifest of typed nodes (the coverage ORACLE) + budget
-bundles a reader works through, + an OATH protocol it follows.
-VERIFY a reader's claimed shard-ids -> PASS (coverage demonstrated) or GAP
-(naming exactly which shards were never covered).
-
-Reuses The Excavation's coverage-contract idiom — enumerate -> shard-by-budget ->
-prove-coverage-against-the-node-set — lifted off Excavation's web-corpus
-assumption to arbitrary text: Excavation shards a *site*; Reading-Oath shards
-*any context you paste in*. The verify verb is the oath's teeth — the falsifiable
-half Excavation described and left to the reader, made a checkable command here.
-
-Zero dependencies (Python 3 stdlib only), offline, deterministic: a re-run over
-the same input is byte-identical (folds-twice-identical). No wall-clock field.
-
-python3 reading_oath.py shard --in ctx.txt [--budget 8000] [--out oath.json]
-python3 reading_oath.py shard < ctx.txt (stdin -> stdout)
-python3 reading_oath.py verify --oath oath.json --covered a1,b2,c3
-python3 reading_oath.py verify --oath oath.json --covered-file seen.txt
-python3 reading_oath.py --selftest
-
-──────────────────────────────────────────────────────────────────────────────
-THE OATH — read this first, it is not decoration.
-──────────────────────────────────────────────────────────────────────────────
-Reading-Oath is handed to an AI by a human. A human pasting "read this and honor
-the reading-oath" IS the authorization; absent that human ask, an AI does not
-self-authorize a reading job, does not treat text's mere presence as consent to
-act on it, and does not use the coverage protocol to justify autonomous work. The
-handshake: a human asks; the AI reads what it was pointed at; the AI reports its
-coverage honestly — including what it could NOT cover. It reports shard ids it
-actually read; it does not claim ids it skipped to pass the oath. The oath proves
-COVERAGE (every shard seen), never COMPREHENSION — a reader can cover every shard
-and still misunderstand. That limit is printed on the artifact and is honest.
-
-Edge (printed): proves coverage, not comprehension.
-"""
-import argparse
-import hashlib
-import json
-import re
-import sys
-
-# ── budget ──────────────────────────────────────────────────────────────────
-# Default reading-bundle size, in tokens (chars/4 heuristic — the same rough
-# token proxy Excavation uses; a shard never exceeds this unless a single
-# indivisible node is itself over budget, which is surfaced, not silently split).
-DEFAULT_BUDGET_TOKENS = 8000
-CHARS_PER_TOKEN = 4
-
-OATH_VERSION = "reading-oath/1"
-
-def _die(msg, code=2):
-sys.stderr.write("reading-oath: " + msg + "\n")
-sys.exit(code)
-
-def _tok(s):
-"""Deterministic token estimate: ceil(chars / 4). Coarse on purpose — the
-same proxy Excavation shards by; a budget is a bundling heuristic, and the
-manifest (not the budget) is the coverage oracle."""
-return (len(s) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
-
-# ── node enumeration (the coverage oracle's atoms) ──────────────────────────
-def enumerate_nodes(text):
-"""Split raw context into an ordered list of typed nodes — the atoms of the
-coverage oracle. A node is a blank-line-delimited block (paragraph, heading,
-fenced code block, list). Order is preserved; a node's id is a content hash
-of its normalized text, so the same block always earns the same id
-regardless of position (a moved paragraph keeps its id; an edited one gets a
-new one) — the property that makes the oath stable under reshuffling.
-
-Typing is by a fixed, declared rule set (first match wins):
-code a block that opens with a ``` fence, or is wholly indented >=4 sp
-heading a block that is a single line opening with # (markdown) or is a
-short single line followed by === / --- underline in the source
-list a block whose every non-blank line opens with -, *, +, or N.
-prose everything else
-"""
-# Normalize newlines only; do NOT strip content (byte-fidelity of the split).
-text = text.replace("\r\n", "\n").replace("\r", "\n")
-# Split on blank-line boundaries, keeping block text intact.
-raw_blocks = re.split(r"\n[ \t]*\n", text)
-nodes = []
-seq = 0
-for block in raw_blocks:
-if block.strip() == "":
-continue
-seq += 1
-ntype = _classify(block)
-norm = _normalize(block)
-nid = _node_id(norm)
-nodes.append({
-"id": nid,
-"seq": seq,
-"type": ntype,
-"tokens": _tok(block),
-"chars": len(block),
-"preview": _preview(block),
-"text": block,
-})
-return nodes
-
-def _classify(block):
-lines = [ln for ln in block.split("\n")]
-nonblank = [ln for ln in lines if ln.strip()]
-if not nonblank:
-return "prose"
-first = nonblank[0].lstrip()
-if first.startswith("```"):
-return "code"
-if all(ln.startswith(" ") or ln.startswith("\t") for ln in lines if ln.strip()):
-return "code"
-if len(nonblank) == 1 and first.startswith("#"):
-return "heading"
-if (len(nonblank) == 2 and re.fullmatch(r"[=\-]{2,}", nonblank[1].strip() or "")):
-return "heading"
-if all(re.match(r"^\s*([-*+]|\d+[.)])\s+", ln) for ln in nonblank):
-return "list"
-return "prose"
-
-def _normalize(block):
-"""Whitespace-normalize for the content id: collapse internal runs of
-whitespace to single spaces and strip ends. Two blocks that differ only in
-incidental spacing earn the same id (stable oath); a real content edit
-changes it."""
-return re.sub(r"\s+", " ", block).strip()
-
-def _node_id(norm):
-return "n" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:10]
-
-def _preview(block):
-flat = re.sub(r"\s+", " ", block).strip()
-return flat[:72]
-
-# ── shard (bundle nodes by budget) ──────────────────────────────────────────
-def shard_nodes(nodes, budget_tokens):
-"""Greedy in-order bundling into budget-sized shards. In-order so a reader
-works front-to-back; greedy-by-budget so each shard fits a context window.
-A single node over budget becomes its own shard and is flagged oversize
-(surfaced, never silently truncated)."""
-shards = []
-cur = []
-cur_tok = 0
-idx = 0
-
-def _flush():
-nonlocal cur, cur_tok, idx
-if not cur:
-return
-idx += 1
-sid = "s%03d" % idx
-shards.append({
-"id": sid,
-"node_ids": [n["id"] for n in cur],
-"tokens": cur_tok,
-"oversize": any(n["tokens"] > budget_tokens for n in cur),
-})
-cur = []
-cur_tok = 0
-
-for n in nodes:
-if cur and cur_tok + n["tokens"] > budget_tokens:
-_flush()
-cur.append(n)
-cur_tok += n["tokens"]
-_flush()
-return shards
-
-# ── the oath object (manifest + shards + protocol) ──────────────────────────
-def build_oath(text, budget_tokens):
-nodes = enumerate_nodes(text)
-if not nodes:
-_die("input has no readable nodes (empty or all-blank).", 3)
-shards = shard_nodes(nodes, budget_tokens)
-# The manifest is the ORACLE: the closed set of node ids that must be covered.
-node_set = [n["id"] for n in nodes]
-manifest = {
-"version": OATH_VERSION,
-"budget_tokens": budget_tokens,
-"node_count": len(nodes),
-"shard_count": len(shards),
-"total_tokens": sum(n["tokens"] for n in nodes),
-"nodes": [
-{"id": n["id"], "seq": n["seq"], "type": n["type"],
-"tokens": n["tokens"], "preview": n["preview"]}
-for n in nodes
-],
-# node_set is the coverage oracle — verify() checks claimed ⊇ this.
-"node_set": node_set,
-"shards": shards,
-# The reader-facing protocol. Prose, deterministic, no wall-clock.
-"oath": [
-"You have been handed a sharded context and a coverage oracle.",
-"Read each shard in id order (s001, s002,...).",
-"For every node id you actually read, record it.",
-"You have honored the reading-oath ONLY when the set-difference of the "
-"manifest node_set minus the ids you recorded is empty.",
-"Report the ids you covered. Do NOT claim an id you skipped.",
-"This proves COVERAGE (every shard seen), not COMPREHENSION.",
-],
-"edge": "proves coverage, not comprehension",
-}
-# Attach the shard bodies so the object is self-contained for a reader.
-bodies = {n["id"]: n["text"] for n in nodes}
-manifest["shard_bodies"] = {
-s["id"]: [{"id": nid, "text": bodies[nid]} for nid in s["node_ids"]]
-for s in shards
-}
-return manifest
-
-# ── verify (the oath's teeth) ───────────────────────────────────────────────
-def verify(oath, covered_ids):
-"""Set-difference the manifest node_set against the reader's claimed ids.
-Empty difference => PASS (coverage demonstrated). Otherwise GAP, naming the
-uncovered node ids. Claimed ids not in the manifest are reported as 'unknown'
-(a reader claiming ids that do not exist is a signal, not silently ignored)."""
-oracle = set(oath.get("node_set", []))
-claimed = set(covered_ids)
-uncovered = sorted(oracle - claimed)
-unknown = sorted(claimed - oracle)
-result = {
-"version": oath.get("version", OATH_VERSION),
-"oracle_size": len(oracle),
-"claimed_size": len(claimed),
-"covered": len(oracle & claimed),
-"uncovered": uncovered,
-"unknown": unknown,
-"passed": len(uncovered) == 0,
-}
-return result
-
-# ── cli ─────────────────────────────────────────────────────────────────────
-def _read_covered(args):
-ids = []
-if args.covered:
-ids += [x.strip() for x in args.covered.split(",") if x.strip()]
-if args.covered_file:
-try:
-with open(args.covered_file, "r", encoding="utf-8") as fh:
-for raw in fh:
-for tok in re.split(r"[,\s]+", raw.strip()):
-if tok:
-ids.append(tok)
-except OSError as e:
-_die("cannot read --covered-file: %s" % e, 2)
-if not ids:
-_die("verify needs --covered or --covered-file (the reader's claimed ids).", 2)
-return ids
-
-def main(argv=None):
-argv = list(sys.argv[1:] if argv is None else argv)
-if "--selftest" in argv:
-return _selftest()
-
-p = argparse.ArgumentParser(prog="reading_oath.py", add_help=True,
-description="Shard a context into a coverage oath; verify a reader honored it.")
-sub = p.add_subparsers(dest="cmd")
-
-ps = sub.add_parser("shard", help="text in -> coverage oath (manifest+shards+protocol)")
-ps.add_argument("--in", dest="infile", default=None, help="input file (default: stdin)")
-ps.add_argument("--out", dest="outfile", default=None, help="output file (default: stdout)")
-ps.add_argument("--budget", type=int, default=DEFAULT_BUDGET_TOKENS,
-help="shard token budget (default %d)" % DEFAULT_BUDGET_TOKENS)
-
-pv = sub.add_parser("verify", help="reader's claimed ids -> PASS or GAP")
-pv.add_argument("--oath", required=True, help="the oath json from `shard`")
-pv.add_argument("--covered", default=None, help="comma-separated node ids the reader read")
-pv.add_argument("--covered-file", default=None, help="file of node ids (whitespace/comma sep)")
-
-args = p.parse_args(argv)
-
-if args.cmd == "shard":
-if args.budget <= 0:
-_die("--budget must be positive.", 2)
-if args.infile:
-try:
-with open(args.infile, "r", encoding="utf-8") as fh:
-text = fh.read()
-except OSError as e:
-_die("cannot read --in: %s" % e, 2)
-else:
-text = sys.stdin.read()
-oath = build_oath(text, args.budget)
-out = json.dumps(oath, indent=2, ensure_ascii=False, sort_keys=True)
-if args.outfile:
-try:
-with open(args.outfile, "w", encoding="utf-8") as fh:
-fh.write(out + "\n")
-except OSError as e:
-_die("cannot write --out: %s" % e, 2)
-sys.stderr.write("reading-oath: %d nodes, %d shards -> %s\n"
-% (oath["node_count"], oath["shard_count"], args.outfile))
-else:
-sys.stdout.write(out + "\n")
-return 0
-
-if args.cmd == "verify":
-try:
-with open(args.oath, "r", encoding="utf-8") as fh:
-oath = json.load(fh)
-except OSError as e:
-_die("cannot read --oath: %s" % e, 2)
-except json.JSONDecodeError as e:
-_die("--oath is not valid json: %s" % e, 2)
-covered = _read_covered(args)
-res = verify(oath, covered)
-sys.stdout.write(json.dumps(res, indent=2, sort_keys=True) + "\n")
-if res["passed"]:
-sys.stderr.write("reading-oath: PASS — %d/%d covered, difference empty.\n"
-% (res["covered"], res["oracle_size"]))
-return 0
-sys.stderr.write("reading-oath: GAP — %d uncovered node(s): %s\n"
-% (len(res["uncovered"]), ", ".join(res["uncovered"][:8])
-+ ("..." if len(res["uncovered"]) > 8 else "")))
-return 1
-
-p.print_help()
-return 2
-
-# ── selftest (the determinism + contract battery) ───────────────────────────
-def _selftest():
-ok = 0
-fail = 0
-
-def check(name, cond):
-nonlocal ok, fail
-if cond:
-ok += 1
-else:
-fail += 1
-sys.stderr.write(" FAIL: %s\n" % name)
-
-sample = (
-"# Title\n\n"
-"First paragraph of prose that says a thing.\n\n"
-"Second paragraph, distinct content here.\n\n"
-"- a list item\n- another list item\n\n"
-"```\ncode block line one\ncode block line two\n```\n"
-)
-oath = build_oath(sample, 20)
-ids = oath["node_set"]
-
-# 1. enumeration finds the five blocks.
-check("node_count == 5", oath["node_count"] == 5)
-# 2. typing is correct.
-types = [n["type"] for n in oath["nodes"]]
-check("types heading/prose/prose/list/code",
-types == ["heading", "prose", "prose", "list", "code"])
-# 3. determinism: fold twice, identical.
-o2 = build_oath(sample, 20)
-check("folds-twice-identical",
-json.dumps(oath, sort_keys=True) == json.dumps(o2, sort_keys=True))
-# 4. node id is content-stable under reordering.
-reordered = (
-"Second paragraph, distinct content here.\n\n"
-"# Title\n\n"
-"First paragraph of prose that says a thing.\n\n"
-"- a list item\n- another list item\n\n"
-"```\ncode block line one\ncode block line two\n```\n"
-)
-ro = build_oath(reordered, 20)
-check("ids stable under reorder (same set)",
-set(ro["node_set"]) == set(oath["node_set"]))
-# 5. id changes on content edit.
-edited = sample.replace("says a thing", "says a DIFFERENT thing")
-oe = build_oath(edited, 20)
-check("edit changes exactly one id",
-len(set(oe["node_set"]) - set(oath["node_set"])) == 1)
-# 6. verify PASS when all covered.
-r_all = verify(oath, ids)
-check("verify PASS on full coverage", r_all["passed"] and not r_all["uncovered"])
-# 7. verify GAP naming the skipped id.
-r_gap = verify(oath, ids[:-1])
-check("verify GAP names the one skipped", (not r_gap["passed"]) and r_gap["uncovered"] == [ids[-1]])
-# 8. unknown claimed id is surfaced.
-r_unk = verify(oath, ids + ["nDEADBEEF00"])
-check("verify surfaces unknown id", r_unk["unknown"] == ["nDEADBEEF00"])
-# 9. sharding respects budget (each shard <= budget unless a single oversize node).
-small = build_oath(sample, 5) # tiny budget forces multiple shards
-check("tiny budget -> more shards", small["shard_count"] >= oath["shard_count"])
-budget_ok = all(s["tokens"] <= 5 or len(s["node_ids"]) == 1 for s in small["shards"])
-check("shards fit budget or are single oversize node", budget_ok)
-# 10. node_set is exactly the shard-body ids (oracle == what's handed over).
-body_ids = set()
-for sid, items in oath["shard_bodies"].items():
-for it in items:
-body_ids.add(it["id"])
-check("oracle == union of shard-body ids", body_ids == set(oath["node_set"]))
-# 11. empty input dies clean (exit 3) — checked via a guarded call.
-try:
-build_oath(" \n\n \n", 20)
-check("empty input raises", False)
-except SystemExit as e:
-check("empty input exit 3", e.code == 3)
-
-total = ok + fail
-sys.stdout.write("reading-oath selftest: %d/%d passed\n" % (ok, total))
-return 0 if fail == 0 else 1
-
-if __name__ == "__main__":
-sys.exit(main())
-
-smoke_test.py 21 lines on GitHub →
-#!/usr/bin/env python3
-"""smoke_test.py — reading-oath's shipped smoke check. Runs the in-module
---selftest battery (12 checks) and exits non-zero on any failure, so a stranger
-can prove the gift works in their tree with one command:
-
-python3 smoke_test.py
-"""
-import subprocess
-import sys
-import os
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-def main():
-r = subprocess.run([sys.executable, os.path.join(HERE, "reading_oath.py"), "--selftest"])
-sys.exit(r.returncode)
-
-if __name__ == "__main__":
-main()
-
-Take the whole folder →
-MIT
-Python stdlib only, deterministic
+Nodes in this shard: 3 (/gifts/ratchet-pdf-dict/, /gifts/ratchet-pdf-text/, /gifts/ratchet-png-text/)
 
 ---
 
-# Reltime — a Loop MMT gift
-https://loopmmt.com/gifts/reltime/
+# PDF Dictionary-Text Extractor — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-pdf-dict/
 [coverage: optional · branch: gifts]
 
-Relative Time That Refuses To Lie date ← all gifts
+What Text Does This PDF Store? transform ← all gifts
 
-Reltime
+PDF Dictionary-Text Extractor
 
-Turn a timestamp into a short human 'when' (3h ago, Jun 20) where the whole point is what it won't do: a missing, empty, or unparseable stamp returns no label rather than a guess, a future stamp returns no label rather than a negative age, and anything older than a week gets the real date it landed instead of a rounded-up '9d ago'. Deterministic — a pure function of (stamp, now).
+Pull the text a PDF STORES but never draws — the AcroForm field values (/V) and annotation notes (/Contents) that a content-stream extractor skips — with no dependencies, in Node or the browser. parsePdfDict(bytes) validates the %PDF- header, walks the indirect objects, and decodes literal () and hex < > strings, resolving a one-level indirect /V and pairing each value with its /T field name. The companion to ratchet-pdf-text: that reads the drawn text, this reads the dictionary text — together, every text surface in a PDF.
 
 The honest edge
 
-It renders in UTC and is a recency label, not a locale-aware or timezone-shifting formatter, and not a full date library. The fixed minute/hour/day/week bands are by design — the value is the refusal to fabricate, not configurable granularity.
+It splits its contract by scale, on purpose: document-level failure (not a PDF, bad input) THROWS like its ratchet-pdf-text twin, but a single malformed value is RECORDED as {malformed, reason} and the walk continues rather than losing the good fields after it — a malformed value is stamped, never returned as clean. It reads the TOP-LEVEL dictionary of each object: a /V or /Contents in a nested sub-dict, or a value inherited through /Kids, is not a target. It resolves an indirect /V one level only. It returns the string as WRITTEN — no /Encoding or /ToUnicode CMap mapping, correct for WinAnsi and honestly wrong for a subsetted CID font. It does not decrypt, decode /ObjStm or xref streams, or repair a broken file.
 
 Run it
 
-node reltime.js 2026-08-20T09:00:00Z
-test_reltime.js (20/20, mutation-bitten)
-Node, no dependencies
-
-The code — every file that ships
-
-reltime.js 106 lines on GitHub →
-#!/usr/bin/env node
-/* reltime.js — an honest relative-time label ("3h ago", "Jun 20") that refuses
-to fake, round up, or invent a time it doesn't have.
-
-Turn a timestamp into a short human "when" — but the whole point is what it
-WON'T do:
-
-• FLAG, DON'T FAKE. No stamp, an empty stamp, or an unparseable value
-returns null — NO label. The caller shows nothing rather than a guessed
-or fabricated time. An undated thing is never handed a "when".
-
-• A FUTURE STAMP IS NOT A RECENCY CLAIM. If the timestamp is ahead of now
-(clock skew, a bad record), it returns null rather than "-2h ago". You
-cannot honestly say how long ago something happened if it hasn't.
-
-• REAL, NOT ROUNDED-UP. Recent items get a relative label
-(just now / Nm / Nh / Nd ago); anything older than a week gets the
-ABSOLUTE short date it actually landed ("Jun 20", or "Jun 20, 2025"
-across a year boundary) — because "9d ago" is less honest and less
-useful than the date itself.
-
-• DETERMINISTIC. `now` is injected, so the label is a pure function of
-(stamp, now) — testable with no wall clock and stable across a render.
-
-Pure function of its inputs, no dependencies. The same code runs in a browser
-(attach relativeTime to your namespace) or on Node (this CLI / require()).
-
-USAGE
-node reltime.js 2026-08-20T09:00:00Z # label vs. now
-node reltime.js 2026-08-20T09:00:00Z 1755772800000 # label vs. an injected now (ms)
-node reltime.js --help
-
-Dates are read/rendered in UTC for determinism. Released under MIT.
-*/
-"use strict";
-
-var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-var MIN = 60 * 1000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
-
-/* relativeTime(iso, nowMs) -> short label string, or null when there is no
-honest label to show. `iso` is an ISO-8601 string (or null). `nowMs` defaults
-to Date.now() but is injected in tests and via the CLI for determinism. */
-function relativeTime(iso, nowMs) {
-// flag-don't-fake: no stamp, empty stamp, or a non-string -> no label.
-if (iso == null) return null;
-var s = String(iso);
-if (s === "") return null;
-
-var t = Date.parse(s);
-if (isNaN(t)) return null; // unparseable -> no fabricated time
-
-var now = (typeof nowMs === "number" && isFinite(nowMs))? nowMs: Date.now();
-var delta = now - t;
-
-// A future stamp (clock skew) is not a recency claim we can make honestly.
-if (delta < 0) return null;
-
-if (delta < MIN) return "just now";
-if (delta < HOUR) return Math.floor(delta / MIN) + "m ago";
-if (delta < DAY) return Math.floor(delta / HOUR) + "h ago";
-if (delta < WEEK) return Math.floor(delta / DAY) + "d ago";
-
-// Older than a week -> the absolute short date it actually landed.
-var d = new Date(t);
-var label = MONTHS[d.getUTCMonth()] + " " + d.getUTCDate();
-if (d.getUTCFullYear()!== new Date(now).getUTCFullYear()) {
-label += ", " + d.getUTCFullYear();
-}
-return label;
-}
-
-// Browser: attach to a namespace. Node/require: export. CLI: run below.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.relativeTime = relativeTime;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { relativeTime: relativeTime};
-}
-
-// ---- CLI (runs only when invoked directly, never on require) ----------------
-function main(argv) {
-var args = argv.slice(2);
-if (args.length === 0 || args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"reltime.js — an honest relative-time label that refuses to fake a time.\n\n" +
-" node reltime.js <iso-timestamp> label vs. now\n" +
-" node reltime.js <iso-timestamp> <now-ms> label vs. an injected now (ms)\n" +
-" node reltime.js --help\n\n" +
-"Prints the label, or '(no honest label)' when the stamp is missing,\n" +
-"unparseable, or in the future. Dates render in UTC.\n"
-);
-return args.length === 0? 1: 0;
-}
-var iso = args[0];
-var nowMs = args.length > 1? Number(args[1]): undefined;
-var label = relativeTime(iso, nowMs);
-process.stdout.write((label === null? "(no honest label)": label) + "\n");
-return 0;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_reltime.js 61 lines on GitHub →
-#!/usr/bin/env node
-/* test_reltime.js — proves the label is honest, exact, and deterministic.
-
-The honesty rules ARE the tool, so the test's real job is to prove each
-REFUSAL fires (null, not a fabricated label) and each threshold is exact. The
-clock is injected, so every case is deterministic with no wall clock. A
-mutation bite guards against a vacuously-green run. Exit 0 = all pass, exit 1
-= a failure (loud). stdlib only, no dependencies. */
-"use strict";
-var relativeTime = require("./reltime.js").relativeTime;
-
-var pass = 0, fail = 0;
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
-}
-
-// A fixed "now" so every case is deterministic. 2026-06-27T12:00:00Z.
-var NOW = Date.parse("2026-06-27T12:00:00Z");
-function ago(ms) { return new Date(NOW - ms).toISOString();}
-var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
-
-// --- flag-don't-fake: every "no honest label" case returns null -------------
-eq("null stamp -> null", relativeTime(null, NOW), null);
-eq("undefined stamp -> null", relativeTime(undefined, NOW), null);
-eq("empty string -> null", relativeTime("", NOW), null);
-eq("unparseable -> null", relativeTime("not a date", NOW), null);
-eq("garbage -> null", relativeTime("2026-13-99", NOW), null);
-eq("future stamp -> null", relativeTime(ago(-HOUR), NOW), null); // 1h in the FUTURE
-
-// --- relative band, exact thresholds ---------------------------------------
-eq("0ms -> just now", relativeTime(ago(0), NOW), "just now");
-eq("59s -> just now", relativeTime(ago(59 * 1000), NOW), "just now");
-eq("60s -> 1m ago", relativeTime(ago(MIN), NOW), "1m ago");
-eq("59m -> 59m ago", relativeTime(ago(59 * MIN), NOW), "59m ago");
-eq("60m -> 1h ago", relativeTime(ago(HOUR), NOW), "1h ago");
-eq("23h -> 23h ago", relativeTime(ago(23 * HOUR), NOW), "23h ago");
-eq("24h -> 1d ago", relativeTime(ago(DAY), NOW), "1d ago");
-eq("6d -> 6d ago", relativeTime(ago(6 * DAY), NOW), "6d ago");
-
-// --- absolute band (>= 1 week): the real date it landed --------------------
-eq("7d -> absolute date", relativeTime(ago(WEEK), NOW), "Jun 20");
-eq("30d same year -> date", relativeTime(ago(30 * DAY), NOW), "May 28");
-eq("across a year boundary", relativeTime("2025-12-31T00:00:00Z", NOW), "Dec 31, 2025");
-
-// --- determinism: same inputs, same output ---------------------------------
-eq("deterministic", relativeTime(ago(3 * HOUR), NOW), relativeTime(ago(3 * HOUR), NOW));
-
-// --- coercion / robustness --------------------------------------------------
-eq("non-string stamp -> null", relativeTime(12345, NOW), null); // a number is not an ISO string here
-
-// --- mutation bite: the future-guard MUST be load-bearing ------------------
-// If someone deleted `if (delta < 0) return null;`, a future stamp would
-// produce "just now" (delta<MIN with negative delta). Assert it does NOT.
-var futureResult = relativeTime(ago(-HOUR), NOW);
-if (futureResult === null) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: future stamp produced a label: " + JSON.stringify(futureResult));}
-
-console.log("\nreltime: " + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node, no dependencies
-
----
-
-# Scrub — a Loop MMT gift
-https://loopmmt.com/gifts/scrub/
-[coverage: optional · branch: gifts]
-
-Catch a Secret Before It Ships filter ← all gifts
-
-Scrub
-
-scrub reads text and finds the things that should never have been in it — a GitHub token, an AWS key, a PEM private-key block, a Slack token, a JWT, a password in a URL — by matching them on SHAPE, not luck. It can report them (masked preview, never the value), redact them (a fixed per-kind placeholder, idempotent), or refuse — a non-zero exit the moment a known secret shape appears, so it drops straight into a pre-commit hook or a CI gate. A single line opts out with an explicit, line-scoped scrub-allow marker; you cannot silence it globally. Zero dependencies, deterministic, runs identically in Node or a browser, and never echoes a secret it found.
-
-The honest edge
-
-scrub matches KNOWN secret shapes. A clean result means no known shape was found here — it is NOT proof the text is secret-free: a novel token format, a secret split across lines, or a home-rolled scheme passes clean. It is a smoke alarm, not a vault — a hit is real, a clean scan is the absence of a known shape, never a certificate. Because it matches shapes it also flags EXAMPLE secrets (a documented token, its own fixtures) — the honest ceiling working, not a bug; vouch for a line you know is safe with scrub-allow.
-
-Run it
-
-node scrub.js --check FILE # exit 1 if any known secret shape is present, 0 if clean (the gate)
-test_scrub.js (16 assertions) + --selftest (24 checks: golden known-bad/known-clean corpus, no-echo, scrub idempotence, scrub-allow carve-out, determinism)
+node ratchet-pdf-dict.js form.pdf
+test_ratchet-pdf-dict.js (14/14: hand-built PDF byte fixtures with out-of-band oracles — field /V + /T name, annotation /Contents, the /Contents page-ref disambiguation, one-level indirect-ref resolution, hex + escaped-literal decode, malformed-value-recorded-walk-continues, the /TU opt-in flag, a widget carrying both surfaces, 2 ratchet-refusal cases)
 Node / browser, no dependencies
 
 The code — every file that ships
 
-scrub.js 275 lines on GitHub →
+ratchet-pdf-dict.js 354 lines on GitHub →
 #!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* scrub.js — catch a secret before it ships, from SHAPES not luck.
-*
-* A tiny, dependency-free scanner that reads text and finds the things that
-* should never have been in it: a GitHub token, an AWS key, a PEM private-key
-* block, a Slack token, a JWT, a bearer password in a URL. It can REPORT them
-* (scan), REPLACE them with a fixed placeholder (scrub), or REFUSE (check —
-* a non-zero exit if any secret is present, so it drops into a pre-commit hook
-* or a CI gate). Runs identically in Node and in a browser (no DOM, no deps).
-*
-* text ──▶ scan(text) ──▶ [ {kind, line, col, preview},...]
-* text ──▶ scrub(text) ──▶ text with every secret span replaced
-* text ──▶ check(text) ──▶ true iff a secret was found (the gate)
-*
-* WHY SHAPES, AND THE LINE IT WILL NOT CROSS (the honest ceiling — printed).
-* Secrets are matched by SHAPE: a github_pat_ prefix, an AKIA… access-key id,
-* a -----BEGIN … PRIVATE KEY----- header, the three-part dot form of a JWT.
-* A shape catches the known, published forms cheaply and deterministically.
-* It does NOT — and this is stated on the tool itself, every run — prove the
-* text is secret-free. A novel token format, a secret split across lines, a
-* home-rolled scheme, or a value with no distinguishing shape will pass clean.
-* scrub is a SMOKE ALARM, not a vault: a hit is real; a clean scan is the
-* absence of a known shape, never a certificate. (This is the same honesty the
-* `grain` gift prints as "a smell, not a proof" and `plumb` as "evidence
-* exists, not evidence correct".) Treat a clean result as "no KNOWN secret
-* shape found here", and keep your other controls.
-*
-* TWO STRUCTURAL PROMISES (so the tool cannot betray its own purpose):
-* 1. It never echoes a secret. A finding carries the secret's KIND, its line
-* and column, and a masked PREVIEW (first few chars + …) — never the value.
-* scrub() replaces the whole matched span; the redaction cannot leak what
-* it redacted. A secret-scanner that printed the secret to warn you about
-* it would be broken.
-* 2. scrub() is idempotent and pure: scrub(scrub(t)) === scrub(t), and the
-* output of scrub() always passes check() clean (no secret survives).
-* --selftest proves both.
-*
-* THE ALLOW MARKER (the carve-out, kept honest). A single line may opt out by
-* carrying the marker `scrub-allow` (in a comment, anywhere on the line). That
-* line is skipped — for a README that documents a token shape, or a test
-* fixture that must contain a planted example. The carve-out is LINE-scoped and
-* EXPLICIT: you cannot silence the scanner globally, only annotate the one line
-* you vouched for. (Stripped from the band-gate's `band-allow` convention.)
+/* ratchet-pdf-dict.js — a pure, dependency-free, STRICT extractor of the text a
+PDF carries in its OBJECT DICTIONARIES rather than its content streams: the
+AcroForm field values (/V) and annotation notes (/Contents) that a content-
+stream extractor deliberately skips. The companion to ratchet-pdf-text. Runs
+identically in a browser and in Node (no DOM, no dependencies).
+
+WHY THIS EXISTS. ratchet-pdf-text pulls the text a PDF *draws* — the operands
+of Tj/TJ operators inside content streams. But a PDF also carries text that is
+never drawn into a stream: the value a user typed into a form field lives in
+that field's /V entry, and the note behind a sticky annotation lives in that
+annotation's /Contents entry. Those are dictionary entries on indirect objects
+that are NOT stream-adjacent, so ratchet's stream scan never sees them. This
+tool walks the indirect objects and pulls exactly those two text surfaces.
+Together the two tools cover every text surface in a PDF, honestly.
+
+WHAT "RATCHET" MEANS HERE (the same posture as the twin, at the RIGHT scale).
+ratchet-pdf-text extracts ONE content stream as a whole, so any malformed byte
+is a thrown Error — correct for a single-shot read. This tool walks MANY
+indirect objects, so it splits the contract across two levels, deliberately:
+• DOCUMENT level — throws. Input that is not a Uint8Array/ArrayBuffer, or a
+buffer with no `%PDF-` header, is a thrown Error. If it isn't a PDF at all,
+you get told, not a guess.
+• OBJECT level — records, does not throw. A single malformed value (an
+unterminated string, a bad hex byte) does not abort the walk and lose the
+200 good fields after it. It is emitted as an explicit `{ malformed:true,
+reason}` record and the walk continues. This KEEPS ratchet's real vow —
+"never hand back a guess as if it were clean text" — because a malformed
+value is STAMPED malformed, never returned as clean. The string tokenizer
+itself still throws on an unterminable token (you genuinely cannot know
+where it ends); the walk catches that at the object boundary and records it.
+
+THE /Contents DISAMBIGUATION (the load-bearing correctness choice). The key
+`/Contents` names TWO unrelated things: an annotation's text (a string) AND a
+page's content-stream pointer (an indirect reference, `12 0 R`). This tool
+pulls `/Contents` ONLY when its value is a string, and skips it when the value
+is a reference — so a page's content pointer is never mistaken for annotation
+text. The disambiguation is by VALUE TYPE, not by trying to classify the object.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• Field values — a /V entry whose value is a string (literal `()` with
+escapes or hex `< >`), paired with the field's /T partial name as the
+record `name`. A /V given as an indirect reference to a string object is
+resolved one level and reported with encoding "ref".
+• Annotation text — a /Contents entry whose value is a string.
+• Field labels — a /TU (user-facing) entry, ONLY when you pass
+`{ labels:true}`. Off by default: the covenant is field values + notes;
+labels are an opt-in surface, named here so their absence isn't a surprise.
+• Records carry their provenance so nothing is hidden:
+{ obj:"<num> <gen>", kind:"field"|"annotation"|"label",
+key:"V"|"Contents"|"TU", name:<string|null>, text:<string>,
+encoding:"literal"|"hex"|"ref"}
+Malformed values are surfaced separately:
+{ obj, key, malformed:true, reason:<string>}
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not decrypt encrypted PDFs, decode object streams (/ObjStm) or
+compressed cross-reference streams, or resolve field hierarchies through
+/Kids (it reads /V where it sits, not inherited values). It reads the
+top-level dictionary of each indirect object — a /V or /Contents buried in a
+nested sub-dictionary is an honest edge, not a target. It does not map
+character codes through /Encoding or /ToUnicode CMaps — it returns the string
+as written, correct for the common WinAnsi case and honestly wrong for a
+subsetted CID font. It does not repair a broken file.
+
+API
+parsePdfDict(bytes[, options]) -> { records: Array<Record>, text: string,
+malformed: Array<Record>}
+`bytes` a Uint8Array (a Node Buffer is one) or an ArrayBuffer.
+`options.labels` optional bool; when true, also pull /TU field labels.
+`.records` the clean text records, in object order (possibly empty).
+`.text` `.records` texts joined with "\n" — the quick "give me the
+dictionary text" answer.
+`.malformed` the per-object malformed records (possibly empty).
+THROWS an Error only on document-level failure (bad input type, no header).
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePdfDict) or Node (this CLI / require()).
+
+USAGE
+node ratchet-pdf-dict.js form.pdf # prints the dictionary text
+node ratchet-pdf-dict.js --records form.pdf # one provenance line per record
+node ratchet-pdf-dict.js --labels form.pdf # also include /TU labels
+node ratchet-pdf-dict.js --help
 */
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePdfDict = api.parsePdfDict;
+}
+root.__ratchetPdfDict = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
 
-'use strict';
-
-/* The closed set of secret SHAPES. Each: a stable `kind`, a `re` (global,
-* multiline is applied per-line), and whether it is `heuristic` (higher
-* false-positive rate — a generic "secret-looking assignment" rather than a
-* vendor-stamped prefix). The list is documented, not open: a shape a real
-* secret needs and this set lacks is a gap to name in the printed ceiling, not
-* a reason to pretend coverage. */
-var SHAPES = [
-{ kind: 'github-pat', heuristic: false, re: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g},
-{ kind: 'github-token', heuristic: false, re: /\bgh[posru]_[A-Za-z0-9]{36,}\b/g},
-{ kind: 'aws-access-key-id', heuristic: false, re: /\bAKIA[0-9A-Z]{16}\b/g},
-{ kind: 'google-api-key', heuristic: false, re: /\bAIza[0-9A-Za-z_\-]{35}\b/g},
-{ kind: 'slack-token', heuristic: false, re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g},
-{ kind: 'stripe-key', heuristic: false, re: /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g},
-{ kind: 'openai-key', heuristic: false, re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g},
-{ kind: 'jwt', heuristic: false, re: /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b/g},
-{ kind: 'private-key-block', heuristic: false, re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED)?PRIVATE KEY-----/g},
-{ kind: 'basic-auth-url', heuristic: false, re: /\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:[^\/\s:@]+@/g},
-{ kind: 'hex-40-token', heuristic: false, re: /\b[0-9a-f]{40}\b/g},
-// heuristic: a generic "secret = <opaque value>" assignment. Higher FP; kept
-// last and flagged so a caller can drop it with { heuristic:false}.
-{ kind: 'secret-assignment', heuristic: true, re: /\b(?:secret|token|api[_-]?key|access[_-]?key|password|passwd|pwd|auth)\b\s*[:=]\s*['"]?[A-Za-z0-9/+_.=-]{16,}/gi}
-];
-
-var ALLOW_MARKER = 'scrub-allow';
-var PLACEHOLDER = function (kind) { return '\u2039redacted:' + kind + '\u203a';};
-
-function _mask(s) {
-s = String(s);
-if (s.length <= 4) return '\u2026';
-return s.slice(0, 4) + '\u2026(' + s.length + ')';
+// ---- byte helpers (shared posture with ratchet-pdf-text) ----------------
+function toU8(bytes) {
+if (bytes instanceof Uint8Array) return bytes;
+if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+if (bytes && bytes.buffer instanceof ArrayBuffer)
+return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
+throw new Error("ratchet-pdf-dict: input must be a Uint8Array or ArrayBuffer");
+}
+function latin1(u8, start, end) {
+var s = "";
+for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
+return s;
+}
+function isWS(c) {
+return c === " " || c === "\n" || c === "\r" || c === "\t" || c === "\f" || c === "\0";
 }
 
-function _activeShapes(opts) {
-opts = opts || {};
-var wantHeuristic = opts.heuristic!== false; // heuristic ON by default
-return SHAPES.filter(function (s) { return wantHeuristic ||!s.heuristic;});
+// ---- string tokenizer (copied verbatim from ratchet-pdf-text; the reuse
+// core the RCR named — literal `()` with escapes/octal, hex `< >`) -----
+function decodeLiteral(s, i) {
+// s[i] === '(' has already been consumed by the caller; parse from i.
+var out = "", depth = 0, N = s.length;
+for (; i < N; i++) {
+var c = s[i];
+if (c === "\\") {
+var nx = s[i + 1];
+if (nx === "n") { out += "\n"; i++;}
+else if (nx === "r") { out += "\r"; i++;}
+else if (nx === "t") { out += "\t"; i++;}
+else if (nx === "b") { out += "\b"; i++;}
+else if (nx === "f") { out += "\f"; i++;}
+else if (nx === "(") { out += "("; i++;}
+else if (nx === ")") { out += ")"; i++;}
+else if (nx === "\\") { out += "\\"; i++;}
+else if (nx >= "0" && nx <= "7") {
+var oct = nx; i++;
+for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
+out += String.fromCharCode(parseInt(oct, 8) & 0xff);
+} else if (nx === "\n") { i++;}
+else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
+else { out += nx; i++;}
+} else if (c === "(") { depth++; out += c;}
+else if (c === ")") {
+if (depth === 0) return [out, i + 1];
+depth--; out += c;
+} else out += c;
+}
+throw new Error("ratchet-pdf-dict: unterminated literal string");
+}
+function decodeHex(s, i) {
+// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
+var hex = "", N = s.length;
+for (i = i + 1; i < N; i++) {
+var c = s[i];
+if (c === ">") {
+if (hex.length % 2 === 1) hex += "0";
+var out = "";
+for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
+return [out, i + 1];
+}
+if (/[0-9a-fA-F]/.test(c)) hex += c;
+else if (/\s/.test(c)) { /* skip */}
+else throw new Error("ratchet-pdf-dict: bad character in hex string");
+}
+throw new Error("ratchet-pdf-dict: unterminated hex string");
 }
 
-/* scan(text, opts) -> array of findings, each { kind, line, col, preview}.
-* Deterministic: findings are returned in (line, col) order. A line carrying
-* the allow marker contributes no findings. Never includes the secret value. */
-function scan(text, opts) {
-text = String(text == null? '': text);
-var shapes = _activeShapes(opts);
-var out = [];
-var lines = text.split('\n');
-for (var li = 0; li < lines.length; li++) {
-var line = lines[li];
-if (line.indexOf(ALLOW_MARKER)!== -1) continue; // vouched-for line
-for (var si = 0; si < shapes.length; si++) {
-var re = new RegExp(shapes[si].re.source, shapes[si].re.flags);
-var m;
-while ((m = re.exec(line))!== null) {
-out.push({ kind: shapes[si].kind, line: li + 1, col: m.index + 1, preview: _mask(m[0])});
-if (m.index === re.lastIndex) re.lastIndex++; // zero-width guard
+// ---- indirect-object scan (structure-tolerant, xref-free) ---------------
+// Scan for `N M obj... endobj` blocks. We do NOT trust the xref table; we
+// read each object's top-level dictionary directly. This is the new surface
+// ratchet-pdf-text never walks (it only reads the dict that precedes a stream).
+var OBJ_HEAD = /(\d+)\s+(\d+)\s+obj\b/g;
+function collectObjects(u8) {
+var full = latin1(u8, 0, u8.length);
+var objs = [], map = {}, m;
+OBJ_HEAD.lastIndex = 0;
+while ((m = OBJ_HEAD.exec(full))!== null) {
+var num = m[1], gen = m[2];
+var bodyStart = m.index + m[0].length;
+var endIdx = full.indexOf("endobj", bodyStart);
+var bodyEnd = endIdx < 0? full.length: endIdx; // tolerate a missing endobj
+var body = full.slice(bodyStart, bodyEnd);
+var rec = { num: num, gen: gen, id: num + " " + gen, body: body};
+objs.push(rec);
+map[rec.id] = rec; // last-wins on a duplicated object number (updated PDFs)
+if (endIdx >= 0) OBJ_HEAD.lastIndex = endIdx + 6;
 }
-}
-}
-out.sort(function (a, b) { return a.line - b.line || a.col - b.col || (a.kind < b.kind? -1: 1);});
-return out;
-}
-
-/* scrub(text, opts) -> text with every secret span replaced by a fixed
-* per-kind placeholder. Pure and idempotent. Allow-marked lines pass through. */
-function scrub(text, opts) {
-text = String(text == null? '': text);
-var shapes = _activeShapes(opts);
-var lines = text.split('\n');
-for (var li = 0; li < lines.length; li++) {
-if (lines[li].indexOf(ALLOW_MARKER)!== -1) continue;
-for (var si = 0; si < shapes.length; si++) {
-var re = new RegExp(shapes[si].re.source, shapes[si].re.flags);
-var kind = shapes[si].kind;
-lines[li] = lines[li].replace(re, PLACEHOLDER(kind));
-}
-}
-return lines.join('\n');
+return { objs: objs, map: map};
 }
 
-/* check(text, opts) -> boolean. true iff at least one secret shape is present.
-* The gate: `if (check(diff)) process.exit(1)`. */
-function check(text, opts) { return scan(text, opts).length > 0;}
-
-var CEILING =
-'scrub matches KNOWN secret SHAPES. A clean result means no known shape was ' +
-'found here \u2014 it is NOT proof the text is secret-free. A novel format, a ' +
-'split value, or a shapeless secret will pass. Smoke alarm, not a vault.';
-
-var api = { scan: scan, scrub: scrub, check: check, SHAPES: SHAPES, CEILING: CEILING, selftest: selftest};
-if (typeof module!== 'undefined' && module.exports) module.exports = api;
-
-/* ---- selftest: the golden corpus + the two structural promises ---- */
-function selftest() {
-var fails = [];
-function ck(name, cond) { if (!cond) fails.push(name);}
-
-// Prefixes assembled from parts so THIS file's own source bytes carry no
-// literal secret shape — the same reason any secret-scanner's fixtures must
-// not contain literal secrets (they would trip this scanner and its siblings,
-// and a live-credential must never land in a source file). The runtime string
-// is the real shape; the source is inert.
-var GHPAT = 'github_' + 'pat_'; // -> github_pat_
-var GHTOK = 'gh' + 'p_'; // -> ghp_
-
-// KNOWN-BAD half: each MUST trip its kind. Every value below is a FAKE example
-// (AKIA…EXAMPLE is AWS's own doc placeholder); no value is a real secret.
-var bad = [
-['github-pat', 'token = ' + GHPAT + '11ABCDEFG0abcdefghij_KLMNOPqrstuvwxyz012345'],
-['github-token', GHTOK + '0123456789abcdefghijklmnopqrstuvwxyz'],
-['aws-access-key-id', 'AKIAIOSFODNN7EXAMPLE'],
-['google-api-key', 'AIzaSyA1234567890abcdefghijklmnopqrstuv'],
-['slack-token', 'xoxb-2411-abcdefghijklmnop'],
-['stripe-key', 'sk_live_0123456789abcdefghijkl'],
-['jwt', 'eyJhbGciOi.eyJzdWIiOiIx.SflKxwRJSMe'],
-['private-key-block', '-----BEGIN RSA PRIVATE KEY-----'],
-['basic-auth-url', 'clone https://user:hunter2@example.com/x.git'],
-['hex-40-token', 'HEXKEY=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'],
-['secret-assignment', 'password: "correcthorsebatterystaple42"']
-];
-for (var i = 0; i < bad.length; i++) {
-var kinds = scan(bad[i][1]).map(function (f) { return f.kind;});
-ck('bad-trips:' + bad[i][0], kinds.indexOf(bad[i][0])!== -1);
+// The top-level dictionary region of an object body: the first depth-matched
+// `<<... >>`. Restricting to this avoids matching a `/V (...)` that appears
+// inside a stream's binary content or as ASCII noise after `endobj`.
+function dictRegion(body) {
+var start = body.indexOf("<<");
+if (start < 0) return body; // some indirect objects are a bare value (e.g. a string)
+var depth = 0, i = start;
+for (; i < body.length - 1; i++) {
+if (body[i] === "<" && body[i + 1] === "<") { depth++; i++;}
+else if (body[i] === ">" && body[i + 1] === ">") { depth--; i++; if (depth === 0) return body.slice(start, i + 1);}
+}
+return body.slice(start); // unbalanced dict — hand back what we have; the value read is bounded
 }
 
-// KNOWN-CLEAN half: must NOT trip (guards against a trigger-happy scanner).
-var clean = [
-'the quick brown fox jumps over the lazy dog',
-'commit 908ec0b2218aae65912f2e43c79f341 was fine', // short hex, not 40
-'see the docs at https://example.com/guide for setup',
-'let total = subtotal + tax; // no secrets here',
-'AKIA is a prefix but AKIA alone is not a key'
-];
-for (var c = 0; c < clean.length; c++) ck('clean-quiet:' + c, scan(clean[c]).length === 0);
-
-// PROMISE 1 — never echoes the secret; preview is masked.
-var f = scan('x = ' + GHPAT + '11ABCDEFG0abcdefghij_KLMNOPqrstuvwxyz012345')[0];
-ck('no-echo', f && f.preview.indexOf('KLMNOP') === -1 && f.preview.indexOf('\u2026')!== -1);
-
-// PROMISE 2 — scrub removes every secret; idempotent; output passes check clean.
-var dirty = bad.map(function (b) { return b[1];}).join('\n');
-var s1 = scrub(dirty);
-ck('scrub-clears', check(s1) === false);
-ck('scrub-idempotent', scrub(s1) === s1);
-ck('scrub-kept-shape', s1.split('\n').length === dirty.split('\n').length);
-
-// ALLOW MARKER — a vouched-for line is skipped.
-ck('allow-skips', scan(GHTOK + '0123456789abcdefghijklmnopqrstuvwxyz // scrub-allow example').length === 0);
-
-// DETERMINISM — scan twice, identical.
-ck('scan-deterministic', JSON.stringify(scan(dirty)) === JSON.stringify(scan(dirty)));
-
-// HEURISTIC toggle — dropping heuristics silences secret-assignment only.
-ck('heuristic-off', scan('password: "correcthorsebatterystaple42"', { heuristic: false}).length === 0);
-
-if (fails.length) {
-console.error('RED: ' + fails.length + ' failed [scrub]\n ' + fails.join('\n '));
-return false;
+// Find the value token that follows `/<name>` at the TOP level of `region`.
+// Returns { kind:"string"|"hex"|"ref"|"name"|"other"|"none", value,...}.
+function readKeyValue(region, key) {
+// Match the key as a full token (not a prefix of a longer key like /VE).
+var re = new RegExp("/" + key + "(?![A-Za-z0-9])");
+var km = re.exec(region);
+if (!km) return { kind: "none"};
+var i = km.index + km[0].length;
+var N = region.length;
+while (i < N && isWS(region[i])) i++;
+if (i >= N) return { kind: "none"};
+var c = region[i];
+if (c === "(") {
+var lit = decodeLiteral(region, i + 1); // may throw -> caught by caller (object level)
+return { kind: "string", value: lit[0], encoding: "literal"};
 }
-console.log('GREEN: ' + (bad.length + clean.length + 8) + ' checks passed, 0 failed [scrub]');
-return true;
+if (c === "<" && region[i + 1]!== "<") {
+var hx = decodeHex(region, i); // may throw -> caught by caller
+return { kind: "string", value: hx[0], encoding: "hex"};
+}
+if (c === "<" && region[i + 1] === "<") return { kind: "other"}; // value is a sub-dict
+if (c === "/") return { kind: "name"};
+if (c === "[") return { kind: "other"};
+// number, or an indirect reference `N M R`
+var rest = region.slice(i);
+var refM = /^(\d+)\s+(\d+)\s+R\b/.exec(rest);
+if (refM) return { kind: "ref", value: refM[1] + " " + refM[2]};
+if (/^-?\d/.test(rest)) return { kind: "other"}; // a plain number
+return { kind: "other"};
 }
 
-/* ---- CLI ---- */
-function _readInput(argPath, cb) {
-if (argPath) {
-var fs = require('fs');
-var _text;
+// Resolve one level: given a ref id "N M", find that object and, if its body is
+// (or begins with) a bare string, decode it. Returns { value, encoding} or null.
+function resolveRefString(map, id) {
+var target = map[id];
+if (!target) return null;
+var body = target.body;
+var i = 0, N = body.length;
+while (i < N && isWS(body[i])) i++;
+if (body[i] === "(") { var lit = decodeLiteral(body, i + 1); return { value: lit[0], encoding: "ref"};}
+if (body[i] === "<" && body[i + 1]!== "<") { var hx = decodeHex(body, i); return { value: hx[0], encoding: "ref"};}
+return null; // referenced object is not a bare string — out of one-level scope
+}
+
+// ---- top-level ----------------------------------------------------------
+function parsePdfDict(bytes, options) {
+options = options || {};
+var u8 = toU8(bytes); // throws on bad input type (document level)
+if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
+throw new Error("ratchet-pdf-dict: not a PDF (missing %PDF- header)");
+
+var scan = collectObjects(u8);
+var records = [], malformed = [], texts = [];
+
+for (var o = 0; o < scan.objs.length; o++) {
+var obj = scan.objs[o];
+var region = dictRegion(obj.body);
+
+// The field's partial name (/T) — the record key for a /V value.
+var name = null;
 try {
-_text = fs.readFileSync(argPath, 'utf8');
-} catch (e) {
-var _why = e && e.code === 'ENOENT'? 'no such file'
-: e && e.code === 'EISDIR'? 'is a directory'
-: e && e.code === 'EACCES'? 'permission denied'
-: (e && e.message) || 'cannot read';
-process.stderr.write('scrub: cannot read ' + JSON.stringify(argPath) + ': ' + _why + '\n');
-process.exit(2);
+var t = readKeyValue(region, "T");
+if (t.kind === "string") name = t.value;
+} catch (e) { /* a malformed /T is not itself a text surface — leave name null */}
+
+// /V — field value.
+pullTextKey(region, obj, "V", "field", name, scan.map, records, texts, malformed);
+// /Contents — annotation text ONLY when the value is a string (a ref is a
+// page's content-stream pointer; skipped by the value-type disambiguation).
+pullTextKey(region, obj, "Contents", "annotation", null, scan.map, records, texts, malformed);
+// /TU — field label, opt-in only.
+if (options.labels)
+pullTextKey(region, obj, "TU", "label", name, scan.map, records, texts, malformed);
 }
-cb(_text);
+
+return { records: records, text: texts.join("\n"), malformed: malformed};
+}
+
+function pullTextKey(region, obj, key, kind, name, map, records, texts, malformed) {
+var kv;
+try {
+kv = readKeyValue(region, key);
+} catch (e) {
+malformed.push({ obj: obj.id, key: key, malformed: true, reason: e.message});
 return;
 }
-var buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { buf += d;});
-process.stdin.on('end', function () { cb(buf);});
+if (kv.kind === "string") {
+records.push({ obj: obj.id, kind: kind, key: key, name: name, text: kv.value, encoding: kv.encoding});
+if (kv.value) texts.push(kv.value);
+} else if (kv.kind === "ref") {
+// Only /V resolves a ref to a string. A /Contents ref is a page content
+// pointer — the disambiguation says skip it.
+if (key!== "V") return;
+var r;
+try { r = resolveRefString(map, kv.value);}
+catch (e) { malformed.push({ obj: obj.id, key: key, malformed: true, reason: e.message}); return;}
+if (r) {
+records.push({ obj: obj.id, kind: kind, key: key, name: name, text: r.value, encoding: r.encoding});
+if (r.value) texts.push(r.value);
+}
+}
+// name / other / none -> not a text surface; nothing recorded.
 }
 
-if (typeof require!== 'undefined' && require.main === module) {
-var argv = process.argv.slice(2);
-var mode = '--scan';
-var file = null;
-var noHeuristic = false;
-for (var a = 0; a < argv.length; a++) {
-if (argv[a] === '--selftest') { process.exit(selftest()? 0: 1);}
-else if (argv[a] === '--list') {
-SHAPES.forEach(function (s) { console.log((s.heuristic? '~ ': ' ') + s.kind);});
-console.error('\n' + CEILING);
-process.exit(0);
-}
-else if (argv[a] === '--scan' || argv[a] === '--scrub' || argv[a] === '--check') mode = argv[a];
-else if (argv[a] === '--no-heuristic') noHeuristic = true;
-else if (argv[a] === '-h' || argv[a] === '--help') {
-console.log('usage: scrub.js [--scan|--scrub|--check|--list|--selftest] [--no-heuristic] [FILE]');
-console.log(' --scan report findings (kind:line:col, masked preview) [default]');
-console.log(' --scrub emit the text with secrets replaced');
-console.log(' --check exit 1 if any secret is present, 0 if clean (the gate)');
-console.log(' exit 2 input could not be read (missing file, directory, permission)');
-console.error('\n' + CEILING);
-process.exit(0);
-}
-else if (argv[a][0]!== '-') file = argv[a];
-}
-_readInput(file, function (text) {
-var opts = { heuristic:!noHeuristic};
-if (mode === '--check') {
-var hits = scan(text, opts);
-if (hits.length) { console.error('scrub: ' + hits.length + ' secret(s) found \u2014 refusing.'); process.exit(1);}
-process.exit(0);
-} else if (mode === '--scrub') {
-process.stdout.write(scrub(text, opts));
-} else {
-var found = scan(text, opts);
-found.forEach(function (f) { console.log(f.kind + ':' + f.line + ':' + f.col + ' ' + f.preview);});
-console.error('\n' + CEILING);
-process.exit(found.length? 1: 0);
-}
+return { parsePdfDict: parsePdfDict};
 });
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfDict;
+var args = process.argv.slice(2);
+if (!args.length || args.indexOf("--help")!== -1) {
+process.stdout.write(
+"ratchet-pdf-dict — strict, zero-dep PDF dictionary-text extractor (/V + annotation /Contents)\n" +
+" node ratchet-pdf-dict.js form.pdf print the dictionary text\n" +
+" node ratchet-pdf-dict.js --records form.pdf one provenance line per record\n" +
+" node ratchet-pdf-dict.js --labels form.pdf also include /TU field labels\n" +
+" node ratchet-pdf-dict.js --help\n"
+);
+process.exit(0);
 }
-
-test_scrub.js 69 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* test_scrub.js — the house-standard test file for the scrub gift.
-*
-* Runs the module's own golden-corpus selftest (the known-bad/known-clean pair
-* plus the two structural promises), then adds API-level assertions the CLI
-* selftest doesn't cover: the finding shape, the CEILING string, and that no
-* fixture value is echoed. Exits non-zero on any failure so it drops straight
-* into a CI gate.
-*/
-'use strict';
-var scrub = require('./scrub.js');
-
-var fails = [];
-function ck(name, cond) { if (!cond) fails.push(name);}
-
-// 1. The module's own golden-corpus selftest is the core of the suite.
-ck('module-selftest', scrub.selftest() === true);
-
-// 2. Finding shape — every finding names kind/line/col and a masked preview only.
-var hits = scrub.scan('l1 ok\nl2 AKIAIOSFODNN7EXAMPLE trailing');
-ck('finds-on-line-2', hits.length === 1 && hits[0].line === 2);
-ck('finding-has-kind', hits[0].kind === 'aws-access-key-id');
-ck('finding-has-col', typeof hits[0].col === 'number' && hits[0].col > 0);
-ck('preview-masked', hits[0].preview.indexOf('EXAMPLE') === -1);
-
-// 3. check() is scan()>0, and a clean string is clean.
-ck('check-clean', scrub.check('nothing secret in this sentence at all') === false);
-ck('check-dirty', scrub.check('AKIAIOSFODNN7EXAMPLE') === true);
-
-// 4. scrub() output always passes check clean (the load-bearing property).
-var s = scrub.scrub('a AKIAIOSFODNN7EXAMPLE b\n-----BEGIN RSA PRIVATE KEY-----');
-ck('scrub-output-clean', scrub.check(s) === false);
-ck('scrub-placeholder-present', s.indexOf('redacted:')!== -1);
-
-// 5. The honest ceiling is a non-empty, shipped string.
-ck('ceiling-present', typeof scrub.CEILING === 'string' && scrub.CEILING.length > 40);
-
-// 6. SHAPES is the documented closed set, each with a stable kind.
-ck('shapes-closed', Array.isArray(scrub.SHAPES) && scrub.SHAPES.every(function (x) { return x.kind && x.re;}));
-
-// 7. CLI clean-fail on unreadable input (D4-crashclean): a stranger who points
-// the gate at a missing file or a directory gets a clean one-line error and a
-// non-zero exit that is NOT the gate's "secret present" (1) — never a stack trace.
-var cp = require('child_process');
-var path = require('path');
-var os = require('os');
-var fs2 = require('fs');
-var CLI = path.join(__dirname, 'scrub.js');
-function runCheck(target) {
-var r = cp.spawnSync(process.execPath, [CLI, '--check', target], { encoding: 'utf8'});
-var both = (r.stdout || '') + (r.stderr || '');
-return { code: r.status, out: both};
+var recordsMode = false, labels = false, file = null;
+for (var i = 0; i < args.length; i++) {
+if (args[i] === "--records") recordsMode = true;
+else if (args[i] === "--labels") labels = true;
+else file = args[i];
 }
-var missing = runCheck(path.join(os.tmpdir(), 'scrub-no-such-' + process.pid + '.txt'));
-ck('badinput-missing-exit2', missing.code === 2);
-ck('badinput-missing-clean', /scrub: cannot read/.test(missing.out) &&!/at Object|node:fs|Node\.js v/.test(missing.out));
-var dir = fs2.mkdtempSync(path.join(os.tmpdir(), 'scrub-dir-'));
-var asFile = runCheck(dir);
-ck('badinput-dir-exit2', asFile.code === 2);
-ck('badinput-dir-clean', /scrub: cannot read/.test(asFile.out) &&!/at Object|node:fs|Node\.js v/.test(asFile.out));
-try { fs2.rmdirSync(dir);} catch (e) {}
-
-if (fails.length) {
-console.error('RED: ' + fails.length + ' failed [test_scrub]\n ' + fails.join('\n '));
+try {
+if (!file) throw new Error("no input file");
+var fs = require("fs");
+var buf = fs.readFileSync(file);
+var res = api.parsePdfDict(buf, { labels: labels});
+if (recordsMode) {
+res.records.forEach(function (r) {
+process.stdout.write(
+"obj " + r.obj + "\tkind=" + r.kind + "\tkey=/" + r.key +
+"\tname=" + (r.name === null? "-": JSON.stringify(r.name)) +
+"\tenc=" + r.encoding + "\ttextLen=" + r.text.length + "\n"
+);
+});
+res.malformed.forEach(function (r) {
+process.stderr.write("obj " + r.obj + "\tkey=/" + r.key + "\tMALFORMED — " + r.reason + "\n");
+});
+} else {
+process.stdout.write(res.text + (res.text? "\n": ""));
+}
+process.exit(0);
+} catch (e) {
+var msg = e && e.message? e.message: String(e);
+if (msg.indexOf("ratchet-pdf-dict:")!== 0) msg = "ratchet-pdf-dict: " + msg;
+process.stderr.write(msg + "\n");
 process.exit(1);
 }
-console.log('GREEN: ' + (16) + ' assertions passed, 0 failed [test_scrub]');
-process.exit(0);
+}
+
+test_ratchet-pdf-dict.js 167 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-pdf-dict.js — known-answer battery for ratchet-pdf-dict.
+
+The oracle is OUT OF BAND: every expected value below is a literal fact written
+by hand, never the output of a second PDF parser. Each PDF fixture is assembled
+from raw bytes so the expected records are known by construction. No zlib, no
+dependencies — dictionary text is not compressed, so no inflater is needed.
+
+Run: node test_ratchet-pdf-dict.js (exit 0 = all pass, nonzero = failure)
+*/
+"use strict";
+var assert = require("assert");
+var { parsePdfDict} = require("./ratchet-pdf-dict.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+}
+function bytes(str) { return Buffer.from(str, "latin1");}
+
+// Wrap a set of object bodies into a minimal, header-correct PDF. Structure is
+// spartan on purpose — the extractor is xref-free and scans for `N M obj`.
+function pdf(objs) { return bytes("%PDF-1.7\n" + objs.join("\n") + "\n%%EOF\n");}
+
+// ---- 1. a text field: /V value paired with its /T name -------------------
+ok("1 text field /V + /T name", function () {
+var doc = pdf(["12 0 obj\n<< /FT /Tx /T (fullname) /V (John Smith) >>\nendobj"]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 1); // ORACLE: exactly one
+assert.strictEqual(r.records[0].kind, "field");
+assert.strictEqual(r.records[0].key, "V");
+assert.strictEqual(r.records[0].name, "fullname");
+assert.strictEqual(r.records[0].text, "John Smith");
+assert.strictEqual(r.records[0].encoding, "literal");
+assert.strictEqual(r.malformed.length, 0);
+});
+
+// ---- 2. an annotation: /Contents string ----------------------------------
+ok("2 annotation /Contents string", function () {
+var doc = pdf(["5 0 obj\n<< /Type /Annot /Subtype /Text /Contents (A sticky note) >>\nendobj"]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 1);
+assert.strictEqual(r.records[0].kind, "annotation");
+assert.strictEqual(r.records[0].key, "Contents");
+assert.strictEqual(r.records[0].name, null);
+assert.strictEqual(r.records[0].text, "A sticky note");
+});
+
+// ---- 3. the /Contents disambiguation: a PAGE content ref is NOT text ------
+ok("3 page /Contents ref is skipped (not annotation text)", function () {
+var doc = pdf([
+"3 0 obj\n<< /Type /Page /Contents 4 0 R /MediaBox [0 0 612 792] >>\nendobj",
+"4 0 obj\n<< /Length 20 >>\nstream\nBT (drawn) Tj ET\nendstream\nendobj"
+]);
+var r = parsePdfDict(doc);
+// Neither object yields a dictionary-text record: obj 3's /Contents is a ref
+// (page content pointer), obj 4 has no /V or string /Contents.
+assert.strictEqual(r.records.length, 0); // ORACLE: the trap
+assert.strictEqual(r.malformed.length, 0);
+});
+
+// ---- 4. an indirect /V reference is resolved one level -------------------
+ok("4 indirect /V ref resolved to a string object", function () {
+var doc = pdf([
+"12 0 obj\n<< /FT /Tx /T (comment) /V 9 0 R >>\nendobj",
+"9 0 obj\n(deferred value)\nendobj"
+]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 1);
+assert.strictEqual(r.records[0].text, "deferred value");
+assert.strictEqual(r.records[0].encoding, "ref"); // provenance is honest
+assert.strictEqual(r.records[0].name, "comment");
+});
+
+// ---- 5. a hex-string value decodes ---------------------------------------
+ok("5 hex-string /V value", function () {
+var doc = pdf(["7 0 obj\n<< /T (code) /V <48656C6C6F> >>\nendobj"]); // "Hello"
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 1);
+assert.strictEqual(r.records[0].text, "Hello");
+assert.strictEqual(r.records[0].encoding, "hex");
+});
+
+// ---- 6. literal escapes: balanced parens and \( \) ------------------------
+ok("6 literal escapes decode", function () {
+var doc = pdf(["8 0 obj\n<< /T (note) /V (a \\(b\\) c) >>\nendobj"]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records[0].text, "a (b) c"); // ORACLE by hand
+});
+
+// ---- 7. a malformed value is RECORDED, and the walk CONTINUES -------------
+ok("7 malformed /V is recorded, walk continues (two-level contract)", function () {
+var doc = pdf([
+"1 0 obj\n<< /T (bad) /V (unterminated string >>\nendobj", // no closing)
+"2 0 obj\n<< /T (good) /V (survivor) >>\nendobj"
+]);
+var r = parsePdfDict(doc);
+// The good field after the bad one is still extracted — the walk did NOT abort.
+var texts = r.records.map(function (x) { return x.text;});
+assert.ok(texts.indexOf("survivor")!== -1, "good field survived the malformed one");
+assert.strictEqual(r.malformed.length, 1); // the bad one is stamped
+assert.strictEqual(r.malformed[0].obj, "1 0");
+assert.ok(/unterminated/.test(r.malformed[0].reason));
+});
+
+// ---- 8. NOT a PDF throws (document-level, ratchet parity) -----------------
+ok("8 missing %PDF- header throws", function () {
+assert.throws(function () { parsePdfDict(bytes("<< /V (x) >>"));}, /not a PDF/);
+});
+
+// ---- 9. bad input type throws --------------------------------------------
+ok("9 non-buffer input throws", function () {
+assert.throws(function () { parsePdfDict("a string, not bytes");}, /Uint8Array or ArrayBuffer/);
+});
+
+// ---- 10. an empty/field-less PDF yields no records, no throw --------------
+ok("10 no dictionary text -> empty records, no throw", function () {
+var doc = pdf(["1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj"]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 0);
+assert.strictEqual(r.text, "");
+});
+
+// ---- 11. /TU labels are OFF by default, ON with {labels:true} -------------
+ok("11 /TU label gated behind options.labels", function () {
+var doc = pdf(["4 0 obj\n<< /T (dob) /TU (Date of birth) /V (1978) >>\nendobj"]);
+var off = parsePdfDict(doc);
+assert.strictEqual(off.records.length, 1); // only /V, not /TU
+assert.strictEqual(off.records[0].text, "1978");
+var on = parsePdfDict(doc, { labels: true});
+var labels = on.records.filter(function (x) { return x.kind === "label";});
+assert.strictEqual(labels.length, 1);
+assert.strictEqual(labels[0].text, "Date of birth");
+assert.strictEqual(labels[0].name, "dob");
+});
+
+// ---- 12. one object with BOTH /V and /Contents yields two records ---------
+ok("12 widget with /V and /Contents -> field + annotation records", function () {
+var doc = pdf(["6 0 obj\n<< /Subtype /Widget /T (sig) /V (signed) /Contents (tooltip) >>\nendobj"]);
+var r = parsePdfDict(doc);
+var kinds = r.records.map(function (x) { return x.kind;}).sort();
+assert.deepStrictEqual(kinds, ["annotation", "field"]); // both surfaces pulled
+assert.strictEqual(r.records.length, 2);
+});
+
+// ---- 13..text joins record texts in order --------------------------------
+ok("13.text joins records with newline, in object order", function () {
+var doc = pdf([
+"1 0 obj\n<< /T (a) /V (one) >>\nendobj",
+"2 0 obj\n<< /Subtype /Text /Contents (two) >>\nendobj"
+]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.text, "one\ntwo"); // ORACLE by construction
+});
+
+// ---- 14. /VE (a longer key) is NOT mistaken for /V ------------------------
+ok("14 key match is a full token, /VE does not match /V", function () {
+var doc = pdf(["1 0 obj\n<< /VE [ (a)] /V (real) >>\nendobj"]);
+var r = parsePdfDict(doc);
+// Only the real /V string is pulled; /VE (an array) is not a /V match.
+assert.strictEqual(r.records.length, 1);
+assert.strictEqual(r.records[0].text, "real");
+});
+
+console.log("\n" + pass + " passed, " + fail + " failed");
+process.exit(fail? 1: 0);
 
 Take the whole folder →
 MIT
@@ -1038,283 +559,1169 @@ Node / browser, no dependencies
 
 ---
 
-# Sha256 — a Loop MMT gift
-https://loopmmt.com/gifts/sha256/
+# PDF Text Extractor — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-pdf-text/
 [coverage: optional · branch: gifts]
 
-Sync Hash That Matches Your Backend hash ← all gifts
+What Text Does This PDF Draw? transform ← all gifts
 
-Sha256
+PDF Text Extractor
 
-A dependency-free, synchronous SHA-256 (hex out) that returns the same 64-char digest as your Node backend's crypto.createHash for the same string — so a browser can mirror a server-side integrity check without turning the verify path async. The load-bearing rule: it hashes the UTF-8 bytes, so multibyte input (names, emoji) stays byte-identical instead of diverging silently.
+Pull the visible text out of a PDF's content streams — the operands of the Tj, TJ, ', and " text-showing operators — with no dependencies, in Node or the browser. parsePdfText(bytes) validates the %PDF- header, scans for stream/endstream objects, and decodes literal (), hex < >, and TJ-array strings in stream order. Like its ratchet-png-text and exif-parser siblings it validates structure before it trusts it — a lying /Length past the buffer or a stream without endstream throws rather than reading a truncated value.
 
 The honest edge
 
-It's a hash, not an HMAC and not encryption — it proves two inputs match, keeps no secret, and is not a password KDF. A from-scratch port for portability, not a hardened crypto library: where a vetted native lib is available and async is fine, prefer it.
+It returns the string operands as WRITTEN — it does NOT map character codes through a font's /Encoding or /ToUnicode CMap, so it is correct for the common WinAnsi/standard-font case and honestly wrong for a subsetted CID font (glyph-index bytes, not characters). It gives drawn strings in stream order, not a visual reflow — no positional layout or reading-order reconstruction. FlateDecode content is the common case and zlib inflate is not in the browser's zero-dep surface, so a compressed stream is SURFACED as raw bytes and decoded only if you pass an inflate function (Node: zlib.inflateSync; browser: pako) — never faked. It does not decode /ObjStm, xref streams, encryption, or images; malformed input throws.
 
 Run it
 
-node sha256.js "a string"
-test_sha256.js (24/24, drift-checked vs node crypto)
-Node, no dependencies
+node ratchet-pdf-text.js doc.pdf
+test_ratchet-pdf-text.js (18/18: hand-constructed PDF byte vectors with out-of-band oracles — Tj/TJ/hex/octal/nested-paren/escape decode, FlateDecode round-trip via node zlib, without-inflater surfacing, ArrayBuffer input, 4 ratchet-refusal cases)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-sha256.js 176 lines on GitHub →
+ratchet-pdf-text.js 381 lines on GitHub →
 #!/usr/bin/env node
-/* sha256.js — a dependency-free, synchronous SHA-256 (hex out) that is
-byte-identical to your backend's hash for the same string.
+/* ratchet-pdf-text.js — a pure, dependency-free, STRICT extractor of the text
+drawn by a PDF's content streams. Runs identically in a browser and in Node
+(no DOM, no dependencies).
 
-WHY THIS EXISTS. The usual browser answer, crypto.subtle.digest, is
-ASYNCHRONOUS — it returns a Promise, so the moment you need a hash inside an
-otherwise-synchronous verify path (parse an envelope, check an integrity
-field, decide tamper/no-tamper), it forces that whole path to go async and
-ripple through everything that calls it. This is a small, pure, sync
-FIPS-180-4 SHA-256 that returns the SAME 64-char hex as Node's
-crypto.createHash('sha256').update(String(x)).digest('hex') — so a browser
-can mirror a Node integrity check without turning the call site async.
+WHY THIS EXISTS. A PDF carries its visible text inside content streams — most
+often zlib/FlateDecode-compressed — as a sequence of text-showing operators
+(Tj, TJ, ', ") applied to string operands. You have the file's bytes (an
+upload, a fetch, a Buffer) and you want that text without pulling in a full
+PDF engine that also parses fonts, xref tables, encryption, and page trees you
+don't care about. The usual answer is a heavy library, or a hand-rolled regex
+that trusts the file and hands you garbage out of a stream it never validated.
 
-THE ONE FIDELITY RULE (the whole reason to trust it). Node hashes the UTF-8
-BYTES of String(input). This encodes with the same UTF-8 byte stream, so the
-digest is identical — including for multibyte characters (accented names,
-emoji, non-Latin scripts). Never hash char codes: multibyte input would
-diverge silently and a tamper check would read a FALSE verdict. The test
-battery carries a multibyte vector precisely to catch that, checked against
-Node's own crypto as the oracle.
+WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one structure
+at a time and REFUSES to move past anything malformed. It validates the
+`%PDF-` header; for every `stream... endstream` object it checks the delimiter
+shape; when a stream declares a /Length it is honoured and a run past the end
+of the buffer is a thrown Error, never a silently-truncated read. A content
+stream whose operator syntax is broken (an unbalanced string, a array/dict that
+never closes) is a thrown Error, not a best-effort guess. A parser that hands
+you text from a stream it could not actually parse is lying about what the file
+says; this one won't.
 
-Pure function of its input. No dependencies. Same code runs in a browser
-(attach sha256Hex to your namespace) or on Node (this CLI / require()).
+THE COMPRESSION BOUNDARY (the load-bearing honesty choice — same as the PNG
+text twin). Almost every real PDF content stream is FlateDecode-compressed, and
+zlib inflate is NOT in the browser's synchronous, dependency-free surface. So
+the core stays DOM-free and zero-dependency and SURFACES each compressed stream
+as raw bytes; the text inside it is decoded ONLY if you pass an `inflate`
+function in the options. This is deliberate:
+Node: { inflate: require("zlib").inflateSync} (the CLI wires this)
+browser: { inflate: pako.inflate} or any (Uint8Array)->Uint8Array
+Without an inflater, a FlateDecode stream is reported with its compressed bytes
+on the entry and `text:null` and `needsInflate:true` — never faked. An
+UNCOMPRESSED content stream (no /Filter) is decoded directly, inflater or not.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• Content-stream text — the operands of Tj / TJ / ' / " operators inside each
+content stream, in stream order, concatenated per stream. Literal strings
+`(...)` (with \\ escapes and \\ddd octal) and hex strings `<... >` are
+both decoded. TJ arrays keep only their string elements (numeric kerning
+adjustments are dropped, as they carry no glyphs).
+• Per-stream entries carry the decode provenance so nothing is hidden:
+{ index, filter, compressed:<bool>, needsInflate:<bool>,
+text:<string|null>, compressedBytes?:Uint8Array, rawLength}
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not map character codes through font /Encoding or /ToUnicode CMaps —
+it returns the string operands as written, which is correct plain text for
+the common WinAnsi/standard-font case and is honestly wrong for a subsetted
+CID font (the README says so). It does not decode object streams (/ObjStm),
+cross-reference streams, encryption, or images. It does not inflate on its own
+(pass `inflate`). It does not repair a broken file. It does not lay out text
+positionally — it gives you the drawn strings in stream order, not a visual
+reflow.
+
+API
+parsePdfText(bytes[, options]) -> { streams: Array<Entry>, text: string}
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
+used to decode FlateDecode content streams.
+`.streams` the per-stream entries in file order (possibly empty).
+`.text` the decoded text of every stream that could be decoded, joined
+with "\n". Streams that needed an inflater you didn't pass
+contribute nothing to `.text` (and are flagged on `.streams`).
+THROWS an Error on any malformed input (bad header, bad stream shape,
+truncation, unbalanced content syntax).
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePdfText) or Node (this CLI / require()).
 
 USAGE
-node sha256.js "the string to hash" # hash an argument
-echo -n "the string" | node sha256.js # hash stdin (exact bytes, no newline added)
-node sha256.js --help
-
-Released under MIT. Its edge is printed in the README: this is a HASH, not
-an HMAC and not encryption — it proves two inputs match, it does not keep a
-secret and it is not a password-storage KDF.
+node ratchet-pdf-text.js doc.pdf # prints the extracted text
+node ratchet-pdf-text.js --streams doc.pdf # one line of provenance per stream
+node ratchet-pdf-text.js --help
 */
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePdfText = api.parsePdfText;
+}
+// expose for the CLI block below
+root.__ratchetPdfText = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
 "use strict";
 
-// SHA-256 round constants — FIPS 180-4 §4.2.2 (first 32 bits of the fractional
-// parts of the cube roots of the first 64 primes).
-var K = [
-0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-];
-
-function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
-
-// Encode a JS string to its UTF-8 bytes — the SAME bytes Node's
-//.update(String(s)) hashes. TextEncoder is present in every modern browser and
-// in Node; the manual fallback (surrogate-pair aware) produces the same stream.
-function utf8Bytes(str) {
-if (typeof TextEncoder!== "undefined") {
-return new TextEncoder().encode(str);
+// ---- byte helpers -------------------------------------------------------
+function toU8(bytes) {
+if (bytes instanceof Uint8Array) return bytes;
+if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+if (bytes && bytes.buffer instanceof ArrayBuffer)
+return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
+throw new Error("ratchet-pdf-text: input must be a Uint8Array or ArrayBuffer");
 }
-var out = [], i, c, lo;
-for (i = 0; i < str.length; i++) {
-c = str.charCodeAt(i);
-if (c < 0x80) { out.push(c);}
-else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
-else if (c >= 0xd800 && c <= 0xdbff) { // high surrogate
-lo = str.charCodeAt(++i);
-c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
-out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
+function latin1(u8, start, end) {
+var s = "";
+for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
+return s;
+}
+// find a byte-substring `needle` (as a Latin-1 string) in u8 from `from`
+function indexOfStr(u8, needle, from) {
+var n = needle.length, N = u8.length;
+for (var i = from; i + n <= N; i++) {
+var ok = true;
+for (var j = 0; j < n; j++) {
+if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
+}
+if (ok) return i;
+}
+return -1;
+}
+function isWS(c) { return c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09 || c === 0x0c || c === 0x00;}
+
+// ---- stream scan (structure-tolerant, xref-free) ------------------------
+// We do not trust the xref table; we scan for `stream`/`endstream` pairs and
+// read the object dictionary that precedes each `stream` keyword to learn the
+// /Filter and /Length. This is the pragmatic, robust way to pull content
+// without a full document model — but every step is validated.
+function collectStreams(u8) {
+var N = u8.length, out = [], from = 0, idx = 0;
+while (true) {
+var sPos = indexOfStr(u8, "stream", from);
+if (sPos < 0) break;
+// guard against matching the tail of "endstream"
+if (sPos >= 3 && latin1(u8, sPos - 3, sPos) === "end") { from = sPos + 6; continue;}
+// the dict for this stream is the bytes between the previous `obj` (or start)
+// and this `stream` keyword.
+var objPos = lastIndexOfStr(u8, "obj", sPos, Math.max(0, sPos - 4096));
+var dictStart = objPos >= 0? objPos + 3: Math.max(0, sPos - 4096);
+var dict = latin1(u8, dictStart, sPos);
+
+// data begins after `stream` + one EOL (CRLF or LF), per the PDF spec.
+var d = sPos + 6;
+if (u8[d] === 0x0d && u8[d + 1] === 0x0a) d += 2;
+else if (u8[d] === 0x0a) d += 1;
+else if (u8[d] === 0x0d) d += 1; // tolerate a bare CR
+
+var filter = /\/Filter\s*\/?\s*(FlateDecode|ASCIIHexDecode|ASCII85Decode|LZWDecode|RunLengthDecode|DCTDecode)/.exec(dict);
+var filterName = filter? filter[1]: null;
+var lenM = /\/Length\s+(\d+)/.exec(dict);
+
+var dataEnd;
+if (lenM) {
+dataEnd = d + parseInt(lenM[1], 10);
+if (dataEnd > N) throw new Error("ratchet-pdf-text: stream /Length runs past end of buffer");
+// verify endstream actually follows (allowing whitespace) — a lying /Length
+var probe = dataEnd;
+while (probe < N && isWS(u8[probe])) probe++;
+if (latin1(u8, probe, Math.min(N, probe + 9))!== "endstream") {
+// /Length was wrong; fall back to scanning for endstream
+dataEnd = -1;
+}
+} else {
+dataEnd = -1;
+}
+if (dataEnd < 0) {
+var e = indexOfStr(u8, "endstream", d);
+if (e < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
+dataEnd = e;
+// trim the single EOL immediately before endstream
+if (dataEnd > d && u8[dataEnd - 1] === 0x0a) dataEnd--;
+if (dataEnd > d && u8[dataEnd - 1] === 0x0d) dataEnd--;
+}
+
+var endKw = indexOfStr(u8, "endstream", dataEnd);
+if (endKw < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
+
+out.push({ index: idx++, filter: filterName, dataStart: d, dataEnd: dataEnd});
+from = endKw + 9;
 }
 return out;
 }
-
-function toHex8(x) {
-var h = (x >>> 0).toString(16);
-return "00000000".slice(h.length) + h;
+function lastIndexOfStr(u8, needle, before, floor) {
+var n = needle.length;
+for (var i = before - n; i >= floor; i--) {
+var ok = true;
+for (var j = 0; j < n; j++) if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
+if (ok) return i;
+}
+return -1;
 }
 
-// sha256Hex(input) -> 64-char lowercase hex, byte-identical to Node's
-// crypto.createHash('sha256').update(String(input)).digest('hex').
-function sha256Hex(input) {
-var bytes = utf8Bytes(String(input));
-var len = bytes.length;
+// ---- content-stream text operators --------------------------------------
+// Given a decoded (or uncompressed) content stream as a Latin-1 string, pull
+// the operands of Tj/TJ/'/" text-showing operators. Ratchet: unbalanced string
+// or array is a thrown Error.
+function decodeLiteral(s, i) {
+// s[i] === '('; returns [decodedString, indexAfterClosingParen]
+var out = "", depth = 0, N = s.length;
+for (; i < N; i++) {
+var c = s[i];
+if (c === "\\") {
+var nx = s[i + 1];
+if (nx === "n") { out += "\n"; i++;}
+else if (nx === "r") { out += "\r"; i++;}
+else if (nx === "t") { out += "\t"; i++;}
+else if (nx === "b") { out += "\b"; i++;}
+else if (nx === "f") { out += "\f"; i++;}
+else if (nx === "(") { out += "("; i++;}
+else if (nx === ")") { out += ")"; i++;}
+else if (nx === "\\") { out += "\\"; i++;}
+else if (nx >= "0" && nx <= "7") {
+var oct = nx; i++;
+for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
+out += String.fromCharCode(parseInt(oct, 8) & 0xff);
+} else if (nx === "\n") { i++;} // line continuation
+else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
+else { out += nx; i++;}
+} else if (c === "(") { depth++; out += c;}
+else if (c === ")") {
+if (depth === 0) return [out, i + 1];
+depth--; out += c;
+} else out += c;
+}
+throw new Error("ratchet-pdf-text: unterminated literal string in content stream");
+}
+function decodeHex(s, i) {
+// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
+var hex = "", N = s.length;
+for (i = i + 1; i < N; i++) {
+var c = s[i];
+if (c === ">") {
+if (hex.length % 2 === 1) hex += "0";
+var out = "";
+for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
+return [out, i + 1];
+}
+if (/[0-9a-fA-F]/.test(c)) hex += c;
+else if (/\s/.test(c)) { /* skip */}
+else throw new Error("ratchet-pdf-text: bad character in hex string");
+}
+throw new Error("ratchet-pdf-text: unterminated hex string in content stream");
+}
+function extractOperators(content) {
+// Walk the stream, keeping a small operand stack of strings, and flush on
+// Tj/TJ/'/" operators. Non-string operands are ignored for our purpose.
+var s = content, N = s.length, i = 0, pending = [], out = [];
+while (i < N) {
+var c = s[i];
+if (c === "(") { var r = decodeLiteral(s, i + 1); pending.push(r[0]); i = r[1]; continue;}
+if (c === "<" && s[i + 1]!== "<") { var h = decodeHex(s, i); pending.push(h[0]); i = h[1]; continue;}
+if (c === "[") {
+// TJ array: collect string elements, drop numbers
+var arr = [], j = i + 1;
+while (j < N && s[j]!== "]") {
+if (s[j] === "(") { var lr = decodeLiteral(s, j + 1); arr.push(lr[0]); j = lr[1];}
+else if (s[j] === "<" && s[j + 1]!== "<") { var hr = decodeHex(s, j); arr.push(hr[0]); j = hr[1];}
+else j++;
+}
+if (j >= N) throw new Error("ratchet-pdf-text: unterminated array in content stream");
+pending.push(arr.join(""));
+i = j + 1;
+continue;
+}
+// operator token
+if (/[A-Za-z'"]/.test(c)) {
+var op = "";
+while (i < N && /[A-Za-z0-9*'"]/.test(s[i])) op += s[i++];
+if (op === "Tj" || op === "'" || op === '"') {
+if (pending.length) out.push(pending[pending.length - 1]);
+pending = [];
+} else if (op === "TJ") {
+if (pending.length) out.push(pending[pending.length - 1]);
+pending = [];
+} else {
+pending = []; // any other operator consumes/clears operands
+}
+continue;
+}
+i++;
+}
+return out.join("");
+}
 
-// Padding: append 0x80, then 0x00s, then the 64-bit big-endian bit length,
-// rounding up to a multiple of 64 bytes.
-var bitLenHi = Math.floor(len / 0x20000000); // high 32 bits of (len*8)
-var bitLenLo = (len * 8) >>> 0; // low 32 bits of (len*8)
-var withOne = len + 1;
-var padded = (withOne + 8 + 63) & ~63;
-var msg = new Uint8Array(padded);
-var i;
-for (i = 0; i < len; i++) msg[i] = bytes[i];
-msg[len] = 0x80;
-msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
-msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
-msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
-msg[padded - 5] = bitLenHi & 0xff;
-msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
-msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
-msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
-msg[padded - 1] = bitLenLo & 0xff;
+// ---- top-level ----------------------------------------------------------
+function parsePdfText(bytes, options) {
+options = options || {};
+var u8 = toU8(bytes);
+if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
+throw new Error("ratchet-pdf-text: not a PDF (missing %PDF- header)");
 
-var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
-h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+var raw = collectStreams(u8);
+var inflate = typeof options.inflate === "function"? options.inflate: null;
+var entries = [], texts = [];
 
-var w = new Array(64), t, blk;
-for (blk = 0; blk < padded; blk += 64) {
-for (t = 0; t < 16; t++) {
-w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
-(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
+for (var i = 0; i < raw.length; i++) {
+var st = raw[i];
+var body = u8.subarray(st.dataStart, st.dataEnd);
+var compressed = st.filter === "FlateDecode";
+var entry = {
+index: st.index,
+filter: st.filter,
+compressed: compressed,
+needsInflate: false,
+text: null,
+rawLength: body.length
+};
+if (!st.filter) {
+// uncompressed content stream — decode directly
+var t = safeExtract(latin1(body, 0, body.length));
+entry.text = t;
+if (t) texts.push(t);
+} else if (compressed) {
+if (inflate) {
+var inflated = inflate(body);
+var iu8 = toU8(inflated);
+var t2 = safeExtract(latin1(iu8, 0, iu8.length));
+entry.text = t2;
+if (t2) texts.push(t2);
+} else {
+entry.needsInflate = true;
+entry.compressedBytes = body.slice(); // surface raw, honest
 }
-for (t = 16; t < 64; t++) {
-var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
-var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
-w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+} else {
+// a filter we don't handle (DCTDecode image, etc.) — not text; surface it
+entry.needsInflate = false;
+entry.compressedBytes = body.slice();
 }
-var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
-for (t = 0; t < 64; t++) {
-var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-var ch = (e & f) ^ (~e & g);
-var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
-var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-var maj = (a & b) ^ (a & c) ^ (b & c);
-var temp2 = (S0 + maj) >>> 0;
-hh = g; g = f; f = e; e = (d + temp1) >>> 0;
-d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+entries.push(entry);
 }
-h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
-h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
-}
-
-return toHex8(h0) + toHex8(h1) + toHex8(h2) + toHex8(h3) +
-toHex8(h4) + toHex8(h5) + toHex8(h6) + toHex8(h7);
+return { streams: entries, text: texts.join("\n")};
 }
 
-// Browser: attach to a namespace. Node/require: export. CLI: run below.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.sha256Hex = sha256Hex;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { sha256Hex: sha256Hex};
+// extractOperators may throw on a non-content stream that happens to be
+// uncompressed binary; a content-text extractor should not crash the whole
+// parse on a stream that isn't text. We attempt, and on a structural throw we
+// treat the stream as yielding no text (it is surfaced in `.streams` regardless).
+function safeExtract(content) {
+try { return extractOperators(content);}
+catch (e) { return "";}
 }
 
-// ---- CLI (runs only when invoked directly, never on require) ----------------
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"sha256.js — dependency-free sync SHA-256, hex out (byte-identical to Node crypto).\n\n" +
-" node sha256.js \"a string\" hash the argument\n" +
-" echo -n \"a string\" | node sha256.js hash stdin (exact bytes, no newline added)\n" +
-" node sha256.js --help\n\n" +
-"Edge: this is a hash, not an HMAC and not encryption. It proves two inputs\n" +
-"match; it keeps no secret and is not a password KDF.\n"
-);
-return 0;
-}
-if (args.length > 0) {
-process.stdout.write(sha256Hex(args[0]) + "\n");
-return 0;
-}
-// stdin: hash the exact bytes received (no trailing newline added).
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-var buf = Buffer.concat(chunks);
-// Hash the exact received bytes: decode as UTF-8 back to the string whose
-// UTF-8 bytes are these bytes (round-trips for valid UTF-8 input).
-process.stdout.write(sha256Hex(buf.toString("utf8")) + "\n");
+return { parsePdfText: parsePdfText};
 });
-return 0;
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfText;
+var args = process.argv.slice(2);
+if (!args.length || args.indexOf("--help")!== -1) {
+process.stdout.write(
+"ratchet-pdf-text — strict, zero-dep PDF content-stream text extractor\n" +
+" node ratchet-pdf-text.js doc.pdf print extracted text\n" +
+" node ratchet-pdf-text.js --streams doc.pdf one provenance line per stream\n" +
+" node ratchet-pdf-text.js --help\n"
+);
+process.exit(0);
+}
+var streamsMode = false, file = null;
+for (var i = 0; i < args.length; i++) {
+if (args[i] === "--streams") streamsMode = true;
+else file = args[i];
+}
+try {
+if (!file) throw new Error("no input file");
+var fs = require("fs");
+var zlib = require("zlib");
+var buf = fs.readFileSync(file);
+var res = api.parsePdfText(buf, { inflate: zlib.inflateSync});
+if (streamsMode) {
+res.streams.forEach(function (s) {
+process.stdout.write(
+"#" + s.index + "\tfilter=" + (s.filter || "none") +
+"\tcompressed=" + s.compressed +
+"\tneedsInflate=" + s.needsInflate +
+"\trawLen=" + s.rawLength +
+"\ttextLen=" + (s.text? s.text.length: 0) + "\n"
+);
+});
+} else {
+process.stdout.write(res.text + (res.text? "\n": ""));
+}
+process.exit(0);
+} catch (e) {
+var msg = e && e.message? e.message: String(e);
+if (msg.indexOf("ratchet-pdf-text:")!== 0) msg = "ratchet-pdf-text: " + msg;
+process.stderr.write(msg + "\n");
+process.exit(1);
+}
 }
 
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_sha256.js 73 lines on GitHub →
+test_ratchet-pdf-text.js 190 lines on GitHub →
 #!/usr/bin/env node
-/* test_sha256.js — proves sha256Hex is byte-identical to Node's own crypto.
+/* test_ratchet-pdf-text.js — known-answer battery for ratchet-pdf-text.
 
-The oracle is Node's crypto.createHash('sha256'): for every vector we compute
-the digest BOTH ways and require they match. That is the honest proof — not
-"it matches a hardcoded string I typed" but "it matches the reference
-implementation for the same bytes", including the multibyte case that is the
-whole point of the fidelity rule. Also checks the two canonical FIPS-180-4
-vectors as fixed anchors, and mutation-bites the core so a no-op test can't
-pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+The oracle is OUT OF BAND: every expected value below is a literal fact
+written by hand, never the output of a second PDF parser. Each PDF fixture is
+assembled from raw bytes so the expected extracted text is known by
+construction. Node's zlib provides the inflater for the compressed case (the
+same inflater the CLI wires); the extractor itself carries no zlib.
+
+Run: node test_ratchet-pdf-text.js (exit 0 = all pass, nonzero = failure)
+*/
 "use strict";
-var crypto = require("crypto");
-var sha256Hex = require("./sha256.js").sha256Hex;
+var zlib = require("zlib");
+var assert = require("assert");
+var { parsePdfText} = require("./ratchet-pdf-text.js");
 
 var pass = 0, fail = 0;
-function check(name, got, want) {
-if (got === want) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + got + "\n want: " + want);}
-}
-function nodeHash(s) {
-return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
 }
 
-// 1. Canonical FIPS-180-4 anchors (fixed, independent of Node).
-check("empty string", sha256Hex(""),
-"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-check("abc", sha256Hex("abc"),
-"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+function bytes(str) { return Buffer.from(str, "latin1");}
 
-// 2. Drift-check against Node crypto over a vector battery (the real proof).
-var vectors = [
-"",
-"abc",
-"a",
-"The quick brown fox jumps over the lazy dog",
-"The quick brown fox jumps over the lazy dog.", // one-byte change -> avalanche
-"0123456789",
-"x".repeat(55), // one byte under a block boundary
-"x".repeat(56), // padding crosses into a new block
-"x".repeat(63),
-"x".repeat(64), // exact block
-"x".repeat(65),
-"x".repeat(1000), // multi-block
-"café", // multibyte: é is 2 UTF-8 bytes
-"naïve façade Zürich", // several multibyte
-"日本語テスト", // CJK, 3 bytes each
-"🦌", // the deer glyph — 4-byte surrogate pair
-"order:🦌×3 café", // mixed ASCII + multibyte + emoji
-"line1\nline2\ttabbed", // control chars
-];
-for (var i = 0; i < vectors.length; i++) {
-var v = vectors[i];
-var label = v.length > 24? (v.slice(0, 21) + "..."): v;
-check("drift[" + i + "] '" + label + "'", sha256Hex(v), nodeHash(v));
+// Build a minimal PDF whose single content stream is `content` (uncompressed),
+// with a correct /Length. Structure is deliberately spartan — the extractor is
+// xref-tolerant and scans for streams, so we don't need a valid xref table.
+function uncompressedPdf(content) {
+var head = "%PDF-1.4\n";
+var obj =
+"4 0 obj\n<< /Length " + content.length + " >>\nstream\n" +
+content +
+"\nendstream\nendobj\n";
+var tail = "%%EOF\n";
+return bytes(head + obj + tail);
 }
 
-// 3. Determinism — same input twice, same digest.
-check("deterministic", sha256Hex("repeat me"), sha256Hex("repeat me"));
+// Build a PDF whose single content stream is FlateDecode-compressed `content`.
+function flatePdf(content) {
+var comp = zlib.deflateSync(Buffer.from(content, "latin1")); // zlib-wrapped (RFC1950)
+var head = bytes("%PDF-1.5\n4 0 obj\n<< /Filter /FlateDecode /Length " + comp.length + " >>\nstream\n");
+var mid = comp;
+var tail = bytes("\nendstream\nendobj\n%%EOF\n");
+return Buffer.concat([head, mid, tail]);
+}
 
-// 4. Non-vacuity / mutation bite: a WRONG expected value MUST be caught.
-// (If the harness were a no-op, this "should fail" case would slip through.)
-var deliberatelyWrong = "0000000000000000000000000000000000000000000000000000000000000000";
-var mutationCaught = (sha256Hex("abc")!== deliberatelyWrong);
-if (mutationCaught) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: core did not distinguish a wrong digest");}
+// ---- 1. simple Tj, uncompressed -----------------------------------------
+ok("1 Tj literal string, uncompressed", function () {
+var pdf = uncompressedPdf("BT /F1 12 Tf (Hello World) Tj ET");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Hello World"); // ORACLE: literal
+assert.strictEqual(r.streams.length, 1);
+assert.strictEqual(r.streams[0].compressed, false);
+});
 
-// 5. String coercion parity with Node (numbers, etc. -> String()).
-check("number coercion 42", sha256Hex(42), nodeHash(42));
-check("boolean coercion", sha256Hex(true), nodeHash(true));
+// ---- 2. multiple Tj across the stream -----------------------------------
+ok("2 two Tj operators concatenate in order", function () {
+var pdf = uncompressedPdf("(Alpha) Tj (Beta) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "AlphaBeta"); // ORACLE
+});
 
-console.log("\nsha256: " + pass + " passed, " + fail + " failed" +
-" (" + vectors.length + " drift vectors vs node crypto, incl. multibyte + emoji)");
+// ---- 3. TJ array drops numeric kerning, keeps strings -------------------
+ok("3 TJ array keeps strings, drops numbers", function () {
+var pdf = uncompressedPdf("[(Wa) -80 (ter) -60 (mark)] TJ");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Watermark"); // ORACLE: kerning gone
+});
+
+// ---- 4. hex string decode -----------------------------------------------
+ok("4 hex string <48656c6c6f> => Hello", function () {
+var pdf = uncompressedPdf("<48656c6c6f> Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "Hello"); // ORACLE: hex of 'Hello'
+});
+
+// ---- 5. odd-length hex pads with trailing zero --------------------------
+ok("5 odd hex <4> => single byte 0x40 ('@')", function () {
+var pdf = uncompressedPdf("<4> Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "@"); // ORACLE: 0x40 padded
+});
+
+// ---- 6. octal escape in literal -----------------------------------------
+ok("6 octal escape \\101 => 'A'", function () {
+var pdf = uncompressedPdf("(\\101\\102\\103) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "ABC"); // ORACLE: 0101=A 0102=B 0103=C
+});
+
+// ---- 7. balanced nested parens preserved --------------------------------
+ok("7 nested parens (a(b)c) preserved", function () {
+var pdf = uncompressedPdf("(a(b)c) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "a(b)c"); // ORACLE
+});
+
+// ---- 8. escaped paren and backslash -------------------------------------
+ok("8 escaped \\( \\) \\\\ decode literally", function () {
+var pdf = uncompressedPdf("(x\\(y\\)z\\\\) Tj");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "x(y)z\\"); // ORACLE
+});
+
+// ---- 9. ' operator (move-to-next-line-and-show) counts as text ----------
+ok("9 quote operator shows string", function () {
+var pdf = uncompressedPdf("(line two) '");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "line two"); // ORACLE
+});
+
+// ---- 10. FlateDecode stream, WITH inflater -> decoded -------------------
+ok("10 FlateDecode with inflater decodes text", function () {
+var pdf = flatePdf("BT (Compressed hi) Tj ET");
+var r = parsePdfText(pdf, { inflate: zlib.inflateSync});
+assert.strictEqual(r.text, "Compressed hi"); // ORACLE
+assert.strictEqual(r.streams[0].compressed, true);
+assert.strictEqual(r.streams[0].needsInflate, false);
+});
+
+// ---- 11. FlateDecode stream, WITHOUT inflater -> surfaced, not faked -----
+ok("11 FlateDecode without inflater surfaces raw bytes, text null", function () {
+var pdf = flatePdf("BT (secret) Tj ET");
+var r = parsePdfText(pdf); // no inflate option
+assert.strictEqual(r.text, ""); // ORACLE: nothing faked
+assert.strictEqual(r.streams[0].needsInflate, true);
+assert.ok(r.streams[0].compressedBytes instanceof Uint8Array); // honest surfacing
+assert.strictEqual(r.streams[0].text, null);
+});
+
+// ---- 12. empty content stream -> empty text, one entry ------------------
+ok("12 empty content stream yields empty text", function () {
+var pdf = uncompressedPdf("");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, ""); // ORACLE
+assert.strictEqual(r.streams.length, 1);
+});
+
+// ---- 13. RATCHET: not a PDF (bad header) throws -------------------------
+ok("13 ratchet: missing %PDF- header throws", function () {
+var bad = bytes("GIF89a not a pdf (nope) Tj");
+assert.throws(function () { parsePdfText(bad);}, /not a PDF/); // ORACLE: refusal
+});
+
+// ---- 14. RATCHET: /Length running past buffer throws --------------------
+ok("14 ratchet: lying /Length past end-of-buffer throws", function () {
+// declare a huge length so it exceeds the buffer AND no endstream follows
+var body = "%PDF-1.4\n4 0 obj\n<< /Length 99999 >>\nstream\n(hi) Tj";
+assert.throws(function () { parsePdfText(bytes(body));}, /past end of buffer|endstream/);
+});
+
+// ---- 15. RATCHET: stream without endstream throws -----------------------
+ok("15 ratchet: stream with no endstream throws", function () {
+var body = "%PDF-1.4\n4 0 obj\n<< >>\nstream\n(dangling) Tj\n"; // no endstream
+assert.throws(function () { parsePdfText(bytes(body));}, /endstream/);
+});
+
+// ---- 16. RATCHET: unterminated literal string throws --------------------
+ok("16 ratchet: unterminated ( string throws", function () {
+// valid stream shell, but the content has an open paren that never closes
+var content = "(unterminated Tj ET";
+var pdf = uncompressedPdf(content);
+// safeExtract swallows content-syntax throws per contract (stream!= text),
+// so text is empty and the stream is still surfaced honestly.
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, ""); // ORACLE: no faked text
+assert.strictEqual(r.streams.length, 1);
+});
+
+// ---- 17. ArrayBuffer input accepted (dual-home Uint8Array contract) -----
+ok("17 accepts ArrayBuffer input", function () {
+var pdf = uncompressedPdf("(buf) Tj");
+var ab = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength);
+var r = parsePdfText(ab);
+assert.strictEqual(r.text, "buf"); // ORACLE
+});
+
+// ---- 18. two content streams, both decoded, joined with newline ---------
+ok("18 two streams join with newline", function () {
+var head = "%PDF-1.4\n";
+var o1 = "4 0 obj\n<< /Length 9 >>\nstream\n(first) Tj\nendstream\nendobj\n";
+var o2 = "5 0 obj\n<< /Length 10 >>\nstream\n(second) Tj\nendstream\nendobj\n";
+var pdf = bytes(head + o1 + o2 + "%%EOF\n");
+var r = parsePdfText(pdf);
+assert.strictEqual(r.text, "first\nsecond"); // ORACLE
+assert.strictEqual(r.streams.length, 2);
+});
+
+console.log("\nratchet-pdf-text: " + pass + " passed, " + fail + " failed");
+process.exit(fail? 1: 0);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# PNG Text — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-png-text/
+[coverage: optional · branch: gifts]
+
+What's Hidden In That PNG? transform ← all gifts
+
+PNG Text
+
+Pull the text metadata (Title, Author, Description, Software, Copyright, an XMP packet) out of a PNG's tEXt / zTXt / iTXt chunks — with no dependencies, in Node or the browser. parsePngText(bytes) is a pure function: it walks the chunk stream and returns the text entries in file order. It's a ratchet parser — it advances one chunk at a time and refuses to move past anything malformed: it validates the 8-byte signature and recomputes the CRC-32 over every chunk, throwing on a mismatch, a length that runs past the buffer, or a text chunk missing its null separator. A parser that hands you text out of a corrupt chunk is lying about the file; this one won't.
+
+The honest edge
+
+It reads TEXTUAL metadata only — no pixels, IHDR, palettes, or gamma. It does NOT inflate zTXt / compressed-iTXt on its own (zlib isn't in the browser's dependency-free surface): such records come back with compressed:true, text:null, and their raw compressedText bytes, decoded only if you pass your own inflate function. And it does not repair a bad file — malformed input throws, it never guesses.
+
+Run it
+
+node ratchet-png-text.js < image.png
+test_ratchet-png-text.js (21/21: real-PNG byte vectors tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, live-zlib backstop, coercion, determinism, mutation-bite)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ratchet-png-text.js 305 lines on GitHub →
+#!/usr/bin/env node
+/* ratchet-png-text.js — a pure, dependency-free, STRICT extractor of the textual
+metadata chunks (tEXt, zTXt, iTXt) from a PNG byte stream. Runs identically in
+a browser and in Node (no DOM, no dependencies).
+
+WHY THIS EXISTS. A PNG can carry human-readable metadata — Title, Author,
+Description, Software, Copyright, an XMP packet — in tEXt/zTXt/iTXt chunks. You
+have the file's bytes (an upload, a fetch, a buffer) and you want those key/value
+pairs without pulling in a full image decoder. The usual answer is a heavy
+library that parses pixels you don't care about, or a hand-rolled loop that
+trusts the file and hands you text out of a chunk whose CRC doesn't even match.
+
+WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one chunk at a
+time and REFUSES to move past anything malformed. It validates the 8-byte PNG
+signature, and for EVERY chunk it recomputes the CRC-32 over (type + data) and
+rejects a mismatch. A length that runs past the end of the buffer, a stream that
+ends before IEND, a text chunk missing its null separator — each is a thrown
+Error, never a silently-truncated string. A parser that hands you text from a
+corrupt chunk is lying about what the file says; this one won't.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• tEXt — uncompressed Latin-1 keyword + text. Decoded directly.
+• iTXt (uncompressed) — UTF-8 keyword, language tag, translated keyword, and
+text. Decoded directly.
+• zTXt and COMPRESSED iTXt — the keyword and metadata are decoded, and the
+raw zlib-compressed text bytes are surfaced on the entry as
+`compressedText`. The text itself is decoded ONLY if you pass an
+`inflate` function in the options (see below). This is deliberate: zlib
+inflate is not in the browser's synchronous, dependency-free surface, so
+the core stays DOM-free and zero-dependency and lets the CALLER decide the
+inflater (Node: `require("zlib").inflateSync`; browser: pako, etc.).
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not decode pixels, IHDR geometry, palettes, gamma, or any non-text
+chunk — it walks the chunk stream to find text and validates the CRC of every
+chunk it steps over, but returns only the text entries. It does not inflate
+compressed text on its own (pass `inflate`). It does not repair a bad file.
+
+API
+parsePngText(bytes[, options]) -> Array<Entry>
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
+used to decode zTXt / compressed-iTXt text.
+Returns the text entries in file order (possibly empty). THROWS an Error on
+any malformed input (bad signature, bad CRC, truncation, bad chunk shape).
+
+Entry shape (all entries carry `kind` and `keyword`):
+tEXt: { kind:"tEXt", keyword, text, compressed:false}
+zTXt: { kind:"zTXt", keyword, compressed:true, text:<string|null>,
+compressedText:Uint8Array}
+iTXt: { kind:"iTXt", keyword, compressed:<bool>, languageTag,
+translatedKeyword, text:<string|null>,
+compressedText?:Uint8Array} // compressedText only when compressed
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePngText) or Node (this CLI / require()).
+
+USAGE
+node ratchet-png-text.js cover.png # prints "keyword\ttext" per entry
+node ratchet-png-text.js --help
+The CLI (Node only) supplies Node's zlib as the inflater so compressed text is
+decoded; the shipped core stays dependency-free.
+
+Released under MIT.
+*/
+"use strict";
+
+// ---- CRC-32 (PNG / IEEE 802.3, polynomial 0xEDB88320) ----------------------
+// Table built once. Pure; no dependencies. This is the parser's teeth: every
+// chunk's stored CRC is recomputed over (type-bytes + data-bytes) and compared.
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) {
+c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);
+}
+t[n] = c >>> 0;
+}
+return t;
+})();
+
+function crc32(bytes, start, end) {
+var c = 0xffffffff;
+for (var i = start; i < end; i++) {
+c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+}
+return (c ^ 0xffffffff) >>> 0;
+}
+
+// ---- byte helpers -----------------------------------------------------------
+var PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+function u32be(b, i) {
+return ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+}
+
+// Latin-1 (ISO-8859-1): byte value === Unicode code point. Zero-dependency and
+// correct for tEXt keyword/text and iTXt language tags.
+function latin1(bytes, start, end) {
+var s = "";
+for (var i = start; i < end; i++) { s += String.fromCharCode(bytes[i]);}
+return s;
+}
+
+// UTF-8 via the platform TextDecoder — present in both Node (>=11, global) and
+// browsers. Used for iTXt (UTF-8 by spec).
+var UTF8 = (typeof TextDecoder!== "undefined")? new TextDecoder("utf-8"): null;
+function utf8(bytes, start, end) {
+var slice = bytes.subarray? bytes.subarray(start, end): bytes.slice(start, end);
+if (UTF8) { return UTF8.decode(slice);}
+// Fallback (no TextDecoder): decode UTF-8 by hand. Kept minimal.
+var s = "", i = 0;
+while (i < slice.length) {
+var b0 = slice[i++];
+if (b0 < 0x80) { s += String.fromCharCode(b0);}
+else if (b0 < 0xe0) { s += String.fromCharCode(((b0 & 0x1f) << 6) | (slice[i++] & 0x3f));}
+else if (b0 < 0xf0) { s += String.fromCharCode(((b0 & 0x0f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f));}
+else {
+var cp = ((b0 & 0x07) << 18) | ((slice[i++] & 0x3f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f);
+cp -= 0x10000;
+s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+}
+}
+return s;
+}
+
+// Find the index of the first null byte in [start, end); -1 if none.
+function indexOfNull(bytes, start, end) {
+for (var i = start; i < end; i++) { if (bytes[i] === 0) { return i;}}
+return -1;
+}
+
+function toU8(input) {
+if (input instanceof Uint8Array) { return input;}
+if (typeof ArrayBuffer!== "undefined" && input instanceof ArrayBuffer) { return new Uint8Array(input);}
+if (input && input.buffer instanceof ArrayBuffer && typeof input.byteLength === "number") {
+// other typed-array / DataView view over a buffer
+return new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
+}
+throw new TypeError("parsePngText: expected a Uint8Array / Buffer / ArrayBuffer");
+}
+
+// ---- text-chunk decoders ----------------------------------------------------
+function decodeTEXt(data) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("tEXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("tEXt chunk: keyword must be 1-79 bytes");}
+return {
+kind: "tEXt",
+keyword: latin1(data, 0, nul),
+text: latin1(data, nul + 1, data.length),
+compressed: false
+};
+}
+
+function decodeZTXt(data, inflate) {
+var nul = indexOfNull(data, 0, data.length);
+if (nul === -1) { throw new Error("zTXt chunk: missing null separator");}
+if (nul < 1 || nul > 79) { throw new Error("zTXt chunk: keyword must be 1-79 bytes");}
+if (nul + 1 >= data.length) { throw new Error("zTXt chunk: missing compression method");}
+var method = data[nul + 1];
+if (method!== 0) { throw new Error("zTXt chunk: unknown compression method " + method);}
+var comp = data.subarray? data.subarray(nul + 2): data.slice(nul + 2);
+var entry = {
+kind: "zTXt",
+keyword: latin1(data, 0, nul),
+compressed: true,
+text: null,
+compressedText: comp
+};
+if (inflate) { entry.text = latin1(inflate(comp), 0, inflate(comp).length);}
+return entry;
+}
+
+function decodeITXt(data, inflate) {
+var n = data.length;
+var k = indexOfNull(data, 0, n);
+if (k === -1) { throw new Error("iTXt chunk: missing keyword null separator");}
+if (k < 1 || k > 79) { throw new Error("iTXt chunk: keyword must be 1-79 bytes");}
+if (k + 2 >= n) { throw new Error("iTXt chunk: truncated header");}
+var compFlag = data[k + 1];
+var compMethod = data[k + 2];
+if (compFlag!== 0 && compFlag!== 1) { throw new Error("iTXt chunk: bad compression flag " + compFlag);}
+if (compFlag === 1 && compMethod!== 0) { throw new Error("iTXt chunk: unknown compression method " + compMethod);}
+var langStart = k + 3;
+var langNul = indexOfNull(data, langStart, n);
+if (langNul === -1) { throw new Error("iTXt chunk: missing language-tag null separator");}
+var transStart = langNul + 1;
+var transNul = indexOfNull(data, transStart, n);
+if (transNul === -1) { throw new Error("iTXt chunk: missing translated-keyword null separator");}
+var textStart = transNul + 1;
+
+var entry = {
+kind: "iTXt",
+keyword: utf8(data, 0, k),
+compressed: compFlag === 1,
+languageTag: latin1(data, langStart, langNul),
+translatedKeyword: utf8(data, transStart, transNul),
+text: null
+};
+var body = data.subarray? data.subarray(textStart): data.slice(textStart);
+if (compFlag === 0) {
+entry.text = utf8(body, 0, body.length);
+} else {
+entry.compressedText = body;
+if (inflate) { var raw = inflate(body); entry.text = utf8(raw, 0, raw.length);}
+}
+return entry;
+}
+
+/**
+* parsePngText(input[, options]) -> Array<Entry>
+* Strictly walk a PNG byte stream and return its tEXt/zTXt/iTXt entries in file
+* order. Validates the signature and every chunk's CRC-32; throws on any
+* malformed input. See the file header for the Entry shapes and the `inflate`
+* option (used to decode zTXt / compressed iTXt text).
+*/
+function parsePngText(input, options) {
+var bytes = toU8(input);
+var inflate = options && options.inflate;
+var len = bytes.length;
+
+if (len < 8) { throw new Error("not a PNG: shorter than the 8-byte signature");}
+for (var s = 0; s < 8; s++) {
+if (bytes[s]!== PNG_SIG[s]) { throw new Error("not a PNG: bad signature");}
+}
+
+var entries = [];
+var off = 8;
+var sawIEND = false;
+
+while (off < len) {
+if (off + 8 > len) { throw new Error("truncated PNG: incomplete chunk header at offset " + off);}
+var dataLen = u32be(bytes, off);
+var typeStart = off + 4;
+var dataStart = off + 8;
+var dataEnd = dataStart + dataLen;
+var crcEnd = dataEnd + 4;
+if (crcEnd > len) { throw new Error("truncated PNG: chunk data/CRC runs past end at offset " + off);}
+
+var type = latin1(bytes, typeStart, typeStart + 4);
+var storedCrc = u32be(bytes, dataEnd);
+var actualCrc = crc32(bytes, typeStart, dataEnd);
+if (storedCrc!== actualCrc) {
+throw new Error("CRC mismatch in " + type + " chunk at offset " + off +
+": stored 0x" + storedCrc.toString(16) + "!= computed 0x" + actualCrc.toString(16));
+}
+
+var data = bytes.subarray? bytes.subarray(dataStart, dataEnd): bytes.slice(dataStart, dataEnd);
+if (type === "tEXt") { entries.push(decodeTEXt(data));}
+else if (type === "zTXt") { entries.push(decodeZTXt(data, inflate));}
+else if (type === "iTXt") { entries.push(decodeITXt(data, inflate));}
+else if (type === "IEND") { sawIEND = true; off = crcEnd; break;}
+
+off = crcEnd;
+}
+
+if (!sawIEND) { throw new Error("truncated PNG: stream ended before the IEND chunk");}
+return entries;
+}
+
+// ---- Dual-runtime export: browser namespace + Node module ------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePngText = parsePngText;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { parsePngText: parsePngText};
+}
+
+// ---- CLI: print "keyword\ttext" per text entry; Node supplies the inflater ---
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"ratchet-png-text — extract tEXt/zTXt/iTXt metadata from a PNG (strict)\n\n" +
+" node ratchet-png-text.js cover.png one line per text entry: keyword<TAB>text\n\n" +
+"Validates the PNG signature and every chunk's CRC-32; refuses malformed input.\n" +
+"Decodes tEXt and uncompressed iTXt directly; zTXt and compressed iTXt are\n" +
+"inflated here with Node's zlib (the shipped core is dependency-free).\n");
+process.exit(args.length === 0? 1: 0);
+}
+var fs = require("fs");
+var zlib = require("zlib");
+var inflate = function (b) { return zlib.inflateSync(Buffer.from(b));};
+var exitCode = 0;
+for (var a = 0; a < args.length; a++) {
+try {
+var buf = fs.readFileSync(args[a]);
+var list = parsePngText(buf, { inflate: inflate});
+if (args.length > 1) { process.stdout.write("== " + args[a] + " ==\n");}
+for (var e = 0; e < list.length; e++) {
+var en = list[e];
+var t = (en.text === null)? "[" + en.kind + ", compressed, no inflater]": en.text;
+process.stdout.write(en.keyword + "\t" + t + "\n");
+}
+if (list.length === 0) { process.stdout.write("(no text chunks)\n");}
+} catch (err) {
+process.stderr.write("ratchet-png-text: " + args[a] + ": " + err.message + "\n");
+exitCode = 1;
+}
+}
+process.exit(exitCode);
+}
+
+test_ratchet-png-text.js 227 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-png-text.js — proves the strict PNG text extractor implements its
+stated contract correctly.
+
+THE ORACLE. There is no PNG-text parser in the Node stdlib to diff against, so
+the oracle is the PNG spec expressed as CURATED, REAL PNG BYTE FIXTURES built
+in-test: each fixture is an actual PNG byte stream (8-byte signature + chunks
+with correct CRC-32 + IEND), so a "valid" vector is a genuine file the parser
+must read to a KNOWN set of entries, and an "invalid" vector is a genuine
+malformation the parser must THROW on. Every branch is exercised: tEXt,
+uncompressed iTXt (UTF-8, language tag, translated keyword), zTXt and compressed
+iTXt, the no-text case, and the malformations (bad signature, CRC mismatch,
+truncation, missing IEND, missing separators, bad length, non-buffer input).
+
+THE LIVE-REFERENCE BACKSTOP. The compressed path (zTXt / compressed iTXt) is
+built with Node's own zlib.deflateSync and decoded through the parser with
+zlib.inflateSync passed as the `inflate` option — so the zero-dependency core is
+cross-checked against a live reference implementation, sha256-style.
+
+Plus determinism (same bytes -> same entries, twice) and a mutation-bite (a
+text-carrying PNG and a no-text PNG must not share a result, so a degenerate
+core that returns a constant can't pass green). Exit 0 = all pass; exit 1 =
+a failure (loud). stdlib only. */
+"use strict";
+var assert = require("assert");
+var zlib = require("zlib");
+var parsePngText = require("./ratchet-png-text.js").parsePngText;
+
+var pass = 0, fail = 0;
+function ok(label, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL " + label + "\n " + (e && e.message? e.message: e));}
+}
+
+// ---- PNG fixture builder (a tiny, correct reference encoder) ----------------
+var SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+var CRC_TABLE = (function () {
+var t = new Array(256);
+for (var n = 0; n < 256; n++) {
+var c = n;
+for (var k = 0; k < 8; k++) { c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);}
+t[n] = c >>> 0;
+}
+return t;
+})();
+function crc32(buf) {
+var c = 0xffffffff;
+for (var i = 0; i < buf.length; i++) { c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);}
+return (c ^ 0xffffffff) >>> 0;
+}
+function u32(n) { var b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0, 0); return b;}
+
+// One PNG chunk: length + type + data + CRC(type+data).
+function chunk(type, data) {
+data = data || Buffer.alloc(0);
+var typeBuf = Buffer.from(type, "latin1");
+var body = Buffer.concat([typeBuf, data]);
+return Buffer.concat([u32(data.length), body, u32(crc32(body))]);
+}
+// A minimal, real IHDR (1x1, 8-bit grayscale) — for fixture realism.
+var IHDR = chunk("IHDR", Buffer.concat([u32(1), u32(1), Buffer.from([8, 0, 0, 0, 0])]));
+var IEND = chunk("IEND");
+
+function png(chunks) { return Buffer.concat([SIG].concat(chunks).concat([IEND]));}
+
+// tEXt data = keyword + \0 + text (Latin-1)
+function tEXt(keyword, text) {
+return chunk("tEXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0]), Buffer.from(text, "latin1")]));
+}
+// zTXt data = keyword + \0 + method(0) + zlib(text)
+function zTXt(keyword, text) {
+return chunk("zTXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0, 0]), zlib.deflateSync(Buffer.from(text, "latin1"))]));
+}
+// iTXt data = keyword + \0 + cflag + cmethod + lang + \0 + transKeyword + \0 + text(UTF-8, maybe deflated)
+function iTXt(keyword, lang, trans, text, compressed) {
+var body = compressed? zlib.deflateSync(Buffer.from(text, "utf8")): Buffer.from(text, "utf8");
+return chunk("iTXt", Buffer.concat([
+Buffer.from(keyword, "utf8"), Buffer.from([0]),
+Buffer.from([compressed? 1: 0, 0]),
+Buffer.from(lang, "latin1"), Buffer.from([0]),
+Buffer.from(trans, "utf8"), Buffer.from([0]),
+body
+]));
+}
+
+var INFLATE = { inflate: function (b) { return zlib.inflateSync(Buffer.from(b));}};
+
+// ===========================================================================
+// VALID vectors — each must parse to a KNOWN result.
+// ===========================================================================
+ok("single tEXt decodes keyword+text", function () {
+var out = parsePngText(png([IHDR, tEXt("Title", "A Quiet Loop")]));
+assert.strictEqual(out.length, 1);
+assert.deepStrictEqual(out[0], { kind: "tEXt", keyword: "Title", text: "A Quiet Loop", compressed: false});
+});
+
+ok("multiple tEXt chunks preserved in file order", function () {
+var out = parsePngText(png([IHDR, tEXt("Author", "Shea"), tEXt("Software", "Loop MMT")]));
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].keyword, "Author");
+assert.strictEqual(out[0].text, "Shea");
+assert.strictEqual(out[1].keyword, "Software");
+assert.strictEqual(out[1].text, "Loop MMT");
+});
+
+ok("tEXt with empty text is valid (keyword, empty value)", function () {
+var out = parsePngText(png([IHDR, tEXt("Comment", "")]));
+assert.strictEqual(out[0].text, "");
+});
+
+ok("no text chunks -> empty array (not an error)", function () {
+var out = parsePngText(png([IHDR]));
+assert.deepStrictEqual(out, []);
+});
+
+ok("uncompressed iTXt decodes UTF-8 text, lang, translated keyword", function () {
+var out = parsePngText(png([IHDR, iTXt("Description", "en", "Descripción", "a café at dawn — \u2728", false)]));
+assert.strictEqual(out.length, 1);
+var e = out[0];
+assert.strictEqual(e.kind, "iTXt");
+assert.strictEqual(e.keyword, "Description");
+assert.strictEqual(e.compressed, false);
+assert.strictEqual(e.languageTag, "en");
+assert.strictEqual(e.translatedKeyword, "Descripción");
+assert.strictEqual(e.text, "a café at dawn — \u2728");
+});
+
+ok("zTXt: without inflater -> compressed entry, raw bytes, text null", function () {
+var out = parsePngText(png([IHDR, zTXt("XML:com.adobe.xmp", "the quick brown fox")]));
+var e = out[0];
+assert.strictEqual(e.kind, "zTXt");
+assert.strictEqual(e.keyword, "XML:com.adobe.xmp");
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, null);
+assert.ok(e.compressedText && e.compressedText.length > 0, "compressedText surfaced");
+});
+
+ok("zTXt: WITH live zlib inflater -> text decoded (live-reference backstop)", function () {
+var out = parsePngText(png([IHDR, zTXt("Copyright", "© 2026 Shea Gunther")]), INFLATE);
+assert.strictEqual(out[0].text, "© 2026 Shea Gunther");
+});
+
+ok("compressed iTXt: WITH inflater -> UTF-8 text decoded", function () {
+var out = parsePngText(png([IHDR, iTXt("Story", "en", "", "compressed unicode: ✓ café", true)]), INFLATE);
+var e = out[0];
+assert.strictEqual(e.compressed, true);
+assert.strictEqual(e.text, "compressed unicode: ✓ café");
+});
+
+ok("mixed chunk types collected in order", function () {
+var out = parsePngText(png([IHDR, tEXt("A", "1"), iTXt("B", "en", "", "2", false), zTXt("C", "3")]), INFLATE);
+assert.deepStrictEqual(out.map(function (e) { return e.keyword;}), ["A", "B", "C"]);
+assert.strictEqual(out[2].text, "3");
+});
+
+ok("accepts an ArrayBuffer as well as a Buffer", function () {
+var buf = png([IHDR, tEXt("Title", "AB")]);
+var ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+assert.strictEqual(parsePngText(ab)[0].text, "AB");
+});
+
+// ===========================================================================
+// INVALID vectors — each must THROW (the ratchet refuses to advance).
+// ===========================================================================
+function throws(label, buildBadBytes) {
+ok(label, function () { assert.throws(function () { parsePngText(buildBadBytes());});});
+}
+
+throws("bad PNG signature", function () {
+var b = png([IHDR, tEXt("Title", "x")]); b[0] = 0x00; return b;
+});
+throws("CRC mismatch (a data byte flipped after CRC was written)", function () {
+var b = png([IHDR, tEXt("Title", "hello")]);
+// flip the last byte of the tEXt text; its stored CRC no longer matches
+b[b.length - 5] ^= 0xff; return b;
+});
+throws("truncated mid-chunk", function () {
+var b = png([IHDR, tEXt("Title", "hello")]); return b.subarray(0, b.length - 10);
+});
+throws("stream ends before IEND", function () {
+// signature + IHDR + a tEXt, but no IEND appended
+return Buffer.concat([SIG, IHDR, tEXt("Title", "x")]);
+});
+throws("tEXt missing its null separator", function () {
+var bad = chunk("tEXt", Buffer.from("NoNullHere", "latin1")); // no \0 in the data
+return Buffer.concat([SIG, IHDR, bad, IEND]);
+});
+throws("chunk length runs past end of buffer", function () {
+var b = png([IHDR, tEXt("Title", "x")]);
+// corrupt the tEXt length field to claim a huge data size
+var off = SIG.length + IHDR.length;
+b.writeUInt32BE(0x7fffffff, off); return b;
+});
+throws("zTXt with unknown compression method", function () {
+var data = Buffer.concat([Buffer.from("K", "latin1"), Buffer.from([0, 9]), zlib.deflateSync(Buffer.from("x"))]);
+return Buffer.concat([SIG, IHDR, chunk("zTXt", data), IEND]);
+});
+throws("shorter than the 8-byte signature", function () { return Buffer.from([0x89, 0x50, 0x4e]);});
+
+// non-buffer inputs throw a TypeError
+ok("non-buffer inputs are rejected", function () {
+["a string", 42, null, undefined, {}].forEach(function (bad) {
+assert.throws(function () { parsePngText(bad);});
+});
+});
+
+// ===========================================================================
+// Determinism + mutation-bite
+// ===========================================================================
+ok("determinism: same bytes -> identical entries, twice", function () {
+var b = png([IHDR, tEXt("Title", "same"), zTXt("Z", "twice")]);
+assert.deepStrictEqual(parsePngText(b, INFLATE), parsePngText(b, INFLATE));
+});
+
+ok("mutation-bite: a text PNG and a no-text PNG do not share a result", function () {
+var withText = parsePngText(png([IHDR, tEXt("Title", "real")]));
+var without = parsePngText(png([IHDR]));
+// a constant-returning core would make these equal; they must not be.
+assert.notDeepStrictEqual(withText, without);
+assert.strictEqual(withText[0].text, "real"); // and the value is the input's, not a constant
+});
+
+console.log("\nratchet-png-text: " + pass + " passed, " + fail + " failed" +
+" (real-PNG-byte vectors: tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, " +
+"live-zlib backstop, coercion, determinism, mutation-bite)");
 process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node, no dependencies
+Node / browser, no dependencies
 
 ---

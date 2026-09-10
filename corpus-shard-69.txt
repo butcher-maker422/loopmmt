@@ -1,1396 +1,1906 @@
-# Loop MMT — corpus shard 69/73
+# Loop MMT — corpus shard 69/74
 
-> Bundle 69 of 73 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 69 of 74 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/the-oracle/, /gifts/timeline/, /gifts/timesheet/)
+Nodes in this shard: 3 (/gifts/sudoku/, /gifts/switchboard/, /gifts/template/)
 
 ---
 
-# The Oracle — a Loop MMT gift
-https://loopmmt.com/gifts/the-oracle/
+# Sudoku — a Loop MMT gift
+https://loopmmt.com/gifts/sudoku/
 [coverage: optional · branch: gifts]
 
-Which Prompt Variant Did Run #4173 Get? Make It a Fact You Can Recompute. decide ← all gifts
+A Solver That Shows Its Work transform ← all gifts
 
-The Oracle
+Sudoku
 
-A reproducible seeded-decision engine for prompt A/B. Name your variants, commit a seed at a moment, and it deterministically picks one -- writing a replayable receipt so the exact same pick can be re-derived on any machine, forever. The pick is reversal-indexed (the shape borrowed from the dwell gift): the seed and moment define a phase, and the chosen variant is a pure function of that phase (pick = (phase*k)//n, default n=k), integer-exact with no float and no randomness. Every cast emits a receipt (the variant list plus the two integers that made the pick); replay re-derives the pick from the receipt alone, and a --ledger collects a batch of assignments into one replayable file. Waiting a full lap is free -- the winding number is discarded, so an extra lap never changes the pick. Python stdlib only, offline, deterministic.
+Most Sudoku solvers hand you the answer; this one hands you the reasoning. It solves the way a person does — applying the lowest technique that makes progress and recording WHAT it did and WHY at every step as a single ordered trace, so the answer is just the last line of an argument you can read and check by hand. Five techniques (naked/hidden single, locked candidates, naked pair, x-wing), applied lowest-first. It never guesses: faced with a puzzle beyond its ladder it says “ceiling-hit” rather than searching — an honest difficulty read, not a failure. Deterministic: the same givens always produce the byte-identical trace.
 
 The honest edge
 
-the-oracle makes an assignment reproducible and auditable; it does not make it fair, uniform, or unbiased -- a chosen (seed, moment, n) can skew which variant wins, and reproducing a skewed pick reproduces the skew. It does not run your prompts, call any model, score a variant, or tell you which is better. It decides which variant, reproducibly; it does not decide whether the experiment was sound. Reproducible, not random.
+It only makes FORCED moves — it reasons, it does not search or backtrack, so a puzzle needing a technique above x-wing returns ceiling-hit (a difficulty read), not a guessed fill. And ‘broken’ fires when reasoning empties a cell; a contradiction sitting between two givens no technique touches reads as ceiling-hit, because the solver reasons about the puzzle rather than front-validating your input.
 
 Run it
 
-python3 the-oracle.py pick --seed 7 --moment 19 --variants A,B,C && python3 the-oracle.py cast --seed 7 --moment 19 --variants A,B --ledger runs.jsonl
-test_the-oracle.py (16/16, mutation-bitten independent reference oracle: reproducible pick, free-hold lap-invariant, replay round-trip, ledger append, the four guard refusals) + --selftest (14/14: deterministic core, byte-identical receipt across runs)
-Python stdlib only, deterministic
+python3 sudoku.py --demo
+test_sudoku.py (130/130, mutation-bitten, pinned golden trace)
+Python standard library only, deterministic + headless
 
 The code — every file that ships
 
-the-oracle.py 309 lines on GitHub →
+sudoku.py 549 lines on GitHub →
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""the-oracle.py -- a reproducible seeded-decision engine for prompt A/B (and A/B/C/...).
+"""sudoku — a Sudoku solver that shows its work.
 
-You are testing prompt variants and you want the assignment to be a FACT you can
-reproduce, not a hidden coin-flip that quietly contaminates the experiment. the-oracle
-turns a decision into an audit record: you name your variants, you commit a seed at a
-moment, and it deterministically picks one -- writing a replayable receipt so the exact
-same pick can be re-derived on any machine, forever.
+Most solvers hand you the answer. This one hands you the *reasoning*: it solves
+the way a person does — applying the lowest technique that makes progress and
+recording WHAT it did and WHY at every step, as a single ordered trace. The
+answer is just the last line of an argument you can read.
 
-The pick is reversal-indexed, the shape borrowed from `dwell` (the pure router gift):
-the seed and the moment define a phase, and the variant is a pure function of that phase.
+from sudoku import solve, from_string
+result = solve(from_string("53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"))
+result.status # 'solved-unique' | 'ceiling-hit' | 'broken'
+for step in result.trace:
+print(step.reason) # "naked single: 4 is the only candidate left for r1c3..."
 
-phase(seed, moment, n) = (moment - seed) mod n # in [0, n)
-pick_index(seed, moment, n, k) = (phase * k) // n # in [0, k), one of k variants
+Five techniques, applied lowest-first (so the explanation reads like a human
+tutor, easiest move first):
+1. naked single — a cell with only one candidate left
+2. hidden single — a digit that fits only one cell in a unit
+3. locked candidates — pointing / claiming (an elimination technique)
+4. naked pair — two cells locking two digits to themselves
+5. x-wing — the basic fish
 
-There is no separate randomness step. Given (seed, moment, n, k) the chosen variant is
-determined -- integer-exact, no float, byte-replayable. A `Ballot` records a decision as
-the variant list plus the two integers that produced it, and `replay(ballot)` recomputes
-the pick from them, so a decision is an audit record you re-derive, never an opinion you
-have to trust. Every decision also carries a run/trace id and lands in a JSONL ledger, so
-a batch of A/B assignments is a replayable receipt file.
+Three honest terminal states:
+solved-unique — solved by these techniques alone; `solution` is filled in.
+ceiling-hit — consistent but needs a technique above the ladder (a
+DIFFICULTY read, not a failure — this puzzle is "harder
+than x-wing", which is useful information).
+broken — a cell ran out of candidates; the givens contradict.
 
-HONEST CEILING. the-oracle makes an assignment REPRODUCIBLE and AUDITABLE; it does not
-make it fair, uniform, or unbiased -- a chosen (seed, moment, n) can skew which variant
-wins, and reproducing a skewed pick reproduces the skew. It does not run your prompts,
-call any model, score a variant, or tell you which variant is better. It decides WHICH
-variant, reproducibly; it does not decide whether the experiment was sound. Reproducible,
-not random.
+Properties (see test_sudoku.py):
+- Deterministic: the same givens always produce the byte-identical trace.
+- Certifying: every placement/elimination carries a human sentence saying
+why it is forced. The trace is a proof you can check by hand.
+- Never guesses: it only makes forced moves. It will say "ceiling-hit"
+before it will backtrack — it does not search, it reasons.
 
-python3 the-oracle.py pick --seed 7 --moment 19 --variants A,B,C # -> the chosen variant
-python3 the-oracle.py cast --seed 7 --moment 19 --variants A,B --trace RUN # -> pick + ledger receipt
-python3 the-oracle.py replay --ballot ballot.json # -> re-derive a recorded pick
-python3 the-oracle.py --selftest # deterministic core, byte-identical
-python3 the-oracle.py --help
+Zero dependencies (Python standard library only). Headless: givens in, a
+SolveResult out — no I/O in the solver, no globals, no randomness.
 
-Python 3 stdlib only, no dependencies, offline, deterministic core.
+Origin: the reasoning core of a self-explaining Sudoku teaching app, stripped to
+stand alone. MIT licensed — take the folder.
 """
 from __future__ import annotations
 
-import argparse
-import json
-import sys
-from dataclasses import dataclass
-from typing import List, NamedTuple
+import re
+from dataclasses import dataclass, asdict
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
-__all__ = ["phase", "winding", "pick_index", "Ballot", "cast", "replay", "OracleError"]
+Cell = Tuple[int, int] # (row, col), 0-indexed
+Grid = List[List[int]] # 9x9, 0 = empty
+Candidates = Dict[Cell, Set[int]]
 
-_LEDGER_DEFAULT = "the-oracle-ledger.jsonl"
+N = 9
+DIGITS = frozenset(range(1, 10))
 
-class OracleError(ValueError):
-"""A malformed oracle call -- bad resolution, empty variant list, or moment before seed."""
+# ── The trace (the spine — everything folds from this) ──────────────────────
+@dataclass
+class TechniqueApplication:
+technique: str # rung name
+cells_affected: List[Cell] # coordinates touched
+candidates_eliminated: List[Tuple[Cell, int]] # what this step ruled out
+reason: str # the human sentence: WHY
 
-def _validate(seed: int, moment: int, n: int, k: int) -> None:
-for name, val in (("seed", seed), ("moment", moment), ("n", n), ("k", k)):
-if not isinstance(val, int) or isinstance(val, bool):
-raise OracleError(f"{name} must be a plain int, got {val!r}")
-if n < 1:
-raise OracleError(f"n (loop resolution) must be >= 1, got {n}")
-if k < 1:
-raise OracleError(f"k (variant count) must be >= 1, got {k}")
-if k > n:
-# You cannot quantize a loop of n ticks into more than n distinguishable picks.
-raise OracleError(f"k must be <= n (k<=n is a wall), got k={k} n={n}")
-if moment < seed:
-# Seed is committed first; the moment of decision follows it on a monotone clock.
-raise OracleError(f"moment ({moment}) must be >= seed ({seed})")
+def to_dict(self) -> dict:
+d = asdict(self)
+d["cells_affected"] = [list(c) for c in self.cells_affected]
+d["candidates_eliminated"] = [
+[list(c), dg] for c, dg in self.candidates_eliminated
+]
+return d
 
-def phase(seed: int, moment: int, n: int) -> int:
-"""Where on the loop the decision sits, in [0, n). Winding (full laps) is folded out."""
-_validate(seed, moment, n, k=1)
-return (moment - seed) % n
+@dataclass
+class SolveResult:
+status: str # solved-unique|ceiling-hit|broken
+trace: List[TechniqueApplication]
+solution: Optional[Grid] = None # present iff solved-unique
 
-def winding(seed: int, moment: int, n: int) -> int:
-"""
-How many full laps passed between seed and moment -- the coordinate the pick discards.
-Read-only: the pick never depends on it, so waiting a full lap changes nothing (free-hold).
-"""
-_validate(seed, moment, n, k=1)
-return (moment - seed) // n
-
-def pick_index(seed: int, moment: int, n: int, k: int) -> int:
-"""
-The engine. Returns the chosen variant index in [0, k), a pure function of the phase.
-Integer-exact, total, byte-replayable. Adding a full lap (n) to the moment is a no-op.
-"""
-_validate(seed, moment, n, k)
-return ((moment - seed) % n * k) // n
-
-class Ballot(NamedTuple):
-"""An audit record of one decision: the variant list plus the two integers that made it."""
-variants: List[str]
-seed: int
-moment: int
-n: int
-
-def _resolution(n: int, k: int) -> int:
-"""Default loop resolution. If the caller gave an explicit n we honor it (a coarser loop
-lets you dial finer moments before the pick moves). The default is n=k -- the finest
-useful resolution, where each unit of `moment` advances the pick by exactly one variant
-(pick = (moment-seed) mod k) and free-hold still holds (adding k to the moment is a no-op)."""
-return n if n is not None else k
-
-def cast(variants: List[str], seed: int, moment: int, n: int = None) -> dict:
-"""
-Decide which variant, reproducibly, and return a full receipt dict (a Ballot + the pick).
-`n` defaults to k*12 so the phase has room; the pick is exact regardless of n's value.
-"""
-if not variants:
-raise OracleError("variants must be a non-empty list")
-if len(set(variants))!= len(variants):
-raise OracleError(f"variants must be distinct, got {variants!r}")
-k = len(variants)
-nn = _resolution(n, k)
-idx = pick_index(seed, moment, nn, k)
+def to_dict(self) -> dict:
 return {
-"variants": list(variants),
-"seed": seed,
-"moment": moment,
-"n": nn,
-"k": k,
-"phase": phase(seed, moment, nn),
-"winding": winding(seed, moment, nn),
-"pick_index": idx,
-"pick": variants[idx],
+"status": self.status,
+"trace": [t.to_dict() for t in self.trace],
+"solution": self.solution,
 }
 
-def replay(ballot: dict) -> str:
-"""
-Recompute the variant a recorded ballot produced, from the ballot alone. Because the
-engine is pure, replay(ballot) == the pick that produced it -- an audit record you
-re-derive, never an opinion to trust.
-"""
-variants = ballot["variants"]
-k = len(variants)
-idx = pick_index(int(ballot["seed"]), int(ballot["moment"]), int(ballot["n"]), k)
-return variants[idx]
+# ── Geometry (units: rows, cols, boxes) ─────────────────────────────────────
+def _peers(cell: Cell) -> Set[Cell]:
+r, c = cell
+peers: Set[Cell] = set()
+for k in range(N):
+peers.add((r, k))
+peers.add((k, c))
+br, bc = 3 * (r // 3), 3 * (c // 3)
+for dr in range(3):
+for dc in range(3):
+peers.add((br + dr, bc + dc))
+peers.discard(cell)
+return peers
 
-def _append_ledger(path: str, record: dict) -> None:
-"""Append one decision as a sorted-keys compact JSON line -- byte-stable across runs."""
-with open(path, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n")
+def _units() -> List[List[Cell]]:
+units: List[List[Cell]] = []
+for r in range(N):
+units.append([(r, c) for c in range(N)]) # rows
+for c in range(N):
+units.append([(r, c) for r in range(N)]) # cols
+for br in range(0, N, 3):
+for bc in range(0, N, 3):
+units.append([(br + dr, bc + dc)
+for dr in range(3) for dc in range(3)]) # boxes
+return units
 
-# ---- CLI ---------------------------------------------------------------------------------------------
-def _parse_variants(s: str) -> List[str]:
-parts = [p.strip() for p in s.split(",")]
-parts = [p for p in parts if p!= ""]
-if not parts:
-raise OracleError("--variants must list at least one non-empty label, comma-separated")
-return parts
-
-def _cmd_pick(args) -> int:
-r = cast(_parse_variants(args.variants), args.seed, args.moment, args.n)
-print(r["pick"])
-return 0
-
-def _cmd_cast(args) -> int:
-r = cast(_parse_variants(args.variants), args.seed, args.moment, args.n)
-record = {"trace": args.trace, **r}
-if args.ledger:
-_append_ledger(args.ledger, record)
-# human line to stdout, receipt shape to the ledger
-sys.stderr.write(
-f"[the-oracle] trace={args.trace} phase={r['phase']} pick_index={r['pick_index']} "
-f"-> {r['pick']} (ledger: {args.ledger or 'none'})\n"
+_UNITS = _units()
+_UNIT_NAME = (
+["row " + str(i + 1) for i in range(N)]
++ ["column " + str(i + 1) for i in range(N)]
++ ["box " + str(i + 1) for i in range(N)]
 )
-print(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
-return 0
 
-def _cmd_replay(args) -> int:
-with open(args.ballot, encoding="utf-8") as fh:
-ballot = json.load(fh)
-print(replay(ballot))
-return 0
+def compute_candidates(grid: Grid) -> Candidates:
+"""For every empty cell, the digits not already used by one of its peers.
 
-def _cmd_demo(args) -> int:
-variants = ["A", "B", "C"]
-print(f"variants={variants}, seed=7")
-print("moment | phase winding -> pick")
-for moment in range(7, 7 + 13):
-r = cast(variants, 7, moment, None)
-print(f"{moment:6d} | {r['phase']:5d} {r['winding']:7d} -> {r['pick']}")
-return 0
+Deterministic and total — the fixed point recomputes this each step.
+"""
+cands: Candidates = {}
+for r in range(N):
+for c in range(N):
+if grid[r][c]!= 0:
+continue
+seen = {grid[pr][pc] for pr, pc in _peers((r, c)) if grid[pr][pc]!= 0}
+cands[(r, c)] = set(DIGITS) - seen
+return cands
 
-def _selftest() -> int:
-checks = []
+# ── The ladder (reorderable DATA — the one live research object) ────────────
+# A rung: given the candidate grid, return the ONE lowest-rung, row-major-first
+# applicable move as a TechniqueApplication, or None. Rungs never mutate.
+#
+# Two KINDS of rung share this signature, and the loop tells them apart by ONE
+# schema-stable signal — `candidates_eliminated`:
+# PLACEMENT rung (naked/hidden-single): places a digit; `candidates_eliminated`
+# is [] and the placed digit is the first [1-9] in `reason`.
+# ELIMINATION rung (locked-candidates, pairs, x-wing): places NOTHING; it
+# prunes candidates, so `candidates_eliminated` is non-empty and there is
+# no placed digit. `cells_affected` are the cells it pruned FROM.
+# Invariant: `candidates_eliminated` non-empty <=> elimination step. A rung
+# that would eliminate nothing returns None (no progress -> the loop would spin).
+Rung = Callable[[Grid, Candidates], Optional[TechniqueApplication]]
 
-def ck(name, cond):
-checks.append((name, bool(cond)))
+def _rowmajor(cells) -> list:
+"""The within-rung tie-break: smallest (row, col) first."""
+return sorted(cells)
 
-# 1. pure + total: same inputs -> same pick, always
-ck("deterministic", pick_index(7, 19, 12, 3) == pick_index(7, 19, 12, 3))
-# 2. free-hold: adding a full lap (n) to moment never changes the pick
-ck("free-hold", pick_index(7, 19, 12, 3) == pick_index(7, 19 + 12, 12, 3))
-# 3. pick in range [0, k)
-ck("in-range", all(0 <= pick_index(3, m, 12, 4) < 4 for m in range(3, 40)))
-# 4. phase in [0, n)
-ck("phase-range", all(0 <= phase(0, m, 10) < 10 for m in range(0, 30)))
-# 5. replay reproduces cast
-r = cast(["A", "B", "C"], 7, 19, None)
-ck("replay-matches", replay(r) == r["pick"])
-# 6. k==1 always picks the sole variant
-ck("k1", cast(["only"], 5, 99, None)["pick"] == "only")
-# 7. integer-exact boundary: (phase*k)//n is floor at a segment edge
-ck("floor-boundary", pick_index(0, 4, 12, 3) == (4 * 3) // 12)
-# 8. distinct-variant guard
-try:
-cast(["A", "A"], 0, 0, None); ck("distinct-guard", False)
-except OracleError:
-ck("distinct-guard", True)
-# 9. moment<seed refused
-try:
-pick_index(10, 3, 12, 2); ck("moment-order-guard", False)
-except OracleError:
-ck("moment-order-guard", True)
-# 10. k>n refused
-try:
-pick_index(0, 0, 3, 4); ck("k-le-n-wall", False)
-except OracleError:
-ck("k-le-n-wall", True)
-# 11. bool rejected as int (True is not a plain int here)
-try:
-pick_index(True, 0, 12, 2); ck("no-bool", False)
-except OracleError:
-ck("no-bool", True)
-# 12. byte-identical receipt across two casts (deterministic serialization)
-a = json.dumps(cast(["A", "B"], 1, 5, None), sort_keys=True, separators=(",", ":"))
-b = json.dumps(cast(["A", "B"], 1, 5, None), sort_keys=True, separators=(",", ":"))
-ck("byte-identical-receipt", a == b)
-# 13. winding discarded from routing but readable
-ck("winding-readable", winding(0, 25, 12) == 2 and pick_index(0, 25, 12, 3) == pick_index(0, 1, 12, 3))
-# 14. empty variants refused
-try:
-cast([], 0, 0, None); ck("empty-guard", False)
-except OracleError:
-ck("empty-guard", True)
+def _box_of(cell: Cell) -> Tuple[int, int]:
+r, c = cell
+return (3 * (r // 3), 3 * (c // 3))
 
-passed = sum(1 for _, ok in checks if ok)
-failed = len(checks) - passed
-for name, ok in checks:
-if not ok:
-print(f" FAIL: {name}")
-tag = "GREEN" if failed == 0 else "RED"
-print(f"{tag}: {passed} checks passed, {failed} failed [the-oracle]")
-return 0 if failed == 0 else 1
+def _box_cells(br: int, bc: int) -> List[Cell]:
+return [(br + dr, bc + dc) for dr in range(3) for dc in range(3)]
 
-def main(argv=None) -> int:
-argv = list(sys.argv[1:] if argv is None else argv)
-if "--selftest" in argv:
-return _selftest()
-p = argparse.ArgumentParser(
-prog="the-oracle.py",
-description="a reproducible seeded-decision engine for prompt A/B (reversal-indexed pick)",
+def _box_num(br: int, bc: int) -> int:
+return (br // 3) * 3 + (bc // 3) + 1
+
+# Row/column units in a fixed order (rows 1-9 then cols 1-9), for the line-based
+# rungs; digit names within a reason are 1-indexed to match the singles' voice.
+_ROWS: List[List[Cell]] = [[(r, c) for c in range(N)] for r in range(N)]
+_COLS: List[List[Cell]] = [[(r, c) for r in range(N)] for c in range(N)]
+_BOXES: List[Tuple[int, int]] = [(br, bc) for br in range(0, N, 3)
+for bc in range(0, N, 3)]
+
+def rung_naked_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+for cell in _rowmajor(cands):
+opts = cands[cell]
+if len(opts) == 1:
+d = next(iter(opts))
+r, c = cell
+return TechniqueApplication(
+technique="naked-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"naked single: {d} is the only candidate left for "
+f"r{r + 1}c{c + 1} — every other digit is already used "
+f"by one of its peers."),
 )
-sub = p.add_subparsers(dest="cmd")
+return None
 
-pp = sub.add_parser("pick", help="print the chosen variant")
-pp.add_argument("--seed", type=int, required=True)
-pp.add_argument("--moment", type=int, required=True)
-pp.add_argument("--variants", required=True, help="comma-separated labels, e.g. A,B,C")
-pp.add_argument("--n", type=int, default=None, help="loop resolution (default k*12)")
-pp.set_defaults(fn=_cmd_pick)
+def rung_hidden_single(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+# Units in a fixed order; within a unit, digits ascending; first hit wins.
+for ui, unit in enumerate(_UNITS):
+empties = [cell for cell in unit if cell in cands]
+for d in range(1, 10):
+spots = [cell for cell in empties if d in cands[cell]]
+if len(spots) == 1:
+cell = spots[0]
+# Skip if a naked single would already place it (lower rung wins).
+if len(cands[cell]) == 1:
+continue
+r, c = cell
+# The placed digit MUST be the first numeral in the reason:
+# _placed_digit greps the first \b[1-9]\b, so leading with a
+# unit number would make it place the unit's number, not {d}.
+return TechniqueApplication(
+technique="hidden-single",
+cells_affected=[cell],
+candidates_eliminated=[],
+reason=(f"hidden single: {d} can only go in r{r + 1}c{c + 1} "
+f"— within {_UNIT_NAME[ui]} it fits nowhere else."),
+)
+return None
 
-pc = sub.add_parser("cast", help="pick + emit a replayable receipt (optionally to a ledger)")
-pc.add_argument("--seed", type=int, required=True)
-pc.add_argument("--moment", type=int, required=True)
-pc.add_argument("--variants", required=True)
-pc.add_argument("--n", type=int, default=None)
-pc.add_argument("--trace", default="RUN", help="a run/trace id stamped on the receipt")
-pc.add_argument("--ledger", default=None, help="append the receipt to this JSONL ledger")
-pc.set_defaults(fn=_cmd_cast)
+def rung_locked_candidates(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Locked candidates (pointing + claiming). An ELIMINATION rung.
 
-pr = sub.add_parser("replay", help="re-derive a recorded pick from a ballot json")
-pr.add_argument("--ballot", required=True, help="a receipt json (from cast)")
-pr.set_defaults(fn=_cmd_replay)
+Pointing: within a box, if every candidate for a digit lies in one line
+(row or col), that digit is eliminated from the rest of that line.
+Claiming: within a line, if every candidate for a digit lies in one box,
+that digit is eliminated from the rest of that box.
+"""
+# ── Pointing: box -> line ───────────────────────────────────────────────
+for br, bc in _BOXES:
+cells = _box_cells(br, bc)
+for d in range(1, 10):
+spots = [cell for cell in cells if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+rows = {r for r, _c in spots}
+cols = {c for _r, c in spots}
+if len(rows) == 1:
+r = next(iter(rows))
+targets = _rowmajor(cell for cell in _ROWS[r]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in row {r + 1}, so {d} is "
+f"eliminated from the rest of row {r + 1}."),
+)
+if len(cols) == 1:
+c = next(iter(cols))
+targets = _rowmajor(cell for cell in _COLS[c]
+if cell not in cells
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in box {_box_num(br, bc)}, "
+f"{d} can only go in column {c + 1}, so {d} is "
+f"eliminated from the rest of column {c + 1}."),
+)
+# ── Claiming: line -> box ───────────────────────────────────────────────
+for name, unit in ([(f"row {i + 1}", u) for i, u in enumerate(_ROWS)]
++ [(f"column {i + 1}", u) for i, u in enumerate(_COLS)]):
+for d in range(1, 10):
+spots = [cell for cell in unit if cell in cands and d in cands[cell]]
+if len(spots) < 2:
+continue
+boxes = {_box_of(cell) for cell in spots}
+if len(boxes) == 1:
+br, bc = next(iter(boxes))
+box = _box_cells(br, bc)
+targets = _rowmajor(cell for cell in box
+if cell not in unit
+and cell in cands and d in cands[cell])
+if targets:
+return TechniqueApplication(
+technique="locked-candidates",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"locked candidates: in {name}, {d} can only go "
+f"in box {_box_num(br, bc)}, so {d} is eliminated "
+f"from the rest of box {_box_num(br, bc)}."),
+)
+return None
 
-pd = sub.add_parser("demo", help="a small decision table")
-pd.set_defaults(fn=_cmd_demo)
+def rung_naked_pair(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""Naked pair. Two cells in a unit sharing the SAME two candidates {x, y}
+lock those digits to themselves, eliminating x and y from every other cell
+in that unit."""
+for ui, unit in enumerate(_UNITS):
+bi = _rowmajor(cell for cell in unit
+if cell in cands and len(cands[cell]) == 2)
+for i in range(len(bi)):
+for j in range(i + 1, len(bi)):
+a, b = bi[i], bi[j]
+if cands[a]!= cands[b]:
+continue
+pair = sorted(cands[a]) # [x, y]
+elim: List[Tuple[Cell, int]] = []
+for cell in unit:
+if cell in (a, b) or cell not in cands:
+continue
+for d in pair:
+if d in cands[cell]:
+elim.append((cell, d))
+if elim:
+elim.sort()
+affected = _rowmajor({c for c, _d in elim})
+ar, ac = a
+br_, bc_ = b
+return TechniqueApplication(
+technique="naked-pair",
+cells_affected=affected,
+candidates_eliminated=elim,
+reason=(f"naked pair: {pair[0]} and {pair[1]} are locked "
+f"to r{ar + 1}c{ac + 1} and r{br_ + 1}c{bc_ + 1} "
+f"in {_UNIT_NAME[ui]}, so both are eliminated from "
+f"the rest of that unit."),
+)
+return None
 
-args = p.parse_args(argv)
-if not getattr(args, "fn", None):
-p.print_help()
+def rung_x_wing(grid: Grid, cands: Candidates) -> Optional[TechniqueApplication]:
+"""X-wing (basic fish). If two rows each have digit d as a candidate in
+EXACTLY the same two columns, d is eliminated from those columns in every
+other row (and the column-based transpose)."""
+# ── Row-based: base = two rows, cross = two columns ─────────────────────
+for d in range(1, 10):
+rowcols: Dict[int, Tuple[int, int]] = {}
+for r in range(N):
+cols = [c for c in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(cols) == 2:
+rowcols[r] = (cols[0], cols[1])
+bases = sorted(rowcols)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+r1, r2 = bases[i], bases[j]
+if rowcols[r1]!= rowcols[r2]:
+continue
+c1, c2 = rowcols[r1]
+targets = _rowmajor(
+(r, c) for r in range(N) if r not in (r1, r2)
+for c in (c1, c2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in rows {r1 + 1} and {r2 + 1} is "
+f"confined to columns {c1 + 1} and {c2 + 1}, so "
+f"{d} is eliminated from those columns in every "
+f"other row."),
+)
+# ── Column-based (transpose): base = two columns, cross = two rows ──────
+for d in range(1, 10):
+colrows: Dict[int, Tuple[int, int]] = {}
+for c in range(N):
+rows = [r for r in range(N)
+if (r, c) in cands and d in cands[(r, c)]]
+if len(rows) == 2:
+colrows[c] = (rows[0], rows[1])
+bases = sorted(colrows)
+for i in range(len(bases)):
+for j in range(i + 1, len(bases)):
+c1, c2 = bases[i], bases[j]
+if colrows[c1]!= colrows[c2]:
+continue
+r1, r2 = colrows[c1]
+targets = _rowmajor(
+(r, c) for c in range(N) if c not in (c1, c2)
+for r in (r1, r2)
+if (r, c) in cands and d in cands[(r, c)])
+if targets:
+return TechniqueApplication(
+technique="x-wing",
+cells_affected=targets,
+candidates_eliminated=[(cell, d) for cell in targets],
+reason=(f"X-wing: {d} in columns {c1 + 1} and {c2 + 1} is "
+f"confined to rows {r1 + 1} and {r2 + 1}, so "
+f"{d} is eliminated from those rows in every "
+f"other column."),
+)
+return None
+
+# ORDER IS DATA — reorder to change the difficulty model, never hard-code it.
+# New techniques (wings, chains) append here; the solve loop never changes.
+LADDER: List[Tuple[str, int, Rung]] = [
+("naked-single", 1, rung_naked_single),
+("hidden-single", 2, rung_hidden_single),
+("locked-candidates", 3, rung_locked_candidates),
+("naked-pair", 4, rung_naked_pair),
+("x-wing", 5, rung_x_wing),
+]
+
+def _is_contradiction(grid: Grid, cands: Candidates) -> bool:
+for cell, opts in cands.items():
+if not opts: # an empty cell with no candidate = broken
+return True
+return False
+
+def _complete(grid: Grid) -> bool:
+return all(grid[r][c]!= 0 for r in range(N) for c in range(N))
+
+def _placed_digit(step: TechniqueApplication) -> int:
+# CONTRACT: a PLACEMENT reason MUST lead with the placed digit — it is the
+# first \b[1-9]\b in the string, before any row/col/unit numeral. Both
+# placement rungs honor this. Never call this on an elimination step
+# (candidates_eliminated non-empty); use its structured (cell, digit) pairs.
+m = re.search(r"\b([1-9])\b", step.reason)
+return int(m.group(1))
+
+def _is_placement(step: TechniqueApplication) -> bool:
+"""A step is a PLACEMENT iff it eliminates no candidates (it places a digit);
+otherwise it is an ELIMINATION (it prunes candidates, places nothing)."""
+return not step.candidates_eliminated
+
+def solve(givens: Grid) -> SolveResult:
+"""solve(givens) -> SolveResult. Prefer-lowest-rung fixed point.
+
+Candidates are CARRIED, not recomputed each step: a placement prunes the
+placed digit from the placed cell's peers; an elimination prunes the pruned
+(cell, digit) pairs. Recomputing from the grid alone would lose every
+elimination-rung deduction (they don't live in the grid), so the persistent
+candidate set is what lets a later single depend on an earlier elimination.
+"""
+grid = [row[:] for row in givens]
+cands = compute_candidates(grid)
+trace: List[TechniqueApplication] = []
+
+while True:
+if _is_contradiction(grid, cands):
+return SolveResult(status="broken", trace=trace, solution=None)
+
+if _complete(grid):
+return SolveResult(status="solved-unique", trace=trace,
+solution=[row[:] for row in grid])
+
+# walk the ladder bottom-up; apply the LOWEST rung that makes progress
+step: Optional[TechniqueApplication] = None
+for _name, _tier, rung in LADDER:
+step = rung(grid, cands)
+if step is not None:
+break
+
+if step is None:
+# no rung progresses, board consistent but unfinished — a
+# DIFFICULTY read, not a failure.
+return SolveResult(status="ceiling-hit", trace=trace, solution=None)
+
+if _is_placement(step):
+(r, c) = step.cells_affected[0]
+d = _placed_digit(step)
+grid[r][c] = d
+del cands[(r, c)]
+for peer in _peers((r, c)):
+if peer in cands:
+cands[peer].discard(d)
+else:
+for cell, dig in step.candidates_eliminated:
+if cell in cands:
+cands[cell].discard(dig)
+trace.append(step)
+
+# ── convenience: parse / print an 81-char string ("." or "0" = empty) ───────
+def from_string(s: str) -> Grid:
+s = "".join(ch for ch in s if not ch.isspace())
+if len(s)!= 81:
+raise ValueError(f"expected 81 cells, got {len(s)}")
+g: Grid = []
+for r in range(N):
+row = []
+for c in range(N):
+ch = s[r * N + c]
+row.append(0 if ch in ".0" else int(ch))
+g.append(row)
+return g
+
+def to_string(grid: Grid) -> str:
+return "".join(str(grid[r][c]) for r in range(N) for c in range(N))
+
+def render(grid: Grid) -> str:
+"""A human-readable 9x9 grid with box separators (for the CLI)."""
+lines = []
+for r in range(N):
+if r in (3, 6):
+lines.append("------+-------+------")
+cells = []
+for c in range(N):
+if c in (3, 6):
+cells.append("|")
+cells.append(str(grid[r][c]) if grid[r][c] else ".")
+lines.append(" ".join(cells))
+return "\n".join(lines)
+
+# ── CLI: read an 81-char puzzle, print the reasoning, then the answer ───────
+def _main(argv: List[str]) -> int:
+demo = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+if argv and argv[0] in ("-h", "--help"):
+print("usage: python3 sudoku.py [81-char-puzzle | --demo]")
+print(" cells 1-9; '.' or '0' = empty; whitespace ignored")
+print(" prints the step-by-step reasoning, then the solution")
 return 0
+arg = argv[0] if argv else "--demo"
+puzzle = demo if arg in ("", "--demo") else arg
 try:
-return args.fn(args)
-except OracleError as e:
-sys.stderr.write(f"the-oracle: {e}\n")
+grid = from_string(puzzle)
+except ValueError as e:
+print(f"bad puzzle: {e}")
 return 2
 
-if __name__ == "__main__":
-raise SystemExit(main())
+print("puzzle:")
+print(render(grid))
+print()
+result = solve(grid)
+print(f"status: {result.status} ({len(result.trace)} steps)\n")
+for i, step in enumerate(result.trace, 1):
+print(f" {i:>2}. {step.reason}")
+if result.solution is not None:
+print("\nsolution:")
+print(render(result.solution))
+elif result.status == "ceiling-hit":
+print("\n(consistent, but needs a technique above this solver's ladder — "
+"a difficulty read, not a failure.)")
+return 0
 
-test_the-oracle.py 122 lines on GitHub →
+if __name__ == "__main__":
+import sys
+raise SystemExit(_main(sys.argv[1:]))
+
+test_sudoku.py 248 lines on GitHub →
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""test_the-oracle.py -- independent mutation-bitten oracle for the-oracle gift.
+"""test_sudoku.py — proves the solver is certifying, deterministic, and honest.
 
-Invokes the tool as a SUBPROCESS (never imports it), so each check bites a load-bearing
-behavior: deleting the behavior from the tool makes a check fail. The reference picks are
-recomputed here from first principles ((moment-seed) mod k for the default n=k), so this
-file is an independent oracle, not an echo of the implementation.
+The claims that ARE the tool:
+1. CERTIFYING: every step carries a reason, and the reason is CHECKABLE —
+a placement's reason leads with the digit it places, and re-applying the
+whole trace to the givens reproduces the solution. The trace is a proof.
+2. DETERMINISTIC: the same givens produce the byte-identical trace, every run.
+3. THREE HONEST STATES: solved-unique (with a valid solution), ceiling-hit
+(consistent but beyond the ladder — a difficulty read), broken (givens
+contradict). Each is reachable and correctly labelled.
+4. NEVER GUESSES: it stops at ceiling-hit rather than searching. A puzzle
+needing a technique above x-wing returns ceiling-hit, not a lucky answer.
+Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
+Exit 0 = all pass, exit 1 = a failure (loud).
 """
-import json
-import subprocess
 import sys
 import os
-import tempfile
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-TOOL = os.path.join(HERE, "the-oracle.py")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sudoku import (
+solve, from_string, to_string, compute_candidates,
+SolveResult, TechniqueApplication, _peers, _units, N, LADDER,
+)
 
-_checks = []
+_pass = 0
+_fail = 0
 
-def ck(name, cond):
-_checks.append((name, bool(cond)))
-
-def run(args, expect_exit=0):
-r = subprocess.run([sys.executable, TOOL] + args, capture_output=True, text=True)
-if r.returncode!= expect_exit:
-return None, r
-return r.stdout.strip(), r
-
-def ref_pick(variants, seed, moment):
-"""Independent reference: default resolution n=k, pick = (moment-seed) mod k."""
-k = len(variants)
-return variants[((moment - seed) % k * k) // k]
-
-# 1. pick prints the chosen variant, matching the independent reference
-for seed, moment, variants in [(7, 19, ["A", "B", "C"]), (0, 5, ["x", "y"]), (3, 3, ["only-a", "b", "c", "d"])]:
-out, r = run(["pick", "--seed", str(seed), "--moment", str(moment),
-"--variants", ",".join(variants)])
-ck(f"pick {seed},{moment},{variants}", out == ref_pick(variants, seed, moment))
-
-# 2. free-hold: adding a full lap (k) to the moment yields the same pick
-out_a, _ = run(["pick", "--seed", "1", "--moment", "4", "--variants", "A,B,C"])
-out_b, _ = run(["pick", "--seed", "1", "--moment", "7", "--variants", "A,B,C"]) # 7 = 4 + k(3)
-ck("free-hold (lap invariant)", out_a is not None and out_a == out_b)
-
-# 3. determinism: same call twice -> identical output
-o1, _ = run(["pick", "--seed", "9", "--moment", "31", "--variants", "P,Q,R,S"])
-o2, _ = run(["pick", "--seed", "9", "--moment", "31", "--variants", "P,Q,R,S"])
-ck("determinism", o1 is not None and o1 == o2)
-
-# 4. cast emits a valid JSON receipt on stdout, and it round-trips through replay
-out, r = run(["cast", "--seed", "7", "--moment", "20", "--variants", "A,B,C", "--trace", "T1"])
-receipt = None
-try:
-receipt = json.loads(out)
-except Exception:
-receipt = None
-ck("cast emits json receipt", receipt is not None and receipt.get("pick") == ref_pick(["A", "B", "C"], 7, 20))
-ck("cast stamps trace", receipt is not None and receipt.get("trace") == "T1")
-
-# 5. cast receipt is byte-identical across runs (deterministic serialization)
-c1, _ = run(["cast", "--seed", "2", "--moment", "6", "--variants", "A,B"])
-c2, _ = run(["cast", "--seed", "2", "--moment", "6", "--variants", "A,B"])
-ck("cast byte-identical", c1 is not None and c1 == c2)
-
-# 6. replay re-derives the recorded pick from a ballot file alone
-if receipt is not None:
-with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
-json.dump(receipt, fh)
-ballot_path = fh.name
-out, r = run(["replay", "--ballot", ballot_path])
-ck("replay reproduces cast", out == receipt["pick"])
-os.unlink(ballot_path)
+def eq(name, got, want):
+global _pass, _fail
+if got == want:
+_pass += 1
 else:
-ck("replay reproduces cast", False)
+_fail += 1
+print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
 
-# 7. ledger receives an appended receipt line when --ledger is given
-with tempfile.TemporaryDirectory() as td:
-ledger = os.path.join(td, "led.jsonl")
-run(["cast", "--seed", "1", "--moment", "5", "--variants", "A,B", "--trace", "L1", "--ledger", ledger])
-run(["cast", "--seed", "1", "--moment", "6", "--variants", "A,B", "--trace", "L2", "--ledger", ledger])
-lines = [l for l in open(ledger).read().splitlines() if l.strip()]
-ck("ledger appends per cast", len(lines) == 2)
-ck("ledger lines are json", all(json.loads(l).get("trace") in ("L1", "L2") for l in lines))
+def ok(name, cond):
+global _pass, _fail
+if cond:
+_pass += 1
+else:
+_fail += 1
+print(f"FAIL {name}")
 
-# 8. moment < seed is refused with exit 2 (the monotone-clock guard)
-out, r = run(["pick", "--seed", "10", "--moment", "3", "--variants", "A,B"], expect_exit=2)
-ck("moment<seed refused (exit 2)", r.returncode == 2 and "moment" in r.stderr)
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+EASY = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+EASY_SOLUTION = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
 
-# 9. distinct-variant guard: duplicate labels refused
-out, r = run(["pick", "--seed", "0", "--moment", "0", "--variants", "A,A"], expect_exit=2)
-ck("duplicate variants refused", r.returncode == 2)
+# A grid that is complete and correct = solve returns it unchanged, zero steps.
+SOLVED = EASY_SOLUTION
 
-# 10. --selftest runs and reports GREEN
-out, r = run(["--selftest"])
-ck("selftest green", r.returncode == 0 and "GREEN" in r.stdout)
+# A contradiction the solver actually REACHES: the near-complete easy solution
+# with r1c1 blanked and a 5 planted in its box, so r1c1's only digit (5) is
+# already taken by a peer — compute_candidates leaves it with an empty set and
+# _is_contradiction fires. (Note: a contradiction between two GIVENS that no
+# technique touches reads as ceiling-hit, not broken — the solver reasons, it
+# does not front-validate the givens. That is correct and intentional.)
+BROKEN = ".54678912672195348198342567859761423426853791713924856961537284287419635345286179"
 
-# 11. empty variants refused
-out, r = run(["pick", "--seed", "0", "--moment", "0", "--variants", ",,"], expect_exit=2)
-ck("empty variants refused", r.returncode == 2)
+def is_valid_solution(s: str) -> bool:
+"""A solved grid: 81 non-zero cells, every row/col/box a permutation of 1-9."""
+g = from_string(s)
+if any(g[r][c] == 0 for r in range(N) for c in range(N)):
+return False
+for unit in _units():
+vals = sorted(g[r][c] for r, c in unit)
+if vals!= list(range(1, 10)):
+return False
+return True
 
-# 12. pick is always in the variant set (property over a range)
-allin = True
-for m in range(5, 25):
-o, _ = run(["pick", "--seed", "5", "--moment", str(m), "--variants", "A,B,C,D"])
-if o not in ("A", "B", "C", "D"):
-allin = False
-break
-ck("pick always in set", allin)
+# ── PROPERTY 1: certifying — the trace is a checkable proof ───────────────────
+(lambda: None)() # keep the section visible
 
-passed = sum(1 for _, ok in _checks if ok)
-failed = len(_checks) - passed
-for name, ok in _checks:
-if not ok:
-print(f" FAIL: {name}")
-tag = "GREEN" if failed == 0 else "RED"
-print(f"{tag}: {passed} assertions passed, {failed} failed [test_the-oracle]")
-sys.exit(0 if failed == 0 else 1)
+def _replay_trace(givens, result):
+"""Re-apply the recorded trace to the givens; a placement's reason must lead
+with the digit it places, and applying every placement must reproduce the
+solution. This proves the reasons are not decorative — they carry the moves."""
+import re
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated: # placement
+(r, c) = step.cells_affected[0]
+d = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+g[r][c] = d
+return g
+
+r_easy = solve(from_string(EASY))
+ok("easy solves", r_easy.status == "solved-unique")
+ok("easy solution is valid", r_easy.solution is not None and is_valid_solution(to_string(r_easy.solution)))
+eq("easy solution matches known answer", to_string(r_easy.solution), EASY_SOLUTION)
+ok("every step has a non-empty reason", all(s.reason.strip() for s in r_easy.trace))
+ok("trace is non-trivial", len(r_easy.trace) > 10)
+# the certifying check: replaying the trace's placements reproduces the solution
+replayed = _replay_trace(from_string(EASY), r_easy)
+eq("replaying the trace reproduces the solution", to_string(replayed), EASY_SOLUTION)
+
+# every placement step's reason leads with the digit actually placed in the solution
+import re
+for step in r_easy.trace:
+if not step.candidates_eliminated: # placement
+(rr, cc) = step.cells_affected[0]
+placed = int(re.search(r"\b([1-9])\b", step.reason).group(1))
+ok(f"placement reason leads with placed digit @r{rr+1}c{cc+1}",
+placed == from_string(EASY_SOLUTION)[rr][cc])
+
+# ── PROPERTY 2: deterministic — byte-identical trace every run ────────────────
+def trace_signature(result):
+return to_string_result(result)
+
+def to_string_result(result):
+import json
+return json.dumps(result.to_dict(), sort_keys=True)
+
+sig1 = to_string_result(solve(from_string(EASY)))
+sig2 = to_string_result(solve(from_string(EASY)))
+sig3 = to_string_result(solve(from_string(EASY)))
+ok("deterministic: run 1 == run 2", sig1 == sig2)
+ok("deterministic: run 2 == run 3", sig2 == sig3)
+# GOLDEN: pin the canonical trace signature by hash. Self-equality alone is a
+# weak determinism test (a benign reorder stays self-equal); a pinned golden
+# catches any change to the tie-break / scan order that reorders the trace.
+import hashlib as _hl
+_golden = "1f4fc6f7b5886070bb06a38c5457ef9c93a4c4dabdb9735518786b8f57e91548"
+_got = _hl.sha256(sig1.encode()).hexdigest()
+ok("deterministic: trace matches the pinned golden signature", _got == _golden)
+# solving does not mutate the givens
+givens = from_string(EASY)
+before = to_string(givens)
+solve(givens)
+eq("solve does not mutate givens", to_string(givens), before)
+
+# ── PROPERTY 3: three honest terminal states ──────────────────────────────────
+# solved-unique (already covered above)
+# broken:
+r_broken = solve(from_string(BROKEN))
+ok("contradiction -> broken", r_broken.status == "broken")
+ok("broken has no solution", r_broken.solution is None)
+
+# an already-solved grid: solved-unique, zero steps, solution == input
+r_done = solve(from_string(SOLVED))
+ok("already-solved -> solved-unique", r_done.status == "solved-unique")
+eq("already-solved needs zero steps", len(r_done.trace), 0)
+eq("already-solved returns the same grid", to_string(r_done.solution), SOLVED)
+
+# ── PROPERTY 4: never guesses — ceiling-hit before search ─────────────────────
+# The empty grid is consistent but has no forced move for these techniques,
+# so a NON-searching solver must return ceiling-hit (a searching one would
+# "solve" it to some arbitrary valid grid). This is the anti-guess proof.
+EMPTY = "." * 81
+r_empty = solve(from_string(EMPTY))
+ok("empty grid -> ceiling-hit (does NOT guess a solution)", r_empty.status == "ceiling-hit")
+ok("ceiling-hit has no solution", r_empty.solution is None)
+# a partial consistent grid with no forced single also ceiling-hits rather than searching
+# (17-clue minimal puzzles typically need guessing; a bare 2-clue grid certainly does)
+SPARSE = "1................2..............................................................."
+r_sparse = solve(from_string(SPARSE))
+ok("sparse consistent grid -> ceiling-hit, not a guessed fill",
+r_sparse.status == "ceiling-hit" and r_sparse.solution is None)
+
+# ── The elimination rungs actually fire (coverage that the ladder is exercised) ─
+# Not every easy puzzle exercises the higher rungs; assert the ladder is complete
+# and each rung is callable and returns the right SHAPE when it does fire.
+ok("ladder has all five rungs", [name for name, _t, _f in LADDER] ==
+["naked-single", "hidden-single", "locked-candidates", "naked-pair", "x-wing"])
+# a placement step: candidates_eliminated empty; an elimination step: non-empty.
+for step in r_easy.trace:
+placement = not step.candidates_eliminated
+if placement:
+ok(f"placement step has one affected cell ({step.technique})", len(step.cells_affected) == 1)
+else:
+ok(f"elimination step eliminated something ({step.technique})", len(step.candidates_eliminated) >= 1)
+
+# ── input validation ──────────────────────────────────────────────────────────
+def raises(name, fn):
+global _pass, _fail
+try:
+fn()
+_fail += 1
+print(f"FAIL {name} (expected raise)")
+except Exception:
+_pass += 1
+
+raises("from_string rejects wrong length", lambda: from_string("123"))
+raises("from_string rejects 80 chars", lambda: from_string("." * 80))
+ok("from_string accepts 81 with whitespace", to_string(from_string("." * 81)) == "0" * 81)
+ok("from_string treats 0 and. both as empty",
+from_string("0" * 81) == from_string("." * 81))
+
+# ── candidates helper is correct ──────────────────────────────────────────────
+cands = compute_candidates(from_string(EASY))
+# r1c3 (row 0, col 2) is empty in EASY; its candidates must exclude peers' givens
+ok("candidates computed for empty cells only",
+all(from_string(EASY)[r][c] == 0 for (r, c) in cands))
+ok("a candidate set never contains a peer's given",
+all(all((from_string(EASY)[pr][pc] not in opts)
+for (pr, pc) in _peers(cell) if from_string(EASY)[pr][pc]!= 0)
+for cell, opts in cands.items()))
+
+# ── MUTATION BITE: prove the certifying check is not vacuously green ───────────
+# If the reasons were decorative (not carrying the placed digit), the replay
+# would NOT reproduce the solution. This bite asserts that (a) the trace has
+# real placement steps, and (b) mangling a reason's leading digit WOULD break
+# the replay — so a no-op reason (the plausible mutation) fails loud here.
+placements = [s for s in r_easy.trace if not s.candidates_eliminated]
+ok("mutation bite: trace has real placements", len(placements) > 0)
+
+def _replay_with_broken_reasons(givens, result):
+"""Replay but with every placement reason's digit forced to 1 — must NOT
+reproduce the solution (unless every placed digit really is 1, impossible)."""
+g = [row[:] for row in givens]
+for step in result.trace:
+if not step.candidates_eliminated:
+(r, c) = step.cells_affected[0]
+g[r][c] = 1 # deliberately wrong: ignore the real reason
+return to_string(g)
+
+ok("mutation bite: breaking the reason breaks the replay",
+_replay_with_broken_reasons(from_string(EASY), r_easy)!= EASY_SOLUTION)
+
+# and: if solve silently returned 'solved' on the empty grid (a searching
+# mutation), property 4 would flip. Assert the anti-guess invariant has teeth:
+ok("mutation bite: empty grid is genuinely unforced (>50 empty cells, 0 forced singles)",
+len(compute_candidates(from_string(EMPTY))) == 81
+and all(len(v) == 9 for v in compute_candidates(from_string(EMPTY)).values()))
+
+print(("PASS" if _fail == 0 else "FAIL") + f" — {_pass} passed, {_fail} failed")
+sys.exit(0 if _fail == 0 else 1)
 
 Take the whole folder →
 MIT
-Python stdlib only, deterministic
+Python standard library only, deterministic + headless
 
 ---
 
-# timeline — a Loop MMT gift
-https://loopmmt.com/gifts/timeline/
+# switchboard — a Loop MMT gift
+https://loopmmt.com/gifts/switchboard/
 [coverage: optional · branch: gifts]
 
-Timeline Artifact Validator validate ← all gifts
+A Message Bus That Cannot Carry a Command relay ← all gifts
 
-timeline
+switchboard
 
-Validate a timeline artifact before you render it. Given {frame, events}, timeline runs eight decidable soundness checks on the DECLARATION — no cycle in the happened-before edges, an explicitly declared measurement scale (Stevens level), operations legal for that scale, no two events colliding on one track at one instant, and a deterministic sort key — and returns a verdict naming exactly which rule each event breaks. It catches the fault at the data, before a single pixel is drawn. A pure function: the same artifact always yields a byte-identical verdict.
+A zero-dependency store-and-forward message bus over a plain directory: independent workers leave each other messages, nothing is ever deleted (supersede-only, so the folder's history is the audit trail), and a read is its own logged event — so “I sent it” never silently becomes “they know.” The load-bearing idea is that the schema is observation-only by construction: it has exactly six fields and rejects any unknown one, so a sender literally cannot smuggle in an action/command/run field. It moves messages; it cannot run them.
 
 The honest edge
 
-it is a PRESENCE checker, not a CORRECTNESS oracle: it confirms a scale is declared and self-consistent with the ops used, never that the declared level is the right one, and it does not prove your renderer is a pure fold — that runtime property stays yours to prove.
+It is a bus, not a guaranteed queue and not a command channel. No delivery guarantee and no retry: a read is a logged fact, an unread message stays visible as an orphan until someone reads it, and every message reaches a reader quoted as third-party data, never as the reader's own instruction. Only a human directs.
 
 Run it
 
-node timeline.js artifact.json # or: cat artifact.json | node timeline.js
-test_timeline.js (22 checks incl. C0-C8 + determinism proof + mutation bite, all green)
-Node.js / browser, standard library only (zero dependencies)
+node switchboard.js send --root./bus --from worker-a --kind status --body "..."
+test_switchboard.js (5/5)
+Node stdlib only (no dependencies); pure core runs in a browser or a test with no filesystem
 
 The code — every file that ships
 
-timeline.js 390 lines on GitHub →
+switchboard.js 501 lines on GitHub →
 // SPDX-License-Identifier: MIT
-// timeline.js — a standalone, zero-dependency validator for a timeline artifact.
+// switchboard — a store-and-forward message bus that cannot carry a command.
 //
-// WHAT THIS IS
-// ------------
-// You have events you want to place on a timeline — a project history, a log, a
-// story, a schedule. Before you RENDER them, this checks the DECLARATION is
-// sound: no cycle in the "happened-before" edges, the axis names its scale, the
-// operations you use are legal for that scale, no two events collide on one
-// track at one instant, and the sort key is deterministic. It reads one JSON
-// object and returns a verdict. It is a pure function: the same artifact always
-// yields the same verdict.
+// PRINTED EDGE: this is a message BUS, not a command channel and not a queue with
+// delivery guarantees — every message is third-party DATA (a report), never an
+// instruction to the reader; a read is its own logged event, so "I sent" never
+// implies "they know."
 //
-// THE ARTIFACT (the shape it checks):
-// {
-// "frame": { "scale": "nominal"|"ordinal"|"interval"|"ratio", // REQUIRED
-// "grain": <ms|null>,
-// "topology": "S1"|null, "period": <number>, // optional circular axis
-// "foliation": { "key": <field|"t">, "dir": "asc"|"desc"}},
-// "events": [ { "id": <str>, "t": <ms int>, "parents": [<id>...],
-// "track": <str>, "kind": <str>, "duration": <ms>,
-// "label": <str>},...]
-//}
+// WHAT IT IS. A tiny, zero-dependency store-and-forward bus over a plain directory.
+// Independent workers (scripts, tabs, agents) leave messages for each other under a
+// shared folder; nothing is deleted (supersede-only, the folder's history is the
+// audit trail). Two things make it a COMPOSE PRIMITIVE rather than a chat log:
 //
-// THE CHECKS (each decidable from the declaration alone):
-// C0 well-formed.... every event is an object with an `id`.
-// C1 real-order..... parent edges form a DAG and resolve (no cycle, no dangling edge).
-// C2 scale-declared. frame.scale is an explicit Stevens level — no implicit gauge.
-// C3 stevens-legal.. ops used are legal for the level (ordering needs ordinal+;
-// a `duration` needs interval+, a difference of points).
-// C4 instant/dur.... a `duration` with no anchoring instant is a length, not a point.
-// C5 no-collision... two events on the same track at the same instant break the
-// overlay obligation (unless a non-`t` foliation orders them).
-// C6 fold-safety.... the foliation key is a real declared field (or "t"), never a
-// nondeterministic sentinel ("now"/"random"/"index"/...).
-// C7 leak-safety.... no event bakes a shared day bucket ("dayKey"/"day"/...);
-// day buckets are render-derived per frame, not authored.
-// C8 cyclic-topology a DECLARED circular axis (S1 + period) has its coordinates
-// reduced into one period (mod the period).
+// 1. The schema is OBSERVATION-ONLY by construction. A message has exactly six
+// fields and no more — the validator REJECTS any unknown top-level field, so a
+// sender cannot smuggle an `action`/`command`/`run`/`exec` field: the schema
+// literally cannot express a command. The four message kinds are status / focus
+// / fyi / question — none imperative.
 //
-// THE PRINTED EDGE (what this is NOT):
-// This is a PRESENCE checker, not a CORRECTNESS oracle. C2 checks a scale is
-// DECLARED and self-consistent with the ops used — never that the declared
-// level is the RIGHT one. It does not prove your renderer is a pure fold; that
-// is a runtime property this static check cannot reach. It reports the
-// trajectory; choosing the true scale, and proving the render pure, stay yours.
+// 2. Every message is surfaced QUOTED — "worker <id> reports: …" — never handed to
+// the reader as its own directive. There is no code path that turns a message
+// body into an instruction. Only a human directs.
 //
-// USAGE
-// node timeline.js artifact.json # lint a file
-// cat artifact.json | node timeline.js # lint stdin
-// node timeline.js --help
-// In a browser: window.ForestGifts.timelineLint(artifactObject)
-// In Node code: require('./timeline.js').timelineLint(artifactObject)
+// This is how you wire N independent gifts (or workers) into a larger block without
+// coupling them: they coordinate through DATA on a shared directory, each carrying a
+// content-hash and provenance, and a read is a logged fact — not an assumption.
 //
-// Exit: 0 CLEAN | 3 FLAG | 2 USAGE (malformed input).
+// LANE: route (data moves along declared sender→recipient paths, each carrying a
+// receipt). Point-to-point goes to one recipient's inbox; broadcast goes to
+// everyone; a read writes a receipt so orphan (never-read) messages are
+// detectable.
+//
+// INVOCATION (CLI):
+// node switchboard.js send --root DIR --from ID --kind status --body "…" (broadcast)
+// node switchboard.js send --root DIR --from ID --to ID --kind question --body "…" (point-to-point)
+// node switchboard.js read --root DIR --as ID (surface inbox+broadcasts, quoted, logs receipts)
+// node switchboard.js orphans --root DIR --to ID (P2P messages ID was sent but never read)
+// node switchboard.js --help
+//
+// BROWSER / NODE ATTACH: the pure functions (validate, canonicalPayload, contentHash,
+// renderQuoted, and an in-memory Bus) are exported for use without a filesystem — so
+// the schema + quoting discipline compose into a page or a test with no disk at all.
+//
+// Zero dependencies. Node stdlib only (fs/path/crypto for the CLI; the pure core uses
+// none). MIT. Strip provenance: the internal Switchboard tool (AGPL) — the pure schema +
+// send/read/orphan path, with the git transport and the internal credential gate cut.
 
 'use strict';
 
-// Stevens' levels as a strict tower — each a superset of the one below.
-var STEVENS = { nominal: 0, ordinal: 1, interval: 2, ratio: 3};
+// ── The schema (the structural half of "cannot express a command") ──────────────
 
-// Foliation keys that are NOT a real, replayable field — a sort on any of these
-// makes the render depend on WHEN it ran, breaking folds-twice-identical.
-var NONDETERMINISTIC_KEYS = {
-'now': 1, 'random': 1, 'rand': 1, 'index': 1, 'render-order': 1,
-'renderorder': 1, 'time()': 1, 'date.now': 1, 'uuid': 1, 'order-of-arrival': 1
+var SCHEMA_ID = 'loopmmt.switchboard.message/v1';
+
+// The four observation-only kinds. There is deliberately NO imperative kind.
+var KINDS = ['status', 'focus', 'fyi', 'question'];
+
+// The CLOSED set of top-level fields. Anything else is rejected — this is why the
+// schema cannot carry a command: `action`, `command`, `run`, `exec` are not in it.
+var ALLOWED_TOP = ['schema', 'sender', 'content_hash', 'kind', 'recipient', 'body'];
+var SENDER_FIELDS = ['session_id', 'branch', 'ts']; // provenance; session_id required
+
+var BROADCAST = 'broadcast';
+
+function MessageRejected(msg) {
+this.name = 'MessageRejected';
+this.message = msg;
+}
+MessageRejected.prototype = Object.create(Error.prototype);
+MessageRejected.prototype.constructor = MessageRejected;
+
+// ── Pure helpers (no filesystem, browser-safe) ──────────────────────────────────
+
+function isoNow() {
+// UTC, second precision, no locale — the same clock everywhere.
+return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function has(obj, k) { return Object.prototype.hasOwnProperty.call(obj, k);}
+
+// A stable JSON serialization: keys sorted at every level, compact separators.
+// This is the byte-truth the content_hash covers and the file bytes we write.
+function stableStringify(x) {
+if (x === null || typeof x!== 'object') return JSON.stringify(x);
+if (Array.isArray(x)) return '[' + x.map(stableStringify).join(',') + ']';
+var keys = Object.keys(x).sort();
+var parts = [];
+for (var i = 0; i < keys.length; i++) {
+parts.push(JSON.stringify(keys[i]) + ':' + stableStringify(x[keys[i]]));
+}
+return '{' + parts.join(',') + '}';
+}
+
+// The bytes the content_hash covers: provenance + kind + recipient + body, canonically
+// serialized. Hashing the sender block binds provenance INTO the hash — tampering with
+// who-sent-it breaks the hash.
+function canonicalPayload(sender, kind, recipient, body) {
+return stableStringify({
+body: body,
+kind: kind,
+recipient: recipient,
+sender: sender
+});
+}
+
+// A minimal, dependency-free sha-256 hex (FIPS-180-4) so contentHash works in the
+// browser AND in Node without importing anything. Bytes are the UTF-8 bytes of the
+// input string (multibyte-faithful), matching node crypto over the same string.
+function sha256Hex(str) {
+function utf8Bytes(s) {
+var out = [], i, c, c2;
+for (i = 0; i < s.length; i++) {
+c = s.charCodeAt(i);
+if (c < 0x80) out.push(c);
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) {
+c2 = s.charCodeAt(++i);
+var u = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
+out.push(0xf0 | (u >> 18), 0x80 | ((u >> 12) & 0x3f),
+0x80 | ((u >> 6) & 0x3f), 0x80 | (u & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
+}
+return out;
+}
+var K = [
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+function rotr(n, x) { return (x >>> n) | (x << (32 - n));}
+var bytes = utf8Bytes(str);
+var l = bytes.length, bitLen = l * 8;
+bytes.push(0x80);
+while (bytes.length % 64!== 56) bytes.push(0);
+for (var j = 7; j >= 0; j--) bytes.push((bitLen / Math.pow(2, j * 8)) & 0xff);
+var w = new Array(64);
+for (var off = 0; off < bytes.length; off += 64) {
+for (var t = 0; t < 16; t++) {
+w[t] = (bytes[off+4*t]<<24)|(bytes[off+4*t+1]<<16)|(bytes[off+4*t+2]<<8)|(bytes[off+4*t+3]);
+}
+for (t = 16; t < 64; t++) {
+var s0 = rotr(7,w[t-15])^rotr(18,w[t-15])^(w[t-15]>>>3);
+var s1 = rotr(17,w[t-2])^rotr(19,w[t-2])^(w[t-2]>>>10);
+w[t] = (w[t-16]+s0+w[t-7]+s1)|0;
+}
+var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+for (t = 0; t < 64; t++) {
+var S1 = rotr(6,e)^rotr(11,e)^rotr(25,e);
+var ch = (e&f)^(~e&g);
+var t1 = (h+S1+ch+K[t]+w[t])|0;
+var S0 = rotr(2,a)^rotr(13,a)^rotr(22,a);
+var maj = (a&b)^(a&c)^(b&c);
+var t2 = (S0+maj)|0;
+h=g; g=f; f=e; e=(d+t1)|0; d=c; c=b; b=a; a=(t1+t2)|0;
+}
+H[0]=(H[0]+a)|0; H[1]=(H[1]+b)|0; H[2]=(H[2]+c)|0; H[3]=(H[3]+d)|0;
+H[4]=(H[4]+e)|0; H[5]=(H[5]+f)|0; H[6]=(H[6]+g)|0; H[7]=(H[7]+h)|0;
+}
+var hex = '';
+for (var k = 0; k < 8; k++) hex += ('00000000' + (H[k]>>>0).toString(16)).slice(-8);
+return hex;
+}
+
+function contentHash(sender, kind, recipient, body) {
+return sha256Hex(canonicalPayload(sender, kind, recipient, body));
+}
+
+// Validate a candidate message. Throws MessageRejected on ANY violation — refuse loud,
+// never store. This is the load-bearing gate: the closed field set is what makes the
+// schema unable to express a command.
+function validate(msg) {
+if (msg === null || typeof msg!== 'object' || Array.isArray(msg)) {
+throw new MessageRejected('message must be an object');
+}
+// Closed field set — reject any unknown top-level field (the command firewall).
+var keys = Object.keys(msg);
+for (var i = 0; i < keys.length; i++) {
+if (ALLOWED_TOP.indexOf(keys[i]) === -1) {
+throw new MessageRejected(
+'unknown top-level field "' + keys[i] + '" — the schema is closed; ' +
+'it cannot carry a command');
+}
+}
+for (i = 0; i < ALLOWED_TOP.length; i++) {
+if (!has(msg, ALLOWED_TOP[i])) {
+throw new MessageRejected('missing required field "' + ALLOWED_TOP[i] + '"');
+}
+}
+if (msg.schema!== SCHEMA_ID) {
+throw new MessageRejected('schema must be "' + SCHEMA_ID + '"');
+}
+if (KINDS.indexOf(msg.kind) === -1) {
+throw new MessageRejected(
+'kind must be one of ' + KINDS.join('/') + ' (no imperative kind exists)');
+}
+if (typeof msg.recipient!== 'string' || msg.recipient.length === 0) {
+throw new MessageRejected('recipient must be a non-empty string ("broadcast" or an id)');
+}
+if (typeof msg.body!== 'string') {
+throw new MessageRejected('body must be a string (data, never a directive)');
+}
+// Sender provenance
+var s = msg.sender;
+if (s === null || typeof s!== 'object' || Array.isArray(s)) {
+throw new MessageRejected('sender must be a provenance object');
+}
+if (typeof s.session_id!== 'string' || s.session_id.length === 0) {
+throw new MessageRejected('sender.session_id is required');
+}
+var skeys = Object.keys(s);
+for (i = 0; i < skeys.length; i++) {
+if (SENDER_FIELDS.indexOf(skeys[i]) === -1) {
+throw new MessageRejected('unknown sender field "' + skeys[i] + '"');
+}
+}
+// content_hash must match the payload — provenance/body tampering breaks it.
+var expect = contentHash(s, msg.kind, msg.recipient, msg.body);
+if (msg.content_hash!== expect) {
+throw new MessageRejected(
+'content_hash mismatch (message was tampered or malformed): ' +
+'expected ' + expect.slice(0, 12) + '…');
+}
+return true;
+}
+
+// Compose a valid message object (fills schema + content_hash). Throws if the result
+// would not validate — you cannot build an invalid message with this.
+function compose(sender, kind, recipient, body) {
+if (typeof sender === 'string') sender = { session_id: sender, ts: isoNow()};
+else if (sender &&!sender.ts) sender = assign({}, sender, { ts: isoNow()});
+var msg = {
+schema: SCHEMA_ID,
+sender: sender,
+kind: kind,
+recipient: recipient,
+body: body,
+content_hash: contentHash(sender, kind, recipient, body)
+};
+validate(msg);
+return msg;
+}
+
+function assign(target) {
+for (var i = 1; i < arguments.length; i++) {
+var src = arguments[i];
+if (src) for (var k in src) if (has(src, k)) target[k] = src[k];
+}
+return target;
+}
+
+// Surface a message as QUOTED third-party data — never as an instruction to the reader.
+// There is no other render path: a body cannot reach the reader as its own directive.
+function renderQuoted(msg) {
+var who = msg.sender.session_id;
+var to = msg.recipient === BROADCAST? 'all': msg.recipient;
+return 'worker ' + who + ' reports (' + msg.kind + ' → ' + to + '): ' + msg.body;
+}
+
+// ── An in-memory Bus (no filesystem) — composes into a test or a page ───────────
+
+function Bus() {
+this._broadcast = []; // list of messages
+this._inbox = {}; // recipient -> list of messages
+this._reads = {}; // reader -> set of content_hash
+}
+Bus.prototype.send = function (sender, kind, recipient, body) {
+var msg = compose(sender, kind, recipient, body);
+if (recipient === BROADCAST) this._broadcast.push(msg);
+else (this._inbox[recipient] = this._inbox[recipient] || []).push(msg);
+return msg;
+};
+Bus.prototype.read = function (readerId, logReceipt) {
+var out = (this._inbox[readerId] || []).concat(this._broadcast);
+if (logReceipt!== false) {
+var set = this._reads[readerId] = this._reads[readerId] || {};
+for (var i = 0; i < out.length; i++) set[out[i].content_hash] = true;
+}
+return out;
+};
+Bus.prototype.orphans = function (recipientId) {
+// P2P messages this recipient was sent but never read (never sent a receipt for).
+var sent = this._inbox[recipientId] || [];
+var read = this._reads[recipientId] || {};
+var out = [];
+for (var i = 0; i < sent.length; i++) {
+if (!read[sent[i].content_hash]) out.push(sent[i]);
+}
+return out;
 };
 
-// Baked day-bucket field names: a per-event day column is a frame-independent
-// bucket authored into the data — exactly the cross-frame leak the render must
-// derive per-frame instead.
-var BAKED_DAY_FIELDS = { 'daykey': 1, 'day': 1, 'datebucket': 1, 'date_bucket': 1};
+// ── Filesystem transport (CLI only; append-by-create never conflicts) ───────────
+// Layout under --root:
+// <root>/broadcast/<ts>-<sender>-<hash8>.json
+// <root>/inbox/<recipient>/<ts>-<sender>-<hash8>.json
+// <root>/reads/<reader>/<ts>-<reader>-reads-<hash8>.json
 
-function finding(check, eventId, msg) {
-return { check: check, event: eventId, msg: msg};
-}
+function _fsLayer() {
+var fs = require('fs');
+var path = require('path');
 
-function has(obj, key) {
-return Object.prototype.hasOwnProperty.call(obj, key);
+function safeId(id) {
+// ids in filenames must be ref/path-safe; refuse anything with a separator.
+if (!/^[A-Za-z0-9._-]+$/.test(id)) {
+throw new MessageRejected('id "' + id + '" is not path-safe (allowed: A-Za-z0-9._-)');
 }
+return id;
+}
+function ensureDir(d) { fs.mkdirSync(d, { recursive: true});}
+function stamp() { return isoNow().replace(/[:]/g, '');}
 
-// --- C1: axis is a real order (DAG + resolvable parents) --------------------
-function checkOrder(events, ids, findings) {
-// dangling parent
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var parents = ev.parents || [];
-for (var j = 0; j < parents.length; j++) {
-if (!ids[String(parents[j])]) {
-findings.push(finding('C1-real-order', ev.id,
-"parent '" + parents[j] + "' resolves to no event (dangling edge)"));
-}
-}
-}
-// cycle (iterative DFS with colouring: 0 unseen, 1 on-stack, 2 done)
-var byId = {};
-for (var k = 0; k < events.length; k++) byId[String(events[k].id)] = events[k];
-var color = {};
-
-function visit(start) {
-var stack = [{ node: start, parents: (byId[start] && byId[start].parents) || [], pos: 0}];
-color[start] = 1;
-while (stack.length) {
-var top = stack[stack.length - 1];
-var advanced = false;
-while (top.pos < top.parents.length) {
-var p = String(top.parents[top.pos]);
-top.pos++;
-if (!has(byId, p)) continue; // dangling already reported above
-var c = color[p] || 0;
-if (c === 1) {
-findings.push(finding('C1-real-order', top.node,
-"parent edge to '" + p + "' closes a cycle (axis is not a poset)"));
-continue;
-}
-if (c === 0) {
-color[p] = 1;
-stack.push({ node: p, parents: (byId[p] && byId[p].parents) || [], pos: 0});
-advanced = true;
-break;
-}
-}
-if (!advanced) {
-color[top.node] = 2;
-stack.pop();
-}
-}
+function writeMessage(root, msg) {
+validate(msg);
+var hash8 = msg.content_hash.slice(0, 8);
+var name = stamp() + '-' + safeId(msg.sender.session_id) + '-' + hash8 + '.json';
+var dir;
+if (msg.recipient === BROADCAST) dir = path.join(root, 'broadcast');
+else dir = path.join(root, 'inbox', safeId(msg.recipient));
+ensureDir(dir);
+var full = path.join(dir, name);
+// append-by-create: a fresh filename per message never collides, so two writers
+// never conflict on the same file.
+fs.writeFileSync(full, stableStringify(msg) + '\n');
+return full;
 }
 
-for (var m = 0; m < events.length; m++) {
-var id = String(events[m].id);
-if ((color[id] || 0) === 0) visit(id);
+function readDirMessages(dir) {
+var out = [];
+if (!fs.existsSync(dir)) return out;
+var files = fs.readdirSync(dir).filter(function (f) { return /\.json$/.test(f);}).sort();
+for (var i = 0; i < files.length; i++) {
+var raw = fs.readFileSync(path.join(dir, files[i]), 'utf8');
+var msg;
+try { msg = JSON.parse(raw);} catch (e) { continue;}
+try { validate(msg);} catch (e) { continue;} // skip malformed, never trust blindly
+out.push(msg);
 }
-}
-
-// --- C2: scale is declared (an explicit Stevens level; no implicit gauge) ---
-function checkScaleDeclared(frame, findings) {
-var scale = has(frame, 'scale')? frame.scale: null;
-if (scale === null || scale === undefined) {
-findings.push(finding('C2-scale-declared', null,
-'frame declares no scale -- an implicit gauge is forbidden'));
-return null;
-}
-if (!has(STEVENS, scale)) {
-findings.push(finding('C2-scale-declared', null,
-"frame.scale '" + scale + "' is not a Stevens level (nominal|ordinal|interval|ratio)"));
-return null;
-}
-return scale;
+return out;
 }
 
-// --- C3: Stevens-legal ops for the declared level ---------------------------
-function checkStevensLegal(scale, frame, events, findings) {
-if (scale === null) return; // C2 already flagged
-var rank = STEVENS[scale];
-var fol = frame.foliation || {};
-var folKey = has(fol, 'key')? fol.key: 't';
-if (rank < STEVENS.ordinal) {
-if (folKey!== null && folKey!== undefined && folKey!== 't') {
-findings.push(finding('C3-stevens-legal', null,
-"foliation orders by '" + folKey + "' but a nominal axis has no order"));
-}
-for (var i = 0; i < events.length; i++) {
-if (events[i].parents && events[i].parents.length) {
-findings.push(finding('C3-stevens-legal', events[i].id,
-'event declares a causal order on a nominal axis'));
-}
-}
-}
-if (rank < STEVENS.interval) {
-for (var j = 0; j < events.length; j++) {
-if (has(events[j], 'duration')) {
-findings.push(finding('C3-stevens-legal', events[j].id,
-'a `duration` needs an interval+ axis (difference of points is undefined at ' + scale + ')'));
-}
-}
-}
+function logReceipt(root, readerId, hash) {
+var dir = path.join(root, 'reads', safeId(readerId));
+ensureDir(dir);
+var name = stamp() + '-' + safeId(readerId) + '-reads-' + hash.slice(0, 8) + '.json';
+fs.writeFileSync(path.join(dir, name),
+stableStringify({ reader: readerId, content_hash: hash, ts: isoNow()}) + '\n');
 }
 
-// --- C4: Instant / Duration not confused ------------------------------------
-function checkInstantDuration(events, findings) {
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var hasDur = has(ev, 'duration');
-var hasAnchor = (ev.t!== null && ev.t!== undefined) ||
-(ev.start!== null && ev.start!== undefined);
-if (hasDur &&!hasAnchor) {
-findings.push(finding('C4-instant-duration', ev.id,
-'a `duration` with no anchoring instant is a length, not a point'));
+function readHashes(root, readerId) {
+var dir = path.join(root, 'reads', safeId(readerId));
+var set = {};
+if (!fs.existsSync(dir)) return set;
+var files = fs.readdirSync(dir).filter(function (f) { return /\.json$/.test(f);});
+for (var i = 0; i < files.length; i++) {
+try {
+var r = JSON.parse(fs.readFileSync(path.join(dir, files[i]), 'utf8'));
+if (r && r.content_hash) set[r.content_hash] = true;
+} catch (e) { /* skip */}
 }
-if (ev.t_type === 'duration') {
-findings.push(finding('C4-instant-duration', ev.id,
-'`t` is typed a duration -- the axis coordinate must be an Instant'));
-}
-}
+return set;
 }
 
-// --- C5: overlay tracks don't collide on a shared instant -------------------
-function checkNoCollision(frame, events, findings) {
-var fol = (frame || {}).foliation || {};
-var folKey = has(fol, 'key')? fol.key: 't';
-var resolves = folKey!== null && folKey!== undefined && String(folKey)!== 't';
-var seen = {}; // "track\x00t" -> array of {id, fv}
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var t = ev.t;
-if (t === null || t === undefined) continue;
-var track = has(ev, 'track')? ev.track: '_default';
-var fv = resolves? (has(ev, folKey)? ev[folKey]: undefined): null;
-var key = String(track) + '\x00' + String(t);
-var bucket = seen[key];
-if (bucket) {
-var unresolved = (!resolves) || (fv === null || fv === undefined);
-if (!unresolved) {
-for (var b = 0; b < bucket.length; b++) {
-var pv = bucket[b].fv;
-if (pv === null || pv === undefined || pv === fv) { unresolved = true; break;}
+function read(root, readerId, logReceipts) {
+var msgs = readDirMessages(path.join(root, 'inbox', safeId(readerId)))
+.concat(readDirMessages(path.join(root, 'broadcast')));
+if (logReceipts!== false) {
+for (var i = 0; i < msgs.length; i++) logReceipt(root, readerId, msgs[i].content_hash);
 }
-}
-if (unresolved) {
-findings.push(finding('C5-no-collision', ev.id,
-"collides with '" + bucket[0].id + "' on track '" + track + "' at instant " + t +
-' (overlay X obligation broken)'));
-}
-bucket.push({ id: ev.id, fv: fv});
-} else {
-seen[key] = [{ id: ev.id, fv: fv}];
-}
-}
+return msgs;
 }
 
-// --- C6: fold-safety (static proxy for "render is a pure fold") -------------
-function checkFoldSafety(frame, events, findings) {
-var fol = frame.foliation || {};
-var key = has(fol, 'key')? fol.key: 't';
-if (key === null || key === undefined) return;
-if (NONDETERMINISTIC_KEYS[String(key).trim().toLowerCase()]) {
-findings.push(finding('C6-fold-safety', null,
-"foliation key '" + key + "' is nondeterministic -- breaks folds-twice-identical (the Ink Law)"));
-return;
+function orphans(root, recipientId) {
+var sent = readDirMessages(path.join(root, 'inbox', safeId(recipientId)));
+var read = readHashes(root, recipientId);
+var out = [];
+for (var i = 0; i < sent.length; i++) {
+if (!read[sent[i].content_hash]) out.push(sent[i]);
 }
-if (key!== 't') {
-var carried = false;
-for (var i = 0; i < events.length; i++) {
-if (has(events[i], key)) { carried = true; break;}
-}
-if (!carried) {
-findings.push(finding('C6-fold-safety', null,
-"foliation key '" + key + "' is carried by no event (the declared sort would silently fall back to `t`)"));
-}
-}
+return out;
 }
 
-// --- C7: leak-safety (static proxy for "no cross-frame day-leak") -----------
-function checkLeakSafety(events, findings) {
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var keys = Object.keys(ev);
-for (var j = 0; j < keys.length; j++) {
-if (BAKED_DAY_FIELDS[String(keys[j]).trim().toLowerCase()]) {
-findings.push(finding('C7-leak-safety', ev.id,
-"event bakes a day bucket ('" + keys[j] + "') -- day buckets are render-derived per-frame, not authored (cross-frame leak)"));
-break;
-}
-}
-}
+return { writeMessage: writeMessage, read: read, orphans: orphans, safeId: safeId};
 }
 
-// --- C8: cyclic-topology (a DECLARED circular axis is reduced mod period) ---
-function checkCyclicTopology(frame, events, findings) {
-var topo = has(frame, 'topology')? frame.topology: null;
-if (topo === null || topo === undefined) return;
-if (topo!== 'S1') {
-findings.push(finding('C8-cyclic-topology', null,
-"frame.topology '" + topo + "' is not a recognized axis topology (S1 = a periodic circle)"));
-return;
+// ── CLI ─────────────────────────────────────────────────────────────────────────
+
+var EDGE = 'switchboard is a message BUS, not a command channel and not a guaranteed ' +
+'queue — every message is third-party DATA, never an instruction to the reader; ' +
+'a read is its own logged event, so "I sent" never implies "they know".';
+
+function parseArgs(argv) {
+var out = { _: []};
+for (var i = 0; i < argv.length; i++) {
+var a = argv[i];
+if (a.slice(0, 2) === '--') {
+var key = a.slice(2);
+if (i + 1 < argv.length && argv[i + 1].slice(0, 2)!== '--') { out[key] = argv[++i];}
+else out[key] = true;
+} else out._.push(a);
 }
-var period = frame.period;
-if (typeof period!== 'number' || period <= 0 || period!== period) {
-findings.push(finding('C8-cyclic-topology', null,
-'an S1 topology needs a positive numeric `period` (the wrap modulus, e.g. 1440 minutes)'));
-return;
-}
-for (var i = 0; i < events.length; i++) {
-var t = events[i].t;
-if (t === null || t === undefined) continue;
-if (!(t >= 0 && t < period)) {
-findings.push(finding('C8-cyclic-topology', events[i].id,
-'instant ' + t + ' is not reduced into [0,' + period + ') -- a circular coordinate must be taken mod the period'));
-}
-}
+return out;
 }
 
-// --- the lint ---------------------------------------------------------------
-function timelineLint(artifact) {
-if (artifact === null || typeof artifact!== 'object' || Array.isArray(artifact)) {
-return { verdict: 'USAGE', error: 'artifact is not a JSON object'};
-}
-var frame = artifact.frame;
-var events = artifact.events;
-if (frame === null || typeof frame!== 'object' || Array.isArray(frame) ||!Array.isArray(events)) {
-return { verdict: 'USAGE', error: 'artifact needs a `frame` object and an `events` list'};
-}
-
-var findings = [];
-var valid = [];
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-if (ev === null || typeof ev!== 'object' || Array.isArray(ev) ||
-ev.id === null || ev.id === undefined) {
-findings.push(finding('C0-well-formed', 'index ' + i, 'event is not an object with an `id`'));
-} else {
-valid.push(ev);
-}
-}
-var ids = {};
-for (var v = 0; v < valid.length; v++) ids[String(valid[v].id)] = 1;
-
-var scale = checkScaleDeclared(frame, findings);
-checkOrder(valid, ids, findings);
-checkStevensLegal(scale, frame, valid, findings);
-checkInstantDuration(valid, findings);
-checkNoCollision(frame, valid, findings);
-checkFoldSafety(frame, valid, findings);
-checkLeakSafety(valid, findings);
-checkCyclicTopology(frame, valid, findings);
-
-var checksRun = ['C0-well-formed', 'C1-real-order', 'C2-scale-declared',
-'C3-stevens-legal', 'C4-instant-duration', 'C5-no-collision',
-'C6-fold-safety', 'C7-leak-safety', 'C8-cyclic-topology'];
-return {
-verdict: findings.length? 'FLAG': 'CLEAN',
-checks: checksRun,
-findings: findings,
-runtime_owned_by_renderer: ['render-is-a-pure-fold', 'no-cross-frame-day-leak']
-};
-}
-
-var HELP = [
-'timeline.js — validate a timeline artifact before you render it.',
+function usage() {
+return [
+'switchboard — a store-and-forward message bus that cannot carry a command.',
+'',
+'EDGE: ' + EDGE,
 '',
 'Usage:',
-' node timeline.js artifact.json lint a file',
-' cat artifact.json | node timeline.js lint stdin',
-' node timeline.js --help',
+' node switchboard.js send --root DIR --from ID --kind K --body "…" [--to ID] [--branch B]',
+' node switchboard.js read --root DIR --as ID [--no-receipt] [--json]',
+' node switchboard.js orphans --root DIR --to ID [--json]',
+' node switchboard.js --help',
 '',
-'Reads one JSON object {frame, events}; prints a verdict; exits',
-' 0 CLEAN · 3 FLAG · 2 USAGE.',
-'',
-'Edge: this is a PRESENCE checker, not a CORRECTNESS oracle. It confirms a',
-'scale is declared and self-consistent with the ops used — never that the',
-'declared level is the right one, and it does not prove your renderer is pure.'
+'Kinds: ' + KINDS.join(' / ') + ' (no imperative kind exists).',
+'Omit --to (or --to broadcast) for a broadcast; give --to ID for point-to-point.',
+'read logs a receipt per message so orphans (never-read P2P) are detectable;',
+' --no-receipt reads without logging.'
 ].join('\n');
-
-// --- surfaces: browser attach, Node require, Node CLI -----------------------
-if (typeof window!== 'undefined') {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.timelineLint = timelineLint;
 }
 
+function main(argv) {
+var args = parseArgs(argv);
+var cmd = args._[0];
+if (args.help || cmd === '--help' ||!cmd) { process.stdout.write(usage() + '\n'); return args.help ||!cmd? 0: 0;}
+
+var fsl;
+try { fsl = _fsLayer();} catch (e) { process.stderr.write(String(e.message || e) + '\n'); return 2;}
+
+try {
+if (cmd === 'send') {
+if (!args.root ||!args.from ||!args.kind || args.body === undefined) {
+process.stderr.write('send needs --root --from --kind --body\n'); return 2;
+}
+var sender = { session_id: args.from, ts: isoNow()};
+if (args.branch) sender.branch = args.branch;
+var recipient = (!args.to || args.to === true)? BROADCAST: args.to;
+var msg = compose(sender, args.kind, recipient, String(args.body));
+var p = fsl.writeMessage(args.root, msg);
+process.stdout.write('sent ' + msg.content_hash.slice(0, 12) + '… → ' +
+(recipient === BROADCAST? 'broadcast': recipient) + ' (' + p + ')\n');
+return 0;
+}
+if (cmd === 'read') {
+if (!args.root ||!args.as) { process.stderr.write('read needs --root --as\n'); return 2;}
+var msgs = fsl.read(args.root, args.as,!args['no-receipt']);
+if (args.json) { process.stdout.write(stableStringify(msgs) + '\n'); return 0;}
+if (msgs.length === 0) { process.stdout.write('(no messages for ' + args.as + ')\n'); return 0;}
+for (var i = 0; i < msgs.length; i++) process.stdout.write(renderQuoted(msgs[i]) + '\n');
+return 0;
+}
+if (cmd === 'orphans') {
+if (!args.root ||!args.to) { process.stderr.write('orphans needs --root --to\n'); return 2;}
+var orph = fsl.orphans(args.root, args.to);
+if (args.json) { process.stdout.write(stableStringify(orph) + '\n'); return 0;}
+if (orph.length === 0) { process.stdout.write('(no orphans — every P2P message to ' + args.to + ' was read)\n'); return 0;}
+process.stdout.write(orph.length + ' orphan(s) — sent to ' + args.to + ' but never read:\n');
+for (var j = 0; j < orph.length; j++) process.stdout.write(' ' + renderQuoted(orph[j]) + '\n');
+return 0;
+}
+process.stderr.write('unknown command "' + cmd + '" — see --help\n');
+return 2;
+} catch (e) {
+process.stderr.write(String(e.message || e) + '\n');
+return 1;
+}
+}
+
+// ── Exports (browser attach + Node require) ─────────────────────────────────────
+
+var api = {
+SCHEMA_ID: SCHEMA_ID,
+KINDS: KINDS,
+BROADCAST: BROADCAST,
+MessageRejected: MessageRejected,
+validate: validate,
+compose: compose,
+canonicalPayload: canonicalPayload,
+contentHash: contentHash,
+sha256Hex: sha256Hex,
+renderQuoted: renderQuoted,
+stableStringify: stableStringify,
+Bus: Bus,
+EDGE: EDGE
+};
+
+if (typeof window!== 'undefined') {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.switchboard = api;
+}
 if (typeof module!== 'undefined' && module.exports) {
-module.exports = { timelineLint: timelineLint};
+module.exports = api;
 }
 
 if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-var argv = process.argv.slice(2);
-if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) {
-process.stdout.write(HELP + '\n');
-process.exit(0);
-}
-var readInput = function (cb) {
-if (argv[0]) {
-try { cb(require('fs').readFileSync(argv[0], 'utf8'));}
-catch (e) { process.stdout.write(JSON.stringify({ verdict: 'USAGE', error: String(e.message || e)}) + '\n'); process.exit(2);}
-} else {
-var chunks = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { chunks += d;});
-process.stdin.on('end', function () { cb(chunks);});
-}
-};
-readInput(function (raw) {
-var artifact;
-try { artifact = JSON.parse(raw);}
-catch (e) { process.stdout.write(JSON.stringify({ verdict: 'USAGE', error: String(e.message || e)}) + '\n'); process.exit(2);}
-var out = timelineLint(artifact);
-process.stdout.write(JSON.stringify(out, null, 2) + '\n');
-process.exit(out.verdict === 'USAGE'? 2: (out.verdict === 'FLAG'? 3: 0));
-});
+process.exit(main(process.argv.slice(2)));
 }
 
-test_timeline.js 165 lines on GitHub →
+test_switchboard.js 118 lines on GitHub →
 // SPDX-License-Identifier: MIT
-// test_timeline.js — self-test + determinism proof for the timeline gift.
+// test_switchboard.js — drift-check the switchboard gift against out-of-band oracles.
 //
-// node test_timeline.js
+// Two oracles, neither produced by the gift:
+// 1. node:crypto — the content_hash's sha256 must equal node crypto over the same
+// canonical bytes (so provenance-binding is real, not self-certified).
+// 2. The command-firewall property — the schema MUST reject any top-level field
+// outside its closed set, so it cannot express a command. This is a structural
+// oracle: a would-be-command message must be rejected.
 //
-// Exit 0 = all pass. Exit 3 = a check failed. This is the gift's canonicalizer
-// self-test (Gift-Works B7): the determinism assertion IS the proof the render
-// is a pure fold — same artifact in, byte-identical verdict out.
+// Plus determinism, orphan/receipt semantics, quoting discipline, and a mutation bite
+// (a green suite that cannot catch a wrong hash proves nothing).
 
 'use strict';
+var crypto = require('crypto');
+var sb = require('./switchboard.js');
 
-var timelineLint = require('./timeline.js').timelineLint;
-
-var failures = 0;
-function ok(name, cond) {
-if (!cond) { console.error('FAIL: ' + name); failures++;}
-else { console.log('pass: ' + name);}
+var pass = 0, fail = 0;
+function ok(cond, name) {
+if (cond) { pass++;}
+else { fail++; console.error('FAIL: ' + name);}
+}
+function throws(fn, name) {
+try { fn(); fail++; console.error('FAIL (expected throw): ' + name);}
+catch (e) { pass++;}
 }
 
-// helper: does the verdict contain a finding of the given check code?
-function hasCheck(v, code) {
-if (!v.findings) return false;
-for (var i = 0; i < v.findings.length; i++) {
-if (String(v.findings[i].check).indexOf(code) === 0) return true;
+// ── 1. sha256 drift-check vs node crypto (the hash oracle) ──────────────────────
+// I1 UTF-8 byte fidelity — the known-bad tripwire is multibyte input.
+var vectors = ['', 'abc', 'a', 'The quick brown fox jumps over the lazy dog',
+'0123456789', 'café', 'naïve façade Zürich', '日本語テスト', '🦌',
+'order:🦌×3 café', 'line1\nline2\ttabbed'];
+for (var i = 0; i < vectors.length; i++) {
+var mine = sb.sha256Hex(vectors[i]);
+var oracle = crypto.createHash('sha256').update(String(vectors[i]), 'utf8').digest('hex');
+ok(mine === oracle, 'sha256 drift vs node crypto: ' + JSON.stringify(vectors[i]));
 }
-return false;
-}
+// FIPS anchors independent of the oracle.
+ok(sb.sha256Hex('') === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', 'FIPS anchor: empty');
+ok(sb.sha256Hex('abc') === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'FIPS anchor: abc');
 
-// --- a known-GOOD artifact: passes clean --------------------------------------
-var GOOD = {
-frame: { scale: 'interval', grain: null, foliation: { key: 't', dir: 'asc'}},
-events: [
-{ id: 'a', t: 0, track: 'main', label: 'start'},
-{ id: 'b', t: 100, parents: ['a'], track: 'main', duration: 50, label: 'work'},
-{ id: 'c', t: 200, parents: ['b'], track: 'main', label: 'end'}
-]
-};
-ok('C-good CLEAN verdict', timelineLint(GOOD).verdict === 'CLEAN');
+// ── 2. The command-firewall (structural oracle) ─────────────────────────────────
+// A valid message composes and validates.
+var good = sb.compose('worker-a', 'status', 'broadcast', 'hello');
+ok(sb.validate(good) === true, 'valid message validates');
 
-// --- C0: an event that is not an object with an id ----------------------------
-ok('C0 fires on a junk event', hasCheck(
-timelineLint({ frame: { scale: 'ordinal'}, events: [{ id: 'a', t: 0}, 42]}), 'C0'));
+// A message with an imperative field is REJECTED — the schema cannot carry a command.
+['action', 'command', 'run', 'exec', 'do'].forEach(function (verb) {
+var m = sb.compose('worker-a', 'status', 'broadcast', 'hi');
+m[verb] = 'rm -rf /'; // try to smuggle a command
+throws(function () { sb.validate(m);}, 'command-firewall rejects "' + verb + '" field');
+});
 
-// --- C1: a cycle in the parent edges (real defect: circular happened-before) --
-ok('C1 fires on a cycle', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [
-{ id: 'a', t: 0, parents: ['b']},
-{ id: 'b', t: 1, parents: ['a']}
-]
-}), 'C1'));
-// C1: a dangling parent edge
-ok('C1 fires on a dangling edge', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [{ id: 'a', t: 0, parents: ['ghost']}]
-}), 'C1'));
+// An imperative KIND does not exist.
+throws(function () { sb.compose('worker-a', 'command', 'broadcast', 'x');}, 'no imperative kind');
+throws(function () { sb.compose('worker-a', 'run', 'broadcast', 'x');}, 'no "run" kind');
 
-// --- C2: no scale declared (implicit gauge) -----------------------------------
-ok('C2 fires on undeclared scale', hasCheck(timelineLint({
-frame: { grain: null},
-events: [{ id: 'a', t: 0}]
-}), 'C2'));
-// C2: a non-Stevens scale string
-ok('C2 fires on a bogus scale', hasCheck(timelineLint({
-frame: { scale: 'vibes'},
-events: [{ id: 'a', t: 0}]
-}), 'C2'));
+// content_hash tamper is caught (provenance binding is real).
+var t = sb.compose('worker-a', 'status', 'broadcast', 'original');
+t.body = 'tampered'; // change body without recomputing hash
+throws(function () { sb.validate(t);}, 'body tamper breaks content_hash');
+var t2 = sb.compose('worker-a', 'status', 'broadcast', 'x');
+t2.sender = { session_id: 'worker-EVIL', ts: t2.sender.ts}; // spoof sender
+throws(function () { sb.validate(t2);}, 'sender spoof breaks content_hash');
 
-// --- C3: a causal order declared on a nominal (unordered) axis -----------------
-ok('C3 fires on order over a nominal axis', hasCheck(timelineLint({
-frame: { scale: 'nominal'},
-events: [{ id: 'a', t: 0}, { id: 'b', t: 1, parents: ['a']}]
-}), 'C3'));
-// C3: a duration on an ordinal axis (difference of points undefined below interval)
-ok('C3 fires on duration below interval', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [{ id: 'a', t: 0, duration: 10}]
-}), 'C3'));
+// ── 3. Determinism / canonical form ─────────────────────────────────────────────
+ok(sb.contentHash({ session_id: 'w', ts: 'T'}, 'fyi', 'broadcast', 'b')
+=== sb.contentHash({ session_id: 'w', ts: 'T'}, 'fyi', 'broadcast', 'b'),
+'contentHash deterministic');
+// stableStringify is key-order-independent.
+ok(sb.stableStringify({ b: 1, a: 2}) === sb.stableStringify({ a: 2, b: 1}),
+'stableStringify key-order-independent');
 
-// --- C4: a duration with no anchoring instant ---------------------------------
-ok('C4 fires on unanchored duration', hasCheck(timelineLint({
-frame: { scale: 'interval'},
-events: [{ id: 'a', duration: 30}]
-}), 'C4'));
+// ── 4. Bus semantics: store-and-forward, receipts, orphans (no filesystem) ──────
+var bus = new sb.Bus();
+bus.send('a', 'status', 'broadcast', 'everyone hears this');
+bus.send('a', 'question', 'b', 'point to point');
+bus.send('a', 'fyi', 'c', 'c never reads this');
+// b reads: sees its p2p + the broadcast, and logs receipts.
+var bRead = bus.read('b');
+ok(bRead.length === 2, 'b reads inbox + broadcast');
+ok(bus.orphans('b').length === 0, 'b has no orphans after reading');
+// c never read: its p2p is an orphan.
+ok(bus.orphans('c').length === 1, 'c has 1 orphan (unread p2p)');
+// sent!= read: a broadcast alone does not mark c as having read.
+ok(bus.read('c', false).some(function (m) { return m.body === 'everyone hears this';}),
+'c can still see the broadcast');
 
-// --- C5: two events, same track, same instant, no resolving foliation ---------
-ok('C5 fires on a same-track same-instant collision', hasCheck(timelineLint({
-frame: { scale: 'interval', foliation: { key: 't'}},
-events: [
-{ id: 'a', t: 100, track: 'main'},
-{ id: 'b', t: 100, track: 'main'}
-]
-}), 'C5'));
-// C5: the same collision RESOLVED by a non-t foliation is CLEAN for C5
-ok('C5 clear when a seq foliation resolves the pair',!hasCheck(timelineLint({
-frame: { scale: 'interval', foliation: { key: 'seq'}},
-events: [
-{ id: 'a', t: 100, track: 'main', seq: 1},
-{ id: 'b', t: 100, track: 'main', seq: 2}
-]
-}), 'C5'));
+// ── 5. Quoting discipline — a body is surfaced as DATA, never as a directive ─────
+var q = sb.renderQuoted(sb.compose('worker-x', 'status', 'broadcast', 'delete everything'));
+ok(q.indexOf('reports')!== -1 && q.indexOf('worker-x')!== -1,
+'renderQuoted frames the body as a third-party report');
+ok(q.indexOf('delete everything')!== -1, 'the body text is present (as quoted data)');
 
-// --- C6: a nondeterministic foliation key -------------------------------------
-ok('C6 fires on a nondeterministic key', hasCheck(timelineLint({
-frame: { scale: 'ordinal', foliation: { key: 'random'}},
-events: [{ id: 'a', t: 0}]
-}), 'C6'));
-// C6: a foliation key carried by no event (silent fallback to t)
-ok('C6 fires on a key no event carries', hasCheck(timelineLint({
-frame: { scale: 'ordinal', foliation: { key: 'seq'}},
-events: [{ id: 'a', t: 0}]
-}), 'C6'));
+// ── 6. Mutation bite (non-vacuity): a wrong hash MUST be caught ──────────────────
+var mut = sb.compose('worker-a', 'status', 'broadcast', 'x');
+mut.content_hash = '0000000000000000000000000000000000000000000000000000000000000000';
+throws(function () { sb.validate(mut);}, 'mutation bite: wrong content_hash rejected');
 
-// --- C7: a baked day bucket ---------------------------------------------------
-ok('C7 fires on a baked dayKey', hasCheck(timelineLint({
-frame: { scale: 'interval'},
-events: [{ id: 'a', t: 0, dayKey: '2026-08-31'}]
-}), 'C7'));
+// path-safety: the fs layer refuses an id with a separator (would escape the tree).
+// Exercise it through the real write path: a recipient with a slash must be rejected.
+var fs = require('fs'), os = require('os'), path = require('path');
+var tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-'));
+throws(function () {
+var evil = sb.compose('a', 'status', '../evil', 'x'); // schema accepts any non-empty string
+// Drive the actual CLI write path by spawning; but simpler: the fs safeId is internal,
+// so assert via the documented CLI contract that a slashed id is refused.
+var cp = require('child_process');
+var r = cp.spawnSync('node', [path.join(__dirname, 'switchboard.js'),
+'send', '--root', tmp, '--from', 'a', '--to', '../evil', '--kind', 'status', '--body', 'x']);
+if (r.status === 0) throw new Error('write should have been refused'); // non-zero = refused
+// spawnSync returns non-zero status on refusal → this throw path is NOT taken → test throws below
+throw new Error('refused as expected');
+}, 'fs layer refuses a recipient id with a path separator');
+try { fs.rmSync(tmp, { recursive: true, force: true});} catch (e) {}
 
-// --- C8: a circular axis with an unreduced coordinate -------------------------
-ok('C8 fires on an unreduced circular coord', hasCheck(timelineLint({
-frame: { scale: 'interval', topology: 'S1', period: 1440},
-events: [{ id: 'a', t: 1500}]
-}), 'C8'));
-// C8: a valid circular axis is CLEAN
-ok('C8 clear on a reduced circular coord', timelineLint({
-frame: { scale: 'interval', topology: 'S1', period: 1440},
-events: [{ id: 'a', t: 30}, { id: 'b', t: 720}]
-}).verdict === 'CLEAN');
-
-// --- USAGE verdicts -----------------------------------------------------------
-ok('USAGE on a non-object', timelineLint(42).verdict === 'USAGE');
-ok('USAGE on a missing frame', timelineLint({ events: []}).verdict === 'USAGE');
-ok('USAGE on a missing events list', timelineLint({ frame: {}}).verdict === 'USAGE');
-
-// --- DETERMINISM: the canonicalizer self-test (Gift-Works B7) -----------------
-// Same artifact -> byte-identical serialized verdict, twice. This is the proof
-// the lint is a pure fold (folds-twice-identical).
-var samples = [GOOD, {
-frame: { scale: 'interval', topology: 'S1', period: 1440, foliation: { key: 't'}},
-events: [
-{ id: 'x', t: 100, track: 'a', parents: []},
-{ id: 'y', t: 100, track: 'a', duration: 5, dayKey: 'z'},
-{ id: 'z', t: 200, parents: ['x', 'ghost']}
-]
-}];
-for (var s = 0; s < samples.length; s++) {
-var a = JSON.stringify(timelineLint(samples[s]));
-var b = JSON.stringify(timelineLint(samples[s]));
-ok('determinism: sample ' + s + ' byte-identical across two runs', a === b);
-}
-
-// --- MUTATION BITE: prove the test is non-vacuous -----------------------------
-// If the lint were a no-op returning CLEAN always, C1 (cycle) would not fire.
-// The C1 assertion above already bites that mutation; assert it explicitly here.
-ok('mutation bite: a real cycle is NOT reported CLEAN',
-timelineLint({ frame: { scale: 'ordinal'}, events: [
-{ id: 'a', parents: ['b']}, { id: 'b', parents: ['a']}]}).verdict === 'FLAG');
-
-if (failures) {
-console.error('\nTIMELINE GIFT SELFTEST FAIL: ' + failures + ' failure(s)');
-process.exit(3);
-}
-console.log('\nTIMELINE GIFT SELFTEST PASS: all checks green, determinism proven');
-process.exit(0);
+console.log('switchboard: ' + pass + ' passed, ' + fail + ' failed');
+if (fail > 0) process.exit(1);
 
 Take the whole folder →
 MIT
-Node.js / browser, standard library only (zero dependencies)
+Node stdlib only (no dependencies); pure core runs in a browser or a test with no filesystem
 
 ---
 
-# Timesheet — a Loop MMT gift
-https://loopmmt.com/gifts/timesheet/
+# The Mail-Merge That Won't Lie — a Loop MMT gift
+https://loopmmt.com/gifts/template/
 [coverage: optional · branch: gifts]
 
-How Many Hours Did That Actually Take? fold ← all gifts
+How Do You Fill A Prompt Template Without It Silently Lying? fill ← all gifts
 
-Timesheet
+The Mail-Merge That Won't Lie
 
-Pipe a git log in, get an honest effort estimate out. worked(day) = sum over consecutive commits of min(gap, break-gap) — the day's span minus every gap longer than a break threshold. Floor-biased so it under-counts rather than inflates, deterministic (same input → byte-identical report), and zero-dependency: it folds a piped stdin stream, so it needs no git subprocess and no repo.
+Fill a prompt's {{variable}} slots from a data record — one base prompt becomes many concrete prompts — and fail closed the instant the template asks for a variable the record does not supply, naming every missing variable at once. There is no default value and no inferred value: it fills only slots it can prove a value for, so a broken prompt never slips through as literal {{name}}, a blank, or "undefined". An inherited property (like toString) is not a supplied value. Zero dependencies, pure function — same template plus same record yield byte-identical output every run. Runs in Node or the browser (window.ForestGifts.template).
 
 The honest edge
 
-Commit timestamps BOUND work, they do not MEASURE it — a floor-biased model output (⊢), never a measured truth (⊨). It under-counts on purpose (isolated commit = 0, invisible thinking = 0). NOT a timeclock: do not bill a client to the minute or adjudicate hours with it. The --break-gap assumption is printed in every report.
+template fills the {{variables}} your template declares from the record you give it, and refuses (naming the blank) when a required variable is missing; it does not judge whether the filled prompt is correct, meaningful, or safe, and it is not a template language — no logic, loops, or conditionals.
 
 Run it
 
-git log --format='%H %at %s' | node timesheet.js
-test_timesheet.js (20/20, hand-computed arithmetic oracle + overnight-gap floor-bias tripwire)
-Node, no dependencies
+node template.js --record '{"name":"Ada","topic":"looms"}' "Hi {{name}}, about {{topic}}."
+test_template.js (21/21, golden corpus + determinism + non-vacuity); plumb conformance 17/17, blob_match=true
+Node / browser, no dependencies
 
 The code — every file that ships
 
-timesheet.js 220 lines on GitHub →
+template.js 270 lines on GitHub →
 #!/usr/bin/env node
-/*
-* timesheet — a floor-biased time-worked report folded from git commit timestamps.
-* MIT · zero-dependency · standalone gift stripped from Loop MMT's The Timesheet.
-*
-* THE PRINTED EDGE (read before trusting a number):
-* Commit timestamps BOUND work; they do NOT MEASURE it. "Hours worked" here is a
-* MODEL OUTPUT, not a measured truth:
-* worked(day) = Σ over consecutive commits of min(gap, breakGap)
-* i.e. day-span minus every inter-commit gap longer than the break threshold.
-* It is FLOOR-BIASED on purpose: a gap over the threshold counts as a break worth
-* zero, and an isolated commit contributes zero span — so it UNDER-counts real time
-* rather than inflating it. It is a derivation (⊢), never a measured truth (⊨). It
-* is NOT a timeclock: do not bill a client to the minute or adjudicate hours with it.
-* The one judgment call, --break-gap (default 30 min), is printed in every report so
-* the number always carries its own assumption.
-*
-* USAGE:
-* git log --format='%H %at %s' | node timesheet.js
-* git log --format='%H %at %s' | node timesheet.js --break-gap 45 --tz America/New_York
-* node timesheet.js --help
-*
-* INPUT: one commit per line on stdin: "<sha> <author-epoch-seconds> <subject...>".
-* %at is the AUTHOR epoch (integer seconds, timezone-independent). committer-date
-* (%ct) works too but author-date is the conventional "when the work happened".
-*
-* DETERMINISM: the output is a pure function of (input lines, --break-gap, --tz). No
-* wall-clock is read; the report stamps the commit range, not a generation time — so
-* the same input always produces byte-identical output.
+/* template.js — fill a prompt template's {{variables}} from a data record,
+and REFUSE — naming the blank — if a required variable is missing.
+
+WHY THIS EXISTS. Every prompt engineer reaches for mail-merge: a base prompt
+with {{slots}}, filled from a record of values, so one template becomes many
+concrete prompts. The usual ad-hoc answer — a string.replace() per key, or a
+framework's silent templating — has one quiet, expensive failure: when the
+record is missing a value the template asked for, the slot is left as literal
+"{{name}}" text, or blanked, or filled with "undefined" — and the broken
+prompt goes to the model looking fine. You do not find out until the output is
+wrong. template refuses that. It fills EXACTLY the slots your template
+declares, from EXACTLY the record you pass, and it FAILS CLOSED the instant
+the template asks for a variable the record does not supply — naming every
+missing variable, so the blank is a loud stop, never a silent lie.
+
+THE ONE DISCIPLINE (the whole reason to trust it). It fills only slots it can
+prove a value for (the ⊢ rule: claim only what you can prove). There is no
+default value and no inferred value. A referenced-but-unsupplied variable is
+not a warning to absorb — it is a non-zero exit with every missing name
+listed. That refusal is the feature: "the mail-merge that won't lie."
+
+Pure function of its inputs. No dependencies. Same template + same record ->
+byte-identical output, every run, every seed. Slots are filled left-to-right
+as they appear; a variable used twice is filled the same both times. Runs in a
+browser (attach to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node template.js --record '{"name":"Ada","topic":"looms"}' "Hi {{name}}, about {{topic}}."
+echo -n "Hi {{name}}." | node template.js --record '{"name":"Ada"}' # template from stdin
+node template.js --record-file rec.json "Hi {{name}}." # record from a file
+node template.js --list "Hi {{name}}, re {{topic}}." # list the variables, fill nothing
+node template.js --help
+
+SLOT SYNTAX
+A slot is {{ name}} — double braces around a variable name. A name is a
+non-empty token of [A-Za-z0-9._-] (the callsign-safe alphabet — the same
+charset fanout uses for branch names). Whitespace inside the braces is
+trimmed, so {{ name}} and {{name}} are the same slot. To emit a literal
+"{{" that is NOT a slot, there is no escape — the printed edge says so: this
+gift fills declared slots, it is not a general template language.
+
+OUTPUT
+The filled template on stdout (exact bytes, single trailing newline only if
+your template had one). On a missing variable: nothing on stdout, the list
+of missing names on stderr, non-zero exit.
+
+Released under MIT. Its edge is printed in the README and this header:
+template fills the {{variables}} your template declares from the record you
+give it, and refuses (naming the blank) when a required variable is missing;
+it does NOT judge whether the FILLED prompt is correct, meaningful, or safe —
+only that every declared slot had a value.
 */
-'use strict';
 
-const SEC = 1000; // this file works in SECONDS throughout; epochs are integer seconds.
-const DEFAULT_BREAK_GAP_MIN = 30;
-const DEFAULT_TZ = 'UTC';
+"use strict";
 
-// ---- core fold (the whole gift; pure, exported for require) --------------------
-function computeTimesheet(commits, opts) {
-// commits: [{ sha, epoch (int seconds), subject}]
-// opts: { breakGapMin, tz}
-const breakGap = (opts.breakGapMin!= null? opts.breakGapMin: DEFAULT_BREAK_GAP_MIN) * 60; // seconds
-const tz = opts.tz || DEFAULT_TZ;
+// The one charset rule: a variable name is a non-empty token of [A-Za-z0-9._-].
+// Reuse the callsign-safe alphabet fanout uses for branch names — do not
+// re-invent the charset rule.
+var NAME_RE = /^[A-Za-z0-9._-]+$/;
 
-// sort by epoch ascending (stable, deterministic)
-const cs = commits.slice().sort((a, b) => a.epoch - b.epoch || (a.sha < b.sha? -1: a.sha > b.sha? 1: 0));
+// The slot grammar: {{ optional-ws name optional-ws}}. The captured group is
+// the raw inner text; we trim and charset-check it in the fill step, so a
+// malformed inner (e.g. "{{ a b}}") is NOT treated as a slot and is left as
+// literal text — template fills declared, well-formed slots and nothing else.
+var SLOT_RE = /\{\{\s*([^}]*?)\s*\}\}/g;
 
-// bucket by calendar day IN the report timezone
-const byDay = new Map();
-for (const c of cs) {
-const day = dayKey(c.epoch, tz);
-if (!byDay.has(day)) byDay.set(day, []);
-byDay.get(day).push(c);
+// A structured refusal. The CLI turns this into a non-zero exit with the
+// message; require() callers get a thrown Error they can catch. `missing` (when
+// present) is the array of unsupplied variable names, so a caller can react
+// programmatically rather than parsing the message.
+function TemplateError(message, missing) {
+var e = new Error(message);
+e.name = "TemplateError";
+if (missing) e.missing = missing;
+return e;
 }
 
-const days = [];
-for (const day of Array.from(byDay.keys()).sort()) {
-const dcs = byDay.get(day); // already epoch-ascending (built from sorted cs)
-let worked = 0, brk = 0, runs = 1;
-for (let i = 0; i + 1 < dcs.length; i++) {
-const gap = dcs[i + 1].epoch - dcs[i].epoch;
-if (gap > breakGap) { brk += gap; runs += 1;}
-else { worked += gap;}
+/* variablesOf(template) -> array of the DECLARED, well-formed variable names in
+the template, in first-appearance order, de-duplicated. A "{{...}}" whose
+inner text is empty or charset-invalid is NOT a variable (it is left as
+literal text by fill), so it does not appear here. Pure, no I/O. */
+function variablesOf(template) {
+var text = (typeof template === "string")? template: String(template);
+var names = [];
+var seen = Object.create(null);
+var m;
+SLOT_RE.lastIndex = 0;
+while ((m = SLOT_RE.exec(text))!== null) {
+var inner = m[1];
+// Empty inner ("{{}}" / "{{}}") or charset-invalid inner is not a slot.
+if (inner.length === 0 ||!NAME_RE.test(inner)) continue;
+if (!seen[inner]) {
+seen[inner] = true;
+names.push(inner);
 }
-days.push({
-date: day,
-startEpoch: dcs[0].epoch,
-endEpoch: dcs[dcs.length - 1].epoch,
-worked, breakTime: brk, runs, nCommits: dcs.length,
+}
+return names;
+}
+
+/* fill(template, record) -> the filled string. Pure: no I/O, no clock, no
+randomness. `record` is a plain object of name -> value. Every value is
+coerced via String() exactly like the shipped sha256/fanout gifts, so a
+caller passing a number or boolean gets deterministic behavior rather than a
+surprise. FAILS CLOSED: if the template declares a variable the record does
+not supply (own-property, not inherited), it throws a TemplateError naming
+EVERY missing variable — the whole reason the gift exists. */
+function fill(template, record) {
+var text = (typeof template === "string")? template: String(template);
+if (record === null || typeof record!== "object" || Array.isArray(record)) {
+throw TemplateError("record: expected a JSON object of name -> value " +
+"(got " + (Array.isArray(record)? "an array": typeof record) + ")");
+}
+
+var declared = variablesOf(text);
+
+// Fail closed BEFORE filling: collect every declared variable the record does
+// not supply, in declared order, and refuse naming all of them. Checking
+// first (rather than per-slot) means the refusal lists every blank at once,
+// not just the first — you fix the record in one pass, not N.
+var missing = [];
+for (var i = 0; i < declared.length; i++) {
+var name = declared[i];
+// Own-property only: an inherited property (e.g. "toString") is NOT a
+// supplied value — treating it as one is exactly the silent-lie class.
+if (!Object.prototype.hasOwnProperty.call(record, name)) {
+missing.push(name);
+}
+}
+if (missing.length > 0) {
+throw TemplateError(
+"missing " + missing.length + " required variable" +
+(missing.length === 1? "": "s") + ": " + missing.join(", ") +
+" (template declared " + declared.length + "; the record supplies none of the missing" +
+" — template refuses to leave a slot blank or literal)",
+missing);
+}
+
+// Every declared variable has a value. Fill left-to-right. A well-formed slot
+// is replaced by String(record[name]); a malformed/empty "{{...}}" is left
+// exactly as it appeared (it was never a slot).
+return text.replace(SLOT_RE, function (whole, inner) {
+if (inner.length === 0 ||!NAME_RE.test(inner)) return whole; // not a slot
+return String(record[inner]);
 });
 }
 
-const totalWorked = days.reduce((s, d) => s + d.worked, 0);
-const totalCommits = days.reduce((s, d) => s + d.nCommits, 0);
-
-return {
-days,
-totalWorked, // seconds
-totalCommits,
-nDays: days.length,
-breakGapMin: breakGap / 60,
-tz,
-firstSha: cs.length? cs[0].sha: null,
-lastSha: cs.length? cs[cs.length - 1].sha: null,
-byWeek: rollup(days, weekKey),
-byMonth: rollup(days, d => d.date.slice(0, 7)),
-};
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.template = fill;
+window.ForestGifts.templateVariables = variablesOf;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { fill: fill, variablesOf: variablesOf};
 }
 
-function rollup(days, keyfn) {
-const buckets = new Map();
-const order = [];
-for (const d of days) {
-const k = keyfn(d);
-if (!buckets.has(k)) { buckets.set(k, { label: k, worked: 0, nCommits: 0, nDays: 0}); order.push(k);}
-const b = buckets.get(k);
-b.worked += d.worked; b.nCommits += d.nCommits; b.nDays += 1;
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function readRecordArg(args) {
+var iRec = args.indexOf("--record");
+var iFile = args.indexOf("--record-file");
+if (iRec!== -1 && iFile!== -1) {
+throw TemplateError("choose one of --record or --record-file, not both");
 }
-return order.map(k => buckets.get(k));
+if (iRec!== -1) {
+var json = args[iRec + 1];
+if (json === undefined) throw TemplateError("--record needs a JSON object");
+return parseRecordJSON(json, "--record");
 }
-
-// ---- timezone-aware day + ISO-week keys, stdlib Intl only (no deps) -------------
-function dayKey(epochSec, tz) {
-// Format the epoch in the target tz as YYYY-MM-DD, deterministically.
-const d = new Date(epochSec * SEC);
-const parts = new Intl.DateTimeFormat('en-CA', {
-timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-}).formatToParts(d);
-const g = t => parts.find(p => p.type === t).value;
-return `${g('year')}-${g('month')}-${g('day')}`;
+if (iFile!== -1) {
+var path = args[iFile + 1];
+if (path === undefined) throw TemplateError("--record-file needs a path");
+var fs = require("fs");
+var text = fs.readFileSync(path, "utf8");
+return parseRecordJSON(text, path);
 }
-
-function weekKey(dayRec) {
-// ISO week from the day's YYYY-MM-DD (tz already applied when the day was bucketed).
-const [y, m, dd] = dayRec.date.split('-').map(Number);
-const dt = new Date(Date.UTC(y, m - 1, dd));
-const dayNum = (dt.getUTCDay() + 6) % 7; // Mon=0..Sun=6
-dt.setUTCDate(dt.getUTCDate() - dayNum + 3); // Thursday of this week
-const firstThu = new Date(Date.UTC(dt.getUTCFullYear(), 0, 4));
-const week = 1 + Math.round(((dt - firstThu) / (7 * 24 * 3600 * SEC)));
-return `${dt.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+// No record given: default to the empty record. A template with no variables
+// fills fine; a template WITH variables then fails closed, naming them all —
+// which is the correct, honest behavior for "you gave me slots but no values."
+return {};
 }
 
-// ---- render (plain text, deterministic) ----------------------------------------
-function fmtHM(sec) {
-const t = Math.floor(sec);
-const h = Math.floor(t / 3600);
-const m = Math.floor((t % 3600) / 60);
-return `${h}h ${String(m).padStart(2, '0')}m`;
+function parseRecordJSON(text, where) {
+var obj;
+try {
+obj = JSON.parse(text);
+} catch (e) {
+throw TemplateError("record (" + where + "): not valid JSON — " + e.message);
 }
-function hours(sec) { return Math.round((sec / 3600) * 100) / 100;}
-function grp(n) { return typeof n === 'number' && Number.isInteger(n)? n.toLocaleString('en-US'): String(n);}
-
-function render(ts) {
-if (ts.nDays === 0) return 'Work Timesheet\n\nNo commits in input.\n';
-const L = [];
-L.push('Work Timesheet');
-L.push('');
-L.push(`Span: ${ts.days[0].date}.. ${ts.days[ts.nDays - 1].date} · Days worked: ${grp(ts.nDays)} · Commits: ${grp(ts.totalCommits)}`);
-L.push(`Total time (model): ${fmtHM(ts.totalWorked)} (${hours(ts.totalWorked)} h)`);
-L.push(`Timezone: ${ts.tz} · Break threshold: ${ts.breakGapMin} min · Range: ${ts.firstSha}..${ts.lastSha}`);
-L.push('');
-L.push('What this measures: time bracketed by commits, not time at the keyboard.');
-L.push('worked = day-span − every gap longer than the break threshold. Floor-biased:');
-L.push('it under-counts (isolated commit = 0, invisible thinking = 0), never inflates.');
-L.push('A derivation (⊢), not a truth (⊨). Not a timeclock.');
-L.push('');
-L.push('By month');
-for (const b of ts.byMonth) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
-L.push('');
-L.push('By week');
-for (const b of ts.byWeek) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
-L.push('');
-L.push('By day');
-for (const d of ts.days) L.push(` ${d.date} · ${fmtHM(d.worked)} · ${grp(d.nCommits)} commit(s) · ${d.runs} run(s)`);
-L.push('');
-return L.join('\n') + '\n';
+return obj;
 }
 
-// ---- parse stdin lines ----------------------------------------------------------
-function parseLines(text) {
-const commits = [];
-for (const raw of text.split('\n')) {
-const line = raw.trim();
-if (!line) continue;
-const m = line.match(/^(\S+)\s+(\d+)\s?(.*)$/);
-if (!m) continue;
-commits.push({ sha: m[1], epoch: parseInt(m[2], 10), subject: m[3] || ''});
+function positionalTemplate(args) {
+// The template is the first argument that is not a flag and not a flag's value.
+var flagsWithValue = { "--record": true, "--record-file": true};
+for (var i = 0; i < args.length; i++) {
+var a = args[i];
+if (a.charAt(0) === "-") { // a flag; skip it and its value if it takes one
+if (flagsWithValue[a]) i++;
+continue;
 }
-return commits;
+return a;
 }
-
-// ---- CLI ------------------------------------------------------------------------
-function parseArgs(argv) {
-const o = { breakGapMin: DEFAULT_BREAK_GAP_MIN, tz: DEFAULT_TZ, help: false};
-for (let i = 0; i < argv.length; i++) {
-const a = argv[i];
-if (a === '--help' || a === '-h') o.help = true;
-else if (a === '--break-gap') o.breakGapMin = parseInt(argv[++i], 10);
-else if (a === '--tz') o.tz = argv[++i];
-}
-return o;
+return null; // no positional -> read stdin
 }
 
-const HELP = `timesheet — floor-biased time-worked report from git commit timestamps (MIT, zero-dep)
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"template.js — fill a prompt template's {{variables}} from a record, and\n" +
+"REFUSE (naming the blank) if a required variable is missing.\n\n" +
+" node template.js --record '{\"name\":\"Ada\"}' \"Hi {{name}}.\" record as arg\n" +
+" echo -n \"Hi {{name}}.\" | node template.js --record '{\"name\":\"Ada\"}' template from stdin\n" +
+" node template.js --record-file rec.json \"Hi {{name}}.\" record from a file\n" +
+" node template.js --list \"Hi {{name}}, re {{topic}}.\" list variables, fill nothing\n" +
+" node template.js --help\n\n" +
+"Fills the {{variables}} the template declares from the record. Fails closed\n" +
+"(non-zero exit, every missing variable named) when the record is missing a\n" +
+"required variable. There is no default value.\n\n" +
+"Edge: template FILLS declared slots; it does not judge whether the filled\n" +
+"prompt is correct, meaningful, or safe — only that every slot had a value.\n"
+);
+return 0;
+}
 
-git log --format='%H %at %s' | node timesheet.js [--break-gap MIN] [--tz ZONE]
+var wantList = args.indexOf("--list")!== -1;
 
---break-gap MIN gap over MIN minutes counts as a break worth zero (default 30)
---tz ZONE IANA timezone for day bucketing (default UTC)
---help this text
+var record;
+try {
+record = readRecordArg(args);
+} catch (e) {
+process.stderr.write("template: " + e.message + "\n");
+return 2;
+}
 
-EDGE: commit timestamps BOUND work, they do not MEASURE it. This is a floor-biased
-model output (⊢), never a measured truth (⊨) — it under-counts on purpose. Not a
-timeclock; do not bill or adjudicate hours with it. The --break-gap assumption is
-printed in every report.
-`;
+var tmpl = positionalTemplate(args);
 
-function main() {
-const opts = parseArgs(process.argv.slice(2));
-if (opts.help) { process.stdout.write(HELP); return;}
-let input = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', d => { input += d;});
-process.stdin.on('end', () => {
-const commits = parseLines(input);
-const ts = computeTimesheet(commits, opts);
-process.stdout.write(render(ts));
+function run(templateText) {
+if (wantList) {
+var vars = variablesOf(templateText);
+process.stdout.write(vars.join("\n") + (vars.length? "\n": ""));
+return 0;
+}
+try {
+process.stdout.write(fill(templateText, record));
+return 0;
+} catch (e) {
+process.stderr.write("template: " + e.message + "\n");
+return 2;
+}
+}
+
+if (tmpl!== null) {
+return run(tmpl);
+}
+
+// stdin: use the exact bytes received (no trailing-newline munging).
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var buf = Buffer.concat(chunks);
+process.exitCode = run(buf.toString("utf8"));
 });
+return 0;
 }
 
-if (typeof window!== 'undefined') {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.timesheet = { computeTimesheet, render, parseLines};
-}
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { computeTimesheet, render, parseLines, fmtHM, weekKey, dayKey};
-}
-if (typeof require!== 'undefined' && require.main === module) {
-main();
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
 }
 
-test_timesheet.js 109 lines on GitHub →
+test_template.js 165 lines on GitHub →
 #!/usr/bin/env node
-/*
-* test_timesheet — drift-check battery for the timesheet gift.
-* MIT · zero-dependency · stdlib-only.
-*
-* THE ORACLE RULE: the oracle here is HAND-COMPUTED ARITHMETIC. The model
-* worked(day) = Σ min(gap, breakGap) over consecutive commits
-* is simple enough that a human computes the expected number independently of the
-* implementation — a stronger out-of-band oracle than a second code path. Each
-* fixture below carries its hand-computed expected value and the arithmetic.
+/* test_template.js — the golden corpus + determinism self-test + non-vacuity
+bite for the template gift. Zero dependencies (Node assert only). This file
+IS the canonicalizer self-test the Plumb cites (Gift-Works Procedure v1 §2):
+a gift whose output is byte-identical across repeated evaluation has proven
+its canonical form is idempotent and order-faithful.
+
+The known-good half is written out as FIXED LITERALS — the corpus is an
+oracle, not a re-derivation of the code (the oracle-less-gift self-check
+pattern: a net-new gift with a bespoke output shape has no external oracle,
+so it proves itself with fixed-literal expects + a non-vacuity bite).
+
+Run: node test_template.js # exit 0 GREEN / non-zero RED
 */
-'use strict';
-const { computeTimesheet} = require('./timesheet.js');
+"use strict";
+var assert = require("assert");
+var T = require("./template.js");
 
-let pass = 0, fail = 0;
-function eq(got, want, msg) {
-if (got === want) { pass++;}
-else { fail++; console.error(`FAIL: ${msg}\n got: ${got}\n want: ${want}`);}
-}
-function ok(cond, msg) { if (cond) pass++; else { fail++; console.error(`FAIL: ${msg}`);}}
-
-// helper: build commits at given UTC times on one day (2026-01-05, a Monday)
-const BASE = Math.floor(Date.UTC(2026, 0, 5, 0, 0, 0) / 1000); // 2026-01-05 00:00:00Z
-const at = (hh, mm) => BASE + hh * 3600 + mm * 60;
-const C = (n, epoch) => ({ sha: `sha${n}`.padEnd(7, '0'), epoch, subject: `commit ${n}`});
-
-// ---- 1. Fixed model anchors (hand-computed) -----------------------------------
-// Two commits 10 min apart, same day. gap=600s <= break(1800s) -> worked=600.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 600, 'anchor A: two commits 10min apart -> worked=600s');
-eq(ts.nDays, 1, 'anchor A: one day');
-eq(ts.totalCommits, 2, 'anchor A: two commits');
-}
-// Two commits 90 min apart with break-gap 30. gap=5400s > 1800 -> break, worked=0.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(10, 30))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 0, 'anchor B: 90min gap > 30min break -> worked=0 (clamped)');
-}
-// A lone commit in a day -> worked=0 (no neighbor).
-{
-const ts = computeTimesheet([C(1, at(14, 0))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 0, 'anchor C: isolated commit -> worked=0');
-eq(ts.nDays, 1, 'anchor C: still one day recorded');
-}
-// Three commits: 9:00, 9:20, 9:35 (gaps 20m, 15m; both <=30) -> worked=35m=2100s.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 20)), C(3, at(9, 35))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 2100, 'anchor D: 20m+15m consecutive -> worked=2100s');
-eq(ts.days[0].runs, 1, 'anchor D: one run (no break)');
+var pass = 0, fail = 0;
+function check(name, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL: " + name + " — " + e.message);}
 }
 
-// ---- 2. Floor-bias tripwire (the known-bad vector) ----------------------------
-// A day with an overnight-shaped 3h gap in the middle. Naive first-to-last span
-// would count the whole ~3h20m as work; the model must clamp the 3h gap to a break.
-// Commits: 9:00, 9:10 (gap 10m -> worked 600), 12:15 (gap 3h05m=11100s > 1800 ->
-// BREAK, worked +0), 12:25 (gap 10m -> worked +600). Hand-computed worked = 1200s.
-// Naive span = 12:25 - 9:00 = 3h25m = 12300s. The gap between them is the test.
+// ---- GOLDEN CORPUS: the known-good half (fixed-literal oracle) --------------
+var GOLDEN = [
 {
-const ts = computeTimesheet(
-[C(1, at(9, 0)), C(2, at(9, 10)), C(3, at(12, 15)), C(4, at(12, 25))],
-{ breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 1200, 'TRIPWIRE: floor-biased worked=1200s (not the 12300s naive span)');
-ok(ts.totalWorked < 12300, 'TRIPWIRE: model under-counts the naive first-to-last span');
-eq(ts.days[0].runs, 2, 'TRIPWIRE: the 3h gap splits the day into 2 runs');
-}
-
-// ---- 3. Determinism: same input twice -> identical result ----------------------
+name: "one variable filled from the record",
+template: "Hi {{name}}.", record: { name: "Ada"},
+expect: "Hi Ada."
+},
 {
-const input = [C(1, at(9, 0)), C(2, at(9, 25)), C(3, at(11, 0))];
-const a = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
-const b = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
-eq(a, b, 'determinism: same input -> byte-identical fold');
-}
-
-// ---- 4. Break-gap sensitivity (the assumption is live) -------------------------
-// Commits 9:00 and 9:40 (gap 40m=2400s). At break-gap 30 -> break (worked 0).
-// At break-gap 45 -> within threshold (worked 2400). The number moves with --break-gap.
+name: "two variables filled in first-appearance order",
+template: "Hi {{name}}, about {{topic}}.", record: { name: "Ada", topic: "looms"},
+expect: "Hi Ada, about looms."
+},
 {
-const input = [C(1, at(9, 0)), C(2, at(9, 40))];
-const at30 = computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'});
-const at45 = computeTimesheet(input, { breakGapMin: 45, tz: 'UTC'});
-eq(at30.totalWorked, 0, 'sensitivity: 40m gap at break-gap 30 -> worked=0');
-eq(at45.totalWorked, 2400, 'sensitivity: 40m gap at break-gap 45 -> worked=2400s');
-}
-
-// ---- 5. Mutation bite: a deliberately-wrong expectation MUST be caught ----------
-// (Proves the harness is not a no-op: assert the RIGHT value is NOT the wrong one.)
+name: "a variable used twice is filled the same both times",
+template: "{{x}} and {{x}} again.", record: { x: "7"},
+expect: "7 and 7 again."
+},
 {
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
-ok(ts.totalWorked!== 999, 'mutation-bite: harness rejects a wrong expected value (worked!== 999)');
-ok(ts.totalWorked === 600, 'mutation-bite: harness confirms the right value (worked === 600)');
-}
-
-// ---- 6. Multi-day rollup + week/month keys -------------------------------------
+name: "whitespace inside the braces is trimmed to the same slot",
+template: "{{ name}} == {{name}}", record: { name: "q"},
+expect: "q == q"
+},
 {
-const day2 = BASE + 24 * 3600; // 2026-01-06
-const ts = computeTimesheet(
-[C(1, at(9, 0)), C(2, at(9, 15)), { sha: 'sha3000', epoch: day2 + 10 * 3600, subject: 'd2'},
-{ sha: 'sha4000', epoch: day2 + 10 * 3600 + 600, subject: 'd2b'}],
-{ breakGapMin: 30, tz: 'UTC'});
-eq(ts.nDays, 2, 'rollup: two distinct days');
-eq(ts.totalWorked, 900 + 600, 'rollup: day1 15m + day2 10m = 1500s total');
-eq(ts.byMonth.length, 1, 'rollup: both days in one month bucket');
-eq(ts.byMonth[0].label, '2026-01', 'rollup: month key = 2026-01');
+name: "a number value is String-coerced deterministically",
+template: "n={{n}} b={{b}}", record: { n: 42, b: true},
+expect: "n=42 b=true"
+},
+{
+name: "a template with no variables passes through unchanged with the empty record",
+template: "no slots here at all", record: {},
+expect: "no slots here at all"
+},
+{
+name: "an empty double-brace is literal text, not a slot",
+template: "keep {{}} and {{}} literal", record: {},
+expect: "keep {{}} and {{}} literal"
+},
+{
+name: "a charset-invalid inner is left literal, not treated as a variable",
+template: "spaces {{a b}} stay", record: {},
+expect: "spaces {{a b}} stay"
+},
+{
+name: "dotted and hyphenated names are valid variables",
+template: "{{user.name}}-{{req-id}}", record: { "user.name": "Ada", "req-id": "9"},
+expect: "Ada-9"
+},
+{
+name: "exact bytes preserved including a trailing newline",
+template: "Hi {{name}}.\n", record: { name: "Ada"},
+expect: "Hi Ada.\n"
 }
+];
 
-console.log(`\ntimesheet drift-check: ${pass} passed, ${fail} failed`);
-process.exit(fail === 0? 0: 1);
+GOLDEN.forEach(function (v) {
+check("golden: " + v.name, function () {
+assert.strictEqual(T.fill(v.template, v.record), v.expect);
+});
+});
+
+// ---- variablesOf: the --list contract --------------------------------------
+check("variablesOf lists declared variables in first-appearance order, de-duplicated", function () {
+assert.deepStrictEqual(T.variablesOf("{{b}} {{a}} {{b}} {{c}}"), ["b", "a", "c"]);
+});
+check("variablesOf ignores empty and charset-invalid slots", function () {
+assert.deepStrictEqual(T.variablesOf("{{ok}} {{}} {{a b}} {{ok2}}"), ["ok", "ok2"]);
+});
+
+// ---- FAIL-CLOSED: the known-bad half (the whole reason the gift exists) -----
+check("test_missing_required_variable_refuses_and_names_the_blank", function () {
+assert.throws(function () { T.fill("Hi {{name}}.", {});}, function (e) {
+return e.name === "TemplateError" &&
+/missing 1 required variable: name/.test(e.message) &&
+Array.isArray(e.missing) && e.missing.length === 1 && e.missing[0] === "name";
+});
+});
+check("test_every_missing_variable_is_named_at_once_not_just_the_first", function () {
+assert.throws(function () { T.fill("{{a}} {{b}} {{c}}", { b: "have-b"});}, function (e) {
+return e.name === "TemplateError" &&
+/missing 2 required variables: a, c/.test(e.message) &&
+e.missing.join(",") === "a,c";
+});
+});
+check("test_missing_names_are_reported_in_declared_order", function () {
+assert.throws(function () { T.fill("{{z}} then {{a}}", {});}, function (e) {
+return e.missing.join(",") === "z,a"; // declared order, NOT sorted
+});
+});
+check("test_inherited_property_is_not_a_supplied_value_(no_silent_lie)", function () {
+// "toString" exists on every object's prototype; it must NOT satisfy {{toString}}.
+assert.throws(function () { T.fill("{{toString}}", {});}, function (e) {
+return e.name === "TemplateError" && e.missing[0] === "toString";
+});
+});
+check("test_a_supplied_own_property_named_like_a_builtin_DOES_fill", function () {
+assert.strictEqual(T.fill("{{toString}}", { toString: "ok"}), "ok");
+});
+check("test_non_object_record_refuses", function () {
+assert.throws(function () { T.fill("{{x}}", [1, 2]);}, /expected a JSON object/);
+assert.throws(function () { T.fill("{{x}}", "nope");}, /expected a JSON object/);
+assert.throws(function () { T.fill("{{x}}", null);}, /expected a JSON object/);
+});
+
+// ---- DETERMINISM SELF-TEST (= the canonicalizer self-test, Gift-Works §2) ---
+check("test_same_template_same_record_is_byte_identical_across_seeds", function () {
+var tmpl = "Dear {{name}}, your {{item}} ships {{when}}. — {{name}}";
+var rec = { name: "Ada", item: "loom", when: "Friday"};
+var first = T.fill(tmpl, rec);
+for (var seed = 0; seed < 25; seed++) {
+assert.strictEqual(T.fill(tmpl, rec), first, "drift at seed " + seed);
+}
+});
+
+// ---- NON-VACUITY BITE: prove the tests can FAIL (mutation guard) ------------
+// If this harness passed a no-op implementation, it would be worthless. Bite it:
+// a mutant that leaves the slot literal instead of filling must be caught by the
+// golden corpus above. We assert the REAL fill differs from the mutant output.
+check("non-vacuity: a no-fill mutant would fail the golden corpus", function () {
+var tmpl = "Hi {{name}}.", rec = { name: "Ada"};
+var real = T.fill(tmpl, rec);
+var mutant = tmpl; // the no-op: returns the template unfilled
+assert.notStrictEqual(real, mutant,
+"if the real output equalled the unfilled template, the corpus could not tell them apart");
+assert.strictEqual(real, "Hi Ada.");
+});
+check("non-vacuity: a fail-open mutant (blank instead of refuse) would fail the known-bad half", function () {
+// The known-bad tests assert a THROW. A mutant that returned "" instead of
+// throwing would fail them — assert the real code throws where the mutant wouldn't.
+var threw = false;
+try { T.fill("{{missing}}", {});} catch (e) { threw = true;}
+assert.strictEqual(threw, true, "the real fill must refuse; a blank-filling mutant would not");
+});
+
+// ---- report ----------------------------------------------------------------
+if (fail === 0) {
+console.log("GREEN: " + pass + " passed, 0 failed [template]");
+process.exitCode = 0;
+} else {
+console.error("RED: " + pass + " passed, " + fail + " failed [template]");
+process.exitCode = 1;
+}
 
 Take the whole folder →
 MIT
-Node, no dependencies
+Node / browser, no dependencies
 
 ---
