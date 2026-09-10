@@ -100,6 +100,13 @@ _BASELINE = [
 # All three must hold for a hit to be dropped. Changed only by an operator-
 # reviewed public-repo commit (like the baseline above).
 _SCRUB_SANCTION_PATH_PREFIX = "gifts/scrub/"
+# The scrub gift's fixtures are also folded into the machine corpus by the
+# aggregation builders (build_corpus_shards.py, build_search_index.py). Those two
+# DECLARED aggregation faces therefore legitimately carry the SAME known fixtures.
+# redact.py sanctions them the same way on the session side (the declared-
+# aggregation sanction). A shard file is `corpus-shard-<N>.txt`; the search index
+# is `search-index.json`. Both sit at the flattened staging ROOT.
+_SCRUB_SANCTION_AGG_RE = re.compile(r"^(?:corpus-shard-\d+\.txt|search-index\.json)$")
 _SCRUB_SANCTION_CLASSES = frozenset({
     "credential-aws",
     "credential-slack",
@@ -119,12 +126,20 @@ _SCRUB_SANCTION_STRINGS = frozenset({
 def _is_scrub_sanctioned(rel, cls, snip):
     """True iff this hit is a KNOWN scrub demo fixture that may ship.
 
-    All three rails must hold: the file is under gifts/scrub/, the class is a
-    credential-demo class, AND the matched text is an exact known fixture. Any
-    one failing → not sanctioned → the hit stands and the run REFUSES.
+    Path rail: the file is EITHER under gifts/scrub/ (the gift's own served
+    files) OR one of the two declared aggregation faces (a corpus shard or the
+    search index) that legitimately fold the gift's fixtures. Class rail: a
+    credential-demo class. String rail: an exact known fixture. All three must
+    hold; any one failing → not sanctioned → the hit stands and the run REFUSES.
+    An UNKNOWN cred shape, or ANY non-cred class, in ANY of these files still
+    REFUSES — the aggregation faces get NO broader waiver than the gift dir.
     """
     rel_norm = rel.replace(os.sep, "/")
-    if not rel_norm.startswith(_SCRUB_SANCTION_PATH_PREFIX):
+    path_ok = (
+        rel_norm.startswith(_SCRUB_SANCTION_PATH_PREFIX)
+        or _SCRUB_SANCTION_AGG_RE.match(rel_norm) is not None
+    )
+    if not path_ok:
         return False
     if cls not in _SCRUB_SANCTION_CLASSES:
         return False
@@ -194,6 +209,9 @@ def scan_tree(root):
                     snip = m.group(0).strip()
                     if snip and not _is_scrub_sanctioned(rel, cls, snip):
                         hits.append((rel, i, cls, snip))
+            # Session-exported extras are NEVER sanctioned — the sanction is a
+            # public-owned baseline concept only; a session cannot both add a
+            # stricter literal and then waive it.
             for cls, needle in extras:
                 if needle in line:
                     hits.append((rel, i, cls, needle))
@@ -222,4 +240,3 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
-
