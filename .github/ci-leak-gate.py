@@ -79,6 +79,58 @@ _BASELINE = [
     ("cairn-routing", re.compile(r"the-cairn-(?:seed|manifest)|CAIRN-SEED|cairn_seed")),
 ]
 
+# --- The scrub-gift fixture sanction (operator ruling S09.2057 option B) --------
+# The `scrub` gift is a secret-scanner whose PUBLIC PURPOSE is to display
+# credential SHAPES so a person can see what the scanner catches. It therefore
+# ships fake-by-design credential fixtures. The operator RULED these shippable.
+# The session-side gate (redact.py) already knows this sanction; this is its
+# INDEPENDENT, HARDCODED, PUBLIC-OWNED mirror. It stays inside the anti-weakening
+# design (§5.3): the session can never widen it — it is owned HERE, and it is
+# pinned THREE ways so a real leak can never ride the waiver:
+#
+#   1. PATH-scoped   — only files under `gifts/scrub/` are eligible.
+#   2. CLASS-scoped  — only the credential-demo classes are waivable; a
+#      path/infra/session-id/private-repo/cairn hit inside gifts/scrub/ still
+#      REFUSES (a scrubber gift may demo a fake cred, never leak real infra).
+#   3. STRING-pinned — the waived hit's exact text must be one of the KNOWN fake
+#      fixtures. An UNKNOWN credential shape in a scrub file (a real key smuggled
+#      in) matches no pin and still REFUSES. This is stronger than a bare
+#      path+class waiver and is what makes the sanction safe to own publicly.
+#
+# All three must hold for a hit to be dropped. Changed only by an operator-
+# reviewed public-repo commit (like the baseline above).
+_SCRUB_SANCTION_PATH_PREFIX = "gifts/scrub/"
+_SCRUB_SANCTION_CLASSES = frozenset({
+    "credential-aws",
+    "credential-slack",
+    "credential-private-key",
+    "hex40-assignment",
+})
+# The exact fake fixtures scrub ships (assembled from fragments so THIS gate file
+# carries no literal credential-shape that would self-flag a whole-repo scan).
+_SCRUB_SANCTION_STRINGS = frozenset({
+    "AKIA" + "IOSFODNN7" + "EXAMPLE",                       # AWS doc example key
+    "xoxb-" + "2411-" + "abcdefghijklmnop",                 # fake slack bot token
+    "-----BEGIN RSA PRIVATE KEY-----",                      # fixture PEM header
+    "HEXKEY=" + "deadbeef" * 5,                             # 40-hex fake assignment
+})
+
+
+def _is_scrub_sanctioned(rel, cls, snip):
+    """True iff this hit is a KNOWN scrub demo fixture that may ship.
+
+    All three rails must hold: the file is under gifts/scrub/, the class is a
+    credential-demo class, AND the matched text is an exact known fixture. Any
+    one failing → not sanctioned → the hit stands and the run REFUSES.
+    """
+    rel_norm = rel.replace(os.sep, "/")
+    if not rel_norm.startswith(_SCRUB_SANCTION_PATH_PREFIX):
+        return False
+    if cls not in _SCRUB_SANCTION_CLASSES:
+        return False
+    return snip in _SCRUB_SANCTION_STRINGS
+
+
 _EXTRAS_FILE = ".ci-extra-signatures.txt"
 
 
@@ -140,7 +192,7 @@ def scan_tree(root):
             for cls, rx in _BASELINE:
                 for m in rx.finditer(line):
                     snip = m.group(0).strip()
-                    if snip:
+                    if snip and not _is_scrub_sanctioned(rel, cls, snip):
                         hits.append((rel, i, cls, snip))
             for cls, needle in extras:
                 if needle in line:
@@ -170,3 +222,4 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+
