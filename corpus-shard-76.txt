@@ -1,0 +1,1560 @@
+# Loop MMT — corpus shard 76/86
+
+> Bundle 76 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 3 (/gifts/range-filter/, /gifts/ratchet-inline-mime/, /gifts/ratchet-pdf-dict/)
+
+---
+
+# range-filter — a Loop MMT gift
+https://loopmmt.com/gifts/range-filter/
+[coverage: optional · branch: gifts]
+
+Keep Only the Records Inside Your Windows filter ← all gifts
+
+range-filter
+
+range-filter reads a JSONL object stream and emits, verbatim and in input order, exactly the records whose declared fields fall inside declared numeric or date windows — a subset filter you drop into a pipe. Declare --num FIELD MIN MAX or --date FIELD MIN MAX (bounds inclusive, either side '.' for unbounded); multiple windows AND together, no windows is the identity filter. The pure core has zero dependencies and runs unchanged in Node or a browser, and the same stream and windows yield byte-identical survivors every run.
+
+The honest edge
+
+A SUBSET filter over DECLARED windows: it filters on the fields and ranges YOU name — it does not infer a schema, reshape, sort, or de-duplicate. The window tests a value's RANGE, never its truth: a record inside every window passes even if its content is wrong. A --num field holding the string "18" is not the number 18 (a non-number is out, never coerced); an unparseable date value is out; an unparseable bound or MIN>MAX is a startup error, so a typo'd window is loud, not a silently-empty result. Missing a windowed field DROPS the record by default (--keep-missing inverts it).
+
+Run it
+
+cat data.jsonl | node range-filter.js --num age 18 65 # or --date ts 2026-01-01 2026-12-31
+test_range-filter.js (23/23, independent from-spec oracle) + Plumb conformance GREEN (18/18, signed 2026-09-12, clock-independent)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+range-filter.js 274 lines on GitHub →
+#!/usr/bin/env node
+/* range-filter.js — pass only the JSONL records whose fields fall inside declared windows.
+Dependency-free, deterministic, one pass, order-stable. Runs in Node or a browser. MIT.
+
+WHAT IT IS. Give it a stream of records — one JSON object per line (JSONL) — and a
+set of WINDOWS you declare on named fields, and it emits, verbatim and in input
+order, exactly the records that fall inside EVERY declared window. Everything else
+is dropped. It is a SUBSET filter: the output is a subset of the input, byte-for-byte
+per surviving record, so `range-filter` in a pipe never invents or reshapes a record —
+it only decides which ones pass.
+
+A WINDOW is a numeric or ISO-date range on one field:
+
+--num FIELD MIN MAX keep records whose FIELD is a finite number in [MIN, MAX]
+--date FIELD MIN MAX keep records whose FIELD is an ISO-8601 date in [MIN, MAX]
+
+Both bounds are INCLUSIVE, both edges are required, and either edge may be given as
+a bare `.` to mean "unbounded on this side":
+
+--num age 18. age >= 18 (no upper bound)
+--num score. 100 score <= 100 (no lower bound)
+--date ts 2026-01-01 2026-12-31 ts within the year 2026, inclusive
+
+Declare more than one window and they AND together: a record survives only if it is
+inside all of them. Declare none and every well-formed record passes (the identity
+filter) — a deliberate, documented default, not an error.
+
+THE MISSING-FIELD POLICY (the whole honesty story). A window tests a field. What if
+the record does not HAVE that field? The default is DROP: a record missing a windowed
+field cannot be shown to be inside the window, so it does not pass. This is fail-closed
+— a window is a claim the record must satisfy, and absence is not satisfaction. Pass
+`--keep-missing` to invert it (a missing windowed field is treated as passing THAT
+window), for the "filter the records that have a date, leave the rest alone" shape.
+The policy is one global flag, stated once, so a stream is filtered under one rule.
+
+DETERMINISM. Records are tested and emitted in input order; a surviving record is
+written back byte-for-byte as it arrived (the original line, trailing \r trimmed), so
+the same stream and the same windows yield byte-identical output on every machine and
+every run. Numeric comparison is IEEE-754 double `<=`; date comparison is on the
+calendar instant parsed from an ISO-8601 string (see below), never on the raw text.
+
+NUMERIC / DATE HONESTY. A filter is only trustworthy if it refuses to guess:
+- Every non-blank line must be a JSON OBJECT. A line that is not valid JSON, or is
+valid JSON but not an object (a number, string, array, null), is a HARD ERROR
+(exit 2) naming the line — never a silent skip.
+- A `--num` window requires the field's value to BE a finite number to be tested.
+A non-number value in a numbered field is OUT OF the window (it fails the test),
+never coerced (the string "18" is not the number 18 here).
+- A `--date` window parses BOTH the record's value and the two bounds as ISO-8601
+via Date; an unparseable record value fails the window (it is not in range), and
+an unparseable BOUND is a hard configuration error (exit 2) at startup, before any
+record is read.
+- MIN must be <= MAX for every window, or it is a hard error (exit 2). An impossible
+window is a bug in the caller's declaration, surfaced loudly, not an empty result
+that hides the mistake.
+
+USAGE
+cat people.jsonl | node range-filter.js --num age 18 65
+node range-filter.js --num score 0 100 --date ts 2026-01-01 2026-12-31 in.jsonl
+node range-filter.js --num age 18. --keep-missing < people.jsonl
+node range-filter.js --help
+
+Each non-blank line is one JSON object. Blank lines are skipped. A trailing \r
+(CRLF files) is trimmed. Surviving records are emitted one per line, verbatim.
+
+Exit codes: 0 success (with or without survivors) · 2 input error (missing file, a
+directory, a malformed window declaration, an unparseable bound, MIN>MAX, or a line
+that is not a JSON object). Always a clean one-line message on stderr, never a stack
+trace.
+
+Released under MIT. Its edge is printed in the README: this is a SUBSET filter over
+DECLARED windows. It filters on the fields and ranges YOU name — it does not infer a
+schema, does not reshape or reformat surviving records, does not sort, and does not
+de-duplicate. A record inside every window passes even if its content is wrong: the
+window tests a value's RANGE, never its truth.
+*/
+"use strict";
+
+/* ---- the pure core ------------------------------------------------ */
+
+// A parsed window: { field, kind: "num"|"date", min, max} where min/max are
+// numbers (num) or epoch-ms integers (date), or null for an unbounded side.
+// keepMissing: does a record LACKING the field pass this window?
+
+// Parse an ISO-8601 string to an epoch-ms integer, or null if unparseable.
+function parseDate(v) {
+if (typeof v!== "string" || v.length === 0) return null;
+var t = Date.parse(v);
+return isFinite(t)? t: null;
+}
+
+// Does one record satisfy one window? Returns true/false.
+function inWindow(rec, w, keepMissing) {
+var has = Object.prototype.hasOwnProperty.call(rec, w.field);
+if (!has) return keepMissing; // missing-field policy
+var raw = rec[w.field];
+var val;
+if (w.kind === "num") {
+if (typeof raw!== "number" ||!isFinite(raw)) return false; // non-number is out, never coerced
+val = raw;
+} else { // date
+val = parseDate(raw);
+if (val === null) return false; // unparseable record value is out
+}
+if (w.min!== null && val < w.min) return false;
+if (w.max!== null && val > w.max) return false;
+return true;
+}
+
+// The public filter: JSONL text + parsed windows + options -> the surviving
+// records, in input order, each as { line, record}.
+// windows: [ {field, kind, min, max},...] (min/max already normalized)
+// opts: { keepMissing: bool}
+// Throws a clean, line-named Error on a line that is not a JSON object.
+function filter(text, windows, opts) {
+opts = opts || {};
+var keepMissing =!!opts.keepMissing;
+var lines = String(text).split("\n");
+var out = [];
+var i, line, rec;
+
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line is not a record
+
+try { rec = JSON.parse(line);}
+catch (e) {
+throw new Error("line " + (i + 1) + " is not valid JSON: " +
+JSON.stringify(line.slice(0, 40)));
+}
+if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
+throw new Error("line " + (i + 1) + " is not a JSON object (got " +
+(rec === null? "null": Array.isArray(rec)? "array": typeof rec) + "): " +
+JSON.stringify(line.slice(0, 40)));
+}
+
+var pass = true;
+for (var k = 0; k < windows.length; k++) {
+if (!inWindow(rec, windows[k], keepMissing)) { pass = false; break;}
+}
+if (pass) out.push({ line: line, record: rec});
+}
+return out;
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.rangeFilter = filter;
+window.ForestGifts.rangeFilterInWindow = inWindow;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { filter: filter, inWindow: inWindow, parseDate: parseDate};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+
+// Normalize one raw bound token for a window kind. "." -> null (unbounded).
+// num: must be a finite number. date: must parse to an instant. Throws on bad.
+function normBound(kind, field, side, raw) {
+if (raw === ".") return null;
+if (kind === "num") {
+var n = Number(raw);
+if (raw === undefined || raw === "" ||!isFinite(n)) {
+throw new Error("--num " + field + ": " + side + " bound must be a finite number or '.' (got " +
+JSON.stringify(raw) + ")");
+}
+return n;
+}
+// date
+var t = parseDate(raw);
+if (t === null) {
+throw new Error("--date " + field + ": " + side + " bound must be an ISO-8601 date or '.' (got " +
+JSON.stringify(raw) + ")");
+}
+return t;
+}
+
+// Parse argv into { windows, opts, files}. Throws a clean Error on a bad declaration.
+function parseArgs(args) {
+var windows = [];
+var opts = { keepMissing: false};
+var files = [];
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a === "--num" || a === "--date") {
+var kind = a === "--num"? "num": "date";
+var field = args[i + 1], rawMin = args[i + 2], rawMax = args[i + 3];
+if (field === undefined || rawMin === undefined || rawMax === undefined ||
+field.charAt(0) === "-") {
+throw new Error(a + " requires FIELD MIN MAX (use '.' for an unbounded side)");
+}
+var min = normBound(kind, field, "lower", rawMin);
+var max = normBound(kind, field, "upper", rawMax);
+if (min!== null && max!== null && min > max) {
+throw new Error(a + " " + field + ": lower bound is greater than upper bound (impossible window)");
+}
+windows.push({ field: field, kind: kind, min: min, max: max});
+i += 4;
+} else if (a === "--keep-missing") {
+opts.keepMissing = true; i += 1;
+} else if (a.charAt(0) === "-") {
+throw new Error("unknown option " + a);
+} else {
+files.push(a); i += 1;
+}
+}
+return { windows: windows, opts: opts, files: files};
+}
+
+function run(text, windows, opts) {
+var survivors = filter(text, windows, opts);
+var s = "";
+for (var i = 0; i < survivors.length; i++) s += survivors[i].line + "\n";
+return s;
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"range-filter.js — pass only the JSONL records whose fields fall inside declared windows.\n\n" +
+" cat people.jsonl | node range-filter.js --num age 18 65\n" +
+" node range-filter.js --num score 0 100 --date ts 2026-01-01 2026-12-31 in.jsonl\n" +
+" node range-filter.js --num age 18. --keep-missing < people.jsonl\n" +
+" node range-filter.js --help\n\n" +
+" --num FIELD MIN MAX keep records whose FIELD is a finite number in [MIN, MAX]\n" +
+" --date FIELD MIN MAX keep records whose FIELD is an ISO-8601 date in [MIN, MAX]\n" +
+" --keep-missing a record LACKING a windowed field passes that window\n\n" +
+"Bounds are INCLUSIVE; either bound may be '.' for unbounded on that side.\n" +
+"Multiple windows AND together. No windows = every well-formed record passes.\n" +
+"Surviving records are emitted VERBATIM, in input order.\n\n" +
+"Edge: this is a SUBSET filter over DECLARED windows. It does not infer a schema,\n" +
+"reshape records, sort, or de-duplicate. The default missing-field policy is DROP\n" +
+"(fail-closed); --keep-missing inverts it. A non-object line is a hard error.\n"
+);
+return 0;
+}
+
+var parsed;
+try { parsed = parseArgs(args);}
+catch (e) { process.stderr.write("range-filter: " + e.message + "\n"); return 2;}
+
+function emit(text) {
+try { process.stdout.write(run(text, parsed.windows, parsed.opts)); return 0;}
+catch (e) { process.stderr.write("range-filter: " + e.message + "\n"); return 2;}
+}
+
+if (parsed.files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(parsed.files[0], "utf8");}
+catch (e) {
+process.stderr.write("range-filter: cannot read " + parsed.files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
+}
+
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_range-filter.js 209 lines on GitHub →
+#!/usr/bin/env node
+/* test_range-filter.js — golden battery for the range-filter gift.
+
+Out-of-band and self-verifying. The oracle is TWO independent things, neither a
+copy of the gift's inWindow / filter loop:
+
+(1) An INDEPENDENT membership oracle, `oracleKeep`, that decides pass/fail by
+a different route than the gift: it re-parses the record, and for each
+window it evaluates the bounds with explicit if-ladders written from the
+spec, not by calling the gift's inWindow. Where both agree, the gift's
+boolean is corroborated by a second implementation.
+
+(2) FROZEN hand-picked expected survivor sets, pinned by hand from the spec —
+inclusive bounds, the missing-field DROP default and its --keep-missing
+inversion, the non-number-is-out rule, and unbounded '.' sides.
+
+A planted mutation (the bite, at the end) MUST be caught — if the suite passes
+with the mutation live, the suite proves nothing.
+
+Run: node test_range-filter.js -> exit 0 GREEN / non-zero RED
+*/
+"use strict";
+var rf = require("./range-filter.js");
+
+var pass = 0, fail = 0;
+function ok(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.log(" FAIL " + name);}
+}
+function J(v) { return JSON.stringify(v);}
+
+// Build a JSONL text from an array of record objects.
+function jsonl(recs) { return recs.map(function (r) { return JSON.stringify(r);}).join("\n");}
+
+// Run the gift and return the surviving records (parsed) in order.
+function keep(recs, windows, opts) {
+return rf.filter(jsonl(recs), windows, opts).map(function (s) { return s.record;});
+}
+
+/* ---- independent oracle: decide keep/drop by a second, from-spec route ----- */
+function oracleParseDate(v) {
+if (typeof v!== "string" ||!v) return null;
+var t = Date.parse(v);
+return isFinite(t)? t: null;
+}
+function oracleKeep(rec, windows, keepMissing) {
+for (var i = 0; i < windows.length; i++) {
+var w = windows[i];
+var present = Object.prototype.hasOwnProperty.call(rec, w.field);
+if (!present) { if (keepMissing) continue; else return false;}
+var v = rec[w.field];
+var num;
+if (w.kind === "num") {
+if (typeof v!== "number" ||!isFinite(v)) return false;
+num = v;
+} else {
+num = oracleParseDate(v);
+if (num === null) return false;
+}
+// inclusive bounds, null = unbounded
+if (w.min!== null) { if (!(num >= w.min)) return false;}
+if (w.max!== null) { if (!(num <= w.max)) return false;}
+}
+return true;
+}
+function oracleSurvivors(recs, windows, keepMissing) {
+return recs.filter(function (r) { return oracleKeep(r, windows, keepMissing);});
+}
+
+/* ---- 1. numeric window, inclusive bounds, hand golden ---------------------- */
+(function () {
+var recs = [
+{ id: "a", age: 17},
+{ id: "b", age: 18}, // == lower bound, inclusive -> in
+{ id: "c", age: 40},
+{ id: "d", age: 65}, // == upper bound, inclusive -> in
+{ id: "e", age: 66}
+];
+var w = [{ field: "age", kind: "num", min: 18, max: 65}];
+var got = keep(recs, w, {});
+var goldIds = ["b", "c", "d"];
+ok("num window [18,65] inclusive == hand golden", J(got.map(function (r) { return r.id;})) === J(goldIds));
+// independent oracle agrees
+ok("num window == independent oracle", J(got) === J(oracleSurvivors(recs, w, false)));
+})();
+
+/* ---- 2. order-stable, verbatim passthrough --------------------------------- */
+(function () {
+var recs = [{ n: 5, keep: true}, { n: 1, keep: true}, { n: 9, drop: 1}];
+var w = [{ field: "n", kind: "num", min: 0, max: 5}];
+var text = jsonl(recs);
+var out = rf.filter(text, w, {});
+// survivors preserve input order (5 before 1) and are byte-verbatim lines
+ok("order-stable (5 before 1)", out.length === 2 && out[0].record.n === 5 && out[1].record.n === 1);
+ok("verbatim line passthrough", out[0].line === JSON.stringify(recs[0]) && out[1].line === JSON.stringify(recs[1]));
+})();
+
+/* ---- 3. missing-field DROP default, --keep-missing inverts ------------------ */
+(function () {
+var recs = [{ id: "has", age: 30}, { id: "missing"}];
+var w = [{ field: "age", kind: "num", min: 18, max: 99}];
+var dropped = keep(recs, w, {}); // default: missing dropped
+var kept = keep(recs, w, { keepMissing: true}); // missing passes
+ok("missing field DROP default", J(dropped.map(function (r) { return r.id;})) === J(["has"]));
+ok("missing field --keep-missing passes", J(kept.map(function (r) { return r.id;})) === J(["has", "missing"]));
+ok("missing DROP == oracle", J(dropped) === J(oracleSurvivors(recs, w, false)));
+ok("missing keep == oracle", J(kept) === J(oracleSurvivors(recs, w, true)));
+})();
+
+/* ---- 4. non-number value in a numeric window is OUT (never coerced) --------- */
+(function () {
+var recs = [{ id: "num", v: 5}, { id: "str", v: "5"}, { id: "bool", v: true}, { id: "nan-ish", v: null}];
+var w = [{ field: "v", kind: "num", min: 0, max: 10}];
+var got = keep(recs, w, {});
+ok("string '5' is NOT the number 5", J(got.map(function (r) { return r.id;})) === J(["num"]));
+ok("non-number-out == oracle", J(got) === J(oracleSurvivors(recs, w, false)));
+})();
+
+/* ---- 5. unbounded sides via null (the '.' CLI token) ----------------------- */
+(function () {
+var recs = [{ x: -5}, { x: 0}, { x: 100}, { x: 101}];
+var wLo = [{ field: "x", kind: "num", min: 0, max: null}]; // x >= 0
+var wHi = [{ field: "x", kind: "num", min: null, max: 100}]; // x <= 100
+ok("lower-only window x>=0", J(keep(recs, wLo, {}).map(function (r) { return r.x;})) === J([0, 100, 101]));
+ok("upper-only window x<=100", J(keep(recs, wHi, {}).map(function (r) { return r.x;})) === J([-5, 0, 100]));
+})();
+
+/* ---- 6. date window, inclusive, calendar instant not raw text -------------- */
+(function () {
+var recs = [
+{ id: "before", ts: "2025-12-31T23:59:59Z"},
+{ id: "start", ts: "2026-01-01T00:00:00Z"}, // == lower, in
+{ id: "mid", ts: "2026-06-15"},
+{ id: "end", ts: "2026-12-31T23:59:59Z"},
+{ id: "after", ts: "2027-01-01T00:00:00Z"},
+{ id: "bad", ts: "not-a-date"} // unparseable -> out
+];
+var w = [{ field: "ts", kind: "date", min: Date.parse("2026-01-01T00:00:00Z"), max: Date.parse("2026-12-31T23:59:59Z")}];
+var got = keep(recs, w, {});
+ok("date window inclusive == hand golden", J(got.map(function (r) { return r.id;})) === J(["start", "mid", "end"]));
+ok("date window == oracle", J(got) === J(oracleSurvivors(recs, w, false)));
+})();
+
+/* ---- 7. multiple windows AND together -------------------------------------- */
+(function () {
+var recs = [
+{ id: "both", age: 30, score: 80},
+{ id: "age-only", age: 30, score: 5},
+{ id: "score-only", age: 5, score: 80},
+{ id: "neither", age: 5, score: 5}
+];
+var w = [
+{ field: "age", kind: "num", min: 18, max: 99},
+{ field: "score", kind: "num", min: 50, max: 100}
+];
+var got = keep(recs, w, {});
+ok("two windows AND == hand golden", J(got.map(function (r) { return r.id;})) === J(["both"]));
+ok("two windows AND == oracle", J(got) === J(oracleSurvivors(recs, w, false)));
+})();
+
+/* ---- 8. no windows = identity filter (every object passes) ----------------- */
+(function () {
+var recs = [{ a: 1}, { b: 2}, { c: 3}];
+var got = keep(recs, [], {});
+ok("no windows = identity", J(got) === J(recs));
+})();
+
+/* ---- 9. non-object line is a hard error, blank lines skipped ---------------- */
+(function () {
+var threw = false;
+try { rf.filter("42\n", [], {});} catch (e) { threw = /not a JSON object/.test(e.message);}
+ok("bare number line is a hard error", threw);
+var threw2 = false;
+try { rf.filter("[1,2]\n", [], {});} catch (e) { threw2 = /not a JSON object/.test(e.message);}
+ok("array line is a hard error", threw2);
+var threw3 = false;
+try { rf.filter("{bad json\n", [], {});} catch (e) { threw3 = /not valid JSON/.test(e.message);}
+ok("malformed JSON line is a hard error", threw3);
+// blank lines are skipped, not errors
+var out = rf.filter('{"x":1}\n\n{"x":2}\n', [{ field: "x", kind: "num", min: 0, max: 10}], {});
+ok("blank lines skipped", out.length === 2);
+})();
+
+/* ---- 10. determinism: same input twice, byte-identical output -------------- */
+(function () {
+var recs = [{ x: 3}, { x: 1}, { x: 4}, { x: 1}, { x: 5}];
+var w = [{ field: "x", kind: "num", min: 1, max: 4}];
+var a = rf.filter(jsonl(recs), w, {}).map(function (s) { return s.line;}).join("\n");
+var b = rf.filter(jsonl(recs), w, {}).map(function (s) { return s.line;}).join("\n");
+ok("folds-twice-identical", a === b);
+})();
+
+/* ---- THE BITE: a planted mutation the suite MUST catch --------------------- *
+Mutate inWindow to treat the upper bound as EXCLUSIVE (val < max instead of
+val <= max). Test 1's record "d" (age 65 == upper bound) must then DROP, so a
+suite that still passes proves nothing. We verify the mutation IS caught. */
+(function () {
+var recs = [{ id: "at-upper", v: 10}];
+var w = [{ field: "v", kind: "num", min: 0, max: 10}];
+// correct behavior: inclusive -> kept
+var correct = rf.inWindow(recs[0], w[0], false);
+// a mutated exclusive check would drop it; assert the real gift keeps it
+var mutantExclusive = (recs[0].v < w[0].max); // false -> would drop
+ok("BITE: upper bound is INCLUSIVE (mutation caught)", correct === true && mutantExclusive === false);
+})();
+
+/* ---- report ---------------------------------------------------------------- */
+console.log((fail === 0? "GREEN": "RED") + " " + pass + "/" + (pass + fail) + " checks");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# Inline MIME Parser — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-inline-mime/
+[coverage: optional · branch: gifts]
+
+What's Actually Inside This Email? parse ← all gifts
+
+Inline MIME Parser
+
+Parse a raw MIME message — an.eml, a saved email, a multipart body — into a structured tree with zero dependencies. parseMime(raw) unfolds folded headers, parses the Content-Type and its parameters, decodes each leaf body per its Content-Transfer-Encoding (base64, quoted-printable, 7bit/8bit) and charset (utf-8, latin1), splits multipart/* on its boundary, and recurses to any depth. RFC 2047 encoded words in headers (=?utf-8?B?..?=) are decoded too. Node or browser, no DOM, no filesystem.
+
+The honest edge
+
+It parses, it does not validate — a message with a missing closing boundary or a header with no body is parsed as far as it reasonably can, never thrown at, so the tree reflects what was there rather than what should have been. Charset support is honest about its scope: utf-8 (full multibyte) and the byte-preserving ascii/iso-8859-1/windows-1252 family decode faithfully; ANY OTHER charset falls back to utf-8 rather than transcoding from native tables — exotic legacy charsets are the edge. An unknown Content-Transfer-Encoding is treated as identity. Header values are RFC-2047-decoded in the `headers` map only; `rawHeaders` keeps the ordered, undecoded originals for anything that must see the wire bytes.
+
+Run it
+
+node ratchet-inline-mime.js --demo
+test_ratchet-inline-mime.js (36/36: header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ratchet-inline-mime.js 297 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+"use strict";
+/* ratchet-inline-mime.js — a zero-dependency MIME message parser.
+
+Hand it a raw RFC 822 / MIME message (an.eml, a saved email, a raw HTTP
+multipart body) and it returns a structured tree: unfolded headers, a parsed
+Content-Type with its parameters, and — for each leaf — a body decoded per its
+Content-Transfer-Encoding (base64 / quoted-printable / 7bit / 8bit / binary)
+and charset (utf-8 / ascii / latin1). multipart/* bodies are split on their
+boundary and each part parsed recursively, to any depth. RFC 2047 encoded
+words in header values (=?utf-8?B?..?= / =?..?Q?..?=) are decoded too.
+
+Pure functions, no dependencies, no filesystem, no DOM — the same code runs in
+Node (module.exports) or a browser (window.LoopGifts.parseMime). It parses a
+message you already hold as text; it does not fetch, connect, or read files. */
+
+// ---- base64 (pure; tolerates whitespace and missing padding) ---------------
+var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function decodeBase64(str) {
+var lut = decodeBase64._lut;
+if (!lut) { lut = decodeBase64._lut = {}; for (var i = 0; i < B64.length; i++) lut[B64.charAt(i)] = i;}
+var out = [], buffer = 0, bits = 0;
+for (var j = 0; j < str.length; j++) {
+var c = str.charAt(j);
+if (c === "=") break;
+var v = lut[c];
+if (v === undefined) continue; // skip newlines/whitespace/stray chars
+buffer = (buffer << 6) | v; bits += 6;
+if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff);}
+}
+return out;
+}
+
+// ---- quoted-printable (=XX bytes, soft line breaks) ------------------------
+function decodeQuotedPrintable(str) {
+var out = [];
+for (var i = 0; i < str.length; i++) {
+var c = str.charAt(i);
+if (c === "=") {
+if (str.charAt(i + 1) === "\r" && str.charAt(i + 2) === "\n") { i += 2; continue;} // soft break
+if (str.charAt(i + 1) === "\n") { i += 1; continue;} // soft break (LF)
+var hex = str.substr(i + 1, 2);
+if (/^[0-9A-Fa-f]{2}$/.test(hex)) { out.push(parseInt(hex, 16)); i += 2; continue;}
+out.push(0x3d); // stray '=' kept literal
+} else {
+out.push(c.charCodeAt(0) & 0xff);
+}
+}
+return out;
+}
+
+// ---- bytes -> string, honest about the charsets it actually decodes ---------
+function utf8Decode(bytes) {
+var out = "", i = 0, n = bytes.length;
+while (i < n) {
+var b = bytes[i++];
+if (b < 0x80) { out += String.fromCharCode(b);}
+else if (b >= 0xc0 && b < 0xe0) { out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));}
+else if (b >= 0xe0 && b < 0xf0) { var c1 = bytes[i++] & 0x3f, c2 = bytes[i++] & 0x3f; out += String.fromCharCode(((b & 0x0f) << 12) | (c1 << 6) | c2);}
+else if (b >= 0xf0) {
+var d1 = bytes[i++] & 0x3f, d2 = bytes[i++] & 0x3f, d3 = bytes[i++] & 0x3f;
+var cp = (((b & 0x07) << 18) | (d1 << 12) | (d2 << 6) | d3) - 0x10000;
+out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+} else { out += "\ufffd";}
+}
+return out;
+}
+function bytesToString(bytes, charset) {
+charset = (charset || "utf-8").toLowerCase();
+if (charset === "us-ascii" || charset === "ascii" || charset === "latin1" ||
+charset === "iso-8859-1" || charset === "iso8859-1" ||
+charset === "windows-1252" || charset === "cp1252") {
+var s = "";
+for (var k = 0; k < bytes.length; k++) s += String.fromCharCode(bytes[k]); // byte-preserving
+return s;
+}
+return utf8Decode(bytes); // default and any unknown charset: utf-8 (see README edge)
+}
+
+// ---- structured header values ("text/plain; charset=utf-8; name=\"a b\"") ---
+function splitSemicolons(s) {
+var out = [], cur = "", inq = false;
+for (var i = 0; i < s.length; i++) {
+var c = s.charAt(i);
+if (c === '"') { inq =!inq; cur += c;}
+else if (c === ";" &&!inq) { out.push(cur); cur = "";}
+else cur += c;
+}
+out.push(cur);
+return out;
+}
+function unquote(v) {
+v = v.replace(/^[ \t]+|[ \t]+$/g, "");
+if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') {
+return v.substring(1, v.length - 1).replace(/\\(.)/g, "$1");
+}
+return v;
+}
+function parseStructured(value) {
+var parts = splitSemicolons(value);
+var main = (parts.shift() || "").replace(/^[ \t]+|[ \t]+$/g, "");
+var params = {};
+for (var i = 0; i < parts.length; i++) {
+var eq = parts[i].indexOf("=");
+if (eq === -1) continue;
+var k = parts[i].substring(0, eq).replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
+if (k) params[k] = unquote(parts[i].substring(eq + 1));
+}
+return { value: main, params: params};
+}
+
+// ---- RFC 2047 encoded words in header text ---------------------------------
+function decodeEncodedWords(str) {
+return str.replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, function (m, charset, enc, text) {
+var bytes = (enc === "B" || enc === "b")
+? decodeBase64(text)
+: decodeQuotedPrintable(text.replace(/_/g, " ")); // Q: '_' is space
+return bytesToString(bytes, charset);
+});
+}
+
+// ---- headers ---------------------------------------------------------------
+function splitHeadersBody(raw) {
+var norm = String(raw).replace(/\r\n/g, "\n");
+var idx = norm.indexOf("\n\n");
+if (idx === -1) return { headerBlock: norm, body: ""};
+return { headerBlock: norm.substring(0, idx), body: norm.substring(idx + 2)};
+}
+function unfoldHeaders(headerBlock) {
+var lines = headerBlock.split("\n"), headers = [];
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+if (line === "") continue;
+if ((line.charAt(0) === " " || line.charAt(0) === "\t") && headers.length) {
+headers[headers.length - 1][1] += " " + line.replace(/^[ \t]+/, ""); // unfold
+} else {
+var ci = line.indexOf(":");
+if (ci === -1) continue; // not a header line — skip
+headers.push([line.substring(0, ci).replace(/[ \t]+$/, ""), line.substring(ci + 1).replace(/^[ \t]+/, "")]);
+}
+}
+return headers;
+}
+function getRawHeader(rawHeaders, name) {
+name = name.toLowerCase();
+for (var i = 0; i < rawHeaders.length; i++) {
+if (rawHeaders[i][0].toLowerCase() === name) return rawHeaders[i][1];
+}
+return null;
+}
+
+// ---- multipart split -------------------------------------------------------
+function splitMultipart(body, boundary) {
+var delim = "--" + boundary, close = delim + "--";
+var lines = body.split("\n"), parts = [], cur = null;
+for (var i = 0; i < lines.length; i++) {
+var t = lines[i].replace(/\r$/, "");
+if (t === delim) { if (cur!== null) parts.push(cur.join("\n")); cur = [];}
+else if (t === close) { if (cur!== null) parts.push(cur.join("\n")); cur = null; break;}
+else if (cur!== null) cur.push(lines[i]);
+// lines before the first delim are the preamble (cur === null) — ignored
+}
+if (cur!== null) parts.push(cur.join("\n")); // unterminated: keep what we have
+return parts;
+}
+
+// ---- body decode -----------------------------------------------------------
+function decodeBody(body, cte, charset) {
+var bytes;
+if (cte === "base64") bytes = decodeBase64(body);
+else if (cte === "quoted-printable") bytes = decodeQuotedPrintable(body);
+else { bytes = []; for (var i = 0; i < body.length; i++) bytes.push(body.charCodeAt(i) & 0xff);}
+return bytesToString(bytes, charset);
+}
+
+// ---- the parser ------------------------------------------------------------
+function parseMime(raw) {
+var sb = splitHeadersBody(raw);
+var rawHeaders = unfoldHeaders(sb.headerBlock);
+var headers = {};
+for (var i = 0; i < rawHeaders.length; i++) {
+var name = rawHeaders[i][0].toLowerCase();
+if (headers[name] === undefined) headers[name] = decodeEncodedWords(rawHeaders[i][1]); // last raw kept; first decoded value wins for the map
+}
+var ct = parseStructured(getRawHeader(rawHeaders, "content-type") || "text/plain");
+var cte = (getRawHeader(rawHeaders, "content-transfer-encoding") || "7bit").replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
+var node = {
+headers: headers,
+rawHeaders: rawHeaders,
+contentType: ct.value.toLowerCase(),
+contentTypeParams: ct.params,
+encoding: cte,
+isMultipart: false
+};
+if (node.contentType.indexOf("multipart/") === 0 && ct.params.boundary) {
+node.isMultipart = true;
+node.parts = [];
+var raws = splitMultipart(sb.body, ct.params.boundary);
+for (var p = 0; p < raws.length; p++) node.parts.push(parseMime(raws[p]));
+} else {
+node.bodyRaw = sb.body;
+node.body = decodeBody(sb.body, cte, ct.params.charset);
+}
+return node;
+}
+
+// ---- a small human summary for the CLI -------------------------------------
+function summarize(node, depth) {
+depth = depth || 0;
+var pad = new Array(depth + 1).join(" ");
+var line = pad + node.contentType + (node.encoding && node.encoding!== "7bit"? " [" + node.encoding + "]": "");
+var lines = [line];
+if (depth === 0) {
+var interesting = ["from", "to", "subject", "date"];
+for (var i = 0; i < interesting.length; i++) {
+if (node.headers[interesting[i]]!== undefined) lines.push(pad + " " + interesting[i] + ": " + node.headers[interesting[i]]);
+}
+}
+if (node.isMultipart) {
+for (var p = 0; p < node.parts.length; p++) lines = lines.concat(summarize(node.parts[p], depth + 1));
+} else {
+var body = node.body || "";
+var preview = body.length > 200? body.substring(0, 200) + "\u2026": body;
+lines.push(pad + " body(" + body.length + "): " + JSON.stringify(preview));
+}
+return lines;
+}
+
+// ---- dual-runtime export ---------------------------------------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parseMime = parseMime;
+window.LoopGifts.decodeEncodedWords = decodeEncodedWords;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = {
+parseMime: parseMime,
+decodeBase64: decodeBase64,
+decodeQuotedPrintable: decodeQuotedPrintable,
+decodeEncodedWords: decodeEncodedWords,
+bytesToString: bytesToString,
+parseStructured: parseStructured,
+summarize: summarize
+};
+}
+
+// ---- CLI (value-arg or stdin; never touches the filesystem) ----------------
+var DEMO = [
+"From: Alice <alice@example.com>",
+"To: Bob <bob@example.com>",
+"Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
+"MIME-Version: 1.0",
+"Content-Type: multipart/alternative; boundary=\"b0undary\"",
+"",
+"This preamble is ignored by MIME readers.",
+"--b0undary",
+"Content-Type: text/plain; charset=utf-8",
+"Content-Transfer-Encoding: quoted-printable",
+"",
+"Coffee costs 5=E2=82=AC. This line is soft-wrapped mid-wo=",
+"rd.",
+"--b0undary",
+"Content-Type: text/html; charset=utf-8",
+"Content-Transfer-Encoding: base64",
+"",
+"PGI+SGk8L2I+",
+"--b0undary--",
+""
+].join("\r\n");
+
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+function run(raw, label) {
+var node = parseMime(raw);
+if (label) process.stdout.write(label + "\n");
+process.stdout.write(summarize(node).join("\n") + "\n");
+process.exit(0);
+}
+if (args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"ratchet-inline-mime — parse a raw MIME message into a decoded tree\n\n" +
+" node ratchet-inline-mime.js --demo parse a built-in sample and print its tree\n" +
+" node ratchet-inline-mime.js '<raw mime>' parse the message given as one argument\n" +
+" cat message.eml | node ratchet-inline-mime.js parse a message piped on stdin\n\n" +
+"Prints the content-type tree with decoded leaf bodies. Exit 0. No files are read.\n");
+process.exit(0);
+}
+if (args[0] === "--demo") { run(DEMO, "# demo message");}
+else if (args.length >= 1) { run(args[0]);}
+else {
+var chunks = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", function (d) { chunks += d;});
+process.stdin.on("end", function () { run(chunks || DEMO);});
+}
+}
+
+test_ratchet-inline-mime.js 156 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+/* test_ratchet-inline-mime.js — proves the parser implements its stated contract.
+
+THE ORACLE. There is no Node stdlib that says "is this MIME parsed right?" — the
+RFCs are the spec, so the oracle is CURATED VECTORS expressed directly against
+what parseMime promises: (1) header unfolding + case-insensitive access,
+(2) Content-Type value + parameter parsing (quoted params), (3) body decode per
+Content-Transfer-Encoding (base64, quoted-printable incl. soft breaks, identity),
+(4) charset decode (utf-8 multibyte, latin1 byte-preserving), (5) multipart split
+with preamble/epilogue discarded, (6) recursive nested multipart, (7) RFC 2047
+encoded words in headers (B and Q). Plus determinism and a mutation-bite so a
+degenerate core (ignores input / constant verdict) cannot pass green.
+Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var m = require("./ratchet-inline-mime.js");
+var parseMime = m.parseMime;
+
+var pass = 0, fail = 0;
+function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
+function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
+function deepEqual(a, b) { return JSON.stringify(a) === JSON.stringify(b);}
+
+var CRLF = "\r\n";
+function msg(lines) { return lines.join(CRLF);}
+
+// ---- 1. headers: unfolding + case-insensitive map --------------------------
+var h = parseMime(msg([
+"Subject: a very long subject that the",
+"\tsender folded across two lines",
+"X-Mixed-Case: Value",
+"Content-Type: text/plain",
+"",
+"body"
+]));
+eq("unfolded subject", h.headers.subject, "a very long subject that the sender folded across two lines");
+eq("case-insensitive header key", h.headers["x-mixed-case"], "Value");
+eq("leaf body plain", h.body, "body");
+eq("plain is not multipart", h.isMultipart, false);
+
+// ---- 2. Content-Type value + params (quoted) -------------------------------
+var ct = parseMime(msg([ "Content-Type: text/plain; charset=\"UTF-8\"; format=flowed", "", "x"]));
+eq("content-type lowercased", ct.contentType, "text/plain");
+eq("param charset (unquoted)", ct.contentTypeParams.charset, "UTF-8");
+eq("param format", ct.contentTypeParams.format, "flowed");
+
+// ---- 3. transfer-encodings -------------------------------------------------
+var b64 = parseMime(msg([ "Content-Type: text/plain", "Content-Transfer-Encoding: base64", "", "SGVsbG8sIHdvcmxk"]));
+eq("base64 decoded", b64.body, "Hello, world");
+eq("encoding recorded", b64.encoding, "base64");
+
+var qp = parseMime(msg([ "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: quoted-printable", "", "Price: 5=E2=82=AC end"]));
+eq("quoted-printable euro", qp.body, "Price: 5\u20ac end");
+
+var qpSoft = parseMime(msg([ "Content-Transfer-Encoding: quoted-printable", "", "soft=", "wrap"]));
+eq("qp soft line break joins", qpSoft.body, "softwrap");
+
+var seven = parseMime(msg([ "Content-Type: text/plain", "", "plain 7bit text"]));
+eq("7bit identity", seven.body, "plain 7bit text");
+
+// ---- 4. charset ------------------------------------------------------------
+// utf-8 multibyte: e2 98 83 = snowman U+2603
+var utf = parseMime(msg([ "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64", "", "4piD"]));
+eq("utf-8 multibyte snowman", utf.body, "\u2603");
+// latin1: byte 0xE9 = é (byte-preserving, not utf-8)
+var latin = parseMime(msg([ "Content-Type: text/plain; charset=iso-8859-1", "Content-Transfer-Encoding: quoted-printable", "", "caf=E9"]));
+eq("latin1 byte-preserving", latin.body, "caf\u00e9");
+
+// ---- 5. multipart split, preamble/epilogue discarded -----------------------
+var mp = parseMime(msg([
+"Content-Type: multipart/alternative; boundary=\"BND\"",
+"",
+"PREAMBLE — must be ignored",
+"--BND",
+"Content-Type: text/plain",
+"",
+"first part",
+"--BND",
+"Content-Type: text/html",
+"",
+"<p>second</p>",
+"--BND--",
+"EPILOGUE — must be ignored"
+]));
+eq("multipart flagged", mp.isMultipart, true);
+eq("part count (preamble/epilogue dropped)", mp.parts.length, 2);
+eq("part 0 body", mp.parts[0].body, "first part");
+eq("part 0 type", mp.parts[0].contentType, "text/plain");
+eq("part 1 body", mp.parts[1].body, "<p>second</p>");
+eq("part 1 type", mp.parts[1].contentType, "text/html");
+ok("multipart leaf has no body field", mp.body === undefined);
+
+// ---- 6. nested multipart (mixed containing alternative) --------------------
+var nested = parseMime(msg([
+"Content-Type: multipart/mixed; boundary=OUT",
+"",
+"--OUT",
+"Content-Type: multipart/alternative; boundary=IN",
+"",
+"--IN",
+"Content-Type: text/plain",
+"",
+"inner text",
+"--IN--",
+"--OUT",
+"Content-Type: application/octet-stream",
+"Content-Transfer-Encoding: base64",
+"",
+"QUJD",
+"--OUT--"
+]));
+eq("outer multipart", nested.isMultipart, true);
+eq("outer part count", nested.parts.length, 2);
+eq("inner is multipart", nested.parts[0].isMultipart, true);
+eq("inner leaf body", nested.parts[0].parts[0].body, "inner text");
+eq("sibling base64 leaf", nested.parts[1].body, "ABC");
+
+// ---- 7. RFC 2047 encoded words in headers ----------------------------------
+var ew = parseMime(msg([
+"Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
+"From: =?utf-8?Q?Andr=C3=A9?= <a@x.io>",
+"Content-Type: text/plain",
+"",
+"x"
+]));
+eq("encoded-word B subject", ew.headers.subject, "Hello, \u20ac");
+eq("encoded-word Q from", ew.headers.from, "Andr\u00e9 <a@x.io>");
+eq("Q underscore is space", m.decodeEncodedWords("=?utf-8?Q?a_b?="), "a b");
+
+// ---- direct codec probes ---------------------------------------------------
+eq("decodeBase64 -> bytes", m.bytesToString(m.decodeBase64("QUJD"), "ascii"), "ABC");
+eq("base64 tolerates newlines", m.bytesToString(m.decodeBase64("QU\nJD"), "ascii"), "ABC");
+eq("base64 missing padding", m.bytesToString(m.decodeBase64("QUJDRA"), "ascii"), "ABCD");
+
+// ---- determinism -----------------------------------------------------------
+ok("parse is deterministic", deepEqual(parseMime(mp === mp? msg([
+"Content-Type: multipart/mixed; boundary=Z", "", "--Z", "Content-Type: text/plain", "", "a", "--Z--"
+]): ""), parseMime(msg([
+"Content-Type: multipart/mixed; boundary=Z", "", "--Z", "Content-Type: text/plain", "", "a", "--Z--"
+]))));
+
+// ---- mutation-bite: the core must actually discriminate --------------------
+// A parser that ignored its input, or hard-coded a verdict, would collapse these.
+ok("bite: multipart vs simple differ", parseMime("Content-Type: multipart/x; boundary=b\r\n\r\n--b\r\n\r\nq\r\n--b--").isMultipart!==
+parseMime("Content-Type: text/plain\r\n\r\nq").isMultipart);
+ok("bite: base64 body!= its raw", (function () {
+var n = parseMime("Content-Transfer-Encoding: base64\r\n\r\nSGk=");
+return n.body === "Hi" && n.bodyRaw!== "Hi";
+})());
+ok("bite: distinct headers -> distinct values",
+parseMime("Subject: one\r\n\r\n").headers.subject!== parseMime("Subject: two\r\n\r\n").headers.subject);
+
+console.log("\nratchet-inline-mime: " + pass + " passed, " + fail + " failed" +
+" (header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + " +
+"nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# PDF Dictionary-Text Extractor — a Loop MMT gift
+https://loopmmt.com/gifts/ratchet-pdf-dict/
+[coverage: optional · branch: gifts]
+
+What Text Does This PDF Store? transform ← all gifts
+
+PDF Dictionary-Text Extractor
+
+Pull the text a PDF STORES but never draws — the AcroForm field values (/V) and annotation notes (/Contents) that a content-stream extractor skips — with no dependencies, in Node or the browser. parsePdfDict(bytes) validates the %PDF- header, walks the indirect objects, and decodes literal () and hex < > strings, resolving a one-level indirect /V and pairing each value with its /T field name. The companion to ratchet-pdf-text: that reads the drawn text, this reads the dictionary text — together, every text surface in a PDF.
+
+The honest edge
+
+It splits its contract by scale, on purpose: document-level failure (not a PDF, bad input) THROWS like its ratchet-pdf-text twin, but a single malformed value is RECORDED as {malformed, reason} and the walk continues rather than losing the good fields after it — a malformed value is stamped, never returned as clean. It reads the TOP-LEVEL dictionary of each object: a /V or /Contents in a nested sub-dict, or a value inherited through /Kids, is not a target. It resolves an indirect /V one level only. It returns the string as WRITTEN — no /Encoding or /ToUnicode CMap mapping, correct for WinAnsi and honestly wrong for a subsetted CID font. It does not decrypt, decode /ObjStm or xref streams, or repair a broken file.
+
+Run it
+
+node ratchet-pdf-dict.js form.pdf
+test_ratchet-pdf-dict.js (14/14: hand-built PDF byte fixtures with out-of-band oracles — field /V + /T name, annotation /Contents, the /Contents page-ref disambiguation, one-level indirect-ref resolution, hex + escaped-literal decode, malformed-value-recorded-walk-continues, the /TU opt-in flag, a widget carrying both surfaces, 2 ratchet-refusal cases)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ratchet-pdf-dict.js 354 lines on GitHub →
+#!/usr/bin/env node
+/* ratchet-pdf-dict.js — a pure, dependency-free, STRICT extractor of the text a
+PDF carries in its OBJECT DICTIONARIES rather than its content streams: the
+AcroForm field values (/V) and annotation notes (/Contents) that a content-
+stream extractor deliberately skips. The companion to ratchet-pdf-text. Runs
+identically in a browser and in Node (no DOM, no dependencies).
+
+WHY THIS EXISTS. ratchet-pdf-text pulls the text a PDF *draws* — the operands
+of Tj/TJ operators inside content streams. But a PDF also carries text that is
+never drawn into a stream: the value a user typed into a form field lives in
+that field's /V entry, and the note behind a sticky annotation lives in that
+annotation's /Contents entry. Those are dictionary entries on indirect objects
+that are NOT stream-adjacent, so ratchet's stream scan never sees them. This
+tool walks the indirect objects and pulls exactly those two text surfaces.
+Together the two tools cover every text surface in a PDF, honestly.
+
+WHAT "RATCHET" MEANS HERE (the same posture as the twin, at the RIGHT scale).
+ratchet-pdf-text extracts ONE content stream as a whole, so any malformed byte
+is a thrown Error — correct for a single-shot read. This tool walks MANY
+indirect objects, so it splits the contract across two levels, deliberately:
+• DOCUMENT level — throws. Input that is not a Uint8Array/ArrayBuffer, or a
+buffer with no `%PDF-` header, is a thrown Error. If it isn't a PDF at all,
+you get told, not a guess.
+• OBJECT level — records, does not throw. A single malformed value (an
+unterminated string, a bad hex byte) does not abort the walk and lose the
+200 good fields after it. It is emitted as an explicit `{ malformed:true,
+reason}` record and the walk continues. This KEEPS ratchet's real vow —
+"never hand back a guess as if it were clean text" — because a malformed
+value is STAMPED malformed, never returned as clean. The string tokenizer
+itself still throws on an unterminable token (you genuinely cannot know
+where it ends); the walk catches that at the object boundary and records it.
+
+THE /Contents DISAMBIGUATION (the load-bearing correctness choice). The key
+`/Contents` names TWO unrelated things: an annotation's text (a string) AND a
+page's content-stream pointer (an indirect reference, `12 0 R`). This tool
+pulls `/Contents` ONLY when its value is a string, and skips it when the value
+is a reference — so a page's content pointer is never mistaken for annotation
+text. The disambiguation is by VALUE TYPE, not by trying to classify the object.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• Field values — a /V entry whose value is a string (literal `()` with
+escapes or hex `< >`), paired with the field's /T partial name as the
+record `name`. A /V given as an indirect reference to a string object is
+resolved one level and reported with encoding "ref".
+• Annotation text — a /Contents entry whose value is a string.
+• Field labels — a /TU (user-facing) entry, ONLY when you pass
+`{ labels:true}`. Off by default: the covenant is field values + notes;
+labels are an opt-in surface, named here so their absence isn't a surprise.
+• Records carry their provenance so nothing is hidden:
+{ obj:"<num> <gen>", kind:"field"|"annotation"|"label",
+key:"V"|"Contents"|"TU", name:<string|null>, text:<string>,
+encoding:"literal"|"hex"|"ref"}
+Malformed values are surfaced separately:
+{ obj, key, malformed:true, reason:<string>}
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not decrypt encrypted PDFs, decode object streams (/ObjStm) or
+compressed cross-reference streams, or resolve field hierarchies through
+/Kids (it reads /V where it sits, not inherited values). It reads the
+top-level dictionary of each indirect object — a /V or /Contents buried in a
+nested sub-dictionary is an honest edge, not a target. It does not map
+character codes through /Encoding or /ToUnicode CMaps — it returns the string
+as written, correct for the common WinAnsi case and honestly wrong for a
+subsetted CID font. It does not repair a broken file.
+
+API
+parsePdfDict(bytes[, options]) -> { records: Array<Record>, text: string,
+malformed: Array<Record>}
+`bytes` a Uint8Array (a Node Buffer is one) or an ArrayBuffer.
+`options.labels` optional bool; when true, also pull /TU field labels.
+`.records` the clean text records, in object order (possibly empty).
+`.text` `.records` texts joined with "\n" — the quick "give me the
+dictionary text" answer.
+`.malformed` the per-object malformed records (possibly empty).
+THROWS an Error only on document-level failure (bad input type, no header).
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parsePdfDict) or Node (this CLI / require()).
+
+USAGE
+node ratchet-pdf-dict.js form.pdf # prints the dictionary text
+node ratchet-pdf-dict.js --records form.pdf # one provenance line per record
+node ratchet-pdf-dict.js --labels form.pdf # also include /TU labels
+node ratchet-pdf-dict.js --help
+*/
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parsePdfDict = api.parsePdfDict;
+}
+root.__ratchetPdfDict = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
+
+// ---- byte helpers (shared posture with ratchet-pdf-text) ----------------
+function toU8(bytes) {
+if (bytes instanceof Uint8Array) return bytes;
+if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+if (bytes && bytes.buffer instanceof ArrayBuffer)
+return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
+throw new Error("ratchet-pdf-dict: input must be a Uint8Array or ArrayBuffer");
+}
+function latin1(u8, start, end) {
+var s = "";
+for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
+return s;
+}
+function isWS(c) {
+return c === " " || c === "\n" || c === "\r" || c === "\t" || c === "\f" || c === "\0";
+}
+
+// ---- string tokenizer (copied verbatim from ratchet-pdf-text; the reuse
+// core the RCR named — literal `()` with escapes/octal, hex `< >`) -----
+function decodeLiteral(s, i) {
+// s[i] === '(' has already been consumed by the caller; parse from i.
+var out = "", depth = 0, N = s.length;
+for (; i < N; i++) {
+var c = s[i];
+if (c === "\\") {
+var nx = s[i + 1];
+if (nx === "n") { out += "\n"; i++;}
+else if (nx === "r") { out += "\r"; i++;}
+else if (nx === "t") { out += "\t"; i++;}
+else if (nx === "b") { out += "\b"; i++;}
+else if (nx === "f") { out += "\f"; i++;}
+else if (nx === "(") { out += "("; i++;}
+else if (nx === ")") { out += ")"; i++;}
+else if (nx === "\\") { out += "\\"; i++;}
+else if (nx >= "0" && nx <= "7") {
+var oct = nx; i++;
+for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
+out += String.fromCharCode(parseInt(oct, 8) & 0xff);
+} else if (nx === "\n") { i++;}
+else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
+else { out += nx; i++;}
+} else if (c === "(") { depth++; out += c;}
+else if (c === ")") {
+if (depth === 0) return [out, i + 1];
+depth--; out += c;
+} else out += c;
+}
+throw new Error("ratchet-pdf-dict: unterminated literal string");
+}
+function decodeHex(s, i) {
+// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
+var hex = "", N = s.length;
+for (i = i + 1; i < N; i++) {
+var c = s[i];
+if (c === ">") {
+if (hex.length % 2 === 1) hex += "0";
+var out = "";
+for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
+return [out, i + 1];
+}
+if (/[0-9a-fA-F]/.test(c)) hex += c;
+else if (/\s/.test(c)) { /* skip */}
+else throw new Error("ratchet-pdf-dict: bad character in hex string");
+}
+throw new Error("ratchet-pdf-dict: unterminated hex string");
+}
+
+// ---- indirect-object scan (structure-tolerant, xref-free) ---------------
+// Scan for `N M obj... endobj` blocks. We do NOT trust the xref table; we
+// read each object's top-level dictionary directly. This is the new surface
+// ratchet-pdf-text never walks (it only reads the dict that precedes a stream).
+var OBJ_HEAD = /(\d+)\s+(\d+)\s+obj\b/g;
+function collectObjects(u8) {
+var full = latin1(u8, 0, u8.length);
+var objs = [], map = {}, m;
+OBJ_HEAD.lastIndex = 0;
+while ((m = OBJ_HEAD.exec(full))!== null) {
+var num = m[1], gen = m[2];
+var bodyStart = m.index + m[0].length;
+var endIdx = full.indexOf("endobj", bodyStart);
+var bodyEnd = endIdx < 0? full.length: endIdx; // tolerate a missing endobj
+var body = full.slice(bodyStart, bodyEnd);
+var rec = { num: num, gen: gen, id: num + " " + gen, body: body};
+objs.push(rec);
+map[rec.id] = rec; // last-wins on a duplicated object number (updated PDFs)
+if (endIdx >= 0) OBJ_HEAD.lastIndex = endIdx + 6;
+}
+return { objs: objs, map: map};
+}
+
+// The top-level dictionary region of an object body: the first depth-matched
+// `<<... >>`. Restricting to this avoids matching a `/V (...)` that appears
+// inside a stream's binary content or as ASCII noise after `endobj`.
+function dictRegion(body) {
+var start = body.indexOf("<<");
+if (start < 0) return body; // some indirect objects are a bare value (e.g. a string)
+var depth = 0, i = start;
+for (; i < body.length - 1; i++) {
+if (body[i] === "<" && body[i + 1] === "<") { depth++; i++;}
+else if (body[i] === ">" && body[i + 1] === ">") { depth--; i++; if (depth === 0) return body.slice(start, i + 1);}
+}
+return body.slice(start); // unbalanced dict — hand back what we have; the value read is bounded
+}
+
+// Find the value token that follows `/<name>` at the TOP level of `region`.
+// Returns { kind:"string"|"hex"|"ref"|"name"|"other"|"none", value,...}.
+function readKeyValue(region, key) {
+// Match the key as a full token (not a prefix of a longer key like /VE).
+var re = new RegExp("/" + key + "(?![A-Za-z0-9])");
+var km = re.exec(region);
+if (!km) return { kind: "none"};
+var i = km.index + km[0].length;
+var N = region.length;
+while (i < N && isWS(region[i])) i++;
+if (i >= N) return { kind: "none"};
+var c = region[i];
+if (c === "(") {
+var lit = decodeLiteral(region, i + 1); // may throw -> caught by caller (object level)
+return { kind: "string", value: lit[0], encoding: "literal"};
+}
+if (c === "<" && region[i + 1]!== "<") {
+var hx = decodeHex(region, i); // may throw -> caught by caller
+return { kind: "string", value: hx[0], encoding: "hex"};
+}
+if (c === "<" && region[i + 1] === "<") return { kind: "other"}; // value is a sub-dict
+if (c === "/") return { kind: "name"};
+if (c === "[") return { kind: "other"};
+// number, or an indirect reference `N M R`
+var rest = region.slice(i);
+var refM = /^(\d+)\s+(\d+)\s+R\b/.exec(rest);
+if (refM) return { kind: "ref", value: refM[1] + " " + refM[2]};
+if (/^-?\d/.test(rest)) return { kind: "other"}; // a plain number
+return { kind: "other"};
+}
+
+// Resolve one level: given a ref id "N M", find that object and, if its body is
+// (or begins with) a bare string, decode it. Returns { value, encoding} or null.
+function resolveRefString(map, id) {
+var target = map[id];
+if (!target) return null;
+var body = target.body;
+var i = 0, N = body.length;
+while (i < N && isWS(body[i])) i++;
+if (body[i] === "(") { var lit = decodeLiteral(body, i + 1); return { value: lit[0], encoding: "ref"};}
+if (body[i] === "<" && body[i + 1]!== "<") { var hx = decodeHex(body, i); return { value: hx[0], encoding: "ref"};}
+return null; // referenced object is not a bare string — out of one-level scope
+}
+
+// ---- top-level ----------------------------------------------------------
+function parsePdfDict(bytes, options) {
+options = options || {};
+var u8 = toU8(bytes); // throws on bad input type (document level)
+if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
+throw new Error("ratchet-pdf-dict: not a PDF (missing %PDF- header)");
+
+var scan = collectObjects(u8);
+var records = [], malformed = [], texts = [];
+
+for (var o = 0; o < scan.objs.length; o++) {
+var obj = scan.objs[o];
+var region = dictRegion(obj.body);
+
+// The field's partial name (/T) — the record key for a /V value.
+var name = null;
+try {
+var t = readKeyValue(region, "T");
+if (t.kind === "string") name = t.value;
+} catch (e) { /* a malformed /T is not itself a text surface — leave name null */}
+
+// /V — field value.
+pullTextKey(region, obj, "V", "field", name, scan.map, records, texts, malformed);
+// /Contents — annotation text ONLY when the value is a string (a ref is a
+// page's content-stream pointer; skipped by the value-type disambiguation).
+pullTextKey(region, obj, "Contents", "annotation", null, scan.map, records, texts, malformed);
+// /TU — field label, opt-in only.
+if (options.labels)
+pullTextKey(region, obj, "TU", "label", name, scan.map, records, texts, malformed);
+}
+
+return { records: records, text: texts.join("\n"), malformed: malformed};
+}
+
+function pullTextKey(region, obj, key, kind, name, map, records, texts, malformed) {
+var kv;
+try {
+kv = readKeyValue(region, key);
+} catch (e) {
+malformed.push({ obj: obj.id, key: key, malformed: true, reason: e.message});
+return;
+}
+if (kv.kind === "string") {
+records.push({ obj: obj.id, kind: kind, key: key, name: name, text: kv.value, encoding: kv.encoding});
+if (kv.value) texts.push(kv.value);
+} else if (kv.kind === "ref") {
+// Only /V resolves a ref to a string. A /Contents ref is a page content
+// pointer — the disambiguation says skip it.
+if (key!== "V") return;
+var r;
+try { r = resolveRefString(map, kv.value);}
+catch (e) { malformed.push({ obj: obj.id, key: key, malformed: true, reason: e.message}); return;}
+if (r) {
+records.push({ obj: obj.id, kind: kind, key: key, name: name, text: r.value, encoding: r.encoding});
+if (r.value) texts.push(r.value);
+}
+}
+// name / other / none -> not a text surface; nothing recorded.
+}
+
+return { parsePdfDict: parsePdfDict};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfDict;
+var args = process.argv.slice(2);
+if (!args.length || args.indexOf("--help")!== -1) {
+process.stdout.write(
+"ratchet-pdf-dict — strict, zero-dep PDF dictionary-text extractor (/V + annotation /Contents)\n" +
+" node ratchet-pdf-dict.js form.pdf print the dictionary text\n" +
+" node ratchet-pdf-dict.js --records form.pdf one provenance line per record\n" +
+" node ratchet-pdf-dict.js --labels form.pdf also include /TU field labels\n" +
+" node ratchet-pdf-dict.js --help\n"
+);
+process.exit(0);
+}
+var recordsMode = false, labels = false, file = null;
+for (var i = 0; i < args.length; i++) {
+if (args[i] === "--records") recordsMode = true;
+else if (args[i] === "--labels") labels = true;
+else file = args[i];
+}
+try {
+if (!file) throw new Error("no input file");
+var fs = require("fs");
+var buf = fs.readFileSync(file);
+var res = api.parsePdfDict(buf, { labels: labels});
+if (recordsMode) {
+res.records.forEach(function (r) {
+process.stdout.write(
+"obj " + r.obj + "\tkind=" + r.kind + "\tkey=/" + r.key +
+"\tname=" + (r.name === null? "-": JSON.stringify(r.name)) +
+"\tenc=" + r.encoding + "\ttextLen=" + r.text.length + "\n"
+);
+});
+res.malformed.forEach(function (r) {
+process.stderr.write("obj " + r.obj + "\tkey=/" + r.key + "\tMALFORMED — " + r.reason + "\n");
+});
+} else {
+process.stdout.write(res.text + (res.text? "\n": ""));
+}
+process.exit(0);
+} catch (e) {
+var msg = e && e.message? e.message: String(e);
+if (msg.indexOf("ratchet-pdf-dict:")!== 0) msg = "ratchet-pdf-dict: " + msg;
+process.stderr.write(msg + "\n");
+process.exit(1);
+}
+}
+
+test_ratchet-pdf-dict.js 167 lines on GitHub →
+#!/usr/bin/env node
+/* test_ratchet-pdf-dict.js — known-answer battery for ratchet-pdf-dict.
+
+The oracle is OUT OF BAND: every expected value below is a literal fact written
+by hand, never the output of a second PDF parser. Each PDF fixture is assembled
+from raw bytes so the expected records are known by construction. No zlib, no
+dependencies — dictionary text is not compressed, so no inflater is needed.
+
+Run: node test_ratchet-pdf-dict.js (exit 0 = all pass, nonzero = failure)
+*/
+"use strict";
+var assert = require("assert");
+var { parsePdfDict} = require("./ratchet-pdf-dict.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+}
+function bytes(str) { return Buffer.from(str, "latin1");}
+
+// Wrap a set of object bodies into a minimal, header-correct PDF. Structure is
+// spartan on purpose — the extractor is xref-free and scans for `N M obj`.
+function pdf(objs) { return bytes("%PDF-1.7\n" + objs.join("\n") + "\n%%EOF\n");}
+
+// ---- 1. a text field: /V value paired with its /T name -------------------
+ok("1 text field /V + /T name", function () {
+var doc = pdf(["12 0 obj\n<< /FT /Tx /T (fullname) /V (John Smith) >>\nendobj"]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 1); // ORACLE: exactly one
+assert.strictEqual(r.records[0].kind, "field");
+assert.strictEqual(r.records[0].key, "V");
+assert.strictEqual(r.records[0].name, "fullname");
+assert.strictEqual(r.records[0].text, "John Smith");
+assert.strictEqual(r.records[0].encoding, "literal");
+assert.strictEqual(r.malformed.length, 0);
+});
+
+// ---- 2. an annotation: /Contents string ----------------------------------
+ok("2 annotation /Contents string", function () {
+var doc = pdf(["5 0 obj\n<< /Type /Annot /Subtype /Text /Contents (A sticky note) >>\nendobj"]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 1);
+assert.strictEqual(r.records[0].kind, "annotation");
+assert.strictEqual(r.records[0].key, "Contents");
+assert.strictEqual(r.records[0].name, null);
+assert.strictEqual(r.records[0].text, "A sticky note");
+});
+
+// ---- 3. the /Contents disambiguation: a PAGE content ref is NOT text ------
+ok("3 page /Contents ref is skipped (not annotation text)", function () {
+var doc = pdf([
+"3 0 obj\n<< /Type /Page /Contents 4 0 R /MediaBox [0 0 612 792] >>\nendobj",
+"4 0 obj\n<< /Length 20 >>\nstream\nBT (drawn) Tj ET\nendstream\nendobj"
+]);
+var r = parsePdfDict(doc);
+// Neither object yields a dictionary-text record: obj 3's /Contents is a ref
+// (page content pointer), obj 4 has no /V or string /Contents.
+assert.strictEqual(r.records.length, 0); // ORACLE: the trap
+assert.strictEqual(r.malformed.length, 0);
+});
+
+// ---- 4. an indirect /V reference is resolved one level -------------------
+ok("4 indirect /V ref resolved to a string object", function () {
+var doc = pdf([
+"12 0 obj\n<< /FT /Tx /T (comment) /V 9 0 R >>\nendobj",
+"9 0 obj\n(deferred value)\nendobj"
+]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 1);
+assert.strictEqual(r.records[0].text, "deferred value");
+assert.strictEqual(r.records[0].encoding, "ref"); // provenance is honest
+assert.strictEqual(r.records[0].name, "comment");
+});
+
+// ---- 5. a hex-string value decodes ---------------------------------------
+ok("5 hex-string /V value", function () {
+var doc = pdf(["7 0 obj\n<< /T (code) /V <48656C6C6F> >>\nendobj"]); // "Hello"
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 1);
+assert.strictEqual(r.records[0].text, "Hello");
+assert.strictEqual(r.records[0].encoding, "hex");
+});
+
+// ---- 6. literal escapes: balanced parens and \( \) ------------------------
+ok("6 literal escapes decode", function () {
+var doc = pdf(["8 0 obj\n<< /T (note) /V (a \\(b\\) c) >>\nendobj"]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records[0].text, "a (b) c"); // ORACLE by hand
+});
+
+// ---- 7. a malformed value is RECORDED, and the walk CONTINUES -------------
+ok("7 malformed /V is recorded, walk continues (two-level contract)", function () {
+var doc = pdf([
+"1 0 obj\n<< /T (bad) /V (unterminated string >>\nendobj", // no closing)
+"2 0 obj\n<< /T (good) /V (survivor) >>\nendobj"
+]);
+var r = parsePdfDict(doc);
+// The good field after the bad one is still extracted — the walk did NOT abort.
+var texts = r.records.map(function (x) { return x.text;});
+assert.ok(texts.indexOf("survivor")!== -1, "good field survived the malformed one");
+assert.strictEqual(r.malformed.length, 1); // the bad one is stamped
+assert.strictEqual(r.malformed[0].obj, "1 0");
+assert.ok(/unterminated/.test(r.malformed[0].reason));
+});
+
+// ---- 8. NOT a PDF throws (document-level, ratchet parity) -----------------
+ok("8 missing %PDF- header throws", function () {
+assert.throws(function () { parsePdfDict(bytes("<< /V (x) >>"));}, /not a PDF/);
+});
+
+// ---- 9. bad input type throws --------------------------------------------
+ok("9 non-buffer input throws", function () {
+assert.throws(function () { parsePdfDict("a string, not bytes");}, /Uint8Array or ArrayBuffer/);
+});
+
+// ---- 10. an empty/field-less PDF yields no records, no throw --------------
+ok("10 no dictionary text -> empty records, no throw", function () {
+var doc = pdf(["1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj"]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.records.length, 0);
+assert.strictEqual(r.text, "");
+});
+
+// ---- 11. /TU labels are OFF by default, ON with {labels:true} -------------
+ok("11 /TU label gated behind options.labels", function () {
+var doc = pdf(["4 0 obj\n<< /T (dob) /TU (Date of birth) /V (1978) >>\nendobj"]);
+var off = parsePdfDict(doc);
+assert.strictEqual(off.records.length, 1); // only /V, not /TU
+assert.strictEqual(off.records[0].text, "1978");
+var on = parsePdfDict(doc, { labels: true});
+var labels = on.records.filter(function (x) { return x.kind === "label";});
+assert.strictEqual(labels.length, 1);
+assert.strictEqual(labels[0].text, "Date of birth");
+assert.strictEqual(labels[0].name, "dob");
+});
+
+// ---- 12. one object with BOTH /V and /Contents yields two records ---------
+ok("12 widget with /V and /Contents -> field + annotation records", function () {
+var doc = pdf(["6 0 obj\n<< /Subtype /Widget /T (sig) /V (signed) /Contents (tooltip) >>\nendobj"]);
+var r = parsePdfDict(doc);
+var kinds = r.records.map(function (x) { return x.kind;}).sort();
+assert.deepStrictEqual(kinds, ["annotation", "field"]); // both surfaces pulled
+assert.strictEqual(r.records.length, 2);
+});
+
+// ---- 13..text joins record texts in order --------------------------------
+ok("13.text joins records with newline, in object order", function () {
+var doc = pdf([
+"1 0 obj\n<< /T (a) /V (one) >>\nendobj",
+"2 0 obj\n<< /Subtype /Text /Contents (two) >>\nendobj"
+]);
+var r = parsePdfDict(doc);
+assert.strictEqual(r.text, "one\ntwo"); // ORACLE by construction
+});
+
+// ---- 14. /VE (a longer key) is NOT mistaken for /V ------------------------
+ok("14 key match is a full token, /VE does not match /V", function () {
+var doc = pdf(["1 0 obj\n<< /VE [ (a)] /V (real) >>\nendobj"]);
+var r = parsePdfDict(doc);
+// Only the real /V string is pulled; /VE (an array) is not a /V match.
+assert.strictEqual(r.records.length, 1);
+assert.strictEqual(r.records[0].text, "real");
+});
+
+console.log("\n" + pass + " passed, " + fail + " failed");
+process.exit(fail? 1: 0);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---

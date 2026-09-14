@@ -1,1660 +1,1799 @@
-# Loop MMT — corpus shard 71/74
+# Loop MMT — corpus shard 71/86
 
-> Bundle 71 of 74 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 71 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 2 (/gifts/tracebus/, /gifts/trellis/)
+Nodes in this shard: 4 (/gifts/legible/, /gifts/life-fold/, /gifts/line-source/, /gifts/loop21-component-factory/)
 
 ---
 
-# Tracebus — a Loop MMT gift
-https://loopmmt.com/gifts/tracebus/
+# Text Legibility Gauge — a Loop MMT gift
+https://loopmmt.com/gifts/legible/
 [coverage: optional · branch: gifts]
 
-Nothing Moves Without a Receipt route ← all gifts
+Readable Text, or Machine Rubble? gauge ← all gifts
 
-Tracebus
+Text Legibility Gauge
 
-A publish/subscribe bus with two rules most buses skip: every legal path is declared up front, and every emission is written to an append-only ledger you can replay by trace id. A packet can only reach a subscriber the routing table permits — an unrouted packet is refused, not silently dropped — and a subscriber that throws is caught, recorded, and stepped over so one bad listener can never take the bus down. Thread one traceId through a chain and read the whole journey back out of the ledger, hop by hop.
+Guess whether a string is human-readable text or machine-drawn rubble, and say how sure you are. A text extractor hands you a `.text` field and, by design, can't tell you whether it's readable — the classic failure is a subsetted CID font whose glyphs decode one byte at a time into control-character rubble that only looks like a populated string. assess(text) returns a label (readable / suspect / likely-binary / empty) with the raw score and signal counts exposed, scoring the density of characters human text almost never contains: C0 controls (minus tab/newline) plus U+FFFD, and nothing else. The load-bearing rule: it reports but never scores the C1 band, so legitimate multibyte-as-Latin1 (日本語, Cyrillic) never reads as binary — the CJK false-positive it refuses to make.
 
 The honest edge
 
-It enforces the topology you declare and records every hop; it does NOT invent routes for you (an unrouted packet is a fault, by design) and its ids are v4-shaped for correlation, not cryptographic (Math.random). request/response is opt-in per bus via { requestResponse: true} — the bus name carries no special meaning.
+legible is a heuristic, not a verdict, and it detects control-character rubble — NOT wrong encoding. Mojibake (valid bytes, wrong charset) is still printable characters, so it reads `readable` even though no human can read it: a `readable` means “not control-char rubble,” never “correctly decoded.” It does not decode, validate, or understand the text, and never proves it correct or meaningful. It is a gauge you read, never a gate you route on.
 
 Run it
 
-node tracebus.js --demo
-test_tracebus.js (72/72, mutation-bitten)
-Zero-dependency JavaScript, Node or browser
+node legible.js "some text"
+test_legible.js (20/20, hand-oracle drift-check + CID known-bad + CJK-as-Latin1 regression guard)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-tracebus.js 475 lines on GitHub →
-/*
-* tracebus — a traced, routing-enforced message bus.
-*
-* A publish/subscribe bus where every legal path is declared up front and
-* every emission is written to an append-only ledger you can replay by
-* trace id. A packet can only reach a subscriber the routing table permits;
-* an unrouted packet is refused, not silently dropped. Nothing is delivered
-* without leaving a receipt.
-*
-* The shape: packet ──emit(source)──▶ routingTable.resolve ──▶ subscribers
-* │ │
-* └────────▶ ledger.record ◀─────┘
-*
-* Zero dependencies. Runs in Node or the browser. No I/O, no globals, no
-* clock you can't control (timestamps are ISO strings; ids are v4-shaped).
-*
-* Properties this file holds (see test_tracebus.js):
-* 1. No delivery without a receipt. Every emit() — delivered, partial,
-* rejected, or errored — appends exactly one ledger record.
-* 2. No path that wasn't declared. resolve() throws on an unrouted
-* (packetType, source) pair; emit() records the rejection and rethrows.
-* 3. A wrong-bus packet is refused. A packet routed to bus A cannot be
-* emitted on bus B, even if a subscriber is listening.
-* 4. A subscriber that throws cannot break the emitter. Handler errors are
-* caught, recorded against that destination, and delivery continues.
-* 5. Routing entries are frozen. A registered route cannot be mutated
-* after the fact (deepFreeze), so the declared topology stays declared.
-* 6. A trace is reconstructable. queryByTraceId returns every hop a
-* packet took, in emission order.
-*
-* Origin: stripped from a shipped order-management constellation's internal
-* message fabric (the "one bus, many loops, every packet traced" core) and
-* generalized — the request/response capability, which was hardwired to a
-* single bus name in the original, is now a per-bus flag.
-*
-* MIT licensed. Use it for anything.
-*/
-
-'use strict';
-
-// ────────────────────────────────────────────────────────────────────
-// Primitives (inlined so the file has no dependencies).
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* A v4-shaped identifier: 8-4-4-4-12 hex with the version nibble pinned
-* to 4 and the variant nibble in {8,9,a,b}. Uses Math.random — this is an
-* identifier for correlating log records, NOT a cryptographic token.
-*/
-function generateId() {
-const hex = '0123456789abcdef';
-let id = '';
-for (let i = 0; i < 36; i++) {
-if (i === 8 || i === 13 || i === 18 || i === 23) {
-id += '-';
-} else if (i === 14) {
-id += '4';
-} else if (i === 19) {
-id += hex[(Math.floor(Math.random() * 16) & 0x3) | 0x8];
-} else {
-id += hex[Math.floor(Math.random() * 16)];
-}
-}
-return id;
-}
-
-/** Current time as an ISO-8601 string. The one place time enters. */
-function now() {
-return new Date().toISOString();
-}
-
-/**
-* Recursively freeze an object and everything it owns. A registered
-* routing entry is frozen so the declared topology cannot be edited
-* after registration.
-*/
-function deepFreeze(obj) {
-Object.freeze(obj);
-for (const key of Object.keys(obj)) {
-const val = obj[key];
-if (val && typeof val === 'object' &&!Object.isFrozen(val)) {
-deepFreeze(val);
-}
-}
-return obj;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Packet — the traceable envelope.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a packet: a typed payload wrapped in a header that carries a
-* unique packetId, a traceId (shared across a causal chain — pass it in
-* opts to thread a conversation), a timestamp, and an optional source.
-*
-* @param {string} packetType - a non-empty type string, e.g. 'user.created'
-* @param {object} payload - the packet's data (must be an object)
-* @param {object} [opts] - { traceId?, source?} overrides
-* @returns {object} { packetId, packetType, timestamp, traceId, source, payload}
-*/
-function createPacket(packetType, payload, opts) {
-if (!packetType || typeof packetType!== 'string') {
-throw new Error('[tracebus] Cannot create packet: packetType is required and must be a non-empty string');
-}
-if (!payload || typeof payload!== 'object') {
-throw new Error(`[tracebus] Cannot create packet ${packetType}: payload must be an object`);
-}
-
-return {
-packetId: generateId(),
-packetType: packetType,
-timestamp: now(),
-traceId: (opts && opts.traceId) || generateId(),
-source: (opts && opts.source) || null,
-payload: payload
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Ledger — the append-only receipt log.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create an append-only ledger. Every bus emission is recorded here.
-* Nothing is ever removed; queries are pure reads.
-*/
-function createLedger() {
-const entries = [];
-
-return {
-/**
-* Record one emission.
-* @param {object} record - { bus, packet, source, destinations?, status?}
-*/
-record(record) {
-if (!record ||!record.packet ||!record.packet.packetId) {
-throw new Error('[tracebus] Cannot record: a record needs a packet with a packetId');
-}
-entries.push({
-ledgerId: generateId(),
-recordedAt: now(),
-bus: record.bus,
-packetId: record.packet.packetId,
-packetType: record.packet.packetType,
-traceId: record.packet.traceId,
-source: record.source,
-destinations: record.destinations || [],
-status: record.status || 'delivered'
-});
-},
-
-/**
-* Every record for one traceId, in emission order — a packet's journey.
-* @param {string} traceId
-* @returns {object[]}
-*/
-queryByTraceId(traceId) {
-return entries.filter(e => e.traceId === traceId);
-},
-
-/**
-* Every record of one packetType.
-* @param {string} packetType
-* @returns {object[]}
-*/
-queryByPacketType(packetType) {
-return entries.filter(e => e.packetType === packetType);
-},
-
-/** Total records (diagnostic). */
-count() {
-return entries.length;
-},
-
-/** A copy of every record (diagnostic — the ledger stays private). */
-all() {
-return entries.slice();
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Routing table — the declared topology.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a routing table. Every legal (packetType, source) → destinations
-* path must be registered before a packet can travel it. Registered entries
-* are frozen.
-*/
-function createRoutingTable() {
-// key = `${packetType}:${source}` → array of frozen entries
-const routes = new Map();
-
-return {
-/**
-* Register a legal path.
-* @param {object} entry - { packetType, source, bus, destinations[],
-* entryNumber?, mode?, priority?}
-*/
-register(entry) {
-if (!entry ||!entry.packetType ||!entry.source ||!entry.bus) {
-throw new Error('[tracebus] Cannot register route: packetType, source, and bus are required');
-}
-if (!entry.destinations ||!Array.isArray(entry.destinations) || entry.destinations.length === 0) {
-throw new Error(`[tracebus] Cannot register route ${entry.packetType} from ${entry.source}: destinations must be a non-empty array`);
-}
-
-const key = `${entry.packetType}:${entry.source}`;
-if (!routes.has(key)) {
-routes.set(key, []);
-}
-routes.get(key).push(deepFreeze({
-entryNumber: entry.entryNumber!== undefined? entry.entryNumber: null,
-packetType: entry.packetType,
-source: entry.source,
-bus: entry.bus,
-destinations: entry.destinations.slice(),
-mode: entry.mode || 'push',
-priority: entry.priority || 'standard'
-}));
-},
-
-/**
-* Resolve the routes for a (packetType, source) pair.
-* @throws if no route is registered — an unrouted packet is a fault.
-* @returns {object[]} matching frozen entries
-*/
-resolve(packetType, source) {
-const key = `${packetType}:${source}`;
-const matched = routes.get(key);
-if (!matched || matched.length === 0) {
-throw new Error(`[tracebus] Unrouted packet: ${packetType} from ${source}. No matching routing entry.`);
-}
-return matched;
-},
-
-/** Non-throwing existence check. */
-has(packetType, source) {
-const key = `${packetType}:${source}`;
-const matched = routes.get(key);
-return!!(matched && matched.length > 0);
-},
-
-/** Total registered entries (diagnostic). */
-count() {
-let total = 0;
-for (const list of routes.values()) {
-total += list.length;
-}
-return total;
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Bus — publish/subscribe with enforced routing and a receipt per emit.
-// ────────────────────────────────────────────────────────────────────
-
-/**
-* Create a bus.
-* @param {string} name - this bus's name (matched against a route's `bus`)
-* @param {object} routingTable - a shared routing table (createRoutingTable())
-* @param {object} ledger - a shared ledger (createLedger())
-* @param {object} [opts] - { requestResponse?: boolean} — enable request()
-* on this bus. Default false.
-*/
-function createBus(name, routingTable, ledger, opts) {
-if (!name || typeof name!== 'string') {
-throw new Error('[tracebus] Cannot create bus: name is required and must be a non-empty string');
-}
-if (!routingTable || typeof routingTable.resolve!== 'function') {
-throw new Error(`[tracebus] Cannot create bus ${name}: a routing table is required`);
-}
-if (!ledger || typeof ledger.record!== 'function') {
-throw new Error(`[tracebus] Cannot create bus ${name}: a ledger is required`);
-}
-
-const requestResponse =!!(opts && opts.requestResponse);
-const subscribers = new Map(); // destination name → handler
-
-return {
-name: name,
-
-/**
-* Subscribe a named destination to this bus.
-* @param {string} destination - the name routing entries deliver to
-* @param {function} handler - receives (packet)
-*/
-subscribe(destination, handler) {
-if (!destination || typeof destination!== 'string') {
-throw new Error(`[tracebus:${name}] Cannot subscribe: destination must be a non-empty string`);
-}
-if (typeof handler!== 'function') {
-throw new Error(`[tracebus:${name}] Cannot subscribe ${destination}: handler must be a function`);
-}
-subscribers.set(destination, handler);
-},
-
-/**
-* Emit a packet from a source. Routing decides destinations; a receipt
-* is always recorded. Returns { delivered, missing} — destinations that
-* received the packet and declared destinations with no live subscriber.
-* @param {string} source - the emitter
-* @param {object} packet - from createPacket()
-*/
-emit(source, packet) {
-if (!packet ||!packet.packetType) {
-throw new Error(`[tracebus:${name}] Cannot emit from ${source}: invalid packet (missing packetType)`);
-}
-
-let routeEntries;
-try {
-routeEntries = routingTable.resolve(packet.packetType, source);
-} catch (err) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:unrouted'});
-throw err;
-}
-
-const entry = routeEntries[0];
-if (entry.bus!== name) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:wrong_bus'});
-throw new Error(`[tracebus:${name}] Cannot emit ${packet.packetType} from ${source}: packet is routed to bus ${entry.bus}, not ${name}`);
-}
-
-const delivered = [];
-const missing = [];
-
-for (const re of routeEntries) {
-for (const dest of re.destinations) {
-const handler = subscribers.get(dest);
-if (handler) {
-try {
-handler(packet);
-delivered.push(dest);
-} catch (handlerErr) {
-ledger.record({
-bus: name, packet, source,
-destinations: [dest],
-status: `error:subscriber:${handlerErr.message}`
-});
-delivered.push(dest); // a thrown handler still received the packet
-}
-} else {
-missing.push(dest);
-}
-}
-}
-
-ledger.record({
-bus: name, packet, source,
-destinations: delivered,
-status: missing.length > 0
-? `delivered:partial (missing: ${missing.join(', ')})`
-: 'delivered'
-});
-
-return { delivered, missing};
-},
-
-/**
-* Request/response: emit to a single destination and return its handler's
-* return value. Only available when the bus was created with
-* { requestResponse: true}.
-* @param {string} source
-* @param {object} packet
-* @returns {*} the handler's return value
-*/
-request(source, packet) {
-if (!requestResponse) {
-throw new Error(`[tracebus:${name}] request() is not enabled on this bus (create it with { requestResponse: true})`);
-}
-if (!packet ||!packet.packetType) {
-throw new Error(`[tracebus:${name}] Cannot request from ${source}: invalid packet`);
-}
-
-let routeEntries;
-try {
-routeEntries = routingTable.resolve(packet.packetType, source);
-} catch (err) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:unrouted'});
-throw err;
-}
-
-const entry = routeEntries[0];
-if (entry.bus!== name) {
-ledger.record({ bus: name, packet, source, destinations: [], status: 'rejected:wrong_bus'});
-throw new Error(`[tracebus:${name}] Cannot request ${packet.packetType}: routed to bus ${entry.bus}`);
-}
-
-const dest = entry.destinations[0];
-const handler = subscribers.get(dest);
-if (!handler) {
-ledger.record({ bus: name, packet, source, destinations: [dest], status: 'error:destination_not_registered'});
-throw new Error(`[tracebus:${name}] Cannot request ${packet.packetType} from ${source}: destination ${dest} is not registered`);
-}
-
-let result;
-try {
-result = handler(packet);
-} catch (handlerErr) {
-ledger.record({ bus: name, packet, source, destinations: [dest], status: `error:handler:${handlerErr.message}`});
-throw handlerErr;
-}
-
-ledger.record({ bus: name, packet, source, destinations: [dest], status: 'delivered:request_response'});
-return result;
-},
-
-/** Is a destination subscribed? (diagnostic) */
-hasSubscriber(destination) {
-return subscribers.has(destination);
-},
-
-/** Subscriber count (diagnostic). */
-subscriberCount() {
-return subscribers.size;
-}
-};
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Exports — CommonJS for Node, global for the browser.
-// ────────────────────────────────────────────────────────────────────
-
-const tracebus = {
-generateId,
-createPacket,
-createLedger,
-createRoutingTable,
-createBus,
-deepFreeze
-};
-
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = tracebus;
-}
-if (typeof window!== 'undefined') {
-window.tracebus = tracebus;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Runnable demo: node tracebus.js --demo
-// Wires a tiny two-subscriber bus, emits one packet, and prints the
-// ledger — so `run` shows the receipt trail with no code to write.
-// ────────────────────────────────────────────────────────────────────
-if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-var arg = process.argv[2];
-if (arg === '--demo' || arg === undefined) {
-var routing = createRoutingTable();
-var ledger = createLedger();
-var bus = createBus('DATA', routing, ledger);
-
-routing.register({ packetType: 'order.placed', source: 'checkout', bus: 'DATA', destinations: ['fulfillment', 'email']});
-bus.subscribe('fulfillment', function (p) { console.log(' fulfillment got order', p.payload.id);});
-bus.subscribe('email', function (p) { console.log(' email got order', p.payload.id);});
-
-console.log('emit order.placed from checkout:');
-var result = bus.emit('checkout', createPacket('order.placed', { id: 1001}, { source: 'checkout'}));
-console.log(' delivered:', result.delivered.join(', '), '| missing:', result.missing.join(', ') || '(none)');
-
-console.log('\nledger (the receipt trail):');
-ledger.all().forEach(function (e) {
-console.log(' ' + e.packetType + ' bus=' + e.bus + ' status=' + e.status + ' ->[' + e.destinations.join(', ') + ']');
-});
-
-console.log('\ntry an unrouted packet (refused, but still recorded):');
-try { bus.emit('checkout', createPacket('order.cancelled', { id: 1001}));}
-catch (e) { console.log(' refused: ' + e.message);}
-console.log(' ledger now has ' + ledger.count() + ' records — nothing moved without a receipt.');
-} else {
-console.log('usage: node tracebus.js --demo');
-}
-}
-
-test_tracebus.js 268 lines on GitHub →
+legible.js 217 lines on GitHub →
 #!/usr/bin/env node
-/* test_tracebus.js — proves the bus is honest: nothing moves without a receipt,
-no path travels that wasn't declared, and a bad subscriber can't take the bus down.
+/* legible.js — a pure, dependency-free, HONEST gauge that guesses whether a
+string is human-readable text or machine-drawn rubble, and says how sure it is.
 
-The six properties that ARE the tool:
-1. No delivery without a receipt — every emit() appends exactly one ledger record.
-2. No undeclared path — an unrouted packet is refused (and the refusal is recorded).
-3. A wrong-bus packet is refused — routed to A, cannot be emitted on B.
-4. A throwing subscriber can't break the emitter — error caught, recorded, delivery continues.
-5. Registered routes are frozen — the declared topology stays declared.
-6. A trace is reconstructable — queryByTraceId returns every hop in order.
-Plus the generalizations this strip added over its origin (tested hardest, per the
-"a ported core gets its OWN validation" rule): request() gated by a per-bus flag,
-not a hardcoded bus name. Ends with a mutation bite so a vacuous green fails loud.
-stdlib only, no dependencies. Exit 0 = all pass, exit 1 = a failure (loud). */
+WHY THIS EXISTS. A text extractor (ratchet-pdf-text, ratchet-png-text,
+exif-parser, a MIME part decoder) hands you a `.text` field and, by design,
+cannot tell you whether that text is *readable*. The classic failure: a PDF
+whose glyphs are drawn through a subsetted CID font. The extractor pulls the
+string operands honestly, but each glyph is a 2-byte CID index, and decoded
+one-byte-at-a-time it comes back as control-character rubble that merely
+*looks* like a populated string. You get a confident `.text` that no human
+can read. `legible` reads the delta the extractor can't: it scores the string
+and returns readable / suspect / likely-binary / empty, with the raw score
+and the signal counts exposed so you can see exactly why.
+
+THE SIGNAL (the whole reason to trust it, and its whole limit). Human-readable
+text — in ANY script — almost never contains C0 control characters (0x00–0x1F,
+excluding the ordinary text whitespace tab/LF/CR/FF) or the Unicode
+replacement character U+FFFD. CID glyph indices decoded as Latin-1 land in
+exactly that band disproportionately (the high byte of a low subset index is
+0x00–0x1F, and half the bytes are often 0x00). So the SCORED gauge is the
+density of those "text-never-contains-this" characters — C0 controls plus
+U+FFFD, nothing else. This is deliberately NOT the printable-ratio: a UTF-8
+é / 안 / я decoded byte-wise lands in 0x80–0xFF, which OVERLAPS the C1-control
+band (0x80–0x9F) AND the UTF-8 continuation-byte band — so scoring C1 would
+flag legitimate multibyte text as binary (the CJK false-positive). We report
+C1/DEL and NUL counts as *signals* for your inspection, but we do NOT score
+them, precisely so multibyte-as-Latin1 does not read as rubble.
+
+WHAT IT DOES NOT DO (printed edge — present here and in the README):
+legible is a HEURISTIC, not a verdict, and it detects control-character
+rubble — NOT wrong encoding. Text decoded with the wrong charset (mojibake:
+UTF-8 read as Latin-1, æ—¥æœ¬èªž) is still printable characters, so it reads
+as `readable` even though no human can read it — a `readable` means "not
+control-char rubble," never "correctly decoded." It does not decode,
+validate, or understand the text, and never proves it correct, meaningful,
+or safe. It is a gauge you read, never a gate you route on.
+
+API
+legible(input[, options]) — dispatches on the shape of `input`:
+• a string -> assess(string) -> { label, score, signals}
+• a record with `.text` -> {...record, legibility: assess(record.text)}
+• an array of either -> input.map(legible)
+assess(text[, options]) -> { label, score, signals}
+label one of "readable" | "suspect" | "likely-binary" | "empty"
+score the binary-character ratio in [0,1], rounded to 4 places
+signals { length, control, c1, nul, replacement, binaryRatio}
+options.readableMax (default 0.05) score <= this => readable
+options.binaryMin (default 0.30) score >= this => likely-binary
+(between the two bounds => suspect)
+
+Pure function of its input. No dependencies, no randomness, no clock, no I/O
+in the core — the same input always yields the same output (the determinism
+lint is trivial). Same code in a browser (window.LoopGifts.legible) or Node
+(this CLI / require()).
+
+USAGE
+node legible.js "some text" # assess an argument, print JSON
+cat streams.jsonl | node legible.js # annotate each JSONL record's.text
+node legible.js --port # print this tool's port-verb (transform)
+node legible.js --help
+
+Released under MIT.
+*/
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.legible = api.legible;
+window.LoopGifts.assessLegibility = api.assess;
+}
+root.__legible = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
 "use strict";
-var tb = require("./tracebus.js");
+
+var DEFAULTS = { readableMax: 0.05, binaryMin: 0.30};
+
+// The ordinary text whitespace inside the C0 band — legitimate in readable
+// text, so NOT counted as a binary signal.
+function isTextWhitespace(c) {
+return c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d;
+}
+// C0 control (0x00–0x1F) that is NOT text whitespace.
+function isC0Control(c) {
+return c >= 0x00 && c <= 0x1f &&!isTextWhitespace(c);
+}
+// DEL + C1 controls (0x7F, 0x80–0x9F). Reported as a signal but DELIBERATELY
+// NOT scored: 0x80–0x9F overlaps the UTF-8 continuation-byte band, so scoring
+// it would flag legitimate multibyte-as-Latin1 text as binary (the CJK
+// false-positive). Exposed for inspection; never drives the label.
+function isC1orDel(c) {
+return c === 0x7f || (c >= 0x80 && c <= 0x9f);
+}
+
+function assess(text, options) {
+var opt = options || {};
+var readableMax = typeof opt.readableMax === "number"? opt.readableMax: DEFAULTS.readableMax;
+var binaryMin = typeof opt.binaryMin === "number"? opt.binaryMin: DEFAULTS.binaryMin;
+
+// No signal to judge: null/undefined, empty, or whitespace-only.
+if (text === null || text === undefined) {
+return emptyResult();
+}
+var s = String(text);
+if (s.length === 0 || /^\s*$/.test(s)) {
+return emptyResult(s.length);
+}
+
+var control = 0, c1 = 0, nul = 0, replacement = 0;
+for (var i = 0; i < s.length; i++) {
+var c = s.charCodeAt(i);
+if (c === 0x00) nul++;
+if (c === 0xfffd) { replacement++; continue;}
+if (isC0Control(c)) { control++; continue;}
+if (isC1orDel(c)) { c1++; continue;}
+}
+var n = s.length;
+// SCORED signal: C0 controls + replacement only. c1/nul are reported below
+// for inspection but NOT scored (see isC1orDel — the CJK false-positive).
+var binaryRatio = (control + replacement) / n;
+var score = round4(binaryRatio);
+
+var label;
+if (score <= readableMax) label = "readable";
+else if (score >= binaryMin) label = "likely-binary";
+else label = "suspect";
+
+return {
+label: label,
+score: score,
+signals: {
+length: n,
+control: control, // C0 controls, excluding text whitespace
+c1: c1, // DEL + C1 controls
+nul: nul, // count of 0x00 (a strong binary tell)
+replacement: replacement, // U+FFFD (botched decode)
+binaryRatio: score
+}
+};
+}
+
+function emptyResult(length) {
+return {
+label: "empty",
+score: 0,
+signals: { length: length || 0, control: 0, c1: 0, nul: 0, replacement: 0, binaryRatio: 0}
+};
+}
+
+function round4(x) { return Math.round(x * 1e4) / 1e4;}
+
+// The composition joint: dispatch on the shape of the input.
+function legible(input, options) {
+if (Array.isArray(input)) {
+return input.map(function (x) { return legible(x, options);});
+}
+if (input && typeof input === "object") {
+// A record carrying a `.text` field (e.g. ratchet's.streams[] entries).
+var out = {};
+for (var k in input) if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
+out.legibility = assess(input.text, options);
+return out;
+}
+// A bare string (or anything String()-able).
+return assess(input, options);
+}
+
+return { legible: legible, assess: assess};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__legible;
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--port")!== -1) { process.stdout.write("transform\n"); return 0;}
+if (args.indexOf("--help")!== -1 || (args.length === 0 && process.stdin.isTTY)) {
+process.stdout.write(
+"legible — a heuristic gauge: is this string readable text or machine-drawn rubble?\n" +
+" node legible.js \"some text\" assess an argument, print JSON\n" +
+" cat streams.jsonl | node legible.js annotate each JSONL record's.text\n" +
+" node legible.js --port print the port-verb (transform)\n" +
+" node legible.js --help\n"
+);
+return 0;
+}
+// Argument form: assess the first non-flag argument.
+var textArg = null;
+for (var i = 0; i < args.length; i++) { if (args[i].indexOf("--")!== 0) { textArg = args[i]; break;}}
+if (textArg!== null) {
+process.stdout.write(JSON.stringify(api.assess(textArg)) + "\n");
+return 0;
+}
+// stdin JSONL form: one record (or raw line) per line -> annotate -> emit JSONL.
+var input = "";
+try { input = require("fs").readFileSync(0, "utf8");} catch (e) { input = "";}
+var lines = input.split("\n");
+for (var j = 0; j < lines.length; j++) {
+var line = lines[j];
+if (line === "" && j === lines.length - 1) continue; // trailing newline
+var rec;
+try {
+var parsed = JSON.parse(line);
+rec = api.legible(parsed);
+} catch (e) {
+// Not JSON — treat the raw line as a text string to assess.
+rec = { text: line, legibility: api.assess(line)};
+}
+process.stdout.write(JSON.stringify(rec) + "\n");
+}
+return 0;
+}
+
+process.exitCode = main(process.argv);
+}
+
+test_legible.js 173 lines on GitHub →
+#!/usr/bin/env node
+/* test_legible.js — known-answer battery for legible.
+
+The oracle is OUT OF BAND: every expected label/score below is a fact computed
+BY HAND from the definition (C0-control + U+FFFD density), never the output of
+a second scorer. The two load-bearing fixtures are drawn from real behaviour,
+not invented:
+• the KNOWN-BAD: a 2-byte CID glyph-index run decoded as Latin-1 — the exact
+shape ratchet-pdf-text surfaces for a subsetted CID font.
+• the REGRESSION GUARD: Japanese ("日本語") UTF-8 bytes read as Latin-1 — the
+CJK false-positive that a naive C1-inclusive score would mislabel; this
+test fails if anyone re-adds the C1 band (0x80–0x9F) to the score.
+
+Run: node test_legible.js (exit 0 = all pass, nonzero = failure)
+*/
+"use strict";
+var assert = require("assert");
+var cp = require("child_process");
+var path = require("path");
+var { legible, assess} = require("./legible.js");
 
 var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;} else { fail++; console.error("FAIL " + name);}
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
 }
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
+function cc() { return String.fromCharCode.apply(null, arguments);}
+
+// --- readable ---------------------------------------------------------------
+ok("plain ASCII is readable, score 0", function () {
+var r = assess("Hello, world! This is plain readable text.");
+assert.strictEqual(r.label, "readable");
+assert.strictEqual(r.score, 0);
+assert.strictEqual(r.signals.control, 0);
+});
+
+ok("accented Latin-1 (single-byte é) stays readable", function () {
+// 0xE9 (é) is printable Latin-1, not a control char.
+var r = assess("caf" + cc(0xe9) + " au lait");
+assert.strictEqual(r.label, "readable");
+assert.strictEqual(r.signals.control, 0);
+});
+
+// --- empty (no signal) ------------------------------------------------------
+ok("empty string is empty, not readable", function () {
+assert.strictEqual(assess("").label, "empty");
+});
+ok("whitespace-only is empty", function () {
+assert.strictEqual(assess(" \n\t ").label, "empty");
+});
+ok("null text is empty (via record)", function () {
+var r = legible({ index: 0, text: null});
+assert.strictEqual(r.legibility.label, "empty");
+});
+ok("undefined text is empty", function () {
+assert.strictEqual(assess(undefined).label, "empty");
+});
+
+// --- likely-binary: the KNOWN-BAD (CID glyph indices as Latin-1) -------------
+ok("KNOWN-BAD: 2-byte CID index run is likely-binary, score 1.0", function () {
+// Low subset glyph indices 0x0001..0x0005 as bytes: every char is 0x00–0x1F.
+var cid = cc(0, 1, 0, 2, 0, 3, 0, 4, 0, 5);
+var r = assess(cid);
+assert.strictEqual(r.label, "likely-binary");
+assert.strictEqual(r.score, 1);
+assert.strictEqual(r.signals.nul, 5); // five 0x00 high bytes
+assert.strictEqual(r.signals.control, 10);
+});
+
+// --- the REGRESSION GUARD: CJK-as-Latin1 must NOT be likely-binary -----------
+ok("REGRESSION: Japanese UTF-8 bytes as Latin-1 read as readable (C1 not scored)", function () {
+// "日本語" UTF-8 = E6 97 A5 E6 9C AC E8 AA 9E. Bytes 0x97/0x9C/0x9E are C1
+// controls AND UTF-8 continuation bytes. If C1 were scored, this is 3/9=0.33
+// => likely-binary (the CJK false-positive). C0-only scoring => 0 => readable.
+var mojibake = cc(0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac, 0xe8, 0xaa, 0x9e);
+var r = assess(mojibake);
+assert.strictEqual(r.label, "readable", "CJK-as-Latin1 must not be flagged binary");
+assert.strictEqual(r.score, 0);
+assert.ok(r.signals.c1 >= 3, "c1 IS reported (just not scored)"); // 0x97,0x9C,0x9E
+});
+
+// --- suspect: the mixed stream (half readable, half rubble) ------------------
+ok("mixed readable + a little rubble is suspect", function () {
+// 15 readable chars + 2 control chars => 2/17 = 0.1176 -> suspect.
+var mixed = "Hello World Foo" + cc(1, 2);
+var r = assess(mixed);
+assert.strictEqual(r.label, "suspect");
+assert.ok(r.score > 0.05 && r.score < 0.30, "score " + r.score + " in suspect band");
+});
+
+ok("replacement chars (U+FFFD) count toward the score", function () {
+var r = assess("abc" + cc(0xfffd) + cc(0xfffd) + "d"); // 6 chars, 2 replacement = 0.3333
+assert.strictEqual(r.signals.replacement, 2);
+assert.strictEqual(r.label, "likely-binary"); // 0.3333 >= 0.30
+});
+
+// --- band boundaries (the thresholds are exact) -----------------------------
+ok("score exactly at readableMax (0.05) is readable (<=)", function () {
+// 1 control in 20 chars = 0.05.
+var r = assess("abcdefghijklmnopqrs" + cc(1));
+assert.strictEqual(r.score, 0.05);
+assert.strictEqual(r.label, "readable");
+});
+ok("score exactly at binaryMin (0.30) is likely-binary (>=)", function () {
+// 3 control in 10 chars = 0.30.
+var r = assess("abcdefg" + cc(1, 2, 3));
+assert.strictEqual(r.score, 0.3);
+assert.strictEqual(r.label, "likely-binary");
+});
+
+// --- options override -------------------------------------------------------
+ok("options can widen the readable band", function () {
+var s = "aa" + cc(1); // 1/3 = 0.3333
+assert.strictEqual(assess(s).label, "likely-binary");
+assert.strictEqual(assess(s, { readableMax: 0.5}).label, "readable");
+});
+
+// --- the composition joint --------------------------------------------------
+ok("record passthrough preserves fields and adds.legibility", function () {
+var rec = { index: 2, filter: "FlateDecode", text: "readable content"};
+var out = legible(rec);
+assert.strictEqual(out.index, 2);
+assert.strictEqual(out.filter, "FlateDecode");
+assert.strictEqual(out.text, "readable content");
+assert.strictEqual(out.legibility.label, "readable");
+});
+ok("array input maps element-wise", function () {
+var out = legible(["hello", cc(0, 1, 2, 3)]);
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].label, "readable");
+assert.strictEqual(out[1].label, "likely-binary");
+});
+ok("a ratchet.streams-shaped record annotates cleanly", function () {
+// Mirrors the real join: ratchet-pdf-text emits entries like this.
+var stream = { index: 0, filter: "FlateDecode", compressed: true, needsInflate: false, text: cc(0,1,0,2,0,3), rawLength: 6};
+var out = legible(stream);
+assert.strictEqual(out.legibility.label, "likely-binary");
+assert.strictEqual(out.rawLength, 6); // original fields intact
+});
+
+// --- determinism (the canonicalizer self-test) ------------------------------
+ok("determinism: same input yields byte-identical JSON across runs", function () {
+var inputs = ["Hello", cc(0,1,2), "日本語 as latin1: " + cc(0xe6,0x97,0xa5), "", " "];
+for (var i = 0; i < inputs.length; i++) {
+var a = JSON.stringify(assess(inputs[i]));
+var b = JSON.stringify(assess(inputs[i]));
+assert.strictEqual(a, b, "run 2 differs for input " + i);
 }
-function threws(fn) { try { fn(); return false;} catch (e) { return true;}}
+});
 
-// A fresh, wired-up bus system for a test to use.
-function fixture(busOpts) {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-var bus = tb.createBus("DATA", routing, ledger, busOpts);
-return { routing: routing, ledger: ledger, bus: bus};
-}
+// --- the CLI contract -------------------------------------------------------
+ok("CLI --port prints the port-verb (transform)", function () {
+var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " --port").toString().trim();
+assert.strictEqual(out, "transform");
+});
+ok("CLI argument form prints the assessment JSON", function () {
+var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " 'plain text'").toString().trim();
+var r = JSON.parse(out);
+assert.strictEqual(r.label, "readable");
+});
+ok("CLI stdin JSONL form annotates each record", function () {
+var jsonl = JSON.stringify({ index: 0, text: "readable"}) + "\n" +
+JSON.stringify({ index: 1, text: cc(0,1,2,3)}) + "\n";
+var out = cp.execSync("node " + path.join(__dirname, "legible.js"), { input: jsonl}).toString().trim().split("\n");
+var a = JSON.parse(out[0]), b = JSON.parse(out[1]);
+assert.strictEqual(a.legibility.label, "readable");
+assert.strictEqual(b.legibility.label, "likely-binary");
+assert.strictEqual(b.index, 1);
+});
 
-// ── createPacket: shape + validation ─────────────────────────────────────────
-(function () {
-var p = tb.createPacket("user.created", { id: 7});
-ok("packet has packetId", typeof p.packetId === "string" && p.packetId.length === 36);
-ok("packet has traceId", typeof p.traceId === "string" && p.traceId.length === 36);
-ok("packet keeps type", p.packetType === "user.created");
-ok("packet keeps payload", p.payload.id === 7);
-ok("packet source defaults null", p.source === null);
-ok("packetId!== traceId by default", p.packetId!== p.traceId);
-
-var threaded = tb.createPacket("user.updated", { id: 7}, { traceId: "trace-abc", source: "svc"});
-ok("traceId threads through opts", threaded.traceId === "trace-abc");
-ok("source threads through opts", threaded.source === "svc");
-
-ok("empty packetType throws", threws(function () { tb.createPacket("", {});}));
-ok("non-string packetType throws", threws(function () { tb.createPacket(42, {});}));
-ok("null payload throws", threws(function () { tb.createPacket("t", null);}));
-ok("non-object payload throws", threws(function () { tb.createPacket("t", "nope");}));
-})();
-
-// ── generateId: v4 shape + uniqueness ────────────────────────────────────────
-(function () {
-var a = tb.generateId(), b = tb.generateId();
-ok("id is 36 chars", a.length === 36);
-ok("id version nibble is 4", a[14] === "4");
-ok("id variant nibble in 8,9,a,b", /[89ab]/.test(a[19]));
-ok("dashes at 8,13,18,23", a[8] === "-" && a[13] === "-" && a[18] === "-" && a[23] === "-");
-ok("ids are unique", a!== b);
-// 500 draws, no collision
-var seen = {}, collision = false;
-for (var i = 0; i < 500; i++) { var id = tb.generateId(); if (seen[id]) collision = true; seen[id] = 1;}
-ok("500 ids, no collision",!collision);
-})();
-
-// ── PROPERTY 1: no delivery without a receipt ────────────────────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "e", source: "src", bus: "DATA", destinations: ["sink"]});
-f.bus.subscribe("sink", function () {});
-ok("ledger starts empty", f.ledger.count() === 0);
-f.bus.emit("src", tb.createPacket("e", { n: 1}));
-ok("one emit -> one record", f.ledger.count() === 1);
-f.bus.emit("src", tb.createPacket("e", { n: 2}));
-ok("two emits -> two records", f.ledger.count() === 2);
-ok("delivered status recorded", f.ledger.all()[0].status === "delivered");
-
-// even a REJECTED emit leaves exactly one record
-var g = fixture();
-var before = g.ledger.count();
-threws(function () { g.bus.emit("nobody", tb.createPacket("unrouted", {}));});
-ok("rejected emit still records once", g.ledger.count() === before + 1);
-ok("rejection status is unrouted", g.ledger.all()[0].status === "rejected:unrouted");
-})();
-
-// ── PROPERTY 2: no undeclared path ───────────────────────────────────────────
-(function () {
-var f = fixture();
-ok("unrouted resolve throws", threws(function () { f.routing.resolve("x", "y");}));
-ok("has() is false before register", f.routing.has("x", "y") === false);
-f.routing.register({ packetType: "x", source: "y", bus: "DATA", destinations: ["d"]});
-ok("has() is true after register", f.routing.has("x", "y") === true);
-ok("emit of unrouted throws", threws(function () { f.bus.emit("z", tb.createPacket("x", {}));}));
-// register validation
-ok("register without bus throws", threws(function () { f.routing.register({ packetType: "a", source: "b", destinations: ["d"]});}));
-ok("register with empty destinations throws", threws(function () { f.routing.register({ packetType: "a", source: "b", bus: "DATA", destinations: []});}));
-ok("register with non-array destinations throws", threws(function () { f.routing.register({ packetType: "a", source: "b", bus: "DATA", destinations: "d"});}));
-})();
-
-// ── PROPERTY 3: a wrong-bus packet is refused ────────────────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-var dataBus = tb.createBus("DATA", routing, ledger);
-var ctrlBus = tb.createBus("CONTROL", routing, ledger);
-// route says this packet belongs on CONTROL
-routing.register({ packetType: "cmd", source: "op", bus: "CONTROL", destinations: ["worker"]});
-var landed = false;
-dataBus.subscribe("worker", function () { landed = true;});
-ok("emit on wrong bus throws", threws(function () { dataBus.emit("op", tb.createPacket("cmd", {}));}));
-ok("wrong-bus packet not delivered", landed === false);
-ok("wrong-bus rejection recorded", ledger.all().some(function (e) { return e.status === "rejected:wrong_bus";}));
-})();
-
-// ── PROPERTY 4: a throwing subscriber can't break the emitter ────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "fan", source: "src", bus: "DATA", destinations: ["good", "bad", "also"]});
-var goodHits = 0, alsoHits = 0;
-f.bus.subscribe("good", function () { goodHits++;});
-f.bus.subscribe("bad", function () { throw new Error("boom");});
-f.bus.subscribe("also", function () { alsoHits++;});
-var result;
-ok("emit with a throwing subscriber does not throw",!threws(function () {
-result = f.bus.emit("src", tb.createPacket("fan", {}));
-}));
-ok("good subscriber ran", goodHits === 1);
-ok("subscriber AFTER the thrower still ran", alsoHits === 1);
-ok("throwing dest counted as delivered", result.delivered.indexOf("bad")!== -1);
-ok("subscriber error recorded", f.ledger.all().some(function (e) { return /error:subscriber/.test(e.status);}));
-
-// a declared destination with NO subscriber -> reported missing, not an error
-var g = fixture();
-g.routing.register({ packetType: "e", source: "s", bus: "DATA", destinations: ["present", "absent"]});
-g.bus.subscribe("present", function () {});
-var r2 = g.bus.emit("s", tb.createPacket("e", {}));
-ok("present delivered", r2.delivered.indexOf("present")!== -1);
-ok("absent reported missing", r2.missing.indexOf("absent")!== -1);
-ok("partial status recorded", g.ledger.all().some(function (e) { return /delivered:partial/.test(e.status);}));
-})();
-
-// ── PROPERTY 5: registered routes are frozen ─────────────────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-routing.register({ packetType: "e", source: "s", bus: "DATA", destinations: ["d"]});
-var entry = routing.resolve("e", "s")[0];
-ok("resolved entry is frozen", Object.isFrozen(entry));
-ok("entry.destinations is frozen", Object.isFrozen(entry.destinations));
-// mutating a frozen entry is a silent no-op in non-strict, throws in strict — either way it must not change
-var beforeBus = entry.bus;
-try { entry.bus = "HACKED";} catch (e) { /* strict-mode throw is fine */}
-ok("frozen entry.bus unchanged", entry.bus === beforeBus);
-try { entry.destinations.push("injected");} catch (e) { /* fine */}
-ok("frozen destinations unchanged", entry.destinations.length === 1);
-
-// deepFreeze on a nested object
-var nested = tb.deepFreeze({ a: { b: { c: 1}}});
-ok("deepFreeze freezes root", Object.isFrozen(nested));
-ok("deepFreeze freezes nested", Object.isFrozen(nested.a.b));
-})();
-
-// ── PROPERTY 6: a trace is reconstructable ───────────────────────────────────
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "step1", source: "a", bus: "DATA", destinations: ["b"]});
-f.routing.register({ packetType: "step2", source: "a", bus: "DATA", destinations: ["b"]});
-f.bus.subscribe("b", function () {});
-var trace = "journey-1";
-f.bus.emit("a", tb.createPacket("step1", {}, { traceId: trace}));
-f.bus.emit("a", tb.createPacket("step2", {}, { traceId: trace}));
-f.bus.emit("a", tb.createPacket("step1", {}, { traceId: "other"}));
-var hops = f.ledger.queryByTraceId(trace);
-ok("trace has exactly its two hops", hops.length === 2);
-ok("trace hops in emission order", hops[0].packetType === "step1" && hops[1].packetType === "step2");
-ok("other trace excluded", hops.every(function (h) { return h.traceId === trace;}));
-// query by packetType
-ok("queryByPacketType finds all step1", f.ledger.queryByPacketType("step1").length === 2);
-})();
-
-// ── THE GENERALIZATION (tested hardest — the ported core's OWN validation) ────
-// In the origin, request() was hardwired to a bus literally named 'VAULT'. The strip
-// replaced that with a per-bus { requestResponse} flag. These prove the new gate.
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-routing.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-
-// a bus WITHOUT the flag refuses request(), regardless of its name
-var plain = tb.createBus("RPC", routing, ledger); // note: named RPC, not VAULT — name must NOT matter
-plain.subscribe("answerer", function () { return 99;});
-ok("request refused without flag (name irrelevant)", threws(function () {
-plain.request("asker", tb.createPacket("q", {}));
-}));
-
-// a bus WITH the flag answers — and the answer is the handler's return value
-var routing2 = tb.createRoutingTable();
-var ledger2 = tb.createLedger();
-routing2.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-var rpc = tb.createBus("RPC", routing2, ledger2, { requestResponse: true});
-rpc.subscribe("answerer", function (pkt) { return pkt.payload.a + pkt.payload.b;});
-var answer = rpc.request("asker", tb.createPacket("q", { a: 2, b: 3}));
-ok("request returns handler value", answer === 5);
-ok("request_response status recorded", ledger2.all().some(function (e) { return /request_response/.test(e.status);}));
-
-// request to an unregistered destination -> error, recorded
-var routing3 = tb.createRoutingTable();
-var ledger3 = tb.createLedger();
-routing3.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["ghost"]});
-var rpc3 = tb.createBus("RPC", routing3, ledger3, { requestResponse: true});
-ok("request to unregistered dest throws", threws(function () { rpc3.request("asker", tb.createPacket("q", {}));}));
-ok("unregistered-dest error recorded", ledger3.all().some(function (e) { return /destination_not_registered/.test(e.status);}));
-
-// a throwing request handler propagates (unlike emit) but still records
-var routing4 = tb.createRoutingTable();
-var ledger4 = tb.createLedger();
-routing4.register({ packetType: "q", source: "asker", bus: "RPC", destinations: ["answerer"]});
-var rpc4 = tb.createBus("RPC", routing4, ledger4, { requestResponse: true});
-rpc4.subscribe("answerer", function () { throw new Error("handler failed");});
-ok("request handler error propagates", threws(function () { rpc4.request("asker", tb.createPacket("q", {}));}));
-ok("request handler error recorded", ledger4.all().some(function (e) { return /error:handler/.test(e.status);}));
-})();
-
-// ── constructor validation (the ported core's own guards) ────────────────────
-(function () {
-var routing = tb.createRoutingTable();
-var ledger = tb.createLedger();
-ok("createBus without name throws", threws(function () { tb.createBus("", routing, ledger);}));
-ok("createBus without routing throws", threws(function () { tb.createBus("B", null, ledger);}));
-ok("createBus without ledger throws", threws(function () { tb.createBus("B", routing, null);}));
-ok("createBus with non-table routing throws", threws(function () { tb.createBus("B", {}, ledger);}));
-
-var f = fixture();
-ok("subscribe non-function throws", threws(function () { f.bus.subscribe("d", "not a fn");}));
-ok("subscribe empty dest throws", threws(function () { f.bus.subscribe("", function () {});}));
-ok("ledger.record without packet throws", threws(function () { f.ledger.record({ bus: "DATA"});}));
-
-// diagnostics
-f.bus.subscribe("x", function () {});
-ok("hasSubscriber true for x", f.bus.hasSubscriber("x") === true);
-ok("hasSubscriber false for y", f.bus.hasSubscriber("y") === false);
-ok("subscriberCount is 1", f.bus.subscriberCount() === 1);
-})();
-
-// ── MUTATION BITE: prove the receipt invariant is not vacuously green ─────────
-// If the ledger silently dropped records, property 1's counts would still be
-// "consistent" at zero. This bite asserts the ledger actually grows AND that a
-// real emit produces a record whose fields tie back to the packet — so a no-op
-// record() (the plausible mutation) fails loud here.
-(function () {
-var f = fixture();
-f.routing.register({ packetType: "bite", source: "s", bus: "DATA", destinations: ["d"]});
-f.bus.subscribe("d", function () {});
-var pkt = tb.createPacket("bite", { proof: true});
-f.bus.emit("s", pkt);
-var rec = f.ledger.all()[0];
-ok("mutation bite: ledger actually grew", f.ledger.count() === 1);
-ok("mutation bite: record ties to the packet", rec && rec.packetId === pkt.packetId && rec.traceId === pkt.traceId);
-ok("mutation bite: record carries real status", rec && typeof rec.status === "string" && rec.status.length > 0);
-})();
-
-console.log((fail === 0? "PASS": "FAIL") + " — " + pass + " passed, " + fail + " failed");
+// --- report -----------------------------------------------------------------
+console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Zero-dependency JavaScript, Node or browser
+Node / browser, no dependencies
 
 ---
 
-# The Trellis — a Loop MMT gift
-https://loopmmt.com/gifts/trellis/
+# Life-fold — a Loop MMT gift
+https://loopmmt.com/gifts/life-fold/
 [coverage: optional · branch: gifts]
 
-Two-Way Consistency, Localized cross ← all gifts
+One Conway Step as a Fold, Closed Under Its Own I/O fold ← all gifts
 
-The Trellis
+Life-fold
 
-A 2-D consistency checker that tells you WHICH cell is wrong, not just that something is. Lay your objects on a grid where every cell sits in two crossing constraints — its row and its column — and the whole holds only if every row and every column reads valid. When something doesn't fit, it localizes the failure to the single cell where the failing row crosses the failing column. Constraint propagation sorts every open cell into FORCED, FREE, or CONTRADICTORY — no global placer, no global oracle.
-
-The prompt that made this →
+life-fold reads a set of LIVE CELLS — one JSON [x,y] integer pair per line (JSON Lines) — and folds it into the NEXT generation of Conway's Game of Life by the rule B3/S23, with zero dependencies, on a SPARSE UNBOUNDED grid (only live cells are represented, so a glider travels forever). The output is the SAME SHAPE as the input — [x,y] pairs, one per line, sorted — so the gift is CLOSED UNDER ITS OWN I/O: its output pipes straight back into itself, and life-fold | life-fold == life-fold --steps 2. That closed loop is the point: a fold circulating through its own output channel, each pass confirming the last — a mercury delay line made of live cells. --steps N runs N generations in-process (N=0 canonicalises: dedup + sort). Because the live set is sorted and duplicates collapse, the SAME set in ANY order folds to a BYTE-IDENTICAL record. Same cells in → next generation out, in Node or a browser.
 
 The honest edge
 
-It checks that your constraints are consistent WITH EACH OTHER, never that they are the ones you meant. Hand it the wrong constraints and it will faithfully find them consistent — choosing constraints that capture what you actually care about is your job.
+life-fold is ONE Conway B3/S23 step as a fold over a set of live cells, stepped N times in-process — NOT a renderer (it emits the live-cell SET, not a picture), NOT a bounded grid (it is sparse and unbounded, so gliders travel forever), and NOT a variant rule (it is exactly B3/S23). The output is the same shape as the input, so it is closed under its own I/O (life-fold | life-fold == --steps 2). Fully order-independent — duplicates collapse, output sorted.
 
 Run it
 
-python3 trellis.py --help
-smoke_test.py (6/6)
-Python stdlib only
+printf '%s\n' '[0,0]' '[1,0]' '[2,0]' | node life-fold.js # next generation as JSONL [x,y]; --steps N (N gens; 0 canonicalises); exit 0 ok | 2 input error
+test_life-fold.js (24/24: Conway correctness on frozen hand goldens — blinker period-2, block still-life unchanged, glider population-5 conserved AND translated on an unbounded grid — the TIER-B closure (--steps N == piping the fold into itself N times, N in {2,3,4}), byte-identical order-independence (shuffled == sorted), dedup + steps-0 canonicalisation, empty/blank/CRLF, and numeric/shape honesty hard errors (non-array / wrong-length / non-integer / non-finite / bad-JSON) plus bad-steps guards) + out-of-band conformance conform_life-fold.cjs (43/43 GREEN, subprocess-driven, signed 6d8fc4b5d7da412b, independent dense-grid oracle + B3/S12 wrong-rule mutation bite)
+Zero dependencies, Node or browser, deterministic
 
 The code — every file that ships
 
-trellis.py 722 lines on GitHub →
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# SPDX-License-Identifier: CC-BY-NC-4.0
-"""
-The Trellis -- a 2-D consistency localizer + generator.
-Loop MMT(tm) - Phase 1 of the Trellis V1 plan (S12.1337 -> built S12.1423).
+life-fold.js 196 lines on GitHub →
+#!/usr/bin/env node
+/**
+* life-fold — Conway's Game of Life, one step as a FOLD, in a trace loop.
+*
+* WHAT
+* Reads a set of LIVE CELLS -- one `[x,y]` integer pair per line (JSON Lines) --
+* and folds it into the NEXT generation's live cells by Conway's rule (B3/S23).
+* Output is the same shape as input: `[x,y]` pairs, one per line, sorted. So the
+* gift is CLOSED UNDER ITS OWN I/O -- its output pipes straight back into itself:
+* life-fold < gen0 | life-fold | life-fold == life-fold --steps 3 < gen0
+* That feedback -- the fold circulating through its own output channel, each pass
+* confirming the last -- is Shea's mercury delay line, Loop 1.0 generalized. It is
+* the Tier-B property: the reducer transition stays the `fold` atom; the loop (↻)
+* is only wrapped around it, no new primitive. --steps N internalizes that loop.
+*
+* THE RULE (Conway B3/S23, on an unbounded sparse grid)
+* A live cell with 2 or 3 live neighbours survives; a dead cell with exactly 3
+* live neighbours is born; every other cell is dead next generation. Neighbours
+* are the 8 surrounding cells. The grid is infinite and sparse: only live cells
+* are represented, so patterns may grow without a bounding box.
+*
+* USAGE
+* node life-fold.js [--steps N] [FILE] # stdin if no FILE
+* printf '%s\n' '[0,0]' '[1,0]' '[2,0]' | node life-fold.js # blinker, 1 step
+* -> [1,-1]
+* [1,0]
+* [1,1]
+* --steps N run N generations in-process (default 1). N=0 canonicalises the
+* input (dedups + sorts the live set) without stepping.
+* --help
+*
+* EXIT CODES
+* 0 success
+* 2 input error: a line that is not a JSON array of exactly two FINITE INTEGERS;
+* a bad --steps (non-integer or < 0); a missing file or a directory. Always a
+* clean one-line message on stderr, never a stack trace.
+*
+* EDGE (what this is NOT)
+* ONE deterministic Life implementation stepped N times -- NOT a renderer (it
+* emits the live-cell SET, not a picture), NOT a bounded grid (it is sparse and
+* unbounded, so gliders travel forever), and NOT a variant rule (it is exactly
+* B3/S23). Cells are unordered on input (a SET -- duplicates collapse, order is
+* irrelevant) and SORTED on output (x then y), so the same generation is a
+* byte-identical record regardless of input order.
+*
+* Zero dependencies. Node builtin `require('fs')` for file reads only; runs in a
+* browser with no require (attaches `lifeFold` to window.ForestGifts). MIT.
+*/
+"use strict";
 
-WHAT IT IS (honest claim, post-teardown A1)
-A double word square laid over system objects: every cell sits in exactly two
-orthogonal words (its ROW and its COLUMN). The whole holds iff every row reads
-valid AND every column reads valid. Constraint propagation (arc-consistency,
-AC-3) sorts every open cell into exactly one verdict, and any inconsistency
-localizes to the single cell where the failing row crosses the failing column.
+function key(x, y) { return x + "," + y;}
 
-It is a *consistency localizer + generator*, NOT a global-consistency prover
-(A1): a *detected* break localizes uniquely; *silence* is necessary-not-
-sufficient (the rectangular alias -- co-drift that leaves every row and column
-valid is, by construction, a different valid square and is invisible). State
-the bound; do not oversell.
-
-THE THREE VERDICTS (per open cell)
-FORCED <v> one value satisfies both crossing words -> derive it (no choice)
-FREE {set} several satisfy both -> bounded search = slack
-CONTRADICTORY none satisfies both -> dead cell, called loud + located
-(A fixed cell that violates its words is also CONTRADICTORY -- fixed!= skipped.)
-
-CONSTRAINT TYPES (V1 -- decidable facets only: versions, hashes, lease-state, letters)
-equal: every cell on the line must be equal. With a spec-level
-`reference_col`, non-reference cells must equal the reference
-cell -> an equality break localizes to the single deviating cell
-(the product-code property: failing row x off-canonical col).
-wordlist: the line's cells, read in order, must form one of a list of
-allowed words/tuples (the literal crossword / allowed-combos case).
-
-FAIL-CLOSED (A5): any CONTRADICTORY cell -> overall verdict CONTRADICTORY and a
-non-zero exit (3). FREE picks are reported + counted; there is no ungraded
-override. A spec error fails closed too (exit 2), never silently "consistent".
-
-DETERMINISM: the `result` object on stdout is a pure function of the spec --
-fold the same spec twice, get byte-identical bytes (sorted keys, sorted sets,
-no timestamps in the result). The append-only proof chain (--log) carries a
-timestamp for provenance and is a side effect, never part of the result bytes.
-
-FACET-AUDIT (A4 -- Test by Removal): `audit` drops each constraint in turn and
-re-solves. A constraint whose removal changes the result is ACTIVE (unique
-work in this spec); otherwise REDUNDANT (its work is shared by others).
-REDUNDANT is not a defect -- a double word square is over-determined by
-design, and that overlap IS the product code's error-correction power. The
-real A4 failure is a Trellis with NO ACTIVE AXIS (every constraint passes
-trivially -> it can never carry a catch, e.g. a version-only square that reads
-v36==v36 everywhere and goes blind). That, and only that, is REJECTED.
-
-FIVE RULES (ecosystem tool): single file - one command - zero external deps
-(stdlib only) - JSON storage - append-only proof chain.
-
-USAGE
-trellis.py solve <spec.json> [--log] # solve/check a square
-trellis.py audit <spec.json> # Test-by-Removal on every constraint
-trellis.py verify-chain <chain.jsonl> # re-walk a --log proof chain (Pull R5)
-exit 0 = held (consistent / all open cells FORCED|FREE) -- or a clean proof chain
-exit 3 = CONTRADICTORY (held-fail, localized) -- or a DETECTED proof-chain break (located)
-exit 2 = spec error / unreadable proof chain (fail-closed) -- never silently "consistent"
-"""
-
-import argparse
-import hashlib
-import json
-import os
-import sys
-from datetime import datetime, timezone
-
-RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_runs")
-
-# -----------------------------------------------------------------------------
-# spec model
-# -----------------------------------------------------------------------------
-
-def _cellkey(r, c):
-return "%s|%s" % (r, c)
-
-def load_spec(path):
-with open(path, "r", encoding="utf-8") as fh:
-spec = json.load(fh)
-return validate_spec(spec)
-
-def validate_spec(spec):
-"""Structural validation -- fail closed (raise) on any malformed spec."""
-if not isinstance(spec, dict):
-raise SpecError("spec must be a JSON object")
-for key in ("rows", "cols"):
-if key not in spec or not isinstance(spec[key], list) or not spec[key]:
-raise SpecError("spec.%s must be a non-empty list" % key)
-rows = [str(r) for r in spec["rows"]]
-cols = [str(c) for c in spec["cols"]]
-if len(set(rows))!= len(rows):
-raise SpecError("duplicate row id")
-if len(set(cols))!= len(cols):
-raise SpecError("duplicate col id")
-cells = spec.get("cells", {})
-if not isinstance(cells, dict):
-raise SpecError("spec.cells must be an object")
-valid_keys = {_cellkey(r, c) for r in rows for c in cols}
-for k in cells:
-if k not in valid_keys:
-raise SpecError("cell key %r is not a row|col of this square" % k)
-ref = spec.get("reference_col")
-if ref is not None and str(ref) not in cols:
-raise SpecError("reference_col %r is not a column" % ref)
-rc = spec.get("row_constraints", {})
-cc = spec.get("col_constraints", {})
-if not isinstance(rc, dict) or not isinstance(cc, dict):
-raise SpecError("row_constraints/col_constraints must be objects")
-for line_id, con in list(rc.items()) + list(cc.items()):
-_validate_constraint(line_id, con)
-spec["rows"], spec["cols"] = rows, cols
-if ref is not None:
-spec["reference_col"] = str(ref)
-return spec
-
-def _validate_constraint(line_id, con):
-if not isinstance(con, dict) or "type" not in con:
-raise SpecError("constraint on %r needs a type" % line_id)
-t = con["type"]
-if t == "equal":
-return
-if t == "wordlist":
-words = con.get("words")
-if not isinstance(words, list) or not words:
-raise SpecError("wordlist on %r needs a non-empty words list" % line_id)
-for w in words:
-if not isinstance(w, list):
-raise SpecError("each word on %r must be a list (a tuple of cell values)" % line_id)
-return
-raise SpecError("unknown constraint type %r on %r" % (t, line_id))
-
-class ChainError(Exception):
-"""The proof-chain artifact could not be read/verified at all (fail-closed, exit 2).
-Distinct from a *detected break* in a readable chain (exit 3) -- 'cannot read' is
-never a pass."""
-pass
-
-class SpecError(Exception):
-pass
-
-# -----------------------------------------------------------------------------
-# domains + lines
-# -----------------------------------------------------------------------------
-
-def init_domains(spec):
-"""cellkey -> sorted list of candidate values.
-fixed cell -> singleton {value}; open cell -> the global/per-axis domain."""
-rows, cols = spec["rows"], spec["cols"]
-cells = spec.get("cells", {})
-gdomain = spec.get("domain") # optional global open-cell domain
-domains = {}
-for r in rows:
-for c in cols:
-k = _cellkey(r, c)
-if k in cells and cells[k] is not None:
-domains[k] = [cells[k]]
-else:
-if gdomain is None:
-# open cell with no domain -> derive domain from the union of
-# values that any wordlist on its lines permits at its slot;
-# if it has only `equal` lines and no global domain, that is a
-# spec gap -> fail closed.
-dom = _derived_open_domain(spec, r, c)
-if dom is None:
-raise SpecError(
-"open cell %s has no domain (no global `domain`, no wordlist on "
-"its row or column)" % k)
-domains[k] = sorted(dom, key=_skey)
-else:
-domains[k] = sorted(list(gdomain), key=_skey)
-return domains
-
-def _derived_open_domain(spec, r, c):
-"""Union of slot-values a wordlist on this cell's row or column allows."""
-vals = set()
-found = False
-rc = spec.get("row_constraints", {}).get(r)
-if rc and rc.get("type") == "wordlist":
-idx = spec["cols"].index(c)
-for w in rc["words"]:
-if idx < len(w):
-vals.add(w[idx]); found = True
-cc = spec.get("col_constraints", {}).get(c)
-if cc and cc.get("type") == "wordlist":
-idx = spec["rows"].index(r)
-for w in cc["words"]:
-if idx < len(w):
-vals.add(w[idx]); found = True
-return vals if found else None
-
-def _skey(v):
-"""Stable sort key across heterogeneous JSON scalars."""
-return (type(v).__name__, v if isinstance(v, (int, float)) else json.dumps(v, sort_keys=True))
-
-def row_cells(spec, r):
-return [_cellkey(r, c) for c in spec["cols"]]
-
-def col_cells(spec, c):
-return [_cellkey(r, c) for r in spec["rows"]]
-
-# -----------------------------------------------------------------------------
-# arc-consistency (AC-3)
-# -----------------------------------------------------------------------------
-
-def _supported_wordlist(value, idx, line_keys, domains, words):
-"""value at position idx is supported iff some allowed word places `value`
-at idx and every other position is still achievable in its cell's domain."""
-for w in words:
-if idx >= len(w) or w[idx]!= value:
-continue
-ok = True
-for j, k in enumerate(line_keys):
-if j == idx:
-continue
-if j >= len(w) or w[j] not in domains[k]:
-ok = False
-break
-if ok:
-return True
-return False
-
-def arc_consistency(spec):
-"""Run AC-3 to a fixpoint. Returns (domains, trace) where trace maps a
-cellkey that emptied -> {'axis','line','reason'} naming the constraint that
-killed it (the localization witness)."""
-domains = init_domains(spec)
-ref = spec.get("reference_col")
-rcons = spec.get("row_constraints", {})
-ccons = spec.get("col_constraints", {})
-trace = {}
-
-# Build the arc worklist: (cell, axis, line_id). A cell is revised against
-# each constraint it participates in.
-def lines_for(k):
-r, c = k.split("|", 1)
-out = []
-if r in rcons:
-out.append(("row", r))
-if c in ccons:
-out.append(("col", c))
-return out
-
-work = []
-for r in spec["rows"]:
-for c in spec["cols"]:
-k = _cellkey(r, c)
-for axis, line in lines_for(k):
-work.append((k, axis, line))
-
-# deterministic order
-work.sort()
-qi = 0
-# use an index-based queue but re-add neighbours on change
-queue = list(work)
-while queue:
-k, axis, line = queue.pop(0)
-if not domains[k]:
-continue # already dead
-changed, killed = _revise(spec, domains, ref, k, axis, line, rcons, ccons)
-if killed and k not in trace:
-trace[k] = killed
-if changed:
-# re-enqueue every other cell that shares a line with k
-r, c = k.split("|", 1)
-neighbours = set()
-if r in rcons or True:
-for cc in spec["cols"]:
-nk = _cellkey(r, cc)
-if nk!= k:
-for ax, ln in lines_for(nk):
-neighbours.add((nk, ax, ln))
-for rr in spec["rows"]:
-nk = _cellkey(rr, c)
-if nk!= k:
-for ax, ln in lines_for(nk):
-neighbours.add((nk, ax, ln))
-for item in sorted(neighbours):
-queue.append(item)
-return domains, trace
-
-def _revise(spec, domains, ref, k, axis, line, rcons, ccons):
-"""Prune domain[k] against one constraint. Returns (changed, killed_info)."""
-r, c = k.split("|", 1)
-con = rcons[line] if axis == "row" else ccons[line]
-before = list(domains[k])
-keep = []
-
-if con["type"] == "equal":
-line_keys = row_cells(spec, line) if axis == "row" else col_cells(spec, line)
-if axis == "row" and ref is not None:
-ref_key = _cellkey(line, ref)
-if k == ref_key:
-keep = list(before) # reference defers to no one
-else:
-ref_dom = domains[ref_key]
-keep = [v for v in before if v in ref_dom]
-else:
-# plain mutual equality: v survives iff every line-mate can still take v
-for v in before:
-ok = True
-for nk in line_keys:
-if nk == k:
-continue
-if v not in domains[nk]:
-ok = False
-break
-if ok:
-keep.append(v)
-elif con["type"] == "wordlist":
-line_keys = row_cells(spec, line) if axis == "row" else col_cells(spec, line)
-idx = line_keys.index(k)
-keep = [v for v in before if _supported_wordlist(v, idx, line_keys, domains, con["words"])]
-
-changed = len(keep)!= len(before)
-domains[k] = keep
-killed = None
-if not keep:
-killed = {
-"axis": axis,
-"line": line,
-"type": con["type"],
-"lost": before,
-"reason": _kill_reason(spec, domains, ref, k, axis, line, con, before),
+/* one Conway step over a Set of "x,y" keys -> a new Set of "x,y" keys */
+function step(live) {
+var counts = Object.create(null); // "x,y" -> live-neighbour count
+live.forEach(function (k) {
+var c = k.split(","), x = +c[0], y = +c[1];
+for (var dx = -1; dx <= 1; dx++) {
+for (var dy = -1; dy <= 1; dy++) {
+if (dx === 0 && dy === 0) continue;
+var nk = key(x + dx, y + dy);
+counts[nk] = (counts[nk] || 0) + 1;
 }
-return changed, killed
-
-def _kill_reason(spec, domains, ref, k, axis, line, con, before):
-r, c = k.split("|", 1)
-if con["type"] == "equal":
-if axis == "row" and ref is not None and c!= ref:
-ref_key = _cellkey(line, ref)
-rv = domains[ref_key][0] if domains[ref_key] else "<empty>"
-mine = before[0] if len(before) == 1 else before
-return ("row %r requires equality to reference col %r (=%r); this cell holds %r"
-% (line, ref, rv, mine))
-return "%s %r requires all cells equal; this cell could not agree" % (axis, line)
-return "%s %r (wordlist) admits no value for this cell consistent with its crossing word" % (axis, line)
-
-# -----------------------------------------------------------------------------
-# classify + localize
-# -----------------------------------------------------------------------------
-
-def classify(spec, domains):
-rows, cols = spec["rows"], spec["cols"]
-cells = spec.get("cells", {})
-out = {}
-for r in rows:
-for c in cols:
-k = _cellkey(r, c)
-dom = domains[k]
-fixed = k in cells and cells[k] is not None
-if len(dom) == 0:
-out[k] = {"verdict": "CONTRADICTORY"}
-elif len(dom) == 1:
-if fixed:
-out[k] = {"verdict": "CONSISTENT", "value": dom[0]}
-else:
-out[k] = {"verdict": "FORCED", "value": dom[0]}
-else:
-out[k] = {"verdict": "FREE", "domain": sorted(dom, key=_skey)}
-return out
-
-def localize(spec, domains, trace):
-"""For every CONTRADICTORY cell, name the crossing -- (row R x col C) plus
-BOTH failing words (the row-word and the col-word)."""
-rcons = spec.get("row_constraints", {})
-ccons = spec.get("col_constraints", {})
-out = []
-for r in spec["rows"]:
-for c in spec["cols"]:
-k = _cellkey(r, c)
-if domains[k]:
-continue
-killed = trace.get(k, {})
-row_word = _word_render(spec, "row", r, rcons.get(r))
-col_word = _word_render(spec, "col", c, ccons.get(c))
-out.append({
-"cell": k,
-"row": r,
-"col": c,
-"killed_by": {kk: killed[kk] for kk in ("axis", "line", "type") if kk in killed},
-"reason": killed.get("reason", "no support under its crossing words"),
-"row_word": row_word,
-"col_word": col_word,
-})
-out.sort(key=lambda d: (d["row"], d["col"]))
-return out
-
-def _word_render(spec, axis, line, con):
-if con is None:
-return {"line": line, "type": None, "note": "no constraint on this %s (advisory)" % axis}
-if con["type"] == "equal":
-ref = spec.get("reference_col")
-d = {"line": line, "type": "equal"}
-if axis == "row" and ref is not None:
-d["reference_col"] = ref
-return d
-return {"line": line, "type": "wordlist", "n_words": len(con["words"])}
-
-# -----------------------------------------------------------------------------
-# solve + result
-# -----------------------------------------------------------------------------
-
-def solve(spec):
-"""Pure function of the spec. Returns the deterministic result object."""
-domains, trace = arc_consistency(spec)
-cells = classify(spec, domains)
-contradictions = localize(spec, domains, trace)
-counts = {"FORCED": 0, "FREE": 0, "CONTRADICTORY": 0, "CONSISTENT": 0}
-for v in cells.values():
-counts[v["verdict"]] += 1
-held = counts["CONTRADICTORY"] == 0
-result = {
-"name": spec.get("name", "<unnamed>"),
-"rows": spec["rows"],
-"cols": spec["cols"],
-"reference_col": spec.get("reference_col"),
-"verdict": "HELD" if held else "CONTRADICTORY",
-"counts": counts,
-"cells": cells,
-"contradictions": contradictions,
-"free_picks": sorted(
-[k for k, v in cells.items() if v["verdict"] == "FREE"]),
-"spec_sha256": spec_sha(spec),
 }
-return result
-
-def spec_sha(spec):
-payload = {k: spec[k] for k in spec if not k.startswith("_")}
-return hashlib.sha256(
-json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-).hexdigest()
-
-def result_bytes(result):
-"""Canonical, deterministic serialization of a result (the byte-truth)."""
-return json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2).encode("utf-8")
-
-# -----------------------------------------------------------------------------
-# facet audit -- Test by Removal (A4)
-# -----------------------------------------------------------------------------
-
-def facet_audit(spec):
-"""Test by Removal (A4). Drop each constraint in turn and re-solve; a
-constraint whose removal changes the result is ACTIVE (it does unique work
-in this spec), otherwise REDUNDANT (its work is also done by other
-constraints).
-
-REDUNDANT is NOT a defect: a double word square is over-determined by
-design, and that redundancy IS the error-correction / localization power of
-a product code. The genuine A4 failure -- the false-comfort axis Phase 0
-named -- is a Trellis with NO ACTIVE AXIS: every constraint passes trivially
-and removing any changes nothing, so it can never carry a catch (a
-version-only Trellis reads v36==v36 everywhere and goes blind). That, and
-only that, is REJECTED here.
-
-BOUND (do not oversell): Test-by-Removal sees only the PRESENT constraints.
-It tells you which present facets carry the catch (ACTIVE) vs are redundant
-(REDUNDANT) against a spec that contains a real deviation -- it CANNOT detect
-a *missing* facet (the catch you never modelled). And on a fully-pinned,
-fully-consistent square there is no slack and no break, so every axis is
-trivially redundant -> REJECT fires benignly. Run the audit on a spec with a
-present deviation or open cells for it to mean what it says.
-"""
-base = solve(spec)
-base_sig = _result_sig(base)
-findings = []
-rcons = spec.get("row_constraints", {})
-ccons = spec.get("col_constraints", {})
-for axis, cons in (("row", rcons), ("col", ccons)):
-for line in sorted(cons):
-trial = json.loads(json.dumps({k: spec[k] for k in spec if not k.startswith("_")}))
-key = "row_constraints" if axis == "row" else "col_constraints"
-trial[key] = dict(trial.get(key, {}))
-trial[key].pop(line, None)
-try:
-tspec = validate_spec(trial)
-tres = solve(tspec)
-changed = sorted(_result_diff(base, tres))
-active = base_sig!= _result_sig(tres)
-except SpecError as e:
-# removing it makes the spec ill-formed (an open cell loses its
-# only domain source) -> it WAS doing work.
-changed = ["<spec-gap:%s>" % e]
-active = True
-findings.append({
-"axis": axis,
-"line": line,
-"type": cons[line].get("type"),
-"active": active,
-"changed_if_removed": changed,
-})
-active_axes = [f for f in findings if f["active"]]
-redundant = [f for f in findings if not f["active"]]
-no_active = len(active_axes) == 0 and len(findings) > 0
-return {
-"name": spec.get("name", "<unnamed>"),
-"verdict": "REJECT-NO-ACTIVE-AXIS" if no_active else "OK",
-"active_count": len(active_axes),
-"redundant_count": len(redundant),
-"redundant": [{"axis": f["axis"], "line": f["line"]} for f in redundant],
-"findings": findings,
+});
+var next = new Set();
+for (var k in counts) {
+var n = counts[k];
+if (n === 3 || (n === 2 && live.has(k))) next.add(k); // B3 / S23
+}
+return next;
 }
 
-def _result_sig(result):
-"""A hashable signature of the result's solution content (no spec_sha)."""
-return json.dumps(
-{"cells": result["cells"], "contradictions": result["contradictions"]},
-sort_keys=True, ensure_ascii=False)
-
-def _result_diff(a, b):
-"""Cell keys whose verdict/value/domain differs between two results."""
-out = set()
-keys = set(a["cells"]) | set(b["cells"])
-for k in keys:
-if a["cells"].get(k)!= b["cells"].get(k):
-out.add(k)
-return out
-
-# -----------------------------------------------------------------------------
-# proof chain (append-only) -- a side effect, never part of the result bytes
-# -----------------------------------------------------------------------------
-
-def log_run(result, spec_name):
-os.makedirs(RUNS_DIR, exist_ok=True)
-safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in spec_name)[:80] or "run"
-path = os.path.join(RUNS_DIR, safe + ".jsonl")
-prev = "0" * 64
-if os.path.exists(path):
-with open(path, "r", encoding="utf-8") as fh:
-lines = [ln for ln in fh if ln.strip()]
-if lines:
-try:
-prev = json.loads(lines[-1])["sha256"]
-except Exception:
-prev = "0" * 64
-event = {
-"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-"spec_sha256": result["spec_sha256"],
-"verdict": result["verdict"],
-"counts": result["counts"],
-"contradiction_cells": [c["cell"] for c in result["contradictions"]],
-"prev_sha256": prev,
+/* parse JSONL live cells -> Set of "x,y"; throws on a non-integer-pair line */
+function parse(text) {
+var live = new Set();
+var lines = String(text).split("\n");
+for (var i = 0; i < lines.length; i++) {
+var raw = lines[i];
+if (raw.charCodeAt(raw.length - 1) === 13) raw = raw.slice(0, -1); // CRLF
+if (raw.length === 0) continue; // blank line skipped
+var v;
+try { v = JSON.parse(raw);}
+catch (e) { throw new Error("line " + (i + 1) + ": not valid JSON: " + raw);}
+if (!Array.isArray(v) || v.length!== 2) {
+throw new Error("line " + (i + 1) + ": expected a [x,y] pair: " + raw);
 }
-event["sha256"] = hashlib.sha256(
-(prev + json.dumps(event, sort_keys=True, ensure_ascii=False)).encode("utf-8")
-).hexdigest()
-with open(path, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
-return path
-
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
-
-def verify_chain(path):
-"""Re-walk an append-only proof chain (as written by `solve --log`) and verify,
-for every record in order: (1) the link is continuous (this record's prev_sha256
-equals the previous record's sha256; genesis prev = 64 zeros), and (2) the record
-is intact (recomputing the hash exactly as log_run wrote it -- sha256 over
-prev_sha256 + the record's other fields, sorted -- reproduces the stored sha256).
-
-Returns (ok: bool, n_records: int, problem: str | None).
-- A clean chain returns (True, n, None) -- silent-ok.
-- A *detected* break returns (False, idx, located-reason) -- the caller exits 3, loud.
-Raises ChainError when the artifact cannot be read at all (missing / empty) -- the
-caller exits 2. 'Cannot verify' is never a pass: a localizer that stays silent on a
-chain it could not read would be the exact A1 oversell the Trellis refuses."""
-if not os.path.exists(path):
-raise ChainError("no such chain file: %s" % path)
-with open(path, "r", encoding="utf-8") as fh:
-raw = [ln for ln in fh if ln.strip()]
-if not raw:
-raise ChainError("empty chain (0 records) at %s -- nothing to verify" % path)
-prev = "0" * 64
-for i, ln in enumerate(raw):
-try:
-ev = json.loads(ln)
-except ValueError as e:
-# a corrupted/truncated record is a *detected* break, not a can't-read:
-# the chain was readable to here and is broken at record i.
-return (False, i, "record %d: malformed JSON (chain corrupt): %s" % (i, e))
-if not isinstance(ev, dict) or "sha256" not in ev or "prev_sha256" not in ev:
-return (False, i, "record %d: missing sha256/prev_sha256 (chain corrupt)" % i)
-if ev["prev_sha256"]!= prev:
-return (False, i, "record %d: BROKEN LINK -- prev_sha256 %s.. does not chain "
-"to the previous record's hash %s.." % (i, ev["prev_sha256"][:12], prev[:12]))
-body = {k: v for k, v in ev.items() if k!= "sha256"}
-recomputed = hashlib.sha256(
-(ev["prev_sha256"] + json.dumps(body, sort_keys=True, ensure_ascii=False)).encode("utf-8")
-).hexdigest()
-if recomputed!= ev["sha256"]:
-return (False, i, "record %d: HASH MISMATCH (record tampered) -- stored %s.. "
-"but its contents hash to %s.." % (i, ev["sha256"][:12], recomputed[:12]))
-prev = ev["sha256"]
-return (True, len(raw), None)
-
-def _render_human(result):
-lines = []
-v = result["verdict"]
-mark = "HELD" if v == "HELD" else ">>> CONTRADICTORY <<<"
-lines.append("Trellis: %s [%s]" % (result["name"], mark))
-cnt = result["counts"]
-lines.append(" cells: FORCED=%d FREE=%d CONTRADICTORY=%d CONSISTENT=%d"
-% (cnt["FORCED"], cnt["FREE"], cnt["CONTRADICTORY"], cnt["CONSISTENT"]))
-for fk in result["free_picks"]:
-dom = result["cells"][fk]["domain"]
-lines.append(" FREE %s -> {%s}" % (fk, ", ".join(str(x) for x in dom)))
-for c in result["contradictions"]:
-lines.append(" >>> CONTRADICTORY at cell (%s x %s):" % (c["row"], c["col"]))
-lines.append(" %s" % c["reason"])
-lines.append(" failing row-word: %s | failing col-word: %s"
-% (json.dumps(c["row_word"], sort_keys=True),
-json.dumps(c["col_word"], sort_keys=True)))
-return "\n".join(lines)
-
-def main(argv=None):
-ap = argparse.ArgumentParser(prog="trellis.py", description="The Trellis -- 2-D consistency localizer + generator")
-sub = ap.add_subparsers(dest="cmd")
-ps = sub.add_parser("solve", help="solve/check a square")
-ps.add_argument("spec")
-ps.add_argument("--log", action="store_true", help="append to the proof chain")
-ps.add_argument("--json", action="store_true", help="emit the raw result JSON")
-pa = sub.add_parser("audit", help="Test-by-Removal on every constraint (A4)")
-pa.add_argument("spec")
-pa.add_argument("--json", action="store_true")
-pv = sub.add_parser("verify-chain", help="re-walk a --log proof chain; loud + located on a break (Pull R5)")
-pv.add_argument("chain", help="path to the proof chain.jsonl (as written by `solve --log` under _runs/)")
-args = ap.parse_args(argv)
-
-if args.cmd == "solve":
-try:
-spec = load_spec(args.spec)
-except SpecError as e:
-sys.stderr.write("SPEC ERROR (fail-closed): %s\n" % e)
-return 2
-except (OSError, ValueError) as e:
-sys.stderr.write("SPEC ERROR (fail-closed): %s\n" % e)
-return 2
-result = solve(spec)
-if args.log:
-log_run(result, result["name"])
-if args.json:
-sys.stdout.buffer.write(result_bytes(result) + b"\n")
-else:
-print(_render_human(result))
-return 3 if result["verdict"] == "CONTRADICTORY" else 0
-
-if args.cmd == "audit":
-try:
-spec = load_spec(args.spec)
-except SpecError as e:
-sys.stderr.write("SPEC ERROR (fail-closed): %s\n" % e)
-return 2
-audit = facet_audit(spec)
-if args.json:
-sys.stdout.buffer.write(
-json.dumps(audit, sort_keys=True, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
-else:
-ok = audit["verdict"] == "OK"
-head = ("OK -- %d active / %d redundant" % (audit["active_count"], audit["redundant_count"])
-if ok else ">>> REJECT: no active axis (carries no catch -- A4) <<<")
-print("Facet audit: %s [%s]" % (audit["name"], head))
-for f in audit["findings"]:
-tag = "ACTIVE" if f["active"] else "redundant"
-print(" %-4s %-24s %-9s %s" % (f["axis"], f["line"], f["type"], tag))
-if audit["redundant_count"] and ok:
-print(" (redundant!= defect: in a product code the overlap IS the error-correction power)")
-return 0 if audit["verdict"] == "OK" else 3
-
-if args.cmd == "verify-chain":
-try:
-ok, n, problem = verify_chain(args.chain)
-except ChainError as e:
-sys.stderr.write("CHAIN ERROR (fail-closed): %s\n" % e)
-return 2
-except (OSError, ValueError) as e:
-sys.stderr.write("CHAIN ERROR (fail-closed): %s\n" % e)
-return 2
-if ok:
-print("Proof chain OK: %s [%d record%s -- links + hashes verified]"
-% (args.chain, n, "" if n == 1 else "s"))
-return 0
-sys.stderr.write(">>> PROOF CHAIN BROKEN <<<\n %s\n" % problem)
-return 3
-
-ap.print_help()
-return 2
-
-if __name__ == "__main__":
-sys.exit(main())
-
-smoke_test.py 163 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""smoke_test.py — hermetic proof that trellis.py holds the line. No network, no
-state outside a tmpdir. Each scenario writes a spec, runs trellis.py as a
-subprocess, and checks the exit code and verdict text — the real CLI contract:
-
-1 a solvable square renders and reports FORCED/FREE cells (exit 0)
-2 a genuine double word square holds with the expected FORCED/FREE split
-3 an over-constrained square localizes the clash to CONTRADICTORY cells
-4 --json emits parseable result JSON with the cell verdicts
-5 a malformed spec is rejected loud, not silently passed (nonzero exit)
-6 --help exits 0 (the gift contract: a stranger can discover the tool)
-
-Run: python3 smoke_test.py (expect: 6/6 passed)
-"""
-import json
-import os
-import subprocess
-import sys
-import tempfile
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-TRELLIS = os.path.join(HERE, "trellis.py")
-PASS = 0
-FAIL = 0
-
-def ok(msg):
-global PASS
-PASS += 1
-print(f"ok {msg}")
-
-def bad(msg):
-global FAIL
-FAIL += 1
-print(f"FAIL {msg}")
-
-def run(args, **kw):
-return subprocess.run([sys.executable, TRELLIS] + args,
-capture_output=True, text=True, **kw)
-
-def write(d, name, obj):
-p = os.path.join(d, name)
-with open(p, "w") as fh:
-json.dump(obj, fh)
-return p
-
-# A small solvable 2x2 square: rows and columns are two-letter wordlists that
-# share letters at the crossings.
-SOLVABLE = {
-"rows": ["r0", "r1"], "cols": ["c0", "c1"],
-"cells": {"r0|c0": "A"},
-"row_constraints": {
-"r0": {"type": "wordlist", "words": [["A", "T"], ["A", "N"]]},
-"r1": {"type": "wordlist", "words": [["T", "O"], ["N", "O"]]},
-},
-"col_constraints": {
-"c0": {"type": "wordlist", "words": [["A", "T"], ["A", "N"]]},
-"c1": {"type": "wordlist", "words": [["T", "O"], ["N", "O"]]},
-},
+var x = v[0], y = v[1];
+if (typeof x!== "number" || typeof y!== "number" ||!isFinite(x) ||!isFinite(y) ||
+Math.floor(x)!== x || Math.floor(y)!== y) {
+throw new Error("line " + (i + 1) + ": coordinates must be finite integers: " + raw);
+}
+live.add(key(x, y));
+}
+return live;
 }
 
-# The literal double word square seed, top row fixed.
-WORD_SQUARE = {
-"rows": ["r0", "r1", "r2", "r3"], "cols": ["c0", "c1", "c2", "c3"],
-"cells": {"r0|c0": "S", "r0|c1": "T", "r0|c2": "A", "r0|c3": "R"},
-"row_constraints": {
-"r0": {"type": "wordlist", "words": [["S", "T", "A", "R"], ["S", "T", "A", "B"], ["S", "C", "A", "R"]]},
-"r1": {"type": "wordlist", "words": [["P", "A", "G", "E"], ["P", "A", "V", "E"], ["P", "A", "C", "E"]]},
-"r2": {"type": "wordlist", "words": [["O", "P", "E", "N"], ["O", "V", "E", "N"]]},
-"r3": {"type": "wordlist", "words": [["T", "E", "S", "T"], ["T", "E", "N", "T"], ["T", "E", "X", "T"]]},
-},
-"col_constraints": {
-"c0": {"type": "wordlist", "words": [["S", "P", "O", "T"], ["S", "P", "A", "T"]]},
-"c1": {"type": "wordlist", "words": [["T", "A", "P", "E"], ["C", "A", "P", "E"]]},
-"c2": {"type": "wordlist", "words": [["A", "G", "E", "S"], ["A", "V", "E", "S"], ["A", "C", "E", "S"]]},
-"c3": {"type": "wordlist", "words": [["R", "E", "N", "T"], ["R", "U", "N", "T"]]},
-},
+/* sorted array of [x,y] from a Set of "x,y" (x asc, then y asc) -> canonical order */
+function sortedCells(live) {
+var arr = [];
+live.forEach(function (k) { var c = k.split(","); arr.push([+c[0], +c[1]]);});
+arr.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1];});
+return arr;
 }
 
-# Over-constrained: a fixed cell that no row/column word allows.
-CLASH = {
-"rows": ["r0"], "cols": ["c0", "c1"],
-"cells": {"r0|c0": "Z"},
-"row_constraints": {"r0": {"type": "wordlist", "words": [["A", "T"], ["A", "N"]]}},
-"col_constraints": {
-"c0": {"type": "wordlist", "words": [["A"], ["B"]]},
-"c1": {"type": "wordlist", "words": [["T"], ["N"]]},
-},
+/**
+* Fold a JSONL live-cell set forward N generations.
+* @param {string} text JSONL of [x,y] live cells
+* @param {{steps?:number}} opts steps N (integer >= 0; default 1)
+* @returns {{steps:number, count:number, cells:number[][]}}
+* @throws {Error} on a bad line or a bad steps value.
+*/
+function fold(text, opts) {
+opts = opts || {};
+var steps = opts.steps === undefined? 1: opts.steps;
+if (typeof steps!== "number" ||!isFinite(steps) || Math.floor(steps)!== steps || steps < 0) {
+throw new Error("steps must be an integer >= 0 (got " + steps + ")");
+}
+var live = parse(text);
+for (var s = 0; s < steps; s++) live = step(live);
+var cells = sortedCells(live);
+return { steps: steps, count: cells.length, cells: cells};
 }
 
-def t1(d):
-r = run(["solve", write(d, "s.json", SOLVABLE)])
-if r.returncode == 0 and "FORCED" in r.stdout:
-ok("1 solvable square renders with FORCED cells")
-else:
-bad(f"1 solvable square: rc={r.returncode} out={r.stdout!r} err={r.stderr!r}")
+/* ------------------------------------------------------------------ exports */
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { fold: fold, step: step, parse: parse, sortedCells: sortedCells};
+}
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.lifeFold = fold;
+}
 
-def t2(d):
-r = run(["solve", write(d, "w.json", WORD_SQUARE)])
-if r.returncode == 0 and "FORCED=11" in r.stdout and "FREE=1" in r.stdout:
-ok("2 word square holds with FORCED=11 FREE=1")
-else:
-bad(f"2 word square: rc={r.returncode} out={r.stdout!r}")
+/* ----------------------------------------------------------------- CLI main */
+function main(argv) {
+var args = argv.slice(2);
+var steps = 1, file = null;
+for (var i = 0; i < args.length; i++) {
+var a = args[i];
+if (a === "--help" || a === "-h") {
+process.stdout.write(
+"usage: life-fold.js [--steps N] [FILE]\n" +
+" --steps N run N generations in-process (default 1; N=0 canonicalises)\n" +
+" (no FILE) read live cells from stdin\n" +
+" FILE read live cells from a file\n" +
+" --help\n" +
+"Each non-blank line is one live cell as a JSON [x,y] integer pair. Output is\n" +
+"the next generation's live cells, same shape, one [x,y] per line, sorted --\n" +
+"so `life-fold | life-fold` steps two generations (closed under its own I/O).\n"
+);
+process.exit(0);
+} else if (a === "--steps") {
+var nx = args[i + 1];
+if (nx === undefined) { process.stderr.write("life-fold: --steps requires a value\n"); process.exit(2);}
+steps = Number(nx); i += 1;
+} else if (a.indexOf("--steps=") === 0) {
+steps = Number(a.slice(8));
+} else if (a.charAt(0) === "-" && a!== "-") {
+process.stderr.write("life-fold: unknown option: " + a + "\n"); process.exit(2);
+} else {
+if (file!== null) { process.stderr.write("life-fold: more than one FILE given\n"); process.exit(2);}
+file = a;
+}
+}
 
-def t3(d):
-r = run(["solve", write(d, "c.json", CLASH)])
-if "CONTRADICTORY" in r.stdout and "CONTRADICTORY=0" not in r.stdout:
-ok("3 over-constrained square localizes to CONTRADICTORY")
-else:
-bad(f"3 clash not localized: out={r.stdout!r}")
+function run(text) {
+var rec;
+try { rec = fold(text, { steps: steps});}
+catch (e) { process.stderr.write("life-fold: " + e.message + "\n"); process.exit(2); return;}
+// closed under I/O: emit the live-cell SET as JSONL [x,y] (one per line)
+var out = "";
+for (var i = 0; i < rec.cells.length; i++) out += JSON.stringify(rec.cells[i]) + "\n";
+process.stdout.write(out);
+}
 
-def t4(d):
-r = run(["solve", write(d, "j.json", SOLVABLE), "--json"])
-try:
-obj = json.loads(r.stdout)
-if r.returncode == 0 and isinstance(obj, dict):
-ok("4 --json emits parseable result JSON")
-return
-except Exception:
-pass
-bad(f"4 --json not parseable: out={r.stdout!r}")
+if (file === null || file === "-") {
+var chunks = [];
+process.stdin.on("data", function (c) { chunks.push(c);});
+process.stdin.on("end", function () { run(Buffer.concat(chunks).toString("utf8"));});
+} else {
+var fs = require("fs");
+var text;
+try {
+var st = fs.statSync(file);
+if (st.isDirectory()) { process.stderr.write("life-fold: is a directory: " + file + "\n"); process.exit(2); return;}
+text = fs.readFileSync(file, "utf8");
+} catch (e) {
+process.stderr.write("life-fold: cannot read file: " + file + "\n"); process.exit(2); return;
+}
+run(text);
+}
+}
 
-def t5(d):
-p = os.path.join(d, "bad.json")
-with open(p, "w") as fh:
-fh.write("{ this is not json ")
-r = run(["solve", p])
-if r.returncode!= 0:
-ok("5 malformed spec rejected loud (nonzero exit)")
-else:
-bad(f"5 malformed spec silently passed: rc={r.returncode}")
+if (typeof require!== "undefined" && require.main === module) {
+main(process.argv);
+}
 
-def t6(_d):
-r = run(["--help"])
-if r.returncode == 0 and "Trellis" in r.stdout:
-ok("6 --help exits 0 (discoverable)")
-else:
-bad(f"6 --help: rc={r.returncode}")
+test_life-fold.js 88 lines on GitHub →
+#!/usr/bin/env node
+/* test_life-fold.js — external battery for the life-fold gift.
+*
+* node test_life-fold.js -> exit 0 GREEN / non-zero RED
+*
+* Proves Conway B3/S23 correctness on known patterns (blinker oscillator, block
+* still-life, glider translation on an unbounded grid), the TIER-B closure property
+* (--steps N equals piping the fold into itself N times -- the trace ↻ loop), plus
+* determinism, order-independence, empty/steps-0, dedup, and numeric-honesty errors.
+*/
+"use strict";
+var assert = require("assert");
+var m = require("./life-fold.js");
+var fold = m.fold;
 
-def main():
-for t in (t1, t2, t3, t4, t5):
-with tempfile.TemporaryDirectory() as d:
-t(d)
-t6(None)
-print()
-print(f"{PASS}/{PASS + FAIL} passed")
-return 0 if FAIL == 0 else 1
+var pass = 0, fail = 0;
+function ok(name, cond) { if (cond) pass++; else { fail++; console.error(" RED " + name);}}
+function throws(name, fn) { try { fn(); fail++; console.error(" RED " + name + " (did not throw)");} catch (e) { pass++;}}
+function J(v) { return JSON.stringify(v);}
+function jsonl(cells) { return cells.map(function (c) { return J(c);}).join("\n");}
 
-if __name__ == "__main__":
-sys.exit(main())
+/* re-serialize a fold result back to JSONL (to feed it into itself) */
+function toJSONL(rec) { return rec.cells.map(function (c) { return J(c);}).join("\n");}
+
+/* ---- blinker: 3 in a row oscillates with period 2 -------------------------- */
+var blinkerH = [[0, 0], [1, 0], [2, 0]];
+var blinkerV = [[1, -1], [1, 0], [1, 1]];
+ok("blinker horizontal -> vertical (1 step)", J(fold(jsonl(blinkerH), { steps: 1}).cells) === J(blinkerV));
+ok("blinker vertical -> horizontal (1 step)", J(fold(jsonl(blinkerV), { steps: 1}).cells) === J(blinkerH));
+ok("blinker period 2 (2 steps == identity)", J(fold(jsonl(blinkerH), { steps: 2}).cells) === J(blinkerH));
+
+/* ---- block: 2x2 still-life is unchanged forever ---------------------------- */
+var block = [[0, 0], [0, 1], [1, 0], [1, 1]];
+ok("block still-life unchanged (1 step)", J(fold(jsonl(block), { steps: 1}).cells) === J(block));
+ok("block still-life unchanged (5 steps)", J(fold(jsonl(block), { steps: 5}).cells) === J(block));
+
+/* ---- TIER-B closure: --steps N == piping the fold N times ------------------ */
+var seed = [[0, 0], [1, 0], [2, 0], [5, 5], [5, 6], [6, 5], [6, 6]]; // blinker + block
+function piped(text, n) { var t = text; for (var i = 0; i < n; i++) t = toJSONL(fold(t, { steps: 1})); return t;}
+[2, 3, 4].forEach(function (n) {
+ok("closed under I/O: --steps " + n + " == piped " + n,
+toJSONL(fold(jsonl(seed), { steps: n})) === piped(jsonl(seed), n));
+});
+
+/* ---- glider: population 5 conserved, and it TRANSLATES on an unbounded grid - */
+var glider = [[1, 0], [2, 1], [0, 2], [1, 2], [2, 2]];
+ok("glider population 5 conserved through 4 steps",
+[1, 2, 3, 4].every(function (n) { return fold(jsonl(glider), { steps: n}).count === 5;}));
+function normalize(cells) {
+var minx = Math.min.apply(null, cells.map(function (c) { return c[0];}));
+var miny = Math.min.apply(null, cells.map(function (c) { return c[1];}));
+return cells.map(function (c) { return [c[0] - minx, c[1] - miny];})
+.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1];});
+}
+var g0 = fold(jsonl(glider), { steps: 0}).cells;
+var g4 = fold(jsonl(glider), { steps: 4}).cells;
+ok("glider after 4 steps is the same shape, translated (not identical position)",
+J(normalize(g4)) === J(normalize(g0)) && J(g4)!== J(g0));
+
+/* ---- determinism + order-independence (a SET; shuffled == base) ------------ */
+var shuffled = [[6, 6], [1, 0], [5, 5], [2, 0], [6, 5], [0, 0], [5, 6]];
+ok("order-independent: shuffled seed == sorted seed (1 step, byte-identical)",
+J(fold(jsonl(shuffled), { steps: 1}).cells) === J(fold(jsonl(seed), { steps: 1}).cells));
+ok("determinism: folds twice identical", J(fold(jsonl(seed), { steps: 3})) === J(fold(jsonl(seed), { steps: 3})));
+
+/* ---- dedup: duplicate live cells collapse (a set) -------------------------- */
+ok("duplicate cells collapse (steps 0 canonicalises)",
+J(fold("[0,0]\n[0,0]\n[1,1]\n", { steps: 0}).cells) === J([[0, 0], [1, 1]]));
+ok("steps 0 sorts + dedups", J(fold("[2,2]\n[0,0]\n[2,2]\n", { steps: 0}).cells) === J([[0, 0], [2, 2]]));
+
+/* ---- empty stream ---------------------------------------------------------- */
+ok("empty -> {steps:1,count:0,cells:[]}", J(fold("", { steps: 1})) === J({ steps: 1, count: 0, cells: []}));
+ok("blank lines skipped", J(fold("[0,0]\n\n[1,0]\n\n[2,0]\n", { steps: 0}).cells) === J([[0, 0], [1, 0], [2, 0]]));
+ok("CRLF trimmed", J(fold("[0,0]\r\n[1,0]\r\n[2,0]\r\n", { steps: 1}).cells) === J(blinkerV));
+
+/* ---- numeric / shape honesty: hard errors ---------------------------------- */
+throws("non-array line -> throw", function () { fold("[0,0]\n5\n", { steps: 1});});
+throws("wrong-length pair -> throw", function () { fold("[0,0,0]\n", { steps: 1});});
+throws("non-integer coord -> throw", function () { fold("[0.5,0]\n", { steps: 1});});
+throws("non-finite coord -> throw", function () { fold("[1e999,0]\n", { steps: 1});});
+throws("bad JSON line -> throw", function () { fold("[0,0]\nabc\n", { steps: 1});});
+
+/* ---- bad steps guards ------------------------------------------------------ */
+throws("steps=-1 -> throw", function () { fold("[0,0]", { steps: -1});});
+throws("steps=1.5 -> throw", function () { fold("[0,0]", { steps: 1.5});});
+
+console.log((fail === 0? "GREEN": "RED") + ": " + pass + " assertions passed, " + fail + " failed [test_life-fold]");
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Python stdlib only
+Zero dependencies, Node or browser, deterministic
+
+---
+
+# line-source — a Loop MMT gift
+https://loopmmt.com/gifts/line-source/
+[coverage: optional · branch: gifts]
+
+Turn a Text File into a JSONL Stream, One Record per Line source ← all gifts
+
+line-source
+
+line-source turns line-oriented text (a log, a word list, any one-record-per-line file) into a JSONL stream, one record per line: { line: <text>, n: <index>}. It is the adapter at the front of a pipe that lets the fold/filter/transform gifts consume ordinary text files. It fixes the three quiet failures of naive text.split('\n'): the phantom trailing empty record, the CRLF \r left glued to every line, and the leading UTF-8 BOM. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+
+The honest edge
+
+line-source splits on line terminators (\r\n, \n, \r) and emits one record per line — it does not parse CSV fields (use csv-source), does not parse JSON (lines are verbatim strings), does not read the file itself (you pipe text in), and does not sort or deduplicate. It preserves line bytes (minus the terminator and a leading BOM); with --trim it strips surrounding whitespace, and never otherwise. Empty --field, an unknown option, or a positional argument is refused (exit 2).
+
+Run it
+
+printf 'a\r\nb\n\nc\n' | node line-source.js --skip-blank # -> {"line":"a","n":0} {"line":"b","n":1} {"line":"c","n":3}
+test_line-source.js (138/138, independent regex-normalize-route oracle) + mutation-bite (7/7) + Plumb conformance GREEN (126/126, signed 2026-09-12, clock-independent, non-vacuity proven)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+line-source.js 241 lines on GitHub →
+#!/usr/bin/env node
+/* line-source.js — turn a plain-text file into a JSONL record stream, one record per line.
+Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
+
+WHAT IT IS. A SOURCE: it takes text in and emits a JSONL stream out — the front of a
+pipe. Hand it the contents of a log file, a word list, a CSV-without-structure, any
+line-oriented text, and it emits one JSON object per line: {"line":"...","n":0}. It is
+the adapter that lets the JSONL fold/filter/transform gifts consume ordinary text
+files: `line-source access.log | range-filter...`, `line-source names.txt | dedup-filter`.
+
+THE THREE QUIET FAILURES IT FIXES. Everyone "knows" how to split a file into lines —
+text.split("\n") — and everyone gets it subtly wrong, in three ways that only bite
+later:
+
+1. THE PHANTOM EMPTY RECORD. A well-formed text file ends with a newline. Naive
+"abc\ndef\n".split("\n") yields ["abc","def",""] — a trailing empty string that
+becomes a bogus final record. line-source treats a single trailing newline as the
+line TERMINATOR it is (POSIX: a line is text followed by a newline), not a
+separator, so "abc\ndef\n" is exactly two lines. A file with NO final newline
+("abc\ndef") is also two lines — the last line is still a line. The difference
+between "ends with newline" and "does not" never changes the record count.
+
+2. CRLF. Files authored on Windows end lines with "\r\n". Splitting on "\n" alone
+leaves a trailing "\r" glued to every record — invisible, and a silent mismatch
+the moment you compare or key on that field. line-source recognizes "\r\n", "\n",
+and a lone "\r" (classic-Mac) as line endings and strips them, so the emitted
+"line" value is the text WITHOUT its terminator, whatever the file's convention.
+
+3. THE BOM. A UTF-8 file may open with a byte-order mark (U+FEFF). Left in, it glues
+an invisible character to the first record. line-source strips a single leading
+BOM before splitting, so the first line is clean.
+
+THE MODEL. Input is the whole text (stdin on the CLI, or a string to lines()). Each
+line becomes { line: <text-without-terminator>, n: <0-based index>}, emitted in file
+order, one JSON object per line of output.
+
+--field NAME the key holding the line text (default "line"). Non-empty.
+--index NAME the key holding the 0-based line number (default "n"). Empty string
+disables the index entirely (emit { line:...} only).
+--skip-blank do not emit a record for a line that is empty after its terminator
+is stripped. Index numbering still follows ORIGINAL line position, so
+n stays a faithful pointer into the source file (a dropped blank
+leaves a gap in n — that is the honest behavior, not a bug).
+--trim strip leading/trailing ASCII whitespace from each line's text before
+emitting. Off by default: a source should preserve bytes unless told.
+
+DETERMINISM. lines(text, opts) is a pure function — no clock, no randomness, no files
+beyond the text you pass, no ambient state — so the same text and options yield
+byte-identical output on every run and every machine.
+
+USAGE
+node line-source.js < access.log
+printf 'a\nb\nc\n' | node line-source.js --skip-blank
+node line-source.js --field text --index "" < names.txt
+node line-source.js --help
+
+Exit codes: 0 success (including empty input -> empty stream) · 2 input error (empty
+--field name, unknown option, unexpected positional). Always a clean one-line message
+on stderr, never a stack trace.
+
+Released under MIT. Its edge is printed in the README: line-source splits on line
+TERMINATORS (\r\n, \n, \r) and emits one record per line — it does not parse CSV
+fields (use csv-source), does not parse JSON (the lines are emitted as verbatim
+strings), does not read the file itself (you pipe text in), and does not sort or
+deduplicate. It preserves line bytes (minus the terminator, and minus a leading BOM);
+with --trim it strips surrounding whitespace, and never otherwise.
+*/
+"use strict";
+
+/* ---- the pure core ------------------------------------------------ */
+
+// Split text into its lines, honoring \r\n / \n / \r terminators, treating a final
+// terminator as a terminator (not a separator that spawns a phantom empty line), and
+// stripping a single leading BOM. Returns an array of line strings (terminators removed).
+// Pure: depends only on `text`.
+function splitLines(text) {
+if (typeof text!== "string") text = String(text == null? "": text);
+if (text.length === 0) return [];
+// strip a single leading UTF-8 BOM
+if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+if (text.length === 0) return [];
+var lines = [];
+var start = 0;
+var i = 0;
+var len = text.length;
+while (i < len) {
+var c = text.charCodeAt(i);
+if (c === 10 /* \n */) {
+lines.push(text.slice(start, i));
+i += 1;
+start = i;
+} else if (c === 13 /* \r */) {
+lines.push(text.slice(start, i));
+if (i + 1 < len && text.charCodeAt(i + 1) === 10) i += 2; // \r\n
+else i += 1; // lone \r
+start = i;
+} else {
+i += 1;
+}
+}
+// trailing text with no final terminator is still a line
+if (start < len) lines.push(text.slice(start, len));
+return lines;
+}
+
+function isWs(code) {
+// ASCII whitespace: space, \t, \n, \v, \f, \r
+return code === 32 || (code >= 9 && code <= 13);
+}
+
+function trimAscii(s) {
+var a = 0, b = s.length;
+while (a < b && isWs(s.charCodeAt(a))) a++;
+while (b > a && isWs(s.charCodeAt(b - 1))) b--;
+return s.slice(a, b);
+}
+
+// Turn text into an array of records. Throws a clean Error on invalid options — the CLI
+// turns that into exit 2. Pure; no side effects.
+// opts.field key for the line text (default "line"; non-empty)
+// opts.index key for the 0-based line number (default "n"; "" disables)
+// opts.skipBlank drop lines empty after terminator strip (index still tracks source pos)
+// opts.trim strip surrounding ASCII whitespace from each line's text
+function lines(text, opts) {
+opts = opts || {};
+var field = opts.field === undefined? "line": opts.field;
+var index = opts.index === undefined? "n": opts.index;
+var skipBlank =!!opts.skipBlank;
+var trim =!!opts.trim;
+
+if (typeof field!== "string" || field.length === 0) throw new Error("--field must be a non-empty name");
+if (typeof index!== "string") throw new Error("--index must be a string name (or empty to disable)");
+
+var raw = splitLines(text);
+var out = [];
+for (var i = 0; i < raw.length; i++) {
+var value = trim? trimAscii(raw[i]): raw[i];
+if (skipBlank && value.length === 0) continue;
+var rec = {};
+rec[field] = value;
+// index reflects the ORIGINAL 0-based line position (i), so a skipped blank leaves a
+// faithful gap rather than renumbering — n stays a pointer into the source file.
+if (index.length > 0) rec[index] = i;
+out.push(rec);
+}
+return out;
+}
+
+// Render records as JSONL text (one JSON object per line, trailing newline per record).
+function toJSONL(records) {
+var s = "";
+for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
+return s;
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.lineSource = { lines: lines, splitLines: splitLines, toJSONL: toJSONL};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { lines: lines, splitLines: splitLines, toJSONL: toJSONL};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+
+function parseArgs(args) {
+var opts = {};
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a === "--field") {
+var f = args[i + 1];
+if (f === undefined) throw new Error("--field requires a name");
+opts.field = f;
+i += 2;
+} else if (a === "--index") {
+var x = args[i + 1];
+if (x === undefined) throw new Error("--index requires a name (or \"\" to disable)");
+opts.index = x;
+i += 2;
+} else if (a === "--skip-blank") {
+opts.skipBlank = true;
+i += 1;
+} else if (a === "--trim") {
+opts.trim = true;
+i += 1;
+} else if (a.charAt(0) === "-") {
+throw new Error("unknown option " + a);
+} else {
+throw new Error("unexpected argument " + JSON.stringify(a) + " (line-source reads text from stdin)");
+}
+}
+return opts;
+}
+
+function readStdin() {
+try {
+var fs = require("fs");
+return fs.readFileSync(0, "utf8");
+} catch (e) {
+return "";
+}
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"line-source.js — turn a plain-text file into a JSONL record stream, one record per line.\n\n" +
+" node line-source.js < access.log\n" +
+" printf 'a\\nb\\nc\\n' | node line-source.js --skip-blank\n" +
+" node line-source.js --field text --index \"\" < names.txt\n" +
+" node line-source.js --help\n\n" +
+" --field NAME key holding the line text (default \"line\")\n" +
+" --index NAME key holding the 0-based line number (default \"n\"; \"\" disables)\n" +
+" --skip-blank drop lines empty after the terminator is stripped (n keeps source position)\n" +
+" --trim strip surrounding ASCII whitespace from each line's text\n\n" +
+"Reads text from stdin; emits one JSON object per line: { line: <text>, n: <index>}.\n" +
+"Splits on \\r\\n, \\n, or \\r; a final terminator is a terminator (no phantom empty\n" +
+"record); a leading UTF-8 BOM is stripped.\n\n" +
+"Edge: it splits on line terminators and emits one record per line. It does not parse\n" +
+"CSV fields (use csv-source), does not parse JSON (lines are verbatim strings), does\n" +
+"not read the file itself (pipe text in), and does not sort or deduplicate.\n"
+);
+return 0;
+}
+var opts;
+try { opts = parseArgs(args);}
+catch (e) { process.stderr.write("line-source: " + e.message + "\n"); return 2;}
+var text = readStdin();
+var records;
+try { records = lines(text, opts);}
+catch (e) { process.stderr.write("line-source: " + e.message + "\n"); return 2;}
+process.stdout.write(toJSONL(records));
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_line-source.js 155 lines on GitHub →
+#!/usr/bin/env node
+/* test_line-source.js — battery for the line-source gift.
+`node test_line-source.js` -> exit 0 PASS / non-zero FAIL.
+
+The oracle is INDEPENDENT and takes a DIFFERENT ROUTE than the gift: the gift scans
+char codes and slices; the oracle normalizes terminators with a regex then splits and
+drops one trailing empty. Two routes that share no code — agreement is evidence, not
+tautology. Plus frozen hand goldens for each of the three quiet-failure cases the gift
+exists to fix (phantom empty record, CRLF, BOM).
+*/
+"use strict";
+
+var G = require("./line-source.js");
+var assert = require("assert");
+
+var pass = 0, fail = 0;
+function ok(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.error("FAIL: " + name);}
+}
+function eq(name, got, want) {
+var g = JSON.stringify(got), w = JSON.stringify(want);
+if (g === w) { pass++;}
+else { fail++; console.error("FAIL: " + name + "\n got: " + g + "\n want: " + w);}
+}
+
+/* ---- independent oracle: regex-normalize route ------------------- */
+// Normalize every terminator to \n, strip a leading BOM, then split on \n and drop a
+// single trailing empty caused by a final terminator. A different route than the gift's
+// char-scan; shares no code with it.
+function oracleSplit(text) {
+if (typeof text!== "string") text = String(text == null? "": text);
+if (text.length === 0) return [];
+if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+if (text.length === 0) return [];
+var norm = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+var parts = norm.split("\n");
+// a trailing terminator produces a final "" — drop exactly one (terminator, not separator)
+if (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
+return parts;
+}
+function oracleTrim(s) { return s.replace(/^[\s]+|[\s]+$/g, "");}
+function oracleRecords(text, opts) {
+opts = opts || {};
+var field = opts.field === undefined? "line": opts.field;
+var index = opts.index === undefined? "n": opts.index;
+var raw = oracleSplit(text);
+var out = [];
+for (var i = 0; i < raw.length; i++) {
+var v = opts.trim? oracleTrim(raw[i]): raw[i];
+if (opts.skipBlank && v.length === 0) continue;
+var rec = {};
+rec[field] = v;
+if (index.length > 0) rec[index] = i;
+out.push(rec);
+}
+return out;
+}
+
+/* ---- grid: gift == oracle across many inputs --------------------- */
+var inputs = [
+"",
+"\n",
+"a\n",
+"a",
+"a\nb\nc\n",
+"a\nb\nc",
+"a\r\nb\r\nc\r\n", // CRLF
+"a\rb\rc\r", // classic-mac lone CR
+"a\r\nb\nc\r", // mixed
+"\ufeffhello\nworld\n", // BOM
+"line one\n\nline three\n", // blank in the middle
+" padded \n\ttabbed\t\n",
+"no-newline-at-all",
+"\n\n\n", // three blank lines (terminators only)
+"trailing space \nx",
+];
+var optsets = [
+{},
+{ field: "text"},
+{ index: ""},
+{ index: "row"},
+{ skipBlank: true},
+{ trim: true},
+{ skipBlank: true, trim: true},
+{ field: "L", index: "i", trim: true},
+];
+for (var a = 0; a < inputs.length; a++) {
+for (var b = 0; b < optsets.length; b++) {
+var got = G.lines(inputs[a], optsets[b]);
+var want = oracleRecords(inputs[a], optsets[b]);
+eq("grid input#" + a + " opts#" + b, got, want);
+}
+}
+
+/* ---- hand goldens: the three quiet failures ---------------------- */
+// 1. phantom empty record: a trailing newline is a terminator, not a separator
+eq("golden: trailing newline -> 2 records not 3",
+G.lines("abc\ndef\n"),
+[{ line: "abc", n: 0}, { line: "def", n: 1}]);
+eq("golden: no final newline -> still 2 records",
+G.lines("abc\ndef"),
+[{ line: "abc", n: 0}, { line: "def", n: 1}]);
+
+// 2. CRLF: terminator stripped, no trailing \r glued on
+eq("golden: CRLF stripped clean",
+G.lines("abc\r\ndef\r\n"),
+[{ line: "abc", n: 0}, { line: "def", n: 1}]);
+ok("golden: no lingering CR in CRLF line",
+G.lines("x\r\ny\r\n")[0].line.indexOf("\r") === -1);
+
+// 3. BOM stripped from first line
+eq("golden: leading BOM stripped",
+G.lines("\ufeffalpha\nbeta\n"),
+[{ line: "alpha", n: 0}, { line: "beta", n: 1}]);
+ok("golden: first line has no BOM char",
+G.lines("\ufeffalpha\n")[0].line.charCodeAt(0)!== 0xfeff);
+
+/* ---- feature goldens --------------------------------------------- */
+eq("empty input -> empty stream", G.lines(""), []);
+eq("single blank line (just a terminator)", G.lines("\n"), [{ line: "", n: 0}]);
+eq("--index disabled emits no index key",
+G.lines("a\nb\n", { index: ""}),
+[{ line: "a"}, { line: "b"}]);
+eq("--skip-blank drops blanks but n keeps source position",
+G.lines("a\n\nc\n", { skipBlank: true}),
+[{ line: "a", n: 0}, { line: "c", n: 2}]);
+eq("--trim strips surrounding whitespace",
+G.lines(" hi \n\tbye\t\n", { trim: true}),
+[{ line: "hi", n: 0}, { line: "bye", n: 1}]);
+eq("without --trim bytes are preserved",
+G.lines(" hi \n", {}),
+[{ line: " hi ", n: 0}]);
+eq("custom field + index names",
+G.lines("x\n", { field: "text", index: "row"}),
+[{ text: "x", row: 0}]);
+
+// JSONL rendering
+ok("toJSONL ends every record with newline",
+G.toJSONL([{ line: "a", n: 0}]) === '{"line":"a","n":0}\n');
+ok("toJSONL of empty is empty string", G.toJSONL([]) === "");
+
+/* ---- determinism ------------------------------------------------- */
+var d1 = G.toJSONL(G.lines("a\nb\r\nc\r", {}));
+var d2 = G.toJSONL(G.lines("a\nb\r\nc\r", {}));
+ok("deterministic across two runs", d1 === d2);
+
+/* ---- fail-closed edges ------------------------------------------- */
+function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
+ok("empty --field throws", throws(function () { G.lines("a\n", { field: ""});}));
+ok("non-string --index throws", throws(function () { G.lines("a\n", { index: 5});}));
+
+/* ---- report ------------------------------------------------------ */
+console.log("line-source battery: " + pass + " passed, " + fail + " failed");
+process.exitCode = fail === 0? 0: 1;
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# loop21:component-factory — a Loop MMT gift
+https://loopmmt.com/gifts/loop21-component-factory/
+[coverage: optional · branch: gifts]
+
+Logic Components as Composable Data source ← all gifts
+
+loop21:component-factory
+
+A factory for small logic components — a counter, a toggle, a clamp, an accumulator, a pattern-matcher — emitted not as live objects but as fully-specified JSONL specs one per line, so each component travels: you can pipe it, store it, diff it, hash it, or feed it to any consumer that knows the five built-in kinds. It is a source in the composition algebra (nothing in, JSONL out): the front door to a small, closed catalog of primitives. Every requested component is validated against its kind's parameter schema before a spec is emitted, so a missing required parameter, a bad type, or an out-of-range value is a reported error, never a silently emitted spec a downstream tool will choke on. Auto-generated names use a seeded counter, so --seed yields byte-identical JSONL on any machine, forever.
+
+The honest edge
+
+The factory declares components; it does not run them. An emitted spec is a validated description, not a live object — turning a spec into behavior is the consumer's job, and this tool makes no claim about whether any downstream runner implements a kind correctly. It guarantees the spec is well-formed and catalog-valid, not that anyone honors it.
+
+Run it
+
+python3 loop21-component-factory.py --demo
+test_loop21-component-factory.py (28 checks / 17 tests, mutation-bitten, pinned golden sha256 of a seeded batch)
+Python standard library only, deterministic under --seed, headless
+
+The code — every file that ships
+
+loop21-component-factory.py 408 lines on GitHub →
+#!/usr/bin/env python3
+"""loop21-component-factory — declare small logic components as composable data.
+
+A *source* in the composition algebra (∅ → JSONL): you name the logic
+primitives you want — a counter, a toggle, a clamp, an accumulator, a
+pattern-matcher — give each a small config, and the factory emits one
+fully-specified component **spec** per line of JSONL. Nothing is executed
+here; the factory's job is to *declare* components as portable data that a
+downstream transform, fold, or runner consumes.
+
+spec = {"component": "<kind>", "name": "<id>", "params": {...},
+"port": "transform"|"filter"|..., "spec_version": 1}
+
+WHY IT'S A FACTORY, NOT A LIBRARY
+
+A library hands you a function bound to the process that imported it. This
+hands you a *description* of a component — kind, name, parameters, and the
+composition port it fills — as a line of JSON. That description travels: you
+can pipe it, store it, diff it, hash it, or feed it to any consumer that
+knows the five built-in kinds. The factory is the front door to a small,
+closed catalog of logic primitives, emitted as a stream.
+
+WHY IT'S HONEST
+
+- **A closed, named catalog.** Five component kinds ship: `counter`,
+`toggle`, `clamp`, `accumulator`, `pattern-match`. Each has a declared
+parameter schema and a declared composition port. Ask for a kind that
+isn't in the catalog and the factory refuses loudly (it never emits a
+spec it can't stand behind).
+
+- **Deterministic by construction.** The emitted stream is a pure function
+of the requested specs. Auto-generated names use a seeded, reproducible
+counter, so `--seed 42` yields byte-identical JSONL on any machine,
+forever. Keys are sorted; there is no wall-clock, no RNG that isn't
+seeded, nothing that drifts between runs.
+
+- **Validated at the door.** Every requested component is checked against
+its kind's parameter schema *before* a spec is emitted. A missing
+required parameter, an out-of-range value, or an unknown parameter is a
+reported error (to stderr, non-zero exit) — never a silently emitted
+spec that a downstream consumer will choke on.
+
+- **The spec is the whole contract.** A consumer needs nothing from this
+tool but the JSONL. The `spec_version` field pins the shape so a consumer
+can reject a spec it doesn't understand rather than mis-read it.
+
+THE HONEST EDGE
+
+The factory *declares* components; it does not *run* them. An emitted spec
+is a validated description, not a live object — turning a spec into behavior
+is the consumer's job, and this tool makes no claim about whether any
+downstream runner implements a kind correctly. It guarantees the spec is
+well-formed and catalog-valid, not that anyone honors it.
+
+USAGE
+# one component from a kind + inline params
+python3 loop21-component-factory.py --make counter:start=0,step=2
+
+# several at once, one JSONL line each
+python3 loop21-component-factory.py \
+--make counter:start=0 --make toggle:initial=false \
+--make clamp:lo=0,hi=100
+
+# read a batch request from a JSON file ([{kind,name,params},...])
+python3 loop21-component-factory.py --batch request.json
+
+# list the catalog (kinds, params, ports) as JSONL and exit
+python3 loop21-component-factory.py --catalog
+
+# a short, reproducible demonstration
+python3 loop21-component-factory.py --demo
+
+MIT licensed. Python standard library only. Deterministic under --seed; headless.
+"""
+# SPDX-License-Identifier: MIT
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from typing import Any
+
+SPEC_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# The catalog — a closed, named set of logic-component kinds.
+#
+# Each kind declares:
+# port: the composition port the component fills (source/transform/
+# filter/fold/sink) — this is what a MAP tool reads.
+# params: {name: schema} where schema is
+# {"type": "int"|"number"|"bool"|"string",
+# "required": bool,
+# "default": <value>, # when not required
+# "min": <n>, "max": <n>} # optional bounds (numeric)
+# summary: one line, human-facing.
+# ---------------------------------------------------------------------------
+CATALOG: dict[str, dict[str, Any]] = {
+"counter": {
+"port": "transform",
+"summary": "advances a running integer by a fixed step each item",
+"params": {
+"start": {"type": "int", "required": False, "default": 0},
+"step": {"type": "int", "required": False, "default": 1},
+},
+},
+"toggle": {
+"port": "transform",
+"summary": "flips a boolean on each item, starting from an initial state",
+"params": {
+"initial": {"type": "bool", "required": False, "default": False},
+},
+},
+"clamp": {
+"port": "transform",
+"summary": "constrains a numeric field to an inclusive [lo, hi] range",
+"params": {
+"lo": {"type": "number", "required": True},
+"hi": {"type": "number", "required": True},
+},
+},
+"accumulator": {
+"port": "fold",
+"summary": "reduces a stream to a single running total under an operation",
+"params": {
+"op": {
+"type": "string",
+"required": False,
+"default": "sum",
+"choices": ["sum", "product", "min", "max", "count"],
+},
+"seed": {"type": "number", "required": False, "default": 0},
+},
+},
+"pattern-match": {
+"port": "filter",
+"summary": "passes items whose field matches a fixed literal or set",
+"params": {
+"field": {"type": "string", "required": True},
+"equals": {"type": "string", "required": False, "default": None},
+"in": {"type": "string", "required": False, "default": None},
+},
+},
+}
+
+class FactoryError(Exception):
+"""A requested component could not be produced (unknown kind or bad params)."""
+
+# ---------------------------------------------------------------------------
+# Parameter parsing + coercion
+# ---------------------------------------------------------------------------
+def _coerce(kind: str, pname: str, raw: Any, schema: dict[str, Any]) -> Any:
+"""Coerce a raw parameter value to its declared type, or raise FactoryError."""
+t = schema["type"]
+try:
+if t == "int":
+val = int(raw)
+elif t == "number":
+val = float(raw)
+if val.is_integer():
+val = int(val) # canonical: 3.0 -> 3, keeps JSONL stable
+elif t == "bool":
+if isinstance(raw, bool):
+val = raw
+else:
+s = str(raw).strip().lower()
+if s in ("true", "1", "yes", "on"):
+val = True
+elif s in ("false", "0", "no", "off"):
+val = False
+else:
+raise ValueError(s)
+elif t == "string":
+val = str(raw)
+else: # pragma: no cover - guarded by catalog authorship
+raise FactoryError(f"{kind}.{pname}: unknown schema type {t!r}")
+except (ValueError, TypeError):
+raise FactoryError(
+f"{kind}.{pname}: value {raw!r} is not a valid {t}"
+)
+
+if "choices" in schema and val not in schema["choices"]:
+raise FactoryError(
+f"{kind}.{pname}: {val!r} not in {schema['choices']}"
+)
+for bound, cmp_ok in (("min", lambda v, b: v >= b), ("max", lambda v, b: v <= b)):
+if bound in schema and not cmp_ok(val, schema[bound]):
+raise FactoryError(
+f"{kind}.{pname}: {val!r} violates {bound}={schema[bound]}"
+)
+return val
+
+def build_spec(kind: str, name: str, params: dict[str, Any]) -> dict[str, Any]:
+"""Validate a request against the catalog and return a component spec dict.
+
+Raises FactoryError on an unknown kind, an unknown param, a missing
+required param, or a value that fails coercion/bounds.
+"""
+if kind not in CATALOG:
+raise FactoryError(
+f"unknown component kind {kind!r}; catalog: {', '.join(sorted(CATALOG))}"
+)
+entry = CATALOG[kind]
+schema = entry["params"]
+
+unknown = set(params) - set(schema)
+if unknown:
+raise FactoryError(
+f"{kind}: unknown param(s) {', '.join(sorted(unknown))}; "
+f"allowed: {', '.join(sorted(schema)) or '(none)'}"
+)
+
+resolved: dict[str, Any] = {}
+for pname, pschema in schema.items():
+if pname in params:
+resolved[pname] = _coerce(kind, pname, params[pname], pschema)
+elif pschema.get("required"):
+raise FactoryError(f"{kind}: missing required param {pname!r}")
+else:
+resolved[pname] = pschema.get("default")
+
+if kind == "pattern-match" and resolved.get("equals") is None and resolved.get("in") is None:
+raise FactoryError("pattern-match: exactly one of 'equals' or 'in' is required")
+if kind == "pattern-match" and resolved.get("equals") is not None and resolved.get("in") is not None:
+raise FactoryError("pattern-match: give only one of 'equals' or 'in', not both")
+
+return {
+"component": kind,
+"name": name,
+"params": resolved,
+"port": entry["port"],
+"spec_version": SPEC_VERSION,
+}
+
+# ---------------------------------------------------------------------------
+# Request parsing
+# ---------------------------------------------------------------------------
+def parse_make(expr: str) -> tuple[str, dict[str, Any]]:
+"""Parse a --make expression 'kind:k=v,k2=v2' -> (kind, {params})."""
+if ":" in expr:
+kind, _, param_str = expr.partition(":")
+else:
+kind, param_str = expr, ""
+kind = kind.strip()
+params: dict[str, Any] = {}
+if param_str.strip():
+for pair in param_str.split(","):
+if "=" not in pair:
+raise FactoryError(f"bad param {pair!r} in {expr!r} (want k=v)")
+k, _, v = pair.partition("=")
+params[k.strip()] = v.strip()
+return kind, params
+
+def _auto_name(kind: str, ordinal: int) -> str:
+"""Deterministic auto-name: kind + zero-padded seeded ordinal."""
+return f"{kind}-{ordinal:04d}"
+
+def produce(
+requests: list[dict[str, Any]],
+*,
+seed: int = 0,
+) -> list[dict[str, Any]]:
+"""Turn a list of {kind, name?, params} requests into validated specs.
+
+Auto-generated names are deterministic: they use a per-kind ordinal that
+starts from `seed` and increments in request order, so the same requests
+under the same seed yield byte-identical specs.
+"""
+specs: list[dict[str, Any]] = []
+counters: dict[str, int] = {}
+for req in requests:
+kind = req["kind"]
+params = req.get("params", {})
+name = req.get("name")
+if not name:
+ordinal = counters.get(kind, seed)
+counters[kind] = ordinal + 1
+name = _auto_name(kind, ordinal)
+specs.append(build_spec(kind, name, params))
+return specs
+
+def catalog_lines() -> list[dict[str, Any]]:
+"""The catalog itself, as JSONL-emittable dicts (one per kind)."""
+out = []
+for kind in sorted(CATALOG):
+entry = CATALOG[kind]
+out.append(
+{
+"component": kind,
+"port": entry["port"],
+"summary": entry["summary"],
+"params": {
+p: {k: v for k, v in schema.items()}
+for p, schema in entry["params"].items()
+},
+}
+)
+return out
+
+# ---------------------------------------------------------------------------
+# Emit
+# ---------------------------------------------------------------------------
+def emit(objs: list[dict[str, Any]], stream=None) -> None:
+"""Write objects as JSONL — one per line, keys sorted (deterministic)."""
+stream = sys.stdout if stream is None else stream
+for obj in objs:
+stream.write(json.dumps(obj, sort_keys=True, ensure_ascii=False) + "\n")
+
+def demo(*, seed: int = 42) -> str:
+"""A short reproducible demonstration — returns the JSONL block as a string."""
+reqs = [
+{"kind": "counter", "params": {"start": "0", "step": "2"}},
+{"kind": "toggle", "params": {"initial": "false"}},
+{"kind": "clamp", "params": {"lo": "0", "hi": "100"}},
+{"kind": "accumulator", "params": {"op": "sum"}},
+{"kind": "pattern-match", "params": {"field": "status", "equals": "open"}},
+]
+specs = produce(reqs, seed=seed)
+return "\n".join(
+json.dumps(s, sort_keys=True, ensure_ascii=False) for s in specs
+)
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def _build_arg_parser() -> argparse.ArgumentParser:
+p = argparse.ArgumentParser(
+prog="loop21-component-factory",
+description="Declare small logic components as composable JSONL specs.",
+)
+p.add_argument(
+"--make",
+action="append",
+default=[],
+metavar="KIND:k=v,...",
+help="a component to emit (repeatable)",
+)
+p.add_argument(
+"--batch",
+metavar="FILE",
+help="a JSON file: [{kind, name?, params?},...]",
+)
+p.add_argument("--catalog", action="store_true", help="emit the catalog as JSONL and exit")
+p.add_argument("--demo", action="store_true", help="print a short reproducible demonstration")
+p.add_argument("--seed", type=int, default=0, help="seed for deterministic auto-names")
+return p
+
+def main(argv: list[str] | None = None) -> int:
+parser = _build_arg_parser()
+args = parser.parse_args(argv)
+
+if args.catalog:
+emit(catalog_lines())
+return 0
+
+if args.demo:
+sys.stdout.write(demo() + "\n")
+return 0
+
+requests: list[dict[str, Any]] = []
+try:
+if args.batch:
+with open(args.batch, encoding="utf-8") as fh:
+loaded = json.load(fh)
+if not isinstance(loaded, list):
+raise FactoryError("--batch file must be a JSON array of requests")
+for item in loaded:
+if not isinstance(item, dict) or "kind" not in item:
+raise FactoryError("each --batch item needs a 'kind' field")
+requests.append(
+{
+"kind": item["kind"],
+"name": item.get("name"),
+"params": item.get("params", {}),
+}
+)
+for expr in args.make:
+kind, params = parse_make(expr)
+requests.append({"kind": kind, "params": params})
+
+if not requests:
+parser.error("nothing to make: give --make, --batch, --catalog, or --demo")
+
+specs = produce(requests, seed=args.seed)
+except FactoryError as exc:
+sys.stderr.write(f"loop21-component-factory: {exc}\n")
+return 2
+except (OSError, json.JSONDecodeError) as exc:
+sys.stderr.write(f"loop21-component-factory: {exc}\n")
+return 2
+
+emit(specs)
+return 0
+
+if __name__ == "__main__":
+raise SystemExit(main())
+
+test_loop21-component-factory.py 219 lines on GitHub →
+#!/usr/bin/env python3
+"""test_loop21-component-factory.py — the certifying properties of the factory gift.
+
+Run: python3 test_loop21-component-factory.py (exit 0 = all pass, 1 = failure)
+
+MUTATION-BITTEN: each test is here because a plausible mutation of the tool makes
+it fail loud. The determinism test pins a GOLDEN sha256 of a seeded batch rather
+than checking self-equality — a weak self-equality test passes benign reorders
+(the Loop MMT sudoku lesson), a pinned golden does not.
+"""
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location(
+"lcf", os.path.join(_HERE, "loop21-component-factory.py")
+)
+lcf = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(lcf)
+
+# --- pinned goldens: regenerate ONLY on an intentional change ----------------
+DEMO_GOLDEN_SHA256 = "ba304b3fd40715875b8298b68dd6281d64844f641263bc7121ce27c35da00a08"
+BATCH_GOLDEN_SHA256 = "566171366bffaa9bcfd9001523666585fafe7547f11e3f2851b0cf36288680fe"
+CATALOG_KIND_COUNT = 5
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+def _sha(block: str) -> str:
+return hashlib.sha256(block.encode()).hexdigest()
+
+# --- determinism -------------------------------------------------------------
+def test_seeded_demo_reproduces_pinned_golden():
+"""The seeded demo output is byte-identical to a pinned sha256, forever."""
+block = lcf.demo(seed=42)
+check(_sha(block) == DEMO_GOLDEN_SHA256,
+f"demo golden drift: got {_sha(block)}")
+
+def test_seeded_batch_reproduces_pinned_golden():
+"""A seeded produce() batch is byte-identical to a pinned sha256."""
+reqs = [
+{"kind": "counter", "params": {"start": "5", "step": "3"}},
+{"kind": "accumulator", "params": {"op": "max", "seed": "0"}},
+{"kind": "clamp", "params": {"lo": "-10", "hi": "10"}},
+]
+specs = lcf.produce(reqs, seed=100)
+block = "\n".join(json.dumps(s, sort_keys=True, ensure_ascii=False) for s in specs)
+check(_sha(block) == BATCH_GOLDEN_SHA256,
+f"batch golden drift: got {_sha(block)}")
+
+def test_same_seed_twice_is_identical():
+"""Two runs with the same seed produce identical specs (self-consistency)."""
+reqs = [{"kind": "counter", "params": {}}, {"kind": "toggle", "params": {}}]
+a = lcf.produce(reqs, seed=7)
+b = lcf.produce(reqs, seed=7)
+check(a == b, "same-seed runs diverged")
+
+# --- catalog is a closed, named set ------------------------------------------
+def test_catalog_is_the_declared_five_kinds():
+"""The catalog holds exactly the five declared component kinds."""
+check(len(lcf.CATALOG) == CATALOG_KIND_COUNT,
+f"catalog size changed: {sorted(lcf.CATALOG)}")
+check(set(lcf.CATALOG) == {"counter", "toggle", "clamp", "accumulator", "pattern-match"},
+f"catalog kinds changed: {sorted(lcf.CATALOG)}")
+
+def test_every_catalog_kind_declares_a_valid_port():
+"""Every kind's port is one of the five composition-algebra verbs."""
+valid = {"source", "transform", "filter", "fold", "sink"}
+for kind, entry in lcf.CATALOG.items():
+check(entry["port"] in valid, f"{kind}: bad port {entry['port']!r}")
+
+# --- validation at the door --------------------------------------------------
+def test_unknown_kind_refuses():
+"""An unknown component kind raises FactoryError, never emits a spec."""
+try:
+lcf.build_spec("frobnicate", "x", {})
+check(False, "unknown kind did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_missing_required_param_refuses():
+"""A missing required param (clamp.hi) raises, never emits a spec."""
+try:
+lcf.build_spec("clamp", "c", {"lo": 0})
+check(False, "missing required param did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_unknown_param_refuses():
+"""An unknown param raises rather than being silently dropped or emitted."""
+try:
+lcf.build_spec("counter", "c", {"bogus": 5})
+check(False, "unknown param did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_bad_type_refuses():
+"""A non-int for an int param raises rather than coercing to garbage."""
+try:
+lcf.build_spec("counter", "c", {"step": "abc"})
+check(False, "bad-type param did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_out_of_choice_refuses():
+"""An accumulator op outside the declared choices raises."""
+try:
+lcf.build_spec("accumulator", "a", {"op": "divide"})
+check(False, "out-of-choice op did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+def test_pattern_match_requires_exactly_one_selector():
+"""pattern-match with neither equals nor in raises; with both raises."""
+try:
+lcf.build_spec("pattern-match", "p", {"field": "s"})
+check(False, "pattern-match with no selector did not raise")
+except lcf.FactoryError:
+check(True, "")
+try:
+lcf.build_spec("pattern-match", "p", {"field": "s", "equals": "a", "in": "b"})
+check(False, "pattern-match with both selectors did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+# --- spec shape --------------------------------------------------------------
+def test_spec_carries_version_and_port():
+"""Every emitted spec pins spec_version and declares its port."""
+s = lcf.build_spec("counter", "c", {"start": 0})
+check(s["spec_version"] == lcf.SPEC_VERSION, "spec_version missing/wrong")
+check(s["port"] == "transform", "counter port wrong")
+check(s["component"] == "counter", "component field wrong")
+
+def test_number_type_canonicalizes_integer_floats():
+"""A number param given as 3.0 canonicalizes to 3 so JSONL stays stable."""
+s = lcf.build_spec("clamp", "c", {"lo": "0.0", "hi": "100"})
+check(s["params"]["lo"] == 0 and isinstance(s["params"]["lo"], int),
+f"number did not canonicalize: {s['params']['lo']!r}")
+
+def test_bool_coercion_accepts_words_and_refuses_garbage():
+"""bool params accept true/false words; garbage raises."""
+s = lcf.build_spec("toggle", "t", {"initial": "true"})
+check(s["params"]["initial"] is True, "bool 'true' not coerced")
+try:
+lcf.build_spec("toggle", "t", {"initial": "maybe"})
+check(False, "garbage bool did not raise")
+except lcf.FactoryError:
+check(True, "")
+
+# --- CLI exit codes ----------------------------------------------------------
+def test_cli_bad_request_exits_2():
+"""The CLI returns 2 (not 0, not a traceback) on a bad request."""
+rc = lcf.main(["--make", "counter:step=abc"])
+check(rc == 2, f"bad CLI request returned {rc}, want 2")
+
+def test_cli_catalog_and_demo_exit_0():
+"""--catalog and --demo both succeed (exit 0)."""
+check(lcf.main(["--catalog"]) == 0, "--catalog did not exit 0")
+check(lcf.main(["--demo"]) == 0, "--demo did not exit 0")
+
+def test_auto_names_are_ordinal_and_seeded():
+"""Auto-generated names increment per-kind from the seed, deterministically."""
+specs = lcf.produce(
+[{"kind": "counter", "params": {}}, {"kind": "counter", "params": {}}],
+seed=10,
+)
+check(specs[0]["name"] == "counter-0010", f"first name {specs[0]['name']!r}")
+check(specs[1]["name"] == "counter-0011", f"second name {specs[1]['name']!r}")
+
+def _run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+try:
+t()
+except Exception as exc: # a test itself throwing is a failure
+_FAILURES.append(f"{t.__name__} raised {exc!r}")
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {_PASSES}/{total} checks passed; {len(_FAILURES)} failure(s):")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed across {len(tests)} tests.")
+return 0
+
+if __name__ == "__main__":
+raise SystemExit(_run())
+
+Take the whole folder →
+MIT
+Python standard library only, deterministic under --seed, headless
 
 ---

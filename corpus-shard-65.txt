@@ -1,1935 +1,1656 @@
-# Loop MMT — corpus shard 65/74
+# Loop MMT — corpus shard 65/86
 
-> Bundle 65 of 74 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 65 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/markdown/, /gifts/mint/, /gifts/palimpsest/, /gifts/parity/)
+Nodes in this shard: 4 (/gifts/exif-parser/, /gifts/fanout/, /gifts/forest-title-fit/, /gifts/gantt-sink/)
 
 ---
 
-# Markdown — a Loop MMT gift
-https://loopmmt.com/gifts/markdown/
+# EXIF Parser — a Loop MMT gift
+https://loopmmt.com/gifts/exif-parser/
 [coverage: optional · branch: gifts]
 
-One Source, Two Honest Shadows render ← all gifts
+What Did The Camera Record? transform ← all gifts
 
-Markdown
+EXIF Parser
 
-A tiny dependency-free Markdown compiler with one root and pure emitters: source → parse() → AST → { toHTML, toPlainText}. The point isn't another parser — it's the shared-root property: both renderings fold the same AST, so the plain-text view and the HTML view can never silently disagree about what the writer typed. parse() never throws (a malformed construct renders as literal text) and toPlainText is the raw source verbatim.
+Read a photo's EXIF metadata — Make, Model, DateTime, Orientation, exposure, and GPS — out of the TIFF IFD structure inside a JPEG, with no dependencies, in Node or the browser. parseExif(bytes) finds the EXIF APP1 segment (or reads a bare TIFF/EXIF block), walks IFD0 + the Exif sub-IFD + the GPS sub-IFD, and returns the tags as a flat object. Like its ratchet-png-text sibling it validates structure before it trusts it — the SOI marker, the Exif\0\0 signature, the II/MM byte-order, the 42 magic, and every IFD offset — throwing on anything malformed rather than reading a value out of a truncated buffer.
 
 The honest edge
 
-A bounded, deliberate Markdown subset — headings, lists, blockquote, fenced code, and inline strong/em/code/link/hard-break — not CommonMark, and small on purpose (tables, nested blockquotes, and footnotes are out of scope by design, not by accident). The browser toDOM emitter of the original it's ported from is left out of this runtime-agnostic standalone; the two shadows shipped are HTML and plain text.
+It reads metadata only — no pixels, thumbnails, or MakerNote (vendor-specific: surfaced as raw bytes, never guessed). It follows IFD0 -> Exif-IFD -> GPS-IFD, not IFD1/interop IFDs. It does not strip or rewrite EXIF, and malformed input throws. GPS is left as raw rational components (GPSLatitude as three rationals + a ref) — it does NOT collapse them into a signed decimal degree, because baking one interpretation into the parser is a presentation choice you should own; compose the decimal yourself.
 
 Run it
 
-echo '# hi' | node markdown.js
-test_markdown.js (52/52, mutation-bitten)
-Node, no dependencies
+node exif-parser.js photo.jpg
+test_exif-parser.js (14/14: hand-constructed TIFF/JPEG byte vectors, all TIFF types inline+pooled, big-endian, JPEG APP1 path, GPS sub-IFD, 3 ratchet-refusal cases, mutation bite)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-markdown.js 403 lines on GitHub →
+exif-parser.js 272 lines on GitHub →
 #!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-// markdown.js — one Markdown source, two honest shadows.
-//
-// A tiny, dependency-free Markdown compiler with a single root and pure emitters:
-//
-// source ──▶ parse() ──▶ AST ──▶ { toHTML, toPlainText}
-//
-// The point is not "another Markdown parser" — it is the SHARED-ROOT property:
-// every rendering is a pure fold over the ONE parsed AST, so the plain-text view
-// and the HTML view can never silently disagree about what the writer typed.
-// (The original this is ported from also carries a browser toDOM emitter; that
-// third shadow needs a DOM and is left out of this runtime-agnostic standalone.)
-//
-// Two load-bearing honesty rules, kept from the source:
-// * parse() NEVER throws. A construct it can't parse degrades to LITERAL text
-// rather than raising — a malformed document renders as itself, not an error.
-// * toPlainText(ast) === the raw source. The text view IS the Markdown the
-// writer typed — an honest fallback by construction, never a lossy re-strip
-// that could drift from the HTML render.
-//
-// The ONE user-controlled danger is a link href, so it gets the one real guard:
-// isSafeUrl allows http/https/mailto/relative/#anchor and REJECTS everything else
-// (javascript:, data:, vbscript:, protocol-relative //host, and any unknown
-// scheme). A rejected href is DROPPED — the link renders as its plain-text label,
-// never as a live attacker-controllable link. There is no runtime HTML scrubber:
-// toHTML emits a fixed, frozen tag vocabulary (SAFE_TAGS) by construction, so no
-// user input can ever become a tag. That is a stronger guarantee than sanitizing
-// untrusted HTML after the fact, and it needs no dependency.
-//
-// Grammar — a bounded, deliberate subset (not CommonMark; big on purpose):
-// blocks: heading (#.. ######) · blockquote (>) · ordered/unordered list
-// · fenced code block (``` ```) · paragraph
-// inline: strong (** or __) · em (* or _) · code span (`) · link ([text](url))
-// · hard break (two trailing spaces)
-//
-// Deterministic: the same source always yields the same AST and the same output.
-// Dependency-free: Node or a browser, no build step, no install.
+/* exif-parser.js — a pure, dependency-free EXIF reader that walks the TIFF IFD
+structure inside a JPEG (or a bare TIFF/EXIF block) and returns the tags as
+named key/value entries. Runs identically in a browser and in Node (no DOM,
+no dependencies).
 
-(function (global) {
+WHY THIS EXISTS. A photo carries its camera metadata — Make, Model, DateTime,
+Orientation, ExposureTime, FNumber, ISO, focal length, and (if present) GPS —
+in an EXIF block, which is itself a little-endian-or-big-endian TIFF stream of
+Image File Directories (IFDs). You have the file's bytes and you want those
+fields without pulling in a full image library that decodes pixels you don't
+care about. The usual answer is a heavy dependency, or a hand-rolled loop that
+trusts the file and reads a value off the end of the buffer.
+
+WHAT "RATCHET" MEANS HERE (same discipline as the png-text gift). This parser
+validates structure before it trusts it: the JPEG SOI marker, the "Exif\0\0"
+app1 signature, the TIFF byte-order marker (II / MM) and the 42 magic, and every
+IFD-entry offset before it dereferences it. A count/offset that runs past the end
+of the buffer, a byte-order marker that is neither II nor MM, an IFD that points
+outside the block — each is a thrown Error, never a value read from nowhere. A
+parser that hands you a tag value out of a truncated buffer is lying about what
+the file says; this one won't.
+
+WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
+• The primary IFD (IFD0) and the Exif sub-IFD (tag 0x8769), merged.
+• The GPS sub-IFD (tag 0x8825) when present, under gps:*.
+• Each entry is decoded by TIFF type: BYTE/ASCII/SHORT/LONG/RATIONAL and
+their signed variants, plus UNDEFINED (surfaced as raw bytes). ASCII is
+trimmed of its trailing NUL. RATIONAL is surfaced as { num, den} AND a
+numeric `value` (num/den) for convenience.
+• Tag numbers are mapped to human names for the common set; an unknown tag is
+surfaced under its hex id (e.g. "0x9999") so nothing is silently dropped.
+
+WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
+It does not decode pixels, thumbnails, or the MakerNote blob (vendor-specific,
+undocumented — surfaced as raw UNDEFINED bytes, never guessed). It does not
+rewrite or strip EXIF. It follows IFD0 -> Exif-IFD -> GPS-IFD; it does not
+chase IFD1 (the thumbnail directory) or interoperability IFDs. It does not
+repair a bad file — malformed input throws.
+
+API
+parseExif(bytes) -> { <name>: value,..., gps?: { <name>: value,...}}
+`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
+May be a whole JPEG, or a bare TIFF/EXIF block starting at "II"/"MM".
+Returns a flat object of decoded tags (possibly empty if the file carries no
+EXIF app1). THROWS an Error on any malformed input.
+
+Pure function of its input. Same code in a browser
+(window.LoopGifts.parseExif) or Node (this CLI / require()).
+
+USAGE
+node exif-parser.js photo.jpg # prints "name\tvalue" per tag
+node exif-parser.js --help
+*/
+
 'use strict';
 
-// ---- the link-scheme allowlist -----------------------------------------------------------------------
-// Allow: http, https, mailto, relative paths, and bare fragments (#anchor). Reject everything else.
-// A rejected href is DROPPED (the link renders as its text, never as a live href).
-var SAFE_SCHEME = /^(https?:|mailto:)/i;
-var HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/i; // RFC-3986 scheme shape — if it matches and isn't allowlisted, reject.
-
-function isSafeUrl(rawUrl) {
-if (typeof rawUrl!== 'string') return false;
-var url = rawUrl.trim();
-if (url === '') return false;
-// A well-formed href never contains raw whitespace, angle brackets, or quotes — spaces are %20-encoded,
-// and <>"'` are injection tells. Rejecting them closes the "relative URL that smuggles javascript:
-// mid-string" class without touching any legitimate http/mailto/relative/anchor url.
-if (/[\s<>"'`]/.test(url)) return false;
-if (SAFE_SCHEME.test(url)) return true; // explicit allowlisted scheme
-if (HAS_SCHEME.test(url)) return false; // any OTHER explicit scheme -> reject (javascript:, data:,...)
-// No scheme: relative path, bare anchor (#…), or protocol-relative (//host — treat as unsafe: it's a
-// scheme-carrying network fetch in disguise).
-if (url.startsWith('//')) return false;
-return true; // relative or #fragment — safe
+/* ---- input coercion (Buffer/ArrayBuffer/Uint8Array -> Uint8Array) ---- */
+function toU8(input) {
+if (input instanceof Uint8Array) return input;
+if (input instanceof ArrayBuffer) return new Uint8Array(input);
+if (input && input.buffer instanceof ArrayBuffer) {
+return new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
+}
+throw new Error('exif-parser: input must be a Uint8Array or ArrayBuffer');
 }
 
-// ---- HTML escaping (text nodes + attribute values) --------------------------------------------------
-function escapeText(s) {
-return String(s)
-.replace(/&/g, '&amp;')
-.replace(/</g, '&lt;')
-.replace(/>/g, '&gt;');
+/* ---- endian-aware readers over a byte view; every read bounds-checks ---- */
+function rd16(b, i, le) {
+if (i + 2 > b.length) throw new Error('exif-parser: read past end (u16 @' + i + ')');
+return le? (b[i] | (b[i + 1] << 8)): ((b[i] << 8) | b[i + 1]);
 }
-function escapeAttr(s) {
-return escapeText(s).replace(/"/g, '&quot;');
-}
-
-// =====================================================================================================
-// parse(source) -> AST { type:'document', source, children:[block...]}
-// =====================================================================================================
-// Line-oriented block parse, then an inline pass per text run. Deterministic (same source -> same AST).
-// NEVER throws — any construct it can't parse falls through to literal text.
-
-function parse(source) {
-var src = source == null? '': String(source);
-var doc = { type: 'document', source: src, children: []};
-// Normalize newlines for block-splitting; the AST keeps `source` verbatim for toPlainText.
-var lines = src.replace(/\r\n?/g, '\n').split('\n');
-var i = 0;
-
-var isBlank = function (ln) { return /^\s*$/.test(ln);};
-
-while (i < lines.length) {
-var line = lines[i];
-
-if (isBlank(line)) { i++; continue;}
-
-// --- fenced code block: ```... ``` (opening fence may carry an info string we ignore) ---
-var fence = /^(\s*)```/.exec(line);
-if (fence) {
-var startIdx = i;
-var buf = [];
-i++;
-var closed = false;
-while (i < lines.length) {
-if (/^\s*```\s*$/.test(lines[i])) { closed = true; i++; break;}
-buf.push(lines[i]);
-i++;
-}
-if (closed) {
-doc.children.push({ type: 'codeBlock', text: buf.join('\n')});
-continue;
-}
-// Unclosed fence -> render as source: the stray fence line becomes a LITERAL paragraph and we
-// advance exactly one line, so the buffered lines re-parse as normal blocks. Never rewind into a
-// state where the paragraph branch (which skips fence lines) can't consume this line — that would
-// be an infinite loop (i never advances).
-doc.children.push({ type: 'paragraph', children: parseInline(lines[startIdx].replace(/\s+$/, ''))});
-i = startIdx + 1;
-continue;
+function rd32(b, i, le) {
+if (i + 4 > b.length) throw new Error('exif-parser: read past end (u32 @' + i + ')');
+return le
+? ((b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0)
+: (((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0);
 }
 
-// --- heading: 1-6 leading # then a space ---
-var h = /^(#{1,6})\s+(.*)$/.exec(line);
-if (h) {
-doc.children.push({ type: 'heading', level: h[1].length, children: parseInline(h[2])});
-i++;
-continue;
+/* ---- locate the TIFF block: whole JPEG (find APP1/Exif) or bare TIFF ---- */
+function findTiff(b) {
+// Bare TIFF/EXIF block?
+if (b.length >= 2 && ((b[0] === 0x49 && b[1] === 0x49) || (b[0] === 0x4d && b[1] === 0x4d))) {
+return 0;
+}
+// JPEG? must start with SOI (FFD8).
+if (!(b.length >= 2 && b[0] === 0xff && b[1] === 0xd8)) {
+throw new Error('exif-parser: not a JPEG (no SOI) and not a bare TIFF block');
+}
+let i = 2;
+while (i + 4 <= b.length) {
+if (b[i]!== 0xff) throw new Error('exif-parser: bad JPEG marker @' + i);
+const marker = b[i + 1];
+// Standalone markers with no length (RSTn, SOI, EOI) — shouldn't appear here.
+if (marker === 0xd9 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue;}
+const segLen = rd16(b, i + 2, false); // JPEG segment lengths are big-endian
+if (segLen < 2) throw new Error('exif-parser: bad JPEG segment length @' + i);
+if (marker === 0xe1) { // APP1
+const start = i + 4;
+// "Exif\0\0"
+if (start + 6 <= b.length &&
+b[start] === 0x45 && b[start + 1] === 0x78 && b[start + 2] === 0x69 &&
+b[start + 3] === 0x66 && b[start + 4] === 0x00 && b[start + 5] === 0x00) {
+return start + 6; // TIFF header begins right after "Exif\0\0"
+}
+}
+if (marker === 0xda) break; // SOS — pixel data follows; stop scanning.
+i += 2 + segLen;
+}
+return -1; // no EXIF app1 present
 }
 
-// --- blockquote: one or more '>' lines ---
-if (/^\s*>\s?/.test(line)) {
-var qbuf = [];
-while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
-qbuf.push(lines[i].replace(/^\s*>\s?/, ''));
-i++;
+/* ---- TIFF type sizes ---- */
+var TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8};
+
+/* ---- decode one IFD entry's value(s) ---- */
+function decodeValue(b, type, count, valOff, tiff, le) {
+var size = TYPE_SIZE[type];
+if (!size) return { raw: null, note: 'unknown-type-' + type};
+var total = size * count;
+// Values <= 4 bytes are inline in the 4-byte value field; else valOff is an offset from tiff.
+var at = total <= 4? valOff: (tiff + rd32(b, valOff, le));
+if (at + total > b.length) throw new Error('exif-parser: value runs past end (@' + at + ' len ' + total + ')');
+
+if (type === 2) { // ASCII
+var end = at;
+while (end < at + count && b[end]!== 0) end++;
+var s = '';
+for (var k = at; k < end; k++) s += String.fromCharCode(b[k]);
+return s;
 }
-// Recurse: a blockquote's content is itself block-level markdown.
-var inner = parse(qbuf.join('\n'));
-doc.children.push({ type: 'blockquote', children: inner.children});
-continue;
+if (type === 7 || type === 1 || type === 6) { // UNDEFINED / BYTE / SBYTE -> raw bytes
+return b.slice(at, at + total);
+}
+var out = [];
+for (var j = 0; j < count; j++) {
+var p = at + j * size;
+if (type === 3) out.push(rd16(b, p, le)); // SHORT
+else if (type === 8) { var u = rd16(b, p, le); out.push(u > 0x7fff? u - 0x10000: u);} // SSHORT
+else if (type === 4) out.push(rd32(b, p, le)); // LONG
+else if (type === 9) { var v = rd32(b, p, le); out.push(v > 0x7fffffff? v - 0x100000000: v);} // SLONG
+else if (type === 5 || type === 10) { // RATIONAL / SRATIONAL
+var num = rd32(b, p, le), den = rd32(b, p + 4, le);
+if (type === 10) { if (num > 0x7fffffff) num -= 0x100000000; if (den > 0x7fffffff) den -= 0x100000000;}
+out.push({ num: num, den: den, value: den === 0? null: num / den});
+}
+}
+return count === 1? out[0]: out;
 }
 
-// --- list: consecutive unordered (-,*,+) or ordered (1.) items ---
-var ulItem = /^(\s*)([-*+])\s+(.*)$/;
-var olItem = /^(\s*)(\d+)[.)]\s+(.*)$/;
-if (ulItem.test(line) || olItem.test(line)) {
-var ordered = olItem.test(line);
-var items = [];
-while (i < lines.length) {
-var m = ordered? olItem.exec(lines[i]): ulItem.exec(lines[i]);
-if (!m) {
-// allow the OTHER marker type to end the list cleanly (ambiguous nesting -> flat, never throw)
-if (isBlank(lines[i])) { i++; break;}
-if ((ordered? ulItem: olItem).test(lines[i])) break;
-if (!/^\s+/.test(lines[i])) break; // a non-indented non-item line ends the list
-// an indented continuation line: append to the last item's text
-if (items.length) items[items.length - 1].children.push.apply(
-items[items.length - 1].children, parseInline(' ' + lines[i].trim()));
-i++;
-continue;
-}
-items.push({ type: 'listItem', children: parseInline(m[3])});
-i++;
-}
-doc.children.push({ type: 'list', ordered: ordered, items: items});
-continue;
-}
-
-// --- paragraph: gather until a blank line or a block-starting line ---
-var pbuf = [];
-while (i < lines.length &&!isBlank(lines[i])
-&&!/^\s*```/.test(lines[i])
-&&!/^#{1,6}\s+/.test(lines[i])
-&&!/^\s*>\s?/.test(lines[i])
-&&!ulItem.test(lines[i]) &&!olItem.test(lines[i])) {
-pbuf.push(lines[i]);
-i++;
-}
-if (pbuf.length === 0) { i++; continue;} // progress guard: never stall on a line no branch consumed
-// A hard break inside a paragraph = a line ending in two+ spaces. Preserve it as a {break} node by
-// joining with a sentinel the inline pass understands.
-var joined = pbuf.map(function (ln, idx) {
-return idx < pbuf.length - 1 && / +$/.test(ln)
-? ln.replace(/\s+$/, '') + '\u0000BR\u0000'
-: ln.replace(/\s+$/, '');
-}).join(' ');
-doc.children.push({ type: 'paragraph', children: parseInline(joined)});
-}
-
-return doc;
-}
-
-// ---- inline pass: strong / em / code span / link / hard break / text -------------------------------
-// Tokenizes a single text run. Unmatched delimiters fall through to literal text.
-function parseInline(text) {
-var nodes = [];
-var s = String(text);
-var i = 0;
-var buf = '';
-var flush = function () { if (buf) { nodes.push({ type: 'text', value: buf}); buf = '';}};
-
-while (i < s.length) {
-// hard break sentinel
-if (s.startsWith('\u0000BR\u0000', i)) { flush(); nodes.push({ type: 'break'}); i += 6; continue;}
-
-var c = s[i];
-
-// code span: `...` (no nesting; a lone backtick is literal)
-if (c === '`') {
-var endc = s.indexOf('`', i + 1);
-if (endc > i) { flush(); nodes.push({ type: 'codeSpan', value: s.slice(i + 1, endc)}); i = endc + 1; continue;}
-buf += c; i++; continue;
-}
-
-// strong: ** or __ (greedy to the matching closer; falls through to text if unmatched)
-if ((s.startsWith('**', i) || s.startsWith('__', i))) {
-var delim = s.substr(i, 2);
-var ends = s.indexOf(delim, i + 2);
-if (ends > i + 1) { flush(); nodes.push({ type: 'strong', children: parseInline(s.slice(i + 2, ends))}); i = ends + 2; continue;}
-buf += c; i++; continue;
-}
-
-// em: * or _ (single delimiter; unmatched -> literal)
-if (c === '*' || c === '_') {
-var ende = s.indexOf(c, i + 1);
-if (ende > i) { flush(); nodes.push({ type: 'em', children: parseInline(s.slice(i + 1, ende))}); i = ende + 1; continue;}
-buf += c; i++; continue;
-}
-
-// link: [text](url) — malformed (no closing) etc.) falls through to literal.
-// The closing paren is found by DEPTH-TRACKING so parens inside the URL balance (e.g. a
-// `javascript:alert(1)` payload closes at its own `)`, not the inner one).
-if (c === '[') {
-var close = s.indexOf(']', i + 1);
-if (close > i && s[close + 1] === '(') {
-var depth = 1, j = close + 2;
-while (j < s.length && depth > 0) {
-if (s[j] === '(') depth++;
-else if (s[j] === ')') { depth--; if (depth === 0) break;}
-j++;
-}
-if (depth === 0) {
-var label = s.slice(i + 1, close);
-var href = s.slice(close + 2, j);
-flush();
-nodes.push({ type: 'link', href: href, children: parseInline(label)});
-i = j + 1;
-continue;
-}
-}
-buf += c; i++; continue;
-}
-
-buf += c; i++;
-}
-flush();
-return nodes;
-}
-
-// =====================================================================================================
-// The frozen tag allowlist — the emitter's ENTIRE legal vocabulary, in one place.
-// -----------------------------------------------------------------------------------------------------
-// The emitter emits tags ONLY as hard-coded literals in the switches below, so no user input can ever
-// become a tag; the structural floor fails closed (both switches: `default -> ''`, an unknown node emits
-// nothing, never a raw tag). SAFE_TAGS turns "safe because I read the switches" into "safe, proven on
-// every corpus + fuzz case" — the emit-invariant test scans toHTML output and asserts every opened tag
-// is in this set, so any future case that leaks a new tag fails LOUD at test time. We deliberately do NOT
-// scrub at runtime: a hand-rolled live tag-stripper is the exact fragile security-primitive this design
-// avoids. Frozen so it cannot be mutated at runtime.
-var SAFE_TAGS = Object.freeze([
-'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-'p', 'blockquote', 'pre', 'code',
-'ul', 'ol', 'li',
-'strong', 'em', 'br', 'a'
-]);
-
-// Pure scanner: the set of element tag-names opened in an HTML string (lowercased, no closers/attrs).
-// Used by the emit-invariant test. Never throws.
-function tagsIn(htmlStr) {
-var out = {};
-var re = /<([a-zA-Z][a-zA-Z0-9]*)/g;
-var m;
-while ((m = re.exec(String(htmlStr || '')))!== null) out[m[1].toLowerCase()] = true;
-return Object.keys(out);
-}
-
-// =====================================================================================================
-// toHTML(ast) -> string pure tree-walk; vocabulary is a fixed, known-safe subset by construction.
-// =====================================================================================================
-function toHTML(ast) {
-if (!ast || ast.type!== 'document') return '';
-return ast.children.map(renderBlockHTML).join('\n');
-}
-
-function renderBlockHTML(node) {
-switch (node.type) {
-case 'heading': return '<h' + node.level + '>' + renderInlineHTML(node.children) + '</h' + node.level + '>';
-case 'paragraph': return '<p>' + renderInlineHTML(node.children) + '</p>';
-case 'blockquote': return '<blockquote>' + node.children.map(renderBlockHTML).join('\n') + '</blockquote>';
-case 'codeBlock': return '<pre><code>' + escapeText(node.text) + '</code></pre>';
-case 'list': {
-var tag = node.ordered? 'ol': 'ul';
-var items = node.items.map(function (it) { return '<li>' + renderInlineHTML(it.children) + '</li>';}).join('');
-return '<' + tag + '>' + items + '</' + tag + '>';
-}
-default: return '';
-}
-}
-
-function renderInlineHTML(nodes) {
-return (nodes || []).map(function (n) {
-switch (n.type) {
-case 'text': return escapeText(n.value);
-case 'strong': return '<strong>' + renderInlineHTML(n.children) + '</strong>';
-case 'em': return '<em>' + renderInlineHTML(n.children) + '</em>';
-case 'codeSpan': return '<code>' + escapeText(n.value) + '</code>';
-case 'break': return '<br>';
-case 'link': {
-var innerHtml = renderInlineHTML(n.children);
-// The link-scheme guard: a safe href becomes a real <a>; an unsafe one DROPS the href and
-// renders the label as plain text (never a live javascript:/data: link).
-return isSafeUrl(n.href)? '<a href="' + escapeAttr(n.href.trim()) + '">' + innerHtml + '</a>': innerHtml;
-}
-default: return '';
-}
-}).join('');
-}
-
-// =====================================================================================================
-// toPlainText(ast) -> string === the raw Markdown source (the honest fallback).
-// =====================================================================================================
-function toPlainText(ast) {
-if (!ast || ast.type!== 'document') return '';
-return ast.source;
-}
-
-// ---- the convenience call: source -> { text, html} (the UNSKIPPABLE guard boundary) ---------------
-// One call a send/render route can use so the guard can never be forgotten (hope is not a control).
-// text = the source (honest); html = the guarded HTML emission.
-function render(source) {
-var ast = parse(source);
-return { text: toPlainText(ast), html: toHTML(ast)};
-}
-
-var api = {
-parse: parse,
-toHTML: toHTML,
-toPlainText: toPlainText,
-render: render,
-isSafeUrl: isSafeUrl,
-tagsIn: tagsIn,
-SAFE_TAGS: SAFE_TAGS
+/* ---- common EXIF + GPS tag names (the mapped set; unknowns fall back to hex) ---- */
+var TAGS = {
+0x010f: 'Make', 0x0110: 'Model', 0x0112: 'Orientation', 0x011a: 'XResolution',
+0x011b: 'YResolution', 0x0128: 'ResolutionUnit', 0x0131: 'Software',
+0x0132: 'DateTime', 0x013b: 'Artist', 0x8298: 'Copyright',
+0x8769: 'ExifIFDPointer', 0x8825: 'GPSInfoIFDPointer',
+0x829a: 'ExposureTime', 0x829d: 'FNumber', 0x8827: 'ISOSpeedRatings',
+0x9003: 'DateTimeOriginal', 0x9004: 'DateTimeDigitized', 0x920a: 'FocalLength',
+0xa002: 'PixelXDimension', 0xa003: 'PixelYDimension', 0x9209: 'Flash',
+0x9207: 'MeteringMode', 0xa405: 'FocalLengthIn35mmFilm', 0x927c: 'MakerNote',
+0xa430: 'CameraOwnerName', 0xa433: 'LensMake', 0xa434: 'LensModel'
+};
+var GPS_TAGS = {
+0x0000: 'GPSVersionID', 0x0001: 'GPSLatitudeRef', 0x0002: 'GPSLatitude',
+0x0003: 'GPSLongitudeRef', 0x0004: 'GPSLongitude', 0x0005: 'GPSAltitudeRef',
+0x0006: 'GPSAltitude', 0x0007: 'GPSTimeStamp', 0x001d: 'GPSDateStamp'
 };
 
-// ---- dual export: CommonJS (Node), and a global for the browser -------------------------------------
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = api;
-} else {
-global.markdown = api;
+/* ---- walk one IFD, returning { entries:{name:value}, exifPtr, gpsPtr} ---- */
+function walkIFD(b, ifd, tiff, le, names) {
+if (ifd + 2 > b.length) throw new Error('exif-parser: IFD offset past end (@' + ifd + ')');
+var n = rd16(b, ifd, le);
+var out = {}, exifPtr = 0, gpsPtr = 0;
+for (var e = 0; e < n; e++) {
+var ent = ifd + 2 + e * 12;
+if (ent + 12 > b.length) throw new Error('exif-parser: IFD entry past end (#' + e + ')');
+var tag = rd16(b, ent, le);
+var type = rd16(b, ent + 2, le);
+var count = rd32(b, ent + 4, le);
+var valFieldOff = ent + 8;
+if (tag === 0x8769) { exifPtr = tiff + rd32(b, valFieldOff, le); continue;}
+if (tag === 0x8825) { gpsPtr = tiff + rd32(b, valFieldOff, le); continue;}
+var name = names[tag] || ('0x' + tag.toString(16).padStart(4, '0'));
+out[name] = decodeValue(b, type, count, valFieldOff, tiff, le);
+}
+return { entries: out, exifPtr: exifPtr, gpsPtr: gpsPtr};
 }
 
-// ---- CLI (runs only when invoked directly, never on require) ----------------------------------------
+/* ---- the public entry point ---- */
+function parseExif(input) {
+var b = toU8(input);
+var tiff = findTiff(b);
+if (tiff < 0) return {}; // no EXIF app1 — an honest empty, not an error
+
+// TIFF header: byte-order marker, 42 magic, IFD0 offset.
+var bo = rd16(b, tiff, false);
+var le;
+if (bo === 0x4949) le = true; // "II"
+else if (bo === 0x4d4d) le = false; // "MM"
+else throw new Error('exif-parser: bad TIFF byte-order marker');
+var magic = rd16(b, tiff + 2, le);
+if (magic!== 42) throw new Error('exif-parser: bad TIFF magic (expected 42, got ' + magic + ')');
+var ifd0 = tiff + rd32(b, tiff + 4, le);
+
+var r0 = walkIFD(b, ifd0, tiff, le, TAGS);
+var result = r0.entries;
+
+if (r0.exifPtr) {
+var rExif = walkIFD(b, r0.exifPtr, tiff, le, TAGS);
+for (var k in rExif.entries) result[k] = rExif.entries[k];
+if (rExif.gpsPtr &&!r0.gpsPtr) r0.gpsPtr = rExif.gpsPtr;
+}
+if (r0.gpsPtr) {
+var rGps = walkIFD(b, r0.gpsPtr, tiff, le, GPS_TAGS);
+result.gps = rGps.entries;
+}
+return result;
+}
+
+/* ---- render helpers (deterministic; used by the CLI) ---- */
+function renderText(obj, prefix) {
+prefix = prefix || '';
+var lines = [];
+var keys = Object.keys(obj).sort();
+for (var i = 0; i < keys.length; i++) {
+var key = keys[i], v = obj[key];
+if (key === 'gps' && v && typeof v === 'object' &&!(v instanceof Uint8Array)) {
+lines.push(renderText(v, 'gps:'));
+continue;
+}
+lines.push(prefix + key + '\t' + renderScalar(v));
+}
+return lines.join('\n');
+}
+function renderScalar(v) {
+if (v instanceof Uint8Array) return '<' + v.length + ' bytes>';
+if (Array.isArray(v)) return v.map(renderScalar).join(', ');
+if (v && typeof v === 'object' && 'num' in v) return v.num + '/' + v.den;
+return String(v);
+}
+
+/* ---- dual home ---- */
+if (typeof window!== 'undefined') {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.parseExif = parseExif;
+window.LoopGifts['exif-parser'] = { parseExif: parseExif};
+}
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { parseExif: parseExif, renderText: renderText};
+}
+
+/* ---- CLI ---- */
+if (typeof require!== 'undefined' && require.main === module) {
+var args = process.argv.slice(2);
+if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
+process.stderr.write('usage: node exif-parser.js <photo.jpg>\n' +
+' node exif-parser.js < photo.jpg\n' +
+'Prints "name\\tvalue" per EXIF tag (gps:* for GPS). Zero deps.\n');
+process.exit(args.length === 0? 2: 0);
+}
+var fs = require('fs');
+try {
+var data = args[0] === '-'? fs.readFileSync(0): fs.readFileSync(args[0]);
+var tags = parseExif(new Uint8Array(data));
+var txt = renderText(tags);
+process.stdout.write(txt + (txt? '\n': ''));
+} catch (err) {
+// Clean, single-line failure — no raw Node stack — on bad I/O or malformed input.
+process.stderr.write('exif-parser: ' + err.message + '\n');
+process.exit(1);
+}
+}
+
+test_exif-parser.js 214 lines on GitHub →
+#!/usr/bin/env node
+/* test_exif-parser.js — known-answer battery for exif-parser.js.
+
+The oracle is OUT OF BAND: each EXIF byte stream is hand-constructed here with a
+tiny builder, and the expected decoded value is written independently as a
+literal fact — NOT produced by a second copy of the parser (which could share a
+bug with the parser under test). A byte buffer plus its hand-computed answer is
+the certificate.
+*/
+
+'use strict';
+var assert = require('assert');
+var { parseExif} = require('./exif-parser.js');
+
+var passed = 0;
+function t(name, fn) {
+try { fn(); passed++; console.log(' ok ' + name);}
+catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
+}
+
+/* -- a minimal little-endian TIFF/EXIF builder (test-only, hand-verified) --
+Layout we emit (all offsets relative to TIFF start):
+[0..1] "II"
+[2..3] 42
+[4..7] IFD0 offset = 8
+[8..9] entry count
+[10..] 12 bytes per entry
+after entries: 4-byte next-IFD ptr (0)
+then: the out-of-line value pool
+Each entry: tag(2) type(2) count(4) value/offset(4).
+*/
+function u16le(n) { return [n & 0xff, (n >> 8) & 0xff];}
+function u32le(n) { return [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff];}
+
+// Build a TIFF block from a list of {tag,type,count,inline?:[4 bytes]|pool?:[bytes]}.
+function buildTiff(entries) {
+var header = [0x49, 0x49].concat(u16le(42)).concat(u32le(8));
+var ifdStart = 8;
+var entryBytes = [];
+var pool = [];
+var poolBase = ifdStart + 2 + entries.length * 12 + 4; // after count + entries + nextptr
+for (var i = 0; i < entries.length; i++) {
+var e = entries[i];
+var row = u16le(e.tag).concat(u16le(e.type)).concat(u32le(e.count));
+if (e.pool) {
+row = row.concat(u32le(poolBase + pool.length));
+pool = pool.concat(e.pool);
+} else {
+// inline: pad to 4 bytes
+var v = e.inline.slice();
+while (v.length < 4) v.push(0);
+row = row.concat(v);
+}
+entryBytes = entryBytes.concat(row);
+}
+var body = u16le(entries.length).concat(entryBytes).concat(u32le(0)); // next IFD = 0
+var all = header.concat(body).concat(pool);
+return new Uint8Array(all);
+}
+
+// Wrap a TIFF block in a minimal JPEG APP1 "Exif\0\0" segment.
+function wrapJpeg(tiff) {
+var exifHdr = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]; // "Exif\0\0"
+var payload = exifHdr.concat(Array.from(tiff));
+var segLen = payload.length + 2; // length field includes itself
+var app1 = [0xff, 0xe1].concat([(segLen >> 8) & 0xff, segLen & 0xff]).concat(payload);
+var jpeg = [0xff, 0xd8].concat(app1).concat([0xff, 0xd9]); // SOI... EOI
+return new Uint8Array(jpeg);
+}
+
+function ascii(str) {
+var out = [];
+for (var i = 0; i < str.length; i++) out.push(str.charCodeAt(i));
+out.push(0); // NUL terminator
+return out;
+}
+
+/* ---- 1: SHORT inline (Orientation = 6), oracle = 6 ---- */
+t('SHORT inline: Orientation decodes to 6', function () {
+var tiff = buildTiff([{ tag: 0x0112, type: 3, count: 1, inline: u16le(6)}]);
+var r = parseExif(tiff);
+assert.strictEqual(r.Orientation, 6);
+});
+
+/* ---- 2: ASCII pooled (Make = "LoopCam"), oracle = "LoopCam" ---- */
+t('ASCII pooled: Make decodes to "LoopCam", NUL trimmed', function () {
+var s = ascii('LoopCam');
+var tiff = buildTiff([{ tag: 0x010f, type: 2, count: s.length, pool: s}]);
+var r = parseExif(tiff);
+assert.strictEqual(r.Make, 'LoopCam');
+});
+
+/* ---- 3: LONG inline (PixelXDimension = 4096), oracle = 4096 ---- */
+t('LONG inline: PixelXDimension decodes to 4096', function () {
+var tiff = buildTiff([{ tag: 0xa002, type: 4, count: 1, inline: u32le(4096)}]);
+var r = parseExif(tiff);
+assert.strictEqual(r.PixelXDimension, 4096);
+});
+
+/* ---- 4: RATIONAL pooled (FNumber = 28/10), oracle = {num:28,den:10,value:2.8} ---- */
+t('RATIONAL pooled: FNumber = 28/10 -> value 2.8', function () {
+var pool = u32le(28).concat(u32le(10));
+var tiff = buildTiff([{ tag: 0x829d, type: 5, count: 1, pool: pool}]);
+var r = parseExif(tiff);
+assert.strictEqual(r.FNumber.num, 28);
+assert.strictEqual(r.FNumber.den, 10);
+assert.ok(Math.abs(r.FNumber.value - 2.8) < 1e-9);
+});
+
+/* ---- 5: unknown tag falls back to hex id, never dropped ---- */
+t('unknown tag surfaces as hex id (0x9999)', function () {
+var tiff = buildTiff([{ tag: 0x9999, type: 3, count: 1, inline: u16le(7)}]);
+var r = parseExif(tiff);
+assert.strictEqual(r['0x9999'], 7);
+});
+
+/* ---- 6: multiple entries, order-independent, all present ---- */
+t('multi-entry: Make + Orientation + Model all decode', function () {
+var mk = ascii('LoopCam'), md = ascii('LM-1');
+var tiff = buildTiff([
+{ tag: 0x0112, type: 3, count: 1, inline: u16le(1)},
+{ tag: 0x010f, type: 2, count: mk.length, pool: mk},
+{ tag: 0x0110, type: 2, count: md.length, pool: md}
+]);
+var r = parseExif(tiff);
+assert.strictEqual(r.Orientation, 1);
+assert.strictEqual(r.Make, 'LoopCam');
+assert.strictEqual(r.Model, 'LM-1');
+});
+
+/* ---- 7: big-endian (MM) parses identically ---- */
+t('big-endian (MM): Orientation = 3', function () {
+// hand-build a big-endian TIFF: MM, 0x002A, IFD0=8, 1 entry Orientation SHORT=3
+var be = [0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08]
+.concat([0x00, 0x01]) // count
+.concat([0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00]) // Orientation SHORT 3
+.concat([0x00, 0x00, 0x00, 0x00]); // next IFD
+var r = parseExif(new Uint8Array(be));
+assert.strictEqual(r.Orientation, 3);
+});
+
+/* ---- 8: JPEG-wrapped EXIF (full APP1 path) ---- */
+t('JPEG APP1: Make decodes through the full JPEG scan', function () {
+var mk = ascii('LoopCam');
+var tiff = buildTiff([{ tag: 0x010f, type: 2, count: mk.length, pool: mk}]);
+var jpeg = wrapJpeg(tiff);
+var r = parseExif(jpeg);
+assert.strictEqual(r.Make, 'LoopCam');
+});
+
+/* ---- 9: no-EXIF JPEG returns empty object, not an error ---- */
+t('JPEG with no EXIF app1 -> {} (honest empty)', function () {
+var jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]); // SOI EOI only
+var r = parseExif(jpeg);
+assert.deepStrictEqual(r, {});
+});
+
+/* ---- 10: GPS sub-IFD is surfaced under gps:* ---- */
+t('GPS sub-IFD: GPSLatitudeRef reachable under gps', function () {
+// Build IFD0 with a GPS pointer to a sub-IFD placed in the pool.
+// Sub-IFD (little-endian): count=1, entry GPSLatitudeRef(0x0001) ASCII "N\0", next=0
+var sub = u16le(1)
+.concat(u16le(0x0001)).concat(u16le(2)).concat(u32le(2)).concat([0x4e, 0x00, 0x00, 0x00]) // "N\0" inline
+.concat(u32le(0));
+// IFD0 with one entry: GPSInfoIFDPointer(0x8825) LONG -> offset of sub in the buffer.
+// We must know the sub's absolute offset. Layout: header(8) + ifd0(count2 + 1*12 + next4) = 8+2+12+4 = 26.
+var header = [0x49, 0x49].concat(u16le(42)).concat(u32le(8));
+var subOffset = 8 + 2 + 12 + 4; // = 26
+var ifd0 = u16le(1)
+.concat(u16le(0x8825)).concat(u16le(4)).concat(u32le(1)).concat(u32le(subOffset))
+.concat(u32le(0));
+var buf = new Uint8Array(header.concat(ifd0).concat(sub));
+var r = parseExif(buf);
+assert.ok(r.gps, 'gps block present');
+assert.strictEqual(r.gps.GPSLatitudeRef, 'N');
+});
+
+/* ---- 11: RATCHET — value running past the buffer throws ---- */
+t('ratchet: ASCII count past end throws', function () {
+// Declare an ASCII value of huge count with a pool offset near the end.
+var s = ascii('X'); // 2 bytes
+var tiff = buildTiff([{ tag: 0x010f, type: 2, count: 9999, pool: s}]);
+assert.throws(function () { parseExif(tiff);}, /past end/);
+});
+
+/* ---- 12: RATCHET — a bad byte-order marker reached via the JPEG path throws.
+A bare buffer whose first two bytes are neither II/MM nor the JPEG SOI is
+rejected up front ("not a JPEG... not a bare TIFF block"). To exercise the
+byte-order guard specifically, wrap a corrupt-BOM TIFF in a real JPEG APP1 so
+findTiff locates it via "Exif\0\0" and then the header check fires. ---- */
+t('ratchet: bad byte-order marker (inside a valid JPEG APP1) throws', function () {
+var badTiff = [0x00, 0x00, 0x00, 0x2a, 0, 0, 0, 8, 0, 0, 0, 0]; // BOM 0x0000
+var exifHdr = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00];
+var payload = exifHdr.concat(badTiff);
+var segLen = payload.length + 2;
+var jpeg = [0xff, 0xd8, 0xff, 0xe1, (segLen >> 8) & 0xff, segLen & 0xff]
+.concat(payload).concat([0xff, 0xd9]);
+assert.throws(function () { parseExif(new Uint8Array(jpeg));}, /byte-order/);
+});
+
+/* ---- 13: RATCHET — bad TIFF magic (not 42) throws ---- */
+t('ratchet: bad TIFF magic throws', function () {
+var bad = new Uint8Array([0x49, 0x49, 0x00, 0x63, 0, 0, 0, 8, 0, 0, 0, 0]); // magic 0x6300
+assert.throws(function () { parseExif(bad);}, /magic/);
+});
+
+/* ---- 14: mutation bite — flip the oracle, prove the test would catch a wrong decode ---- */
+t('mutation bite: a wrong Orientation would fail #1', function () {
+var tiff = buildTiff([{ tag: 0x0112, type: 3, count: 1, inline: u16le(6)}]);
+var r = parseExif(tiff);
+assert.notStrictEqual(r.Orientation, 5); // it is 6; a parser returning 5 fails
+});
+
+console.log('\n' + passed + '/14 checks passed');
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# Branch Splitter — a Loop MMT gift
+https://loopmmt.com/gifts/fanout/
+[coverage: optional · branch: gifts]
+
+How Do You Split One Input Into Declared Branches? split ← all gifts
+
+Branch Splitter
+
+Split one payload into a fixed, declared, closed set of named branches — one labeled JSONL record per declared branch, in declared order. It is the open half of a parallel-independent compose (the ⊗ product): fanout splits, its pair junction merges, so fanout | junction round-trips. Zero dependencies, pure function — same payload plus the same branch list yield byte-identical output every run. It fails closed (non-zero exit, offending branch named) on an empty, whitespace, duplicate, or charset-invalid branch, and has no default branch: it emits only to branches you declared, never to one it inferred. Runs in Node or the browser (window.ForestGifts.fanout).
+
+The honest edge
+
+fanout splits one input into declared branches; it does not run them, order them by any policy but declared order, or judge whether a branch name is meaningful — it only refuses an undeclared, empty, duplicate, or ill-formed branch.
+
+Run it
+
+node fanout.js --branches a,b,c "the prompt"
+test_fanout.js (17/17, golden corpus + determinism + non-vacuity); braid test_braid.js 65/65 proves fanout | junction round-trips
+Node / browser, no dependencies
+
+The code — every file that ships
+
+fanout.js 237 lines on GitHub →
+#!/usr/bin/env node
+/* fanout.js — split one input into a fixed, DECLARED set of named branches.
+
+WHY THIS EXISTS. When one base prompt (or any payload) must go to several
+named destinations — models, variants, personas, test conditions — the set
+of destinations should be EXPLICIT and CLOSED, decided up front, not
+discovered at runtime. The usual ad-hoc answer builds the branch list on the
+fly from whatever keys happen to be present, and the day a typo or an
+unhandled case introduces a branch nobody declared, the payload fans to a
+destination no one signed off on — silently. fanout refuses that. You declare
+the branches; it emits exactly one labeled record per declared branch, in
+declared order, and it FAILS CLOSED the instant it is asked to emit to a
+branch that was not declared, is empty, is duplicated, or is ill-formed.
+
+It is the OPEN half of a parallel-independent compose (the ⊗ product): fanout
+splits, its pair `junction` merges. Together they give a pipeline the
+parallel product to sit beside sequential (`|`) composition.
+
+THE ONE DISCIPLINE (the whole reason to trust it). It emits ONLY to branches
+you declared (the ⊢ rule: claim only what you can prove). There is no default
+branch and no inferred branch. An undeclared, empty, duplicate, or
+charset-invalid branch is not a warning to absorb — it is a non-zero exit with
+the offending branch named. That refusal is the feature.
+
+Pure function of its inputs. No dependencies. Same input + same branch list
+-> byte-identical JSONL, every run, every seed. Order is DECLARED order,
+never hash/set order. Runs in a browser (attach fanout to your namespace) or
+on Node (this CLI / require()).
+
+USAGE
+node fanout.js --branches a,b,c "the prompt" # payload as argument
+echo -n "the prompt" | node fanout.js --branches a,b,c # payload from stdin (exact bytes)
+node fanout.js --branches-file branches.txt "the prompt" # one branch per line
+node fanout.js --help
+
+OUTPUT (JSONL, one record per declared branch, in declared order):
+{"branch":"a","input":"the prompt","seq":0,"of":3}
+{"branch":"b","input":"the prompt","seq":1,"of":3}
+{"branch":"c","input":"the prompt","seq":2,"of":3}
+
+Released under MIT. Its edge is printed in the README: fanout splits one
+input into declared branches; it does not RUN them, order them by any policy
+but declared order, or judge whether a branch NAME is meaningful — it only
+refuses an undeclared, empty, duplicate, or ill-formed branch.
+*/
+
+"use strict";
+
+// The one charset rule: a branch name is a non-empty token of [A-Za-z0-9._-].
+// (The callsign-safe alphabet — reuse the charset rule, do not re-invent it.)
+var BRANCH_RE = /^[A-Za-z0-9._-]+$/;
+
+// A structured refusal. The CLI turns this into a non-zero exit with the
+// message; require() callers get a thrown Error they can catch.
+function FanoutError(message) {
+var e = new Error(message);
+e.name = "FanoutError";
+return e;
+}
+
+/* parseBranches(spec) -> array of validated branch names, in declared order.
+`spec` is an array of raw tokens (already split from a CSV or a file). Fails
+closed on: empty list, an empty/whitespace token, a duplicate, a
+charset-invalid token. The offending branch is always named. */
+function parseBranches(spec) {
+if (!Array.isArray(spec)) {
+throw FanoutError("branches: expected a list of branch names");
+}
+var branches = [];
+var seen = Object.create(null);
+for (var i = 0; i < spec.length; i++) {
+var raw = spec[i];
+var name = (typeof raw === "string")? raw.trim(): String(raw).trim();
+if (name.length === 0) {
+throw FanoutError("branches: empty branch name at position " + i +
+" (an undeclared/blank destination is exactly what fanout refuses)");
+}
+if (!BRANCH_RE.test(name)) {
+throw FanoutError("branches: ill-formed branch name " + JSON.stringify(name) +
+" (allowed: letters, digits, dot, underscore, hyphen)");
+}
+if (seen[name]) {
+throw FanoutError("branches: duplicate branch name " + JSON.stringify(name) +
+" (an ambiguous fan is refused; each declared branch must be unique)");
+}
+seen[name] = true;
+branches.push(name);
+}
+if (branches.length === 0) {
+throw FanoutError("branches: no branches declared " +
+"(fanout has no default branch — declare at least one)");
+}
+return branches;
+}
+
+/* fanout(input, branches) -> array of records, one per declared branch, in
+declared order. Pure: no I/O, no clock, no randomness. `input` is coerced via
+String() exactly like the shipped sha256 gift, so a caller passing a number
+or boolean gets deterministic behavior rather than a surprise. */
+function fanout(input, branches) {
+var validated = parseBranches(branches);
+var payload = (typeof input === "string")? input: String(input);
+var of = validated.length;
+var records = [];
+for (var i = 0; i < of; i++) {
+records.push({ branch: validated[i], input: payload, seq: i, of: of});
+}
+return records;
+}
+
+/* fanoutJSONL(input, branches) -> the canonical serialized form: one JSON
+object per line, keys in fixed order (branch,input,seq,of), in declared
+branch order, terminated by a single trailing newline. This string IS the
+gift's canonical output — same input + same branches yields byte-identical
+text every run. */
+function fanoutJSONL(input, branches) {
+var records = fanout(input, branches);
+var lines = [];
+for (var i = 0; i < records.length; i++) {
+var r = records[i];
+// Fixed key order, JSON.stringify per-field to get correct escaping.
+lines.push(
+"{" +
+"\"branch\":" + JSON.stringify(r.branch) + "," +
+"\"input\":" + JSON.stringify(r.input) + "," +
+"\"seq\":" + r.seq + "," +
+"\"of\":" + r.of +
+"}"
+);
+}
+return lines.join("\n") + "\n";
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.fanout = fanout;
+window.ForestGifts.fanoutJSONL = fanoutJSONL;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { fanout: fanout, fanoutJSONL: fanoutJSONL, parseBranches: parseBranches};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function readBranchesArg(args) {
+var iCsv = args.indexOf("--branches");
+var iFile = args.indexOf("--branches-file");
+if (iCsv!== -1 && iFile!== -1) {
+throw FanoutError("choose one of --branches or --branches-file, not both");
+}
+if (iCsv!== -1) {
+var csv = args[iCsv + 1];
+if (csv === undefined) throw FanoutError("--branches needs a comma-separated value");
+return csv.split(",");
+}
+if (iFile!== -1) {
+var path = args[iFile + 1];
+if (path === undefined) throw FanoutError("--branches-file needs a path");
+var fs = require("fs");
+var text = fs.readFileSync(path, "utf8");
+// One branch per line; blank lines are dropped before validation so a
+// trailing newline in the file is not itself an "empty branch".
+return text.split("\n").map(function (s) { return s.replace(/\r$/, "");})
+.filter(function (s) { return s.trim().length > 0;});
+}
+throw FanoutError("no branches declared: pass --branches a,b,c or --branches-file <path>");
+}
+
+function positionalPayload(args) {
+// The payload is the first argument that is not a flag and not a flag's value.
+var flagsWithValue = { "--branches": true, "--branches-file": true};
+for (var i = 0; i < args.length; i++) {
+var a = args[i];
+if (a.charAt(0) === "-") { // a flag; skip it and its value if it takes one
+if (flagsWithValue[a]) i++;
+continue;
+}
+return a;
+}
+return null; // no positional -> read stdin
+}
+
 function main(argv) {
 var args = argv.slice(2);
-var wantText = false;
-var rest = [];
-for (var k = 0; k < args.length; k++) {
-if (args[k] === '--text') wantText = true;
-else if (args[k] === '--help' || args[k] === '-h') rest = ['--help'];
-else rest.push(args[k]);
-}
-if (rest.length === 1 && rest[0] === '--help') {
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
 process.stdout.write(
-'markdown.js — one Markdown source, two honest shadows (HTML + plain text).\n\n' +
-' echo "# hi" | node markdown.js read Markdown on stdin, print HTML\n' +
-' echo "# hi" | node markdown.js --text print the plain-text shadow (=== the source)\n' +
-' node markdown.js "**bold** [x](javascript:alert(1))" read Markdown from an argument\n' +
-' node markdown.js --help\n\n' +
-'HTML emits a fixed, known-safe tag vocabulary; an unsafe link href is dropped, not rendered.\n' +
-'Parsing never throws — anything it can\'t parse renders as literal text.\n'
+"fanout.js — split one input into a fixed, DECLARED set of named branches.\n\n" +
+" node fanout.js --branches a,b,c \"the prompt\" payload as argument\n" +
+" echo -n \"the prompt\" | node fanout.js --branches a,b,c payload from stdin (exact bytes)\n" +
+" node fanout.js --branches-file branches.txt \"the prompt\" one branch per line\n" +
+" node fanout.js --help\n\n" +
+"Emits one JSONL record per DECLARED branch, in declared order. Fails closed\n" +
+"(non-zero exit, branch named) on an undeclared, empty, duplicate, or ill-formed\n" +
+"branch. There is no default branch.\n\n" +
+"Edge: fanout SPLITS; it does not run the branches, order them by any policy but\n" +
+"declared order, or judge whether a branch name is meaningful.\n"
 );
 return 0;
 }
 
-function emit(source) {
-var out = render(source);
-process.stdout.write((wantText? out.text: out.html) + '\n');
+var branchSpec;
+try {
+branchSpec = readBranchesArg(args);
+} catch (e) {
+process.stderr.write("fanout: " + e.message + "\n");
+return 2;
 }
 
-if (rest.length > 0) { emit(rest.join(' ')); return 0;}
+var payload = positionalPayload(args);
 
-// No positional argument: read Markdown from stdin.
+function emit(input) {
+try {
+process.stdout.write(fanoutJSONL(input, branchSpec));
+return 0;
+} catch (e) {
+process.stderr.write("fanout: " + e.message + "\n");
+return 2;
+}
+}
+
+if (payload!== null) {
+return emit(payload);
+}
+
+// stdin: use the exact bytes received (no trailing-newline munging).
 var chunks = [];
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { chunks.push(d);});
-process.stdin.on('end', function () { emit(chunks.join(''));});
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var buf = Buffer.concat(chunks);
+process.exitCode = emit(buf.toString("utf8"));
+});
 return 0;
 }
 
-if (typeof require!== 'undefined' && require.main === module) {
+if (typeof require!== "undefined" && require.main === module) {
 process.exitCode = main(process.argv);
 }
 
-})(typeof globalThis!== 'undefined'? globalThis: this);
-
-test_markdown.js 114 lines on GitHub →
+test_fanout.js 129 lines on GitHub →
 #!/usr/bin/env node
-/* test_markdown.js — proves the compiler is honest, safe, and deterministic.
+/* test_fanout.js — the golden corpus + determinism self-test + non-vacuity bite
+for the fanout gift. Zero dependencies (Node assert only). This file IS the
+canonicalizer self-test the Plumb cites (Gift-Works Procedure v1 §2): a gift
+whose output is byte-identical across repeated evaluation has proven its
+canonical form is idempotent and order-faithful.
 
-The three claims that ARE the tool:
-1. parse() NEVER throws — malformed input renders as literal text, not an error.
-2. toPlainText(ast) === the raw source — the text shadow is the source verbatim.
-3. every tag toHTML emits is in SAFE_TAGS, and an unsafe link href is DROPPED.
-Plus determinism (same source -> byte-identical HTML twice) and a mutation
-bite so a vacuously-green run fails loud. stdlib only, no dependencies.
-Exit 0 = all pass, exit 1 = a failure (loud). */
+Run: node test_fanout.js # exit 0 GREEN / non-zero RED
+*/
 "use strict";
-var md = require("./markdown.js");
+var assert = require("assert");
+var F = require("./fanout.js");
 
 var pass = 0, fail = 0;
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
-}
-function ok(name, cond) {
-if (cond) { pass++;} else { fail++; console.error("FAIL " + name);}
+function check(name, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL: " + name + " — " + e.message);}
 }
 
-// --- 1. never throws: a pile of malformed / adversarial input, none may raise ---------------
-var nasties = [
-null, undefined, "", "\u0000", "```\nunclosed fence",
-"[label](", "[label](unbalanced(", "**unmatched", "_unmatched",
-"`unclosed span", "> ", "- ", "1.", "###### too deep? ####### seven",
-"\r\n\r\n mixed \r newlines \n", "[a](b)(c)", "###nospaceheading"
+// ---- GOLDEN CORPUS: the known-good half -----------------------------------
+// Each vector is (payload, branches, expected JSONL). Expected is written out
+// literally so the corpus is a fixed oracle, not a re-derivation of the code.
+var GOLDEN = [
+{
+name: "single branch",
+input: "p", branches: ["a"],
+expect: '{"branch":"a","input":"p","seq":0,"of":1}\n'
+},
+{
+name: "three branches, declared order preserved",
+input: "the prompt", branches: ["a", "b", "c"],
+expect:
+'{"branch":"a","input":"the prompt","seq":0,"of":3}\n' +
+'{"branch":"b","input":"the prompt","seq":1,"of":3}\n' +
+'{"branch":"c","input":"the prompt","seq":2,"of":3}\n'
+},
+{
+name: "declared order is NOT sorted (z before a)",
+input: "x", branches: ["z", "a"],
+expect:
+'{"branch":"z","input":"x","seq":0,"of":2}\n' +
+'{"branch":"a","input":"x","seq":1,"of":2}\n'
+},
+{
+name: "multibyte payload fidelity (accents, emoji, non-latin)",
+input: "café🦌日本語", branches: ["m"],
+expect: '{"branch":"m","input":"café🦌日本語","seq":0,"of":1}\n'
+},
+{
+name: "payload with quotes/newlines/tabs is JSON-escaped",
+input: 'line1\nline2\t"q"', branches: ["e"],
+expect: '{"branch":"e","input":"line1\\nline2\\t\\"q\\"","seq":0,"of":1}\n'
+},
+{
+name: "charset-legal names: dot, underscore, hyphen, digits",
+input: "p", branches: ["a.1", "b_2", "c-3"],
+expect:
+'{"branch":"a.1","input":"p","seq":0,"of":3}\n' +
+'{"branch":"b_2","input":"p","seq":1,"of":3}\n' +
+'{"branch":"c-3","input":"p","seq":2,"of":3}\n'
+},
+{
+name: "String() coercion parity: number payload",
+input: 42, branches: ["n"],
+expect: '{"branch":"n","input":"42","seq":0,"of":1}\n'
+}
 ];
-nasties.forEach(function (n, idx) {
+
+GOLDEN.forEach(function (v) {
+check("golden: " + v.name, function () {
+assert.strictEqual(F.fanoutJSONL(v.input, v.branches), v.expect);
+});
+});
+
+// ---- FAIL-CLOSED: the known-bad half (real defects, not author-invented) ---
+// Each is a branch declaration fanout MUST refuse. A refusal that does not
+// throw is a silent fan to an undeclared/ambiguous destination — the exact
+// fault this gift exists to prevent.
+var BAD = [
+{ name: "empty branch list", branches: [], match: /no branches declared/},
+{ name: "empty branch token", branches: ["a", ""], match: /empty branch name/},
+{ name: "whitespace-only token", branches: ["a", " "], match: /empty branch name/},
+{ name: "duplicate branch", branches: ["a", "a"], match: /duplicate branch name/},
+{ name: "charset-invalid (space)", branches: ["a", "b c"], match: /ill-formed branch name/},
+{ name: "charset-invalid (slash)", branches: ["a/b"], match: /ill-formed branch name/}
+];
+
+BAD.forEach(function (v) {
+check("fail-closed: " + v.name, function () {
+assert.throws(function () { F.fanoutJSONL("p", v.branches);}, v.match,
+"expected refusal for " + v.name);
+});
+});
+
+// ---- NON-VACUITY MUTATION BITE --------------------------------------------
+// A suite that cannot reject a wrong answer proves nothing. Assert that a
+// deliberately-wrong expectation is CAUGHT (the negation must fail).
+check("mutation bite: wrong output is rejected", function () {
+var wrong = '{"branch":"a","input":"p","seq":9,"of":1}\n'; // seq tampered
+assert.notStrictEqual(F.fanoutJSONL("p", ["a"]), wrong,
+"the corpus must distinguish a wrong (tampered seq) output");
+});
+check("mutation bite: a refused case must actually throw", function () {
 var threw = false;
-try { md.toHTML(md.parse(n)); md.toPlainText(md.parse(n));}
-catch (e) { threw = true;}
-ok("never throws #" + idx,!threw);
+try { F.fanoutJSONL("p", ["a", "a"]);} catch (e) { threw = true;}
+assert.strictEqual(threw, true, "duplicate must throw — a non-throwing refuser has no teeth");
 });
 
-// --- 2. toPlainText === the raw source (honest fallback) ------------------------------------
-var samples = [
-"# Heading\n\nA **bold** and *em* paragraph.",
-"> quote\n> line two",
-"- a\n- b\n- c",
-"1. one\n2. two",
-"```\ncode block\n```",
-"plain [link](https://example.com) here",
-"trailing spaces \nhard break"
-];
-samples.forEach(function (s, idx) {
-eq("toPlainText===source #" + idx, md.toPlainText(md.parse(s)), s);
+// ---- DETERMINISM SELF-TEST (the canonicalizer self-test, Gift-Works §2) ----
+// Evaluate the same input N times; the output must be byte-identical every
+// time. This proves the canonical form is idempotent and order-faithful on the
+// gift's own output — the property the Plumb's canonicalizer self-test names.
+check("determinism: byte-identical across 25 evaluations", function () {
+var first = F.fanoutJSONL("det prompt 🦌", ["one", "two", "three"]);
+for (var i = 0; i < 25; i++) {
+assert.strictEqual(F.fanoutJSONL("det prompt 🦌", ["one", "two", "three"]), first,
+"evaluation " + i + " diverged — output is not deterministic");
+}
+});
+// Order-faithfulness: a permuted branch list yields a permuted output (order is
+// carried, never normalized away).
+check("determinism: order-faithful (permutation changes output)", function () {
+var ab = F.fanoutJSONL("p", ["a", "b"]);
+var ba = F.fanoutJSONL("p", ["b", "a"]);
+assert.notStrictEqual(ab, ba, "declared order must be faithful, not normalized");
 });
 
-// --- 3a. block rendering is correct ---------------------------------------------------------
-eq("heading", md.toHTML(md.parse("# Hi")), "<h1>Hi</h1>");
-eq("h3", md.toHTML(md.parse("### Deep")), "<h3>Deep</h3>");
-eq("paragraph", md.toHTML(md.parse("just text")), "<p>just text</p>");
-eq("strong", md.toHTML(md.parse("**b**")), "<p><strong>b</strong></p>");
-eq("em", md.toHTML(md.parse("*i*")), "<p><em>i</em></p>");
-eq("code span", md.toHTML(md.parse("`x`")), "<p><code>x</code></p>");
-eq("ul", md.toHTML(md.parse("- a\n- b")), "<ul><li>a</li><li>b</li></ul>");
-eq("ol", md.toHTML(md.parse("1. a\n2. b")), "<ol><li>a</li><li>b</li></ol>");
-eq("blockquote", md.toHTML(md.parse("> q")), "<blockquote><p>q</p></blockquote>");
-eq("code block", md.toHTML(md.parse("```\nx < y\n```")), "<pre><code>x &lt; y</code></pre>");
+console.log((fail === 0? "GREEN": "RED") + ": " + pass + " passed, " + fail + " failed");
+process.exitCode = fail === 0? 0: 3;
 
-// --- 3b. text is HTML-escaped (no raw injection through content) ----------------------------
-eq("escape text", md.toHTML(md.parse("a < b & c > d")), "<p>a &lt; b &amp; c &gt; d</p>");
+Take the whole folder →
+MIT
+Node / browser, no dependencies
 
-// --- 3c. the link-scheme guard: safe href -> <a>; unsafe -> DROPPED, label as text ----------
-eq("safe http link", md.toHTML(md.parse("[x](https://a.com)")), '<p><a href="https://a.com">x</a></p>');
-eq("safe relative", md.toHTML(md.parse("[x](/path)")), '<p><a href="/path">x</a></p>');
-eq("safe anchor", md.toHTML(md.parse("[x](#sec)")), '<p><a href="#sec">x</a></p>');
-eq("safe mailto", md.toHTML(md.parse("[x](mailto:a@b.com)")), '<p><a href="mailto:a@b.com">x</a></p>');
-eq("drop javascript", md.toHTML(md.parse("[x](javascript:alert(1))")), "<p>x</p>");
-eq("drop data", md.toHTML(md.parse("[x](data:text/html,<script>)")), "<p>x</p>");
-eq("drop protorel", md.toHTML(md.parse("[x](//evil.host)")), "<p>x</p>");
+---
 
-// isSafeUrl directly
-ok("isSafeUrl https", md.isSafeUrl("https://a.com") === true);
-ok("isSafeUrl rejects js", md.isSafeUrl("javascript:alert(1)") === false);
-ok("isSafeUrl rejects ''", md.isSafeUrl("") === false);
-ok("isSafeUrl rejects non-string", md.isSafeUrl(null) === false);
+# forest-title-fit — a Loop MMT gift
+https://loopmmt.com/gifts/forest-title-fit/
+[coverage: optional · branch: gifts]
 
-// --- 3d. EMIT-INVARIANT: every tag toHTML ever emits is in SAFE_TAGS -------------------------
-var kitchenSink = [
-"# h1", "## h2", "### h3", "#### h4", "##### h5", "###### h6",
-"para with **strong** and *em* and `code` and a [link](https://x.com)",
-"> a quote", "- ul item", "1. ol item", "```\nfenced\n```",
-"line one \nline two after a hard break"
-].join("\n\n");
-var emitted = md.tagsIn(md.toHTML(md.parse(kitchenSink)));
-var safeSet = {};
-md.SAFE_TAGS.forEach(function (t) { safeSet[t] = true;});
-var leaked = emitted.filter(function (t) { return!safeSet[t];});
-eq("emit-invariant: no off-allowlist tag", leaked, []);
-ok("emit-invariant: sink actually emitted tags", emitted.length >= 8);
+Never-Clip Title Sizing fit ← all gifts
 
-// --- determinism: same source -> byte-identical HTML twice ----------------------------------
-ok("deterministic", md.toHTML(md.parse(kitchenSink)) === md.toHTML(md.parse(kitchenSink)));
+forest-title-fit
 
-// --- shared-root property: render() text and html both fold the SAME parse ------------------
-var r = md.render("# Title\n\nbody **b**");
-eq("render.text === source", r.text, "# Title\n\nbody **b**");
-eq("render.html folds AST", r.html, "<h1>Title</h1>\n<p>body <strong>b</strong></p>");
+Pick the largest font size at which a title still fits a fixed width — and never clip, never ellipsize: if it can't fit even at the floor, it wraps on spaces instead. A general shrink-to-fit UI primitive with the font-measuring step injected as a seam, so the fitting logic is pure and testable without a browser.
 
-// --- mutation bite: prove the emit-invariant test is not vacuously green ---------------------
-// If SAFE_TAGS were emptied, the kitchen-sink render MUST now show leaked tags.
-(function () {
-var frozenSafe = md.SAFE_TAGS; // real allowlist
-var emittedTags = md.tagsIn(md.toHTML(md.parse(kitchenSink)));
-var wouldLeakUnderEmpty = emittedTags.length > 0; // an empty allowlist would flag all of these
-ok("mutation bite: invariant has teeth", wouldLeakUnderEmpty && frozenSafe.length > 0);
-})();
+The honest edge
 
-console.log((fail === 0? "PASS": "FAIL") + " — " + pass + " passed, " + fail + " failed");
+It sizes to the measure() you inject — only as accurate as your measurer (a webfont still loading measures as its fallback). It searches integer sizes and breaks on whitespace, not hyphens; a single word wider than the box overflows visibly, by design. It computes sizes and lines; the caller renders.
+
+Run it
+
+node forest-title-fit.js --demo
+test_forest-title-fit.js (23/23)
+JavaScript, zero dependencies (Node + browser)
+
+The code — every file that ships
+
+forest-title-fit.js 172 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+"use strict";
+/* forest-title-fit.js — shrink-to-fit-never-clip title sizing.
+
+The sign-painter's problem: a title must fit a fixed width, at the largest size
+that still fits, and it must NEVER clip and NEVER get an ellipsis — if it can't
+fit on one line even at the floor size, it wraps or the caller is told, but a
+character is never silently cut. This is a general UI primitive: a card title, a
+nav label, a chart caption, a poster headline.
+
+THE SEAM. Measuring rendered text needs a font engine, which lives in the DOM
+(`canvas.getContext('2d').measureText`). To keep this primitive PURE and testable
+without a browser, the measuring function is INJECTED, not imported: every entry
+point takes a `measure(text, fontSize) -> width` callback. In a browser you pass
+a one-line canvas-backed measurer (see makeCanvasMeasure below, guarded so it is
+defined only when a DOM exists); in a test you pass a deterministic stub. The
+fitting LOGIC — the binary search for the largest fitting size, the floor, the
+never-clip guarantee — is the same pure function in both worlds.
+
+No DOM access in the core, no filesystem, no network. Node (module.exports) or
+browser (window.LoopGifts.titleFit). */
+
+/* fitFontSize(text, width, opts) -> {fontSize, fits, width: measuredWidth, floored}
+Find the largest integer font size in [min, max] whose single-line measured width
+is <= the available width.
+text: the string to fit
+width: available width in the same unit measure() returns
+opts.measure: REQUIRED (text, fontSize) -> width. The seam.
+opts.min: floor font size (default 8). Never returns below this.
+opts.max: ceiling font size (default 96).
+Return:
+fontSize: the chosen size (>= min always — never clips by shrinking past floor)
+fits: true iff the text fits at the returned size (false => it overflows
+even at the floor; the caller decides to wrap — see wrapToWidth)
+width: measured width at the returned size
+floored: true iff the search bottomed out at min without fitting */
+function fitFontSize(text, width, opts) {
+opts = opts || {};
+var measure = opts.measure;
+if (typeof measure!== "function")
+throw new Error("fitFontSize: opts.measure(text, fontSize) is required (the seam)");
+var min = (opts.min === undefined)? 8: opts.min;
+var max = (opts.max === undefined)? 96: opts.max;
+if (min > max) throw new Error("fitFontSize: min > max");
+if (typeof width!== "number" || width <= 0) throw new Error("fitFontSize: width must be > 0");
+
+// Largest size whose width <= available. Binary search over integer sizes.
+var lo = min, hi = max, best = null;
+while (lo <= hi) {
+var mid = Math.floor((lo + hi) / 2);
+var w = measure(text, mid);
+if (w <= width) { best = mid; lo = mid + 1;} // fits — try bigger
+else { hi = mid - 1;} // too wide — go smaller
+}
+if (best!== null) {
+return { fontSize: best, fits: true, width: measure(text, best), floored: false};
+}
+// Nothing fit, not even min. Never clip: return the floor and report!fits.
+return { fontSize: min, fits: false, width: measure(text, min), floored: true};
+}
+
+/* wrapToWidth(text, width, fontSize, measure) -> [line, line,...]
+Greedy word-wrap so no line's measured width exceeds `width` at `fontSize`.
+The never-clip fallback when fitFontSize reports!fits: instead of cutting or
+ellipsizing, break on spaces. A single word wider than `width` is placed on its
+own line intact (still never clipped — overflow is visible, not hidden). */
+function wrapToWidth(text, width, fontSize, measure) {
+if (typeof measure!== "function")
+throw new Error("wrapToWidth: measure(text, fontSize) is required");
+if (typeof width!== "number" || width <= 0) throw new Error("wrapToWidth: width must be > 0");
+var words = String(text).split(/\s+/).filter(function (w) { return w.length > 0;});
+var lines = [], cur = "";
+for (var i = 0; i < words.length; i++) {
+var candidate = cur? (cur + " " + words[i]): words[i];
+if (measure(candidate, fontSize) <= width || cur === "") {
+// fits, OR the line is empty (a too-long single word goes on its own line intact)
+if (measure(candidate, fontSize) <= width) { cur = candidate;}
+else { lines.push(words[i]); cur = "";} // lone oversized word: own line
+} else {
+lines.push(cur); cur = words[i];
+}
+}
+if (cur) lines.push(cur);
+return lines.length? lines: [""];
+}
+
+/* fitTitle(text, width, opts) -> {fontSize, lines, fits, floored}
+The convenience entry: try to fit on ONE line at the largest size; if it can't
+fit even at the floor, keep the floor size and WRAP (never clip, never ellipsize).
+Returns the chosen size and the line array to render. */
+function fitTitle(text, width, opts) {
+var f = fitFontSize(text, width, opts);
+if (f.fits) return { fontSize: f.fontSize, lines: [String(text)], fits: true, floored: false};
+var measure = (opts || {}).measure;
+return {
+fontSize: f.fontSize,
+lines: wrapToWidth(text, width, f.fontSize, measure),
+fits: false,
+floored: f.floored
+};
+}
+
+/* makeCanvasMeasure(fontFamily) -> measure(text, fontSize) using a real canvas.
+Defined only in a browser (guarded); this is the DOM half kept OUT of the pure
+core. In Node it is a no-op that throws if called, so the seam stays explicit. */
+function makeCanvasMeasure(fontFamily) {
+fontFamily = fontFamily || "sans-serif";
+if (typeof document === "undefined")
+return function () { throw new Error("makeCanvasMeasure: no DOM (pass your own measure in Node)");};
+var ctx = document.createElement("canvas").getContext("2d");
+return function (text, fontSize) {
+ctx.font = fontSize + "px " + fontFamily;
+return ctx.measureText(String(text)).width;
+};
+}
+
+// ---- dual-runtime export ---------------------------------------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.titleFit = {
+fitFontSize: fitFontSize, wrapToWidth: wrapToWidth,
+fitTitle: fitTitle, makeCanvasMeasure: makeCanvasMeasure
+};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = {
+fitFontSize: fitFontSize, wrapToWidth: wrapToWidth,
+fitTitle: fitTitle, makeCanvasMeasure: makeCanvasMeasure
+};
+}
+
+// ---- CLI (value-arg + --demo; reads NO files) ------------------------------
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+// A deterministic demo measurer: width = chars * fontSize * 0.6 (a monospace-ish model).
+function demoMeasure(text, fontSize) { return String(text).length * fontSize * 0.6;}
+
+function printDemo() {
+var width = 300;
+var cases = ["OK", "A Longer Title Here", "SupercalifragilisticexpialidociousUnbreakableWord"];
+process.stdout.write("# forest-title-fit demo (available width = " + width + ", monospace-ish model)\n");
+for (var i = 0; i < cases.length; i++) {
+var r = fitTitle(cases[i], width, { measure: demoMeasure, min: 8, max: 72});
+process.stdout.write(
+JSON.stringify(cases[i]) + " -> size " + r.fontSize +
+", " + r.lines.length + " line(s), fits=" + r.fits +
+(r.floored? " (floored)": "") + "\n");
+for (var k = 0; k < r.lines.length; k++)
+process.stdout.write(" | " + r.lines[k] + "\n");
+}
+process.exit(0);
+}
+
+if (args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"forest-title-fit — shrink-to-fit-never-clip title sizing\n\n" +
+" node forest-title-fit.js --demo fit a few sample titles to a fixed width\n" +
+" node forest-title-fit.js '<title>' [width] fit one title (uses a monospace-ish model)\n\n" +
+"Library: fitFontSize / fitTitle / wrapToWidth, each taking an injected\n" +
+"measure(text, fontSize) seam. makeCanvasMeasure() supplies the browser one.\n" +
+"Pure — no DOM in the core, no files, no network. Exit 0.\n");
+process.exit(0);
+}
+if (args[0] === "--demo" || args.length === 0) { printDemo();}
+else {
+var w = args[1]? parseInt(args[1], 10): 300;
+var res = fitTitle(args[0], w, { measure: demoMeasure, min: 8, max: 72});
+process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+process.exit(0);
+}
+}
+
+test_forest-title-fit.js 93 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+/* test_forest-title-fit.js — proves the title-fit primitive implements its contract.
+
+THE ORACLE. There is no stdlib that says "is this the largest font that fits?" —
+so the oracle is CURATED VECTORS against a DETERMINISTIC injected measurer
+(width = chars * fontSize * k), which makes the expected size exactly computable:
+the largest integer size s with len*s*k <= width is floor(width/(len*k)). We
+assert: (1) fitFontSize returns exactly that size and reports fits=true; (2) it
+picks the LARGEST fitting size (size+1 would overflow); (3) when nothing fits even
+at the floor it returns the floor with fits=false and floored=true — it NEVER
+returns below min (never clips by shrinking past the floor); (4) wrapToWidth never
+emits a line wider than width, breaks on spaces, and keeps a too-long single word
+intact on its own line (never clips); (5) fitTitle wraps at the floor instead of
+ellipsizing. Plus determinism and a mutation-bite (a constant-size core fails).
+Exit 0 = all pass; exit 1 = failure. stdlib only. */
+"use strict";
+var m = require("./forest-title-fit.js");
+
+var pass = 0, fail = 0;
+function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
+function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
+function threw(label, fn) { var d = false; try { fn();} catch (e) { d = true;} ok(label + " (throws)", d);}
+
+// deterministic measurer: width = chars * fontSize * k
+var K = 0.6;
+function measure(text, fontSize) { return String(text).length * fontSize * K;}
+function largestFit(len, width) { return Math.floor(width / (len * K));}
+
+// ---- 1. fitFontSize returns exactly the largest fitting size ---------------
+var r1 = m.fitFontSize("ABCD", 300, { measure: measure, min: 8, max: 96});
+var expect1 = largestFit(4, 300); // floor(300/2.4) = 125 -> capped at max 96
+expect1 = Math.min(expect1, 96);
+eq("largest fitting size (capped at max)", r1.fontSize, expect1);
+ok("reports fits", r1.fits === true);
+
+// a case where the true optimum is below the cap
+var r2 = m.fitFontSize("ABCDEFGHIJ", 300, { measure: measure, min: 8, max: 96});
+var expect2 = largestFit(10, 300); // floor(300/6) = 50
+eq("largest fitting size (uncapped)", r2.fontSize, expect2);
+// and prove it's the LARGEST: size+1 overflows
+ok("size+1 overflows (it's truly largest)", measure("ABCDEFGHIJ", r2.fontSize + 1) > 300);
+ok("chosen size fits", measure("ABCDEFGHIJ", r2.fontSize) <= 300);
+
+// ---- 2. never clips: floor when nothing fits -------------------------------
+var r3 = m.fitFontSize("aVeryLongUnbreakableTitleString", 30, { measure: measure, min: 8, max: 96});
+ok("floored size == min", r3.fontSize === 8);
+ok("reports!fits when even floor overflows", r3.fits === false);
+ok("reports floored", r3.floored === true);
+ok("NEVER returns below min", r3.fontSize >= 8);
+
+// ---- 3. input guards -------------------------------------------------------
+threw("requires measure seam", function () { m.fitFontSize("x", 100, {});});
+threw("rejects non-positive width", function () { m.fitFontSize("x", 0, { measure: measure});});
+threw("rejects min > max", function () { m.fitFontSize("x", 100, { measure: measure, min: 50, max: 10});});
+
+// ---- 4. wrapToWidth: never a line wider than width, never clips -------------
+var lines = m.wrapToWidth("one two three four five six", 60, 10, measure); // each word small
+for (var i = 0; i < lines.length; i++)
+ok("wrap line " + i + " within width", measure(lines[i], 10) <= 60 || lines[i].split(/\s+/).length === 1);
+ok("wrap breaks into multiple lines", lines.length > 1);
+ok("wrap preserves all words", lines.join(" ").split(/\s+/).sort().join(",") ===
+"five,four,one,six,three,two");
+
+// a single oversized word goes on its own line, intact (never clipped)
+var wl = m.wrapToWidth("tiny enormouslylongwordthatcannotfit tiny", 40, 10, measure);
+ok("oversized word kept intact", wl.indexOf("enormouslylongwordthatcannotfit")!== -1);
+
+// ---- 5. fitTitle: wraps at floor instead of ellipsizing --------------------
+var t1 = m.fitTitle("Short", 300, { measure: measure, min: 8, max: 72});
+ok("short title fits on one line", t1.fits === true && t1.lines.length === 1);
+var t2 = m.fitTitle("several words that will not fit on one single line here", 60,
+{ measure: measure, min: 8, max: 72});
+ok("overflowing title wraps, does not ellipsize", t2.lines.length > 1);
+ok("no ellipsis introduced", t2.lines.join(" ").indexOf("\u2026") === -1 &&
+t2.lines.join(" ").indexOf("...") === -1);
+
+// ---- 6. determinism --------------------------------------------------------
+ok("fitFontSize is deterministic",
+m.fitFontSize("ABCDE", 200, { measure: measure}).fontSize ===
+m.fitFontSize("ABCDE", 200, { measure: measure}).fontSize);
+
+// ---- 7. mutation-bite ------------------------------------------------------
+// A degenerate core that returned a constant size regardless of text/width would
+// give the same size for a short title in a wide box and a long title in a narrow
+// box. Prove they DIFFER.
+var wide = m.fitFontSize("Hi", 400, { measure: measure, min: 8, max: 96}).fontSize;
+var narrow = m.fitFontSize("A much longer title", 80, { measure: measure, min: 8, max: 96}).fontSize;
+ok("MUTATION-BITE: size responds to text length and width", wide!== narrow && wide > narrow);
+
+// ---- report ----------------------------------------------------------------
+console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
 process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node, no dependencies
+JavaScript, zero dependencies (Node + browser)
 
 ---
 
-# Mint — a Loop MMT gift
-https://loopmmt.com/gifts/mint/
+# Gantt-sink — a Loop MMT gift
+https://loopmmt.com/gifts/gantt-sink/
 [coverage: optional · branch: gifts]
 
-IDs That Are Never Reused allocate ← all gifts
+Tasks In, One Gantt SVG Out render ← all gifts
 
-Mint
+Gantt-sink
 
-Hand out IDs that are never reused — and prove it before returning each one, not with an after-the-fact check but as a structural property: a retired ID cannot come back. JSON in, JSON out, backed by a file you can read.
+gantt-sink turns a stream of (start,end,label) tasks into one standalone, deterministic Gantt SVG with zero dependencies — one horizontal <rect> bar per task, top to bottom in input order, each labeled. It renders no axes, dates, gridlines, dependency arrows, or legend — just the bars — so it drops straight into a README, a report, or a CI comment where a project-management tool would be overkill. It is the render-sink cluster's first gift to place caller text in the output (the label), and it closes that one injection surface deliberately: every label is XML-escaped, so caller text can never break out of markup. Same tasks in → byte-identical SVG out.
 
 The honest edge
 
-It guarantees no reuse within the one ID store you point it at. Two independent stores that don't know about each other can still collide — single source of truth is your job.
+gantt-sink is a timeline-bar primitive, not a project-management tool: one <rect> bar per task in INPUT ORDER, each with a <text> label, no axes/dates/dependency-arrows/legend, no fonts/script. Unlike its numbers-only siblings it DOES place caller text — the label — so it carries the one injection surface they avoid; that surface is closed DELIBERATELY: every label is XML-escaped (& < > " '), so a <script> label renders only as escaped entities, never a real tag. Bar colors come from a fixed named palette (index = row), never caller input. A non-finite start/end, an end before its start, or a non-string label is a hard error. Same tasks in → byte-identical SVG out.
 
 Run it
 
-python3 mint.py alloc --root./ids
-test_mint.py (15/15, mutation-bitten)
-Python stdlib only, deterministic
+printf '[0,3,"design"]\n[2,5,"build"]\n' | node gantt-sink.js # a two-row timeline SVG (--width/--row/--pad · --min/--max · --palette loop|mono|warm|cool)
+test_gantt-sink.js (13/13, out-of-band hand-computed SVG oracle incl. hostile-label escaping probe) + Plumb conformance GREEN (I1-I5, I3=escaped-text safety, signed, clock-independent)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-mint.py 321 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""mint.py — hand out IDs that are never reused, and prove it before returning.
-
-A mint stamps a coin once and never stamps that number again. This does the same
-for identifiers: every ID it issues is strictly above every ID it has ever issued
-before, so a number that was retired can never be pointed at a second thing. That
-"never reused" property is not checked after the fact — it is **structural, and
-transactional**: the mint keeps a single **high-water mark** and only ever hands
-out `high_water + 1`, advancing the mark *inside a database transaction that
-commits before any ID is emitted*. A crash right after issuing cannot re-issue
-the same number, because the mark already moved and the move was durable.
-
-Why you'd want that: any time an ID collision would let one record be mistaken for
-another — a retired user's ID reassigned to a new user, a recycled trace ID
-threading two unrelated events — monotonic allocation makes the mistake
-impossible rather than merely unlikely. Retirement is recorded (so you can audit
-what was let go) but a retired ID is **never** returned to the pool: silent
-recycling is the whole failure this refuses, so there is no recycle switch.
-
-STATE lives in a SQLite database at `<root>/mint.db` (Python stdlib `sqlite3`):
-meta.high_water: the last ID issued (or floor-1 when empty), one row
-retired: an append-only table of IDs recorded retired
-the rule: the free pool is [high_water+1..]; nothing lowers the mark.
-SQLite gives atomic commit, crash recovery, schema enforcement, and cross-process
-serialization for free (`BEGIN IMMEDIATE` lets only one allocator advance the mark
-at a time), which is exactly the indivisible decision "allocate and persist" is.
-Invalid, missing, downgraded, or out-of-range state is **refused** (exit 2), never
-silently reset to the floor. A legacy `mint-state.json` is imported once on first
-run — and refused loudly if it is corrupt — so an upgrade never reissues an old ID.
-
-THE GATE, checked at allocation time, before an ID is returned:
-in range floor <= id <= ceil
-monotonic id > high_water (structural: id = high_water + 1)
-not live id not in --live SET (not held right now)
-A gate failure is a refusal with a reason, never a silent second-best.
-
-------------------------------------------------------------------------------
-The JSON-lines contract (so this composes in a pipe):
-- `mint alloc` / `mint peek` / `mint retire` emit ONE JSON object per line on
-stdout — a record you can pipe into the next tool.
-- `mint alloc -n K` emits K lines, one per freshly-minted ID, in order.
-- `--live -` reads a set of currently-held IDs from stdin, one JSON object or
-bare integer per line (field `--live-field`, default "id").
-- errors go to stderr; stdout stays clean JSON-lines.
-
-Exit codes:
-0 the operation succeeded
-1 a gate refusal (out of range / not monotonic / id live)
-2 state could not be read, is invalid/out-of-range, or could not be written
-3 usage / bad input
-"""
-
-import argparse
-import json
-import os
-import sqlite3
-import sys
-
-SCHEMA_VERSION = 1
-
-class MintError(Exception):
-"""A gate refusal or a state fault, carrying an exit code."""
-
-def __init__(self, message, code):
-super().__init__(message)
-self.code = code
-
-def _db_path(root):
-return os.path.join(root, "mint.db")
-
-def _legacy_seed(root, floor, ceil):
-"""One-time seed from a legacy mint-state.json, if present. Returns the mark.
-Refuses (exit 2) rather than resetting: a corrupt or out-of-range legacy mark
-is a fault to surface, never a silent fall back to the floor (the fail-open
-this store exists to kill). An absent legacy file seeds the empty sentinel."""
-legacy = os.path.join(root, "mint-state.json")
-if not os.path.exists(legacy):
-return floor - 1
-try:
-with open(legacy, "r", encoding="utf-8") as fh:
-raw = json.load(fh)
-except (OSError, ValueError) as exc:
-raise MintError(
-"legacy mint-state.json is unreadable; refusing to reset (import by hand): %s"
-% exc, 2)
-hw = raw.get("high_water") if isinstance(raw, dict) else None
-if isinstance(hw, bool) or not isinstance(hw, int):
-raise MintError(
-"legacy mint-state.json high_water is not an integer (%r); refusing to reset"
-% (hw,), 2)
-if hw < floor - 1 or hw > ceil:
-raise MintError(
-"legacy high_water %d is out of range [%d, %d]; refusing to reset"
-% (hw, floor - 1, ceil), 2)
-return hw
-
-def _connect(root, floor, ceil):
-"""Open (creating + seeding on first use) the SQLite store. Validates the
-persisted mark on every open; a downgraded schema or non-int/out-of-range
-mark is a loud refusal, never a silent default."""
-try:
-os.makedirs(root, exist_ok=True)
-conn = sqlite3.connect(_db_path(root), timeout=30.0, isolation_level=None)
-except (OSError, sqlite3.Error) as exc:
-raise MintError("cannot open mint store at %s: %s" % (root, exc), 2)
-try:
-conn.execute("PRAGMA busy_timeout=30000")
-conn.execute(
-"CREATE TABLE IF NOT EXISTS meta ("
-" id INTEGER PRIMARY KEY CHECK(id = 1),"
-" high_water INTEGER NOT NULL,"
-" schema_version INTEGER NOT NULL)")
-conn.execute(
-"CREATE TABLE IF NOT EXISTS retired ("
-" id INTEGER PRIMARY KEY,"
-" retired_at TEXT NOT NULL DEFAULT (datetime('now')))")
-row = conn.execute(
-"SELECT high_water, schema_version FROM meta WHERE id = 1").fetchone()
-if row is None:
-seed = _legacy_seed(root, floor, ceil)
-conn.execute(
-"INSERT INTO meta (id, high_water, schema_version) VALUES (1,?,?)",
-(seed, SCHEMA_VERSION))
-else:
-hw, sv = row
-if not isinstance(hw, int) or isinstance(hw, bool):
-raise MintError("persisted high_water is not an integer (%r)" % (hw,), 2)
-if sv!= SCHEMA_VERSION:
-raise MintError(
-"mint store schema %r!= supported %d (downgraded/upgraded); refusing"
-% (sv, SCHEMA_VERSION), 2)
-if hw < floor - 1 or hw > ceil:
-raise MintError(
-"persisted high_water %d is out of range [%d, %d]; refusing"
-% (hw, floor - 1, ceil), 2)
-except sqlite3.Error as exc:
-conn.close()
-raise MintError("mint store is unusable: %s" % exc, 2)
-except MintError:
-conn.close()
-raise
-return conn
-
-def _read_hw(conn):
-return conn.execute("SELECT high_water FROM meta WHERE id = 1").fetchone()[0]
-
-def assert_allocatable(uid, high_water, live, floor, ceil):
-"""The gate: range, monotonic, not-live. Returns None if OK, else a reason."""
-if not isinstance(uid, int) or uid < floor or uid > ceil:
-return "E_RANGE: %r is outside %d-%d" % (uid, floor, ceil)
-if uid <= high_water:
-return ("E_NOT_MONOTONIC: %d is at/below the high-water mark %d"
-% (uid, high_water))
-if uid in live:
-return "E_LIVE: %d is held by a live holder" % uid
-return None
-
-def allocate(root, live, floor, ceil, count):
-"""Draw `count` IDs monotonically inside one transaction. The bumped mark is
-committed BEFORE any ID is emitted, so a crash never re-issues. On a gate
-failure mid-batch the successfully-minted prefix is committed (never lost),
-then the reason is raised."""
-conn = _connect(root, floor, ceil)
-minted = []
-reason = None
-try:
-conn.execute("BEGIN IMMEDIATE")
-hw = _read_hw(conn)
-for _ in range(count):
-uid = hw + 1
-reason = assert_allocatable(uid, hw, live, floor, ceil)
-if reason is not None:
-break
-hw = uid
-live = live | {uid}
-minted.append(uid)
-if minted:
-conn.execute("UPDATE meta SET high_water =? WHERE id = 1", (hw,))
-conn.commit()
-except sqlite3.Error as exc:
-conn.rollback()
-conn.close()
-raise MintError("allocation could not persist: %s" % exc, 2)
-conn.close()
-if reason is not None and not minted:
-raise MintError(reason, 1)
-return minted, reason
-
-def retire(root, uid, floor, ceil):
-"""Record an ID retired (append-only). It does NOT return to the pool — the
-mark is never lowered, so nothing this records is ever re-issued."""
-conn = _connect(root, floor, ceil)
-try:
-conn.execute("BEGIN IMMEDIATE")
-conn.execute("INSERT OR IGNORE INTO retired (id) VALUES (?)", (uid,))
-hw = _read_hw(conn)
-conn.commit()
-except sqlite3.Error as exc:
-conn.rollback()
-conn.close()
-raise MintError("retire could not persist: %s" % exc, 2)
-conn.close()
-return {"retired": uid, "high_water": hw}
-
-def peek(root, floor, ceil):
-conn = _connect(root, floor, ceil)
-hw = _read_hw(conn)
-retired = [r[0] for r in conn.execute("SELECT id FROM retired ORDER BY id")]
-conn.close()
-return {"high_water": hw, "retired": retired, "next": hw + 1,
-"floor": floor, "ceil": ceil}
-
-def _read_live(stream, field):
-"""Read a set of live IDs from a JSON-lines (or bare-integer-lines) stream."""
-live = set()
-for line in stream:
-line = line.strip()
-if not line or line.startswith("#"):
-continue
-try:
-obj = json.loads(line)
-except ValueError:
-raise MintError("live input line is not JSON: %r" % line, 3)
-if isinstance(obj, bool):
-raise MintError("live line is a boolean, not an id: %r" % line, 3)
-if isinstance(obj, int):
-live.add(obj)
-elif isinstance(obj, dict) and field in obj and isinstance(obj[field], int) \
-and not isinstance(obj[field], bool):
-live.add(obj[field])
-else:
-raise MintError(
-"live line has no integer %r field: %r" % (field, line), 3)
-return live
-
-def _emit(obj):
-sys.stdout.write(json.dumps(obj, sort_keys=True) + "\n")
-
-def main(argv=None):
-p = argparse.ArgumentParser(
-prog="mint",
-description="hand out IDs that are never reused, and prove it before returning.")
-p.add_argument("op", choices=["alloc", "peek", "retire"],
-help="alloc: mint new id(s). peek: show state. retire: record an id retired.")
-p.add_argument("--root", default=".mint",
-help="directory holding mint.db (default:.mint)")
-p.add_argument("--floor", type=int, default=100000,
-help="lowest issuable id (default: 100000)")
-p.add_argument("--ceil", type=int, default=999999,
-help="highest issuable id (default: 999999)")
-p.add_argument("-n", "--count", type=int, default=1,
-help="how many ids to mint (alloc only; default 1)")
-p.add_argument("--live", metavar="FILE",
-help="a JSON-lines file (or - for stdin) naming ids held right now")
-p.add_argument("--live-field", default="id",
-help="field carrying the id in --live objects (default: id)")
-p.add_argument("--id", type=int, help="the id to retire (retire only)")
-args = p.parse_args(argv)
-
-if args.floor > args.ceil:
-sys.stderr.write("mint: --floor must be <= --ceil\n")
-return 3
-
-try:
-live = set()
-if args.live:
-if args.live == "-":
-live = _read_live(sys.stdin, args.live_field)
-else:
-with open(args.live, "r", encoding="utf-8") as fh:
-live = _read_live(fh, args.live_field)
-
-if args.op == "peek":
-state = peek(args.root, args.floor, args.ceil)
-state["op"] = "peek"
-_emit(state)
-return 0
-
-if args.op == "alloc":
-if args.count < 1:
-sys.stderr.write("mint: -n must be >= 1\n")
-return 3
-minted, reason = allocate(args.root, live, args.floor, args.ceil, args.count)
-for uid in minted:
-_emit({"op": "alloc", "id": uid})
-if reason is not None:
-sys.stderr.write("mint: %s\n" % reason)
-return 1
-return 0
-
-if args.op == "retire":
-if args.id is None:
-sys.stderr.write("mint: retire needs --id\n")
-return 3
-rec = retire(args.root, args.id, args.floor, args.ceil)
-rec["op"] = "retire"
-_emit(rec)
-return 0
-
-except MintError as exc:
-sys.stderr.write("mint: %s\n" % exc)
-return exc.code
-
-return 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_mint.py 142 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_mint.py — non-vacuous tests for mint.py (SQLite store).
-
-Every test asserts a SPECIFIC behaviour, and the suite carries a mutation check
-(test 12) so a mint that always returned the same id, or never persisted, could
-not pass green. Run: python3 test_mint.py
-
-Updated for the SQLite rewrite (GIFT-001): state now lives in <root>/mint.db and
-is read back through peek() (a fresh DB read), not the retired load_state() JSON
-helper. "Crash-safety" is tested the way the store actually guarantees it — the
-high-water mark is committed to the DB before any id is emitted, so a fresh
-peek() (equivalent to a cold restart re-reading the db) already sees the bumped
-mark.
-"""
-
-import io
-import json
-import os
-import sys
-import tempfile
-
-import mint
-
-FAIL = 0
-
-def ok(cond, msg):
-global FAIL
-print((" ok " if cond else " FAIL ") + msg)
-if not cond:
-FAIL += 1
-
-def run(root, *args, stdin=None):
-"""Invoke main() capturing stdout, return (exit, [parsed json lines])."""
-old_out, old_in = sys.stdout, sys.stdin
-sys.stdout = io.StringIO()
-if stdin is not None:
-sys.stdin = io.StringIO(stdin)
-try:
-code = mint.main(list(args) + ["--root", root])
-out = sys.stdout.getvalue()
-finally:
-sys.stdout, sys.stdin = old_out, old_in
-lines = [json.loads(l) for l in out.splitlines() if l.strip()]
-return code, lines
-
-def main():
-with tempfile.TemporaryDirectory() as d:
-root = os.path.join(d, "m")
-
-# 1. First alloc issues the floor.
-code, lines = run(root, "alloc", "--floor", "100000")
-ok(code == 0 and lines == [{"op": "alloc", "id": 100000}],
-"first alloc issues the floor id (100000) as one JSON-line")
-
-# 2. Monotonic: every subsequent id is strictly greater.
-code, lines = run(root, "alloc", "-n", "3", "--floor", "100000")
-ids = [r["id"] for r in lines]
-ok(code == 0 and ids == [100001, 100002, 100003],
-"next allocs are strictly increasing (100001,2,3) — monotonic")
-
-# 3. Crash-safety: the mark is committed to the DB before emit, so a
-# fresh read (a cold restart re-reading mint.db) already sees it and
-# never re-issues. peek() IS that fresh read.
-st = mint.peek(root, 100000, 999999)
-ok(st["high_water"] == 100003,
-"high-water mark persisted at 100003 (a restart cannot re-issue)")
-code, lines = run(root, "alloc", "--floor", "100000")
-ok(lines[0]["id"] == 100004,
-"an alloc after 'restart' continues from the mark, never repeats")
-
-# 4. peek reports state without issuing.
-code, lines = run(root, "peek", "--floor", "100000")
-ok(code == 0 and lines[0]["high_water"] == 100004 and lines[0]["next"] == 100005,
-"peek shows high_water=100004, next=100005, issuing nothing")
-code2, _ = run(root, "peek", "--floor", "100000")
-st2 = mint.peek(root, 100000, 999999)
-ok(st2["high_water"] == 100004, "peek did not advance the mark (pure read)")
-
-# 5. Gate: range refusal.
-reason = mint.assert_allocatable(50, high_water=40, live=set(), floor=100, ceil=200)
-ok(reason is not None and reason.startswith("E_RANGE"),
-"gate refuses an out-of-range id (E_RANGE)")
-
-# 6. Gate: monotonic refusal (an id at/below the mark).
-reason = mint.assert_allocatable(100, high_water=100, live=set(), floor=1, ceil=999)
-ok(reason is not None and reason.startswith("E_NOT_MONOTONIC"),
-"gate refuses an id at/below the high-water mark (E_NOT_MONOTONIC)")
-
-# 7. Gate: live refusal.
-reason = mint.assert_allocatable(150, high_water=100, live={150}, floor=1, ceil=999)
-ok(reason is not None and reason.startswith("E_LIVE"),
-"gate refuses an id currently held live (E_LIVE)")
-
-# 8. Gate passes for a clean id.
-ok(mint.assert_allocatable(101, high_water=100, live={200}, floor=1, ceil=999) is None,
-"gate passes an in-range, above-mark, not-live id")
-
-# 9. --live from stdin is honoured: an alloc whose next id is declared
-# live must refuse rather than collide.
-root2 = os.path.join(d, "m2")
-run(root2, "alloc", "--floor", "100000") # issues 100000, mark=100000
-# next would be 100001; declare it live -> refusal (exit 1, no output)
-code, lines = run(root2, "alloc", "--floor", "100000",
-"--live", "-", stdin='{"id": 100001}\n')
-ok(code == 1 and lines == [],
-"an alloc whose next id is declared live refuses (exit 1, no output)")
-
-# 10. retire records the id, does not recycle by default.
-code, lines = run(root2, "retire", "--id", "100000", "--floor", "100000")
-ok(code == 0 and lines[0]["retired"] == 100000 and lines[0]["op"] == "retire",
-"retire records the id (and never lowers the mark)")
-st = mint.peek(root2, 100000, 999999)
-ok(100000 in st["retired"] and st["high_water"] == 100000,
-"retire adds to the retired set and never lowers the mark")
-
-# 11. bare-integer live lines are accepted alongside {id:...} objects.
-live = mint._read_live(io.StringIO("5\n{\"id\": 7}\n# c\n\n9\n"), "id")
-ok(live == {5, 7, 9},
-"--live reads both bare ints and {id:...} objects, skips blanks/comments")
-
-# 12. MUTATION CHECK — a mint that ignored the mark (always issued the
-# floor) would fail test 2/3. Prove the suite BITES by running that
-# mutant inline and asserting it diverges from the real monotonic run.
-def broken_allocate(root_, live_, floor_, ceil_, count_):
-# the no-op mutant: never advances the mark, always issues the floor
-return [floor_] * count_, None
-mutant_ids, _ = broken_allocate(root, set(), 100000, 999999, 3)
-real_ids = [100000, 100001, 100002] # what a correct monotonic mint gives
-ok(mutant_ids!= real_ids,
-"mutation check: a mint that never advances the mark DIVERGES from the "
-"monotonic sequence (the suite would catch it)")
-
-print("\n" + ("MINT: %d FAILED" % FAIL if FAIL else "MINT: ALL GREEN"))
-return 1 if FAIL else 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-Take the whole folder →
-MIT
-Python stdlib only, deterministic
-
----
-
-# Palimpsest — a Loop MMT gift
-https://loopmmt.com/gifts/palimpsest/
-[coverage: optional · branch: gifts]
-
-Which Parts of My Prompt Actually Stuck? fold ← all gifts
-
-Palimpsest
-
-You revise a prompt a dozen times — which words actually mattered? Palimpsest takes your successive versions IN ORDER and, for every line, computes how much of the revision history it survived. The lines you kept through every rewrite are the load-bearing CORE; the lines that came and went are CHURN. A line in all N versions has survival 100%; a line in one has survival 1/N. Lower the --core threshold to loosen “load-bearing” (--core 0.5 = present in at least half the versions). Trailing whitespace merges, blank lines drop, output is totally ordered — so the same versions yield the same core, every run. Deterministic, zero dependencies, offline; runs in Node or a browser.
-
-The honest edge
-
-palimpsest measures SURVIVAL, not QUALITY. A line that survived every draft is load-bearing to the author — not thereby correct, good, or necessary. A mistake copied faithfully through every version survives with rate 100% and lands in the core. Persistence is evidence of intent, never of merit. A human reads the core and decides what it means; the tool only makes survival visible and exact.
-
-Run it
-
-node palimpsest.js v1.txt v2.txt v3.txt # core = lines in every version; --core 0.5 loosens; exit 0 clean | 2 input error
-test_palimpsest.js (PASS) + --selftest (6/6: canon idempotence, all-versions→1.0→core, once-per-version presence, threshold monotonicity, trailing-ws merge, render stability)
-Zero dependencies, Node or browser, deterministic
-
-The code — every file that ships
-
-palimpsest.js 265 lines on GitHub →
+gantt-sink.js 270 lines on GitHub →
 #!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* palimpsest.js — layer every version of a text, find the load-bearing core.
+/*
+* gantt-sink — turn (start,end,label) tasks into one standalone, deterministic Gantt SVG, no deps.
+* MIT · zero-dependency · standalone gift · lane: sink (consumes data, emits an artifact).
 *
-* A palimpsest is a manuscript rewritten over an erased earlier one, where the
-* old writing still shows through. Give this tool the successive versions of a
-* prompt (or any text) in order — v1, v2, … vN — and it shows you what showed
-* THROUGH every rewrite: the lines that survived revision after revision (the
-* load-bearing CORE) versus the lines that came and went (CHURN).
+* THE PRINTED EDGE (read before trusting the output):
+* This is a timeline-bar primitive, not a project-management tool. It draws one horizontal
+* <rect> bar per task, top to bottom in INPUT ORDER, inside a plain <svg> frame, with each
+* task's LABEL as one <text> element beside its bar. It renders NO axes, gridlines, tick
+* marks, date labels, dependency arrows, legend, or interactivity, and it embeds NO fonts
+* and NO <script>. Unlike its render-sink siblings, gantt-sink DOES place caller text in the
+* output — the label — so it carries the one injection surface the numbers-only gifts avoid.
+* That surface is closed DELIBERATELY: every label is XML-escaped (& < > " '), so a caller
+* string can NEVER break out of <text> content into markup. Bar colors are NOT free-form
+* input — bars are painted from a fixed, named palette (index = row), so no attacker-chosen
+* attribute string can appear. A non-finite start/end, an end before its start, or a
+* non-string label is a HARD ERROR, never silently dropped or guessed. Output is a PURE
+* FUNCTION of the input: same tasks in → byte-identical SVG out.
 *
-* v1.txt v2.txt … vN.txt ──▶ layer(versions)
-* ──▶ { core:[…], churn:[…], survival:{line→rate}}
+* USAGE:
+* printf '[0,3,"design"]\n[2,5,"build"]\n' | node gantt-sink.js # two-row timeline
+* printf '{"start":0,"end":4,"label":"spec"}\n' | node gantt-sink.js # object tasks
+* echo '{"tasks":[[0,2,"a"],[1,4,"b"]],"palette":"cool"}' | node gantt-sink.js
+* node gantt-sink.js --help
 *
-* WHAT IT MEASURES. For each distinct line, its SURVIVAL RATE = (number of
-* versions the line appears in) / (number of versions). A line present in all N
-* versions has survival 1.0; a line in one version has survival 1/N. The CORE is
-* every line whose survival ≥ a threshold (default 1.0 — present in ALL versions);
-* CHURN is the rest. Lower the threshold with --core to loosen "load-bearing"
-* (e.g. --core 0.5 = present in at least half the versions).
+* INPUT (stdin): either
+* - JSONL — one task per line, each `[start,end,label]` or `{"start":S,"end":E,"label":"…"}`
+* - a single JSON spec object { tasks, min, max, width, row, pad, palette}
+* start,end are finite numbers (timeline positions, end >= start); label is a STRING.
+* CLI flags (--width --row --pad --min --max --palette) OVERRIDE object fields.
 *
-* DETERMINISM (the promise, and the self-test that proves it). A line is keyed by
-* its canonical form (trimmed of trailing whitespace; interior preserved). Output
-* is sorted — core and churn each by descending survival then by the line's first
-* appearance (the version index it entered), so the result is a pure function of
-* the inputs: same versions, same bytes, every run. `--selftest` proves the key is
-* idempotent and the layering is stable.
+* OUTPUT (stdout): one SVG document string (UTF-8), trailing newline. No tasks → an empty frame.
 *
-* THE LINE IT WILL NOT CROSS (the honest ceiling — printed every --help/--list).
-* palimpsest measures SURVIVAL, not QUALITY. A line that survived every draft is
-* load-bearing to the AUTHOR — it is not thereby correct, good, or necessary. A
-* mistake copied faithfully through every version survives with rate 1.0 and lands
-* in the core. Persistence is evidence of intent, never of merit. A human reads
-* the core and decides what it means; the tool only makes survival visible and exact.
-*
-* EXIT CODES (analysis convention, gate-friendly).
-* 0 ran clean — a survival map was produced (this is the normal result; unlike a
-* two-file diff there is no "they differ" state — an N-version fold always
-* yields a map).
-* 2 input could not be used (fewer than one version, a missing/unreadable/
-* directory path, or a --core outside [0,1]) — always a clean one-line
-* message, never a stack trace.
-*
-* Runs identically in Node and in a browser (no DOM, no deps). MIT.
+* DETERMINISM: fixed 3-decimal coordinate precision, stable attribute order, rows emitted in
+* input order, bar color indexed by row from a fixed palette, every label XML-escaped. No
+* wall-clock, no randomness. Same tasks → same bytes, in Node or a browser.
+* PORTABILITY: pure JS on plain arrays/strings — identical in Node and the browser.
 */
-
 'use strict';
 
-var CEILING =
-'ceiling: palimpsest measures SURVIVAL, not QUALITY. A line that survived every\n' +
-' draft is load-bearing to the author — not thereby correct, good, or necessary.\n' +
-' A mistake copied through every version survives too. A human reads the core.';
+// ---- palettes (the ONLY source of bar color; no free-form color input) ----------
+var PALETTES = {
+loop: ['#2f6f8f', '#c25b3a', '#4a8a52', '#8a6d3b', '#6d4a8a', '#3b6d8a'],
+mono: ['#111111', '#555555', '#999999', '#bbbbbb'],
+warm: ['#c25b3a', '#d98a3a', '#b23b3b', '#8a5a2b'],
+cool: ['#2f6f8f', '#4a8a8a', '#3b5a8a', '#5a6d8a']
+};
+var TEXT_FILL = '#111111'; // fixed label color, never caller input
+var FONT_SIZE = 11; // fixed label size (a number, not an embedded font)
+var DEFAULTS = { width: 204, row: 20, pad: 2, palette: 'loop'};
 
-/* ---- canonical form of a line (idempotent) --------------------------------
-* Trailing whitespace is churn no reader intends; interior whitespace is content.
-* Trimming only the end makes canon(canon(x)) === canon(x). We do NOT lowercase
-* or collapse interior space: two lines that differ in real content are different
-* lines, and that is exactly the signal we are counting.
-*/
-function canonLine(s) {
-return String(s).replace(/[ \t\r]+$/, '');
-}
-
-/* Split a version's raw text into canonical lines. Blank lines are dropped: an
-* empty line is layout, not content, and counting it would let indentation churn
-* masquerade as a surviving core line. */
-function linesOf(raw) {
-var out = [];
-var parts = String(raw).split('\n');
-for (var i = 0; i < parts.length; i++) {
-var c = canonLine(parts[i]);
-if (c.length > 0) out.push(c);
-}
-return out;
+// ---- deterministic number formatting (verbatim from svg-sink) -------------------
+var PRECISION = 3, SCALE = 1000;
+function num(x) {
+var r = Math.round(x * SCALE) / SCALE;
+var s = r.toFixed(PRECISION);
+s = s.replace(/\.?0+$/, '');
+return (s === '' || s === '-0')? '0': s;
 }
 
-/* ---- the fold -------------------------------------------------------------
-* versions: array of raw strings, in chronological order (v1 … vN).
-* opts.core: survival threshold in [0,1] for a line to count as CORE (default 1.0).
-* Returns { n, core:[{line,survival,enteredAt}], churn:[…], survival:{line:rate}}.
-* A line is counted ONCE PER VERSION (presence, not frequency): a line repeated
-* three times in v2 still contributes a single "present in v2". Survival is about
-* persistence across versions, not repetition within one.
-*/
-function layer(versions, opts) {
-opts = opts || {};
-var threshold = (opts.core === undefined || opts.core === null)? 1.0: opts.core;
-var n = versions.length;
-// presence[line] = set of version indices it appears in; firstSeen[line] = min index.
-var presence = Object.create(null);
-var firstSeen = Object.create(null);
-for (var v = 0; v < n; v++) {
-var seenThisVersion = Object.create(null);
-var ls = linesOf(versions[v]);
-for (var j = 0; j < ls.length; j++) {
-var line = ls[j];
-if (seenThisVersion[line]) continue; // count once per version
-seenThisVersion[line] = true;
-if (!presence[line]) { presence[line] = 0; firstSeen[line] = v;}
-presence[line] += 1;
-}
-}
-var survival = Object.create(null);
-var rows = [];
-var keys = Object.keys(presence);
-for (var k = 0; k < keys.length; k++) {
-var ln = keys[k];
-var rate = presence[ln] / n;
-survival[ln] = rate;
-rows.push({ line: ln, survival: rate, enteredAt: firstSeen[ln]});
-}
-// Deterministic order: survival desc, then enteredAt asc, then line asc (total order).
-rows.sort(function (a, b) {
-if (b.survival!== a.survival) return b.survival - a.survival;
-if (a.enteredAt!== b.enteredAt) return a.enteredAt - b.enteredAt;
-return a.line < b.line? -1: (a.line > b.line? 1: 0);
-});
-var core = [], churn = [];
-for (var r = 0; r < rows.length; r++) {
-(rows[r].survival >= threshold? core: churn).push(rows[r]);
-}
-return { n: n, core: core, churn: churn, survival: survival};
+// ---- XML escaping — THE deliberate injection surface, closed here ----------------
+// Every caller label passes through this before entering <text> content. Order matters:
+// the ampersand is replaced FIRST so the entities introduced below are not double-escaped.
+function xmlEscape(s) {
+return String(s)
+.replace(/&/g, '&amp;')
+.replace(/</g, '&lt;')
+.replace(/>/g, '&gt;')
+.replace(/"/g, '&quot;')
+.replace(/'/g, '&#39;');
 }
 
-/* ---- rendering (deterministic text report) -------------------------------- */
-function render(result) {
-var out = [];
-out.push('palimpsest — ' + result.n + ' version' + (result.n === 1? '': 's') + ' layered');
-out.push('');
-out.push('CORE (load-bearing — survived the threshold):');
-if (result.core.length === 0) {
-out.push(' (none)');
+// ---- validation helpers --------------------------------------------------------
+function finiteNum(v, i, which) {
+if (typeof v!== 'number' ||!isFinite(v)) {
+throw new Error('task[' + i + '] ' + which + ' is not a finite number: ' + JSON.stringify(v));
+}
+return v;
+}
+function posInt(v, dflt, name) {
+if (v == null) return dflt;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n <= 0) throw new Error(name + ' must be a positive integer, got ' + JSON.stringify(v));
+return n;
+}
+function numOrThrow(v, name) {
+var n = Number(v);
+if (typeof n!== 'number' ||!isFinite(n)) throw new Error(name + ' must be a finite number, got ' + JSON.stringify(v));
+return n;
+}
+
+// ---- one task -> {start,end,label} (accepts [start,end,label] or {start,end,label}) ----
+function asTask(raw, i) {
+var start, end, label;
+if (Array.isArray(raw)) {
+if (raw.length!== 3) throw new Error('task[' + i + '] array must be [start,end,label] (3 fields), got ' + JSON.stringify(raw));
+start = raw[0]; end = raw[1]; label = raw[2];
+} else if (raw && typeof raw === 'object') {
+if (!('start' in raw) ||!('end' in raw) ||!('label' in raw)) throw new Error('task[' + i + '] object must have start,end,label, got ' + JSON.stringify(raw));
+start = raw.start; end = raw.end; label = raw.label;
 } else {
-for (var i = 0; i < result.core.length; i++) {
-out.push(' ' + pct(result.core[i].survival) + ' ' + result.core[i].line);
+throw new Error('task[' + i + '] must be [start,end,label] or {start,end,label}, got ' + JSON.stringify(raw));
+}
+finiteNum(start, i, 'start'); finiteNum(end, i, 'end');
+if (end < start) throw new Error('task[' + i + '] end (' + end + ') is before start (' + start + ')');
+if (typeof label!== 'string') throw new Error('task[' + i + '] label must be a string, got ' + JSON.stringify(label));
+return { start: start, end: end, label: label};
+}
+
+// ---- scale (shared timeline domain across all tasks) ---------------------------
+function domain(tasks, min, max) {
+var lo = (min!= null)? Number(min): Infinity;
+var hi = (max!= null)? Number(max): -Infinity;
+if (min == null || max == null) {
+for (var i = 0; i < tasks.length; i++) {
+if (min == null && tasks[i].start < lo) lo = tasks[i].start;
+if (max == null && tasks[i].end > hi) hi = tasks[i].end;
 }
 }
-out.push('');
-out.push('CHURN (came and went):');
-if (result.churn.length === 0) {
-out.push(' (none)');
+if (!isFinite(lo)) lo = 0;
+if (!isFinite(hi)) hi = 0;
+if (lo === hi) { lo -= 1; hi += 1;} // all-instant tasks -> unit window, never a divide-by-0
+return { lo: lo, hi: hi};
+}
+
+// ---- input normalization -------------------------------------------------------
+function normalize(input, flags) {
+var spec = {};
+var tasksRaw;
+if (input &&!Array.isArray(input) && typeof input === 'object') {
+tasksRaw = input.tasks;
+if (input.min!= null) spec.min = input.min;
+if (input.max!= null) spec.max = input.max;
+if (input.width!= null) spec.width = input.width;
+if (input.row!= null) spec.row = input.row;
+if (input.pad!= null) spec.pad = input.pad;
+if (input.palette!= null) spec.palette = input.palette;
 } else {
-for (var j = 0; j < result.churn.length; j++) {
-out.push(' ' + pct(result.churn[j].survival) + ' ' + result.churn[j].line);
+tasksRaw = input;
 }
+flags = flags || {};
+for (var k in flags) if (flags[k]!= null) spec[k] = flags[k];
+
+if (tasksRaw == null) tasksRaw = [];
+if (!Array.isArray(tasksRaw)) throw new Error('input has no tasks (expected [[start,end,label],...] or a {tasks:...} object)');
+spec.tasks = tasksRaw.map(asTask);
+spec.width = posInt(spec.width, DEFAULTS.width, 'width');
+spec.row = posInt(spec.row, DEFAULTS.row, 'row');
+spec.pad = (spec.pad!= null)? posIntOrZero(spec.pad, 'pad'): DEFAULTS.pad;
+spec.palette = (spec.palette!= null)? String(spec.palette): DEFAULTS.palette;
+if (spec.min!= null) spec.min = numOrThrow(spec.min, 'min');
+if (spec.max!= null) spec.max = numOrThrow(spec.max, 'max');
+if (spec.min!= null && spec.max!= null && spec.min >= spec.max) {
+throw new Error('min must be < max (got min=' + spec.min + ', max=' + spec.max + ')');
 }
-return out.join('\n');
+if (!PALETTES[spec.palette]) throw new Error('unknown palette "' + spec.palette + '" (expected ' + Object.keys(PALETTES).join(' | ') + ')');
+if (spec.width <= 2 * spec.pad) throw new Error('width too small for pad (need width > 2*pad)');
+return spec;
+}
+function posIntOrZero(v, name) {
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n < 0) throw new Error(name + ' must be a non-negative integer, got ' + JSON.stringify(v));
+return n;
 }
 
-function pct(rate) {
-// Fixed-width, deterministic: "100%", " 50%", " 33%". Integer floor of rate*100,
-// right-justified to 3 cols, plus '%'. Rounding is not used (would be locale-free
-// but still add ambiguity at.5); floor is exact and stable.
-var p = Math.floor(rate * 100 + 1e-9);
-var s = String(p);
-while (s.length < 3) s = ' ' + s;
-return s + '%';
+// ---- core: renderGantt(spec) -> string (pure, the whole gift) ------------------
+function gantt(input, flags) {
+var spec = normalize(input, flags);
+var tasks = spec.tasks, W = spec.width, rowH = spec.row, pad = spec.pad;
+var n = tasks.length;
+var H = 2 * pad + n * rowH;
+var innerW = W - 2 * pad;
+var pal = PALETTES[spec.palette];
+var dom = domain(tasks, spec.min, spec.max);
+function X(t) { return pad + ((t - dom.lo) / (dom.hi - dom.lo)) * innerW;}
+
+var body = [];
+for (var i = 0; i < n; i++) { // rows in INPUT ORDER (a gantt is an ordered list)
+var t = tasks[i];
+var rowTop = pad + i * rowH;
+var x = X(t.start), w = X(t.end) - X(t.start);
+var barY = rowTop + 3, barH = rowH - 6;
+var color = pal[i % pal.length];
+body.push('<rect x="' + num(x) + '" y="' + num(barY) + '" width="' + num(w) +
+'" height="' + num(barH) + '" fill="' + color + '" />');
+// the label — THE injection surface — escaped before it enters <text> content.
+body.push('<text x="' + num(x + 2) + '" y="' + num(rowTop + rowH - 6) +
+'" font-size="' + FONT_SIZE + '" fill="' + TEXT_FILL + '">' + xmlEscape(t.label) + '</text>');
 }
 
-/* ---- self-test (proves the promises) -------------------------------------- */
-function selftest() {
-var fail = [];
-// 1. canon idempotence
-var samples = ['a', 'a ', ' keep interior ', 'tab\there\t', ''];
-for (var i = 0; i < samples.length; i++) {
-var once = canonLine(samples[i]);
-if (canonLine(once)!== once) fail.push('canon not idempotent on ' + JSON.stringify(samples[i]));
-}
-// 2. a line in all versions has survival 1.0 and lands in the default core
-var vs = ['keep\ndrop1', 'keep\ndrop2', 'keep\ndrop3'];
-var res = layer(vs, {});
-if (!(res.survival['keep'] === 1.0)) fail.push('all-versions line survival!= 1.0');
-if (!(res.core.length === 1 && res.core[0].line === 'keep')) fail.push('core is not exactly [keep]');
-if (res.churn.length!== 3) fail.push('churn count!= 3');
-// 3. layering is stable: same inputs -> byte-identical render
-if (render(layer(vs, {}))!== render(layer(vs, {}))) fail.push('render not stable across runs');
-// 4. presence counted once per version (repetition within a version does not inflate survival)
-var rep = layer(['x\nx\nx', 'y'], {});
-if (rep.survival['x']!== 0.5) fail.push('within-version repetition inflated survival');
-// 5. threshold loosening moves lines from churn to core monotonically
-var loose = layer(vs, { core: 0.0});
-if (loose.churn.length!== 0) fail.push('core 0.0 left churn nonempty');
-// 6. trailing whitespace is not a distinct line (canon merge)
-var ws = layer(['line \nline', 'line'], {});
-if (Object.keys(ws.survival).length!== 1) fail.push('trailing-ws produced a distinct line');
-return fail;
+var open = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '">';
+return open + '\n' + (body.length? body.join('\n') + '\n': '') + '</svg>\n';
 }
 
-/* ---- CLI ------------------------------------------------------------------ */
-function fail2(msg) {
-process.stderr.write('palimpsest: ' + msg + '\n');
-process.exit(2);
+// ---- exports (browser attach · require · direct run) ---------------------------
+if (typeof window!== 'undefined') {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts['gantt-sink'] = { gantt: gantt, PALETTES: PALETTES, xmlEscape: xmlEscape};
 }
-
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf('--help')!== -1 || args.indexOf('-h')!== -1) {
-process.stdout.write(usage() + '\n\n' + CEILING + '\n');
-return 0;
-}
-if (args.indexOf('--list')!== -1) {
-process.stdout.write(CEILING + '\n');
-return 0;
-}
-if (args.indexOf('--selftest')!== -1) {
-var fails = selftest();
-if (fails.length === 0) { process.stdout.write('selftest: OK (6 checks)\n'); return 0;}
-process.stderr.write('selftest: FAIL\n ' + fails.join('\n ') + '\n');
-process.exit(1);
-}
-// parse --core <t> and collect file paths
-var threshold = 1.0, paths = [], i;
-for (i = 0; i < args.length; i++) {
-if (args[i] === '--core') {
-var t = parseFloat(args[i + 1]);
-if (isNaN(t) || t < 0 || t > 1) fail2('--core must be a number in [0,1]');
-threshold = t; i++;
-} else if (args[i].charAt(0) === '-') {
-fail2('unknown option: ' + args[i]);
-} else {
-paths.push(args[i]);
-}
-}
-if (paths.length < 1) fail2('need at least one version file (give them in order v1 … vN)');
-var fs = require('fs');
-var versions = [];
-for (i = 0; i < paths.length; i++) {
-var raw;
-try {
-var st = fs.statSync(paths[i]);
-if (st.isDirectory()) fail2('is a directory, not a file: ' + paths[i]);
-raw = fs.readFileSync(paths[i], 'utf8');
-} catch (e) {
-fail2('cannot read ' + paths[i] + ' (' + (e && e.code? e.code: 'unreadable') + ')');
-}
-versions.push(raw);
-}
-var result = layer(versions, { core: threshold});
-process.stdout.write(render(result) + '\n');
-return 0;
-}
-
-function usage() {
-return [
-'palimpsest — layer every version of a text, find the load-bearing core vs churn.',
-'',
-'usage: palimpsest [--core <t>] <v1> <v2>... <vN>',
-' palimpsest --selftest',
-'',
-' <v1> … <vN> version files IN ORDER (oldest first). At least one.',
-' --core <t> survival threshold in [0,1] for CORE (default 1.0 = in every version).',
-' --selftest prove the canon is idempotent and the layering is stable.',
-' --help this message. --list the ceiling only.',
-'',
-'Each line\'s SURVIVAL RATE = (versions it appears in) / (number of versions).',
-'CORE = survival ≥ threshold; CHURN = the rest. Output is sorted, deterministic.'
-].join('\n');
-}
-
-/* Dual use: CLI when run directly, library when required (Node or browser). */
 if (typeof module!== 'undefined' && module.exports) {
-module.exports = { layer: layer, canonLine: canonLine, linesOf: linesOf, render: render, selftest: selftest};
-}
-if (typeof require!== 'undefined' && require.main === module) {
-main(process.argv);
+module.exports = { gantt: gantt, num: num, normalize: normalize, domain: domain, xmlEscape: xmlEscape, PALETTES: PALETTES, TEXT_FILL: TEXT_FILL};
 }
 
-test_palimpsest.js 97 lines on GitHub →
+// ---- cli -----------------------------------------------------------------------
+var HELP =
+'gantt-sink — (start,end,label) tasks -> a standalone, deterministic Gantt SVG, zero deps.\n\n' +
+" printf '[0,3,\"design\"]\\n[2,5,\"build\"]\\n' | node gantt-sink.js\n" +
+" printf '{\"start\":0,\"end\":4,\"label\":\"spec\"}\\n' | node gantt-sink.js\n" +
+" echo '{\"tasks\":[[0,2,\"a\"],[1,4,\"b\"]]}' | node gantt-sink.js --palette cool\n\n" +
+'INPUT (stdin): JSONL of [start,end,label] or {start,end,label} tasks (one per line), OR a\n' +
+'{tasks,...} spec object. Flags (override object fields): --width N --row N --pad N\n' +
+' --min N --max N --palette loop|mono|warm|cool\n\n' +
+'One <rect> bar + one <text> label per task, in input order; no axes/dates/arrows/legend. Bar\n' +
+'colors come from a fixed named palette (not caller input). Labels are XML-escaped — caller text\n' +
+'can never break out of markup. Non-finite start/end, end<start, or a non-string label -> error.\n';
+
+function parseFlags(argv) {
+var f = {};
+for (var i = 0; i < argv.length; i++) {
+var a = argv[i];
+if (a === '--width') f.width = Number(argv[++i]);
+else if (a === '--row') f.row = Number(argv[++i]);
+else if (a === '--pad') f.pad = Number(argv[++i]);
+else if (a === '--min') f.min = Number(argv[++i]);
+else if (a === '--max') f.max = Number(argv[++i]);
+else if (a === '--palette') f.palette = argv[++i];
+}
+return f;
+}
+
+function parseStdin(raw) {
+var trimmed = raw.trim();
+if (trimmed === '') return { tasks: []};
+if (trimmed.charAt(0) === '{') {
+try {
+var obj = JSON.parse(trimmed);
+if (obj &&!Array.isArray(obj) && typeof obj === 'object' && 'tasks' in obj) return obj;
+} catch (e) { /* fall through to JSONL */}
+}
+var tasks = [];
+var lines = trimmed.split('\n');
+for (var i = 0; i < lines.length; i++) {
+var ln = lines[i].trim();
+if (ln === '') continue;
+var task;
+try { task = JSON.parse(ln);}
+catch (e) { throw new Error('line ' + (i + 1) + ' is not valid JSON: ' + e.message);}
+tasks.push(task);
+}
+return { tasks: tasks};
+}
+
+function main() {
+var argv = process.argv.slice(2);
+if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) { process.stdout.write(HELP); return;}
+var flags = parseFlags(argv);
+var chunks = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (d) { chunks += d;});
+process.stdin.on('end', function () {
+var input;
+try { input = parseStdin(chunks);}
+catch (e) { process.stderr.write('gantt-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+var svg;
+try { svg = gantt(input, flags);}
+catch (e) { process.stderr.write('gantt-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+process.stdout.write(svg);
+});
+}
+if (typeof require!== 'undefined' && require.main === module) { main();}
+
+test_gantt-sink.js 134 lines on GitHub →
 #!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* test_palimpsest.js — external battery for palimpsest.js.
+/*
+* test_gantt-sink.js — drift-check battery for the gantt-sink gift.
 *
-* Proves the survival fold, the canon, determinism, and the CLI contract. Run:
-* node test_palimpsest.js
-* Exit 0 = all pass; exit 1 = a failure (with the count). This battery is
-* external (require's the gift, does not reach inside it) so a mutation to the
-* gift's logic is caught here — the "bite." Verify the bite: break a line in
-* palimpsest.js and this battery goes RED.
+* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The expected SVG documents below are hand-computed
+* from the documented math — xScale(t) = pad + (t-lo)/(hi-lo)*innerW (W=204, pad=2, innerW=200,
+* rowH=20), rows in input order, bar color = PALETTES.loop[row], label XML-escaped — written
+* independently of the emitter, not captured from its output. A build cannot certify itself, so
+* the expected strings are the author's fact. The escaping vector is the CHAR-OF-THIS-GIFT: the
+* one caller-text surface, closed by xmlEscape; a <script>/<b> label must appear ONLY as escaped
+* entities, never as raw markup.
+*
+* Run: node test_gantt-sink.js (exit 0 = all pass; nonzero = a named failure)
 */
 'use strict';
-var P = require('./palimpsest.js');
-var fails = [];
-function check(name, cond) { if (!cond) fails.push(name);}
-function eq(name, a, b) { if (a!== b) fails.push(name + ' (got ' + JSON.stringify(a) + ', want ' + JSON.stringify(b) + ')');}
+const assert = require('assert');
+const { gantt} = require('./gantt-sink.js');
 
-/* --- survival math --- */
-var r = P.layer(['keep\na', 'keep\nb', 'keep\nc'], {});
-eq('survival: all-versions line is 1.0', r.survival['keep'], 1.0);
-eq('survival: one-version line is 1/3', r.survival['a'], 1 / 3);
-eq('core default: exactly one core line', r.core.length, 1);
-eq('core default: the survivor', r.core[0].line, 'keep');
-eq('churn default: three churn lines', r.churn.length, 3);
-
-/* --- threshold behavior --- */
-var half = P.layer(['x\ny', 'x\nz', 'w\nx'], { core: 0.5});
-check('core 0.5: x (3/3) in core', half.core.some(function (o) { return o.line === 'x';}));
-check('core 0.5: y (1/3) not in core',!half.core.some(function (o) { return o.line === 'y';}));
-var none = P.layer(['a', 'b'], { core: 0.0});
-eq('core 0.0: no churn', none.churn.length, 0);
-var allT = P.layer(['a', 'b'], { core: 1.0});
-eq('core 1.0: nothing survives disjoint versions', allT.core.length, 0);
-
-/* --- presence counted once per version (not frequency) --- */
-var rep = P.layer(['x\nx\nx\nx', 'y'], {});
-eq('once-per-version: repeated x is still 1/2', rep.survival['x'], 0.5);
-
-/* --- canon --- */
-eq('canon: idempotent', P.canonLine(P.canonLine('a ')), P.canonLine('a '));
-eq('canon: trailing ws trimmed', P.canonLine('a\t '), 'a');
-eq('canon: interior ws preserved', P.canonLine('a b'), 'a b');
-var ws = P.layer(['line \nline', 'line'], {});
-eq('canon: trailing-ws is not a distinct line', Object.keys(ws.survival).length, 1);
-
-/* --- blank lines dropped --- */
-var blanks = P.layer(['real\n\n\n', 'real'], {});
-eq('blank lines dropped: only real counted', Object.keys(blanks.survival).length, 1);
-
-/* --- determinism: render stable, order total --- */
-var vs = ['tie\nsame', 'tie\nsame'];
-eq('render: stable across runs', P.render(P.layer(vs, {})), P.render(P.layer(vs, {})));
-// total order under a survival tie: two lines same survival + same enteredAt -> sorted by line
-var tie = P.layer(['bbb\naaa'], {});
-check('total order: alpha tiebreak', tie.core[0].line === 'aaa' && tie.core[1].line === 'bbb');
-
-/* --- ordering: core sorted by survival desc --- */
-var ord = P.layer(['p\nq', 'p\nr', 'p\ns'], { core: 0.0});
-eq('order: highest survival first', ord.churn.length + ord.core.length, 4);
-eq('order: p first (survival 1.0)', ord.core[0].line, 'p');
-
-/* --- selftest passes internally --- */
-eq('internal selftest clean', P.selftest().length, 0);
-
-/* --- CLI contract via subprocess (exit codes, ceiling in help) --- */
-var cp = require('child_process');
-var path = require('path');
-var GIFT = path.join(__dirname, 'palimpsest.js');
-function run(args) {
-var res = cp.spawnSync('node', [GIFT].concat(args), { encoding: 'utf8'});
-return { code: res.status, out: (res.stdout || '') + (res.stderr || '')};
+let n = 0, passed = 0;
+function check(name, fn) {
+n++;
+try { fn(); passed++; console.log(' ok ' + name);}
+catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
 }
-var fs = require('fs');
-var t1 = path.join(require('os').tmpdir(), 'palimp_t1_' + process.pid + '.txt');
-var t2 = path.join(require('os').tmpdir(), 'palimp_t2_' + process.pid + '.txt');
-fs.writeFileSync(t1, 'core\ndrop1\n');
-fs.writeFileSync(t2, 'core\ndrop2\n');
-eq('CLI: clean run exits 0', run([t1, t2]).code, 0);
-eq('CLI: missing file exits 2', run(['/no/such/palimpsest/file']).code, 2);
-eq('CLI: bad --core exits 2', run(['--core', '9', t1]).code, 2);
-eq('CLI: no args exits 2', run([]).code, 2);
-eq('CLI: --selftest exits 0', run(['--selftest']).code, 0);
-var help = run(['--help']);
-check('CLI: --help prints ceiling (stdout+stderr scanned)', /ceiling: palimpsest measures SURVIVAL/.test(help.out));
-var list = run(['--list']);
-check('CLI: --list prints ceiling', /ceiling: palimpsest measures SURVIVAL/.test(list.out));
-try { fs.unlinkSync(t1); fs.unlinkSync(t2);} catch (e) {}
 
-/* --- report --- */
-if (fails.length === 0) {
-console.log('test_palimpsest: PASS (all checks)');
-process.exit(0);
-} else {
-console.error('test_palimpsest: FAIL (' + fails.length + ')');
-fails.forEach(function (f) { console.error(' - ' + f);});
-process.exit(1);
-}
+// loop palette: #2f6f8f #c25b3a #4a8a52 #8a6d3b #6d4a8a #3b6d8a; text #111111; font-size 11
+const TWO =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 204 44" width="204" height="44">\n' +
+'<rect x="2" y="5" width="120" height="14" fill="#2f6f8f" />\n' +
+'<text x="4" y="16" font-size="11" fill="#111111">design</text>\n' +
+'<rect x="82" y="25" width="120" height="14" fill="#c25b3a" />\n' +
+'<text x="84" y="36" font-size="11" fill="#111111">build</text>\n' +
+'</svg>\n';
+
+// 1 — two tasks: auto-domain [0,5] -> xScale(t)=2+t*40; rows in input order, palette by row.
+check('two tasks: [[0,3,design],[2,5,build]] -> ordered bars + labels', () => {
+assert.strictEqual(gantt({ tasks: [[0,3,"design"],[2,5,"build"]]}), TWO);
+});
+
+// 2 — THE escaping probe: a hostile label renders ONLY as entities, never as raw markup.
+check('escaping: label <b>&"\' -> entities only, no raw markup', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 204 24" width="204" height="24">\n' +
+'<rect x="2" y="5" width="200" height="14" fill="#2f6f8f" />\n' +
+'<text x="4" y="16" font-size="11" fill="#111111">&lt;b&gt;&amp;&quot;&#39;</text>\n' +
+'</svg>\n';
+const out = gantt({ tasks: [[0,1,"<b>&\"'"]]});
+assert.strictEqual(out, exp);
+// security assertions: no raw label markup leaks into the output.
+assert.ok(!out.includes('<b>'), 'raw <b> must never appear');
+assert.ok(out.includes('&lt;b&gt;'), 'label < > must be escaped');
+});
+
+// 2b — a <script> label cannot break out (defense-in-depth, the classic attack).
+check('escaping: <script> label never appears as a real tag', () => {
+const out = gantt({ tasks: [[0,1,"<script>alert(1)</script>"]]});
+assert.ok(!out.includes('<script'), 'no raw <script tag');
+assert.ok(out.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), 'script label fully escaped');
+});
+
+// 3 — milestone (start==end): flat window -> zero-width bar, no divide-by-0.
+check('milestone: [[2,2,ship]] -> zero-width bar centered', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 204 24" width="204" height="24">\n' +
+'<rect x="102" y="5" width="0" height="14" fill="#2f6f8f" />\n' +
+'<text x="104" y="16" font-size="11" fill="#111111">ship</text>\n' +
+'</svg>\n';
+assert.strictEqual(gantt({ tasks: [[2,2,"ship"]]}), exp);
+});
+
+// 4 — empty input -> a valid, empty frame (height = 2*pad).
+check('empty: {tasks:[]} -> empty <svg> frame', () => {
+assert.strictEqual(gantt({ tasks: []}),
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 204 4" width="204" height="4">\n</svg>\n');
+});
+
+// 5 — pinned domain + object-form task render identically to the array form.
+check('pinned + object task: {start,end,label} on [0,4]', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 204 24" width="204" height="24">\n' +
+'<rect x="2" y="5" width="100" height="14" fill="#2f6f8f" />\n' +
+'<text x="4" y="16" font-size="11" fill="#111111">a</text>\n' +
+'</svg>\n';
+assert.strictEqual(gantt({ tasks: [{start:0,end:2,label:"a"}], min:0, max:4}), exp);
+});
+
+// 6 — empty label string is allowed (an empty <text> element).
+check('empty label -> empty <text> element', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 204 24" width="204" height="24">\n' +
+'<rect x="2" y="5" width="200" height="14" fill="#2f6f8f" />\n' +
+'<text x="4" y="16" font-size="11" fill="#111111"></text>\n' +
+'</svg>\n';
+assert.strictEqual(gantt({ tasks: [[0,1,""]]}), exp);
+});
+
+// 7 — determinism: same tasks -> byte-identical output, twice.
+check('determinism: repeated render is byte-identical', () => {
+const t = { tasks: [[0,2,"a"],[1,5,"b"],[3,4,"c"]]};
+assert.strictEqual(gantt(t), gantt(t));
+});
+
+// 8 — non-finite start/end is a hard, named error.
+check('non-finite start/end throws, naming the task', () => {
+assert.throws(() => gantt({ tasks: [[NaN,1,"a"]]}), /task\[0\] start is not a finite number/);
+assert.throws(() => gantt({ tasks: [[0,Infinity,"a"]]}), /task\[0\] end is not a finite number/);
+});
+
+// 9 — end before start is a hard, named error (an inverted task, never silently swapped).
+check('end<start throws', () => {
+assert.throws(() => gantt({ tasks: [[3,1,"a"]]}), /task\[0\] end \(1\) is before start \(3\)/);
+});
+
+// 10 — a non-string label throws (a label must be text, never a coerced number/object).
+check('non-string label throws', () => {
+assert.throws(() => gantt({ tasks: [[0,1,5]]}), /task\[0\] label must be a string/);
+assert.throws(() => gantt({ tasks: [[0,1,{}]]}), /label must be a string/);
+});
+
+// 11 — unknown palette throws (never a silent fallback).
+check('unknown palette throws', () => {
+assert.throws(() => gantt({ tasks: [[0,1,"a"]], palette: "nope"}), /unknown palette/);
+});
+
+// 12 — mutation bite (non-vacuity): a wrong-color SVG is rejected.
+check('mutation bite: a wrong-color SVG is rejected', () => {
+const wrong = TWO.replace('fill="#c25b3a"', 'fill="#4a8a52"');
+const got = gantt({ tasks: [[0,3,"design"],[2,5,"build"]]});
+assert.strictEqual(got, TWO);
+assert.notStrictEqual(got, wrong);
+});
+
+console.log('\n' + passed + '/' + n + ' passed');
+if (passed!== n) process.exit(1);
 
 Take the whole folder →
 MIT
-Zero dependencies, Node or browser, deterministic
-
----
-
-# Parity — a Loop MMT gift
-https://loopmmt.com/gifts/parity/
-[coverage: optional · branch: gifts]
-
-Parity Matrix, Gaps Surfaced fold ← all gifts
-
-Parity
-
-Compare N sibling things against a shared checklist and see exactly where they disagree. Reads a small JSON description of your things and each one's declared marks, joins them on a normalized key so trivial spelling differences collapse to one row, and folds the whole thing into a HAS/LACKS grid: rows are the checklist (the self-building union of every mark any thing declares), columns are your things. The rows where they disagree fall out as the gap list — the whole reason you looked.
-
-The honest edge
-
-HAS means exactly one thing: a mark normalizing to this key was DECLARED for this thing — never that the feature works or behaves like the next column's. Parity is a presence fold, not a behavior test; every cell carries predicate 'declared-present', and any row where two or more things HAS a mark is flagged needs-behavior-check. It surfaces where declarations disagree; it does not verify the declarations are true.
-
-Run it
-
-python3 parity.py spec.json
-test_parity.py (33/33, mutation-bitten, pinned structural golden)
-Python stdlib only, deterministic
-
-The code — every file that ships
-
-parity.py 275 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""parity.py — compare N sibling things against a shared checklist.
-
-Give it several things that are *supposed* to match — three services that should
-all expose the same endpoints, four config files that should carry the same keys,
-five components that should each implement the same set of features — and parity
-folds them into one table: rows are the checklist items, columns are the things,
-each cell says HAS or LACKS. The rows where they *don't* all agree fall out for
-free as the gap list, which is the whole reason you ran it.
-
-WHAT IT IS, HONESTLY
---------------------
-parity reads a small JSON description of your things and the marks each one
-declares, and it joins them on a **normalized key** so trivial spelling
-differences (``Compose`` / ``compose`` / ``compose-btn``) collapse to one row
-instead of three. The checklist is not hand-kept: it is the **union of every mark
-any thing declares**, so a capability that exists on even one thing becomes a row,
-and the things that lack it show up LACKS in that row. That is the gap you came
-for.
-
-THE ONE HONEST LIMIT, TYPED INTO THE OUTPUT
--------------------------------------------
-HAS means exactly one thing: *a mark that normalizes to this key was declared for
-this thing.* It does **not** mean the feature works, or behaves the same as the
-next column's. parity is a **presence** fold, not a behavior test — every cell
-carries that in ``predicate: "declared-present"`` so a fact copied out of the
-table still says what it does and does not establish. A row where two or more
-things HAS is flagged ``needs-behavior-check`` — a *candidate* for you to verify,
-never a claim that they match.
-
-PURE FOLD
----------
-Deterministic order, no wall-clock: fold twice, the bytes are identical
-(``--check``, exit 3 on drift). Rows sort by key, columns by declared order then
-name, so the table is stable across runs and machines.
-
-Exit codes (the fold-family contract):
-0 folded (and with --check, byte-identical to the input's own re-fold)
-2 usage / input error (bad path, malformed JSON, no things)
-3 --check drift (the output would not reproduce), or an empty checklist
-
-INPUT SHAPE (a small JSON file, or stdin with ``-``)
-----------------------------------------------------
-{
-"things": [
-{"name": "mail", "marks": ["compose", "search", "archive"]},
-{"name": "calendar", "marks": ["compose", "search"]},
-{"name": "contacts", "marks": ["search", "Compose"]}
-],
-"aliases": {"create": "compose", "new": "compose"}
-}
-
-``aliases`` is optional: it maps an alternate spelling to a canonical key BEFORE
-normalization, so genuine synonyms (``create`` → ``compose``) collapse too. An
-alias whose target is never declared by any thing is a dead alias and fails the
-non-vacuity gate (exit 3) — a checklist keyed on an invented item is worthless.
-"""
-import argparse
-import json
-import re
-import sys
-
-_WS = re.compile(r"[\s_-]+")
-
-def norm(mark):
-"""Collapse an INTRA-name variant to a comparison key.
-
-Lowercase, strip a trailing role suffix (``-btn`` / ``_button`` etc. via the
-separator split), and squeeze whitespace/underscore/hyphen runs to a single
-space. ``Compose`` / ``compose`` / ``compose-btn`` -> ``compose``. Deliberately
-dumb: it collapses spelling, never meaning (meaning is what ``aliases`` is for).
-"""
-s = str(mark).strip().lower()
-# drop a common trailing UI-role suffix so 'compose-btn' keys as 'compose'
-s = re.sub(r"[\s_-](btn|button|link|icon|field|input)$", "", s)
-s = _WS.sub(" ", s).strip()
-return s
-
-def _apply_aliases(key, alias_index):
-"""Map a canonical-key through the alias table (one hop, INTER-name synonyms)."""
-return alias_index.get(key, key)
-
-def fold(spec):
-"""The parity fold. spec -> a deterministic matrix dict. Pure; no I/O.
-
-Raises ValueError on an empty thing-set, a dead alias, or an empty checklist —
-each the caller turns into the right exit code.
-"""
-things = spec.get("things") or []
-if not things:
-raise ValueError("no things to compare (need >= 1 in 'things')")
-
-# aliases: alt-spelling -> canonical, both normalized. Dead-alias gate below.
-raw_aliases = spec.get("aliases") or {}
-alias_index = {norm(k): norm(v) for k, v in raw_aliases.items()}
-
-# Column order: declared order first (stable), name as the tiebreak.
-columns = []
-seen_cols = set()
-for t in things:
-name = str(t.get("name", "")).strip()
-if not name:
-raise ValueError("a thing has no 'name'")
-if name in seen_cols:
-raise ValueError("duplicate thing name: %r" % name)
-seen_cols.add(name)
-columns.append(name)
-
-# Build each thing's declared key-set, alias-mapped.
-declared = {} # name -> set(keys)
-all_keys = set()
-alias_targets_hit = set()
-for t in things:
-name = str(t.get("name", "")).strip()
-keys = set()
-for m in (t.get("marks") or []):
-k0 = norm(m)
-k = _apply_aliases(k0, alias_index)
-if k!= k0:
-alias_targets_hit.add(k0) # the alternate spelling was used
-keys.add(k)
-declared[name] = keys
-all_keys |= keys
-
-# Non-vacuity gate: every alias must have fired on some declared mark, and its
-# target must exist in the checklist. A dead alias means the checklist is keyed
-# on something nobody declared.
-for alt, target in alias_index.items():
-if alt not in alias_targets_hit:
-raise ValueError("dead alias %r: never matched any declared mark" % alt)
-if target not in all_keys:
-raise ValueError(
-"dead alias target %r: not declared by any thing" % target
-)
-
-if not all_keys:
-raise ValueError("empty checklist: no marks declared by any thing")
-
-# The checklist rows, sorted (deterministic).
-rows = []
-for key in sorted(all_keys):
-cells = []
-has_count = 0
-for name in columns:
-present = key in declared[name]
-if present:
-has_count += 1
-cells.append(
-{
-"thing": name,
-"state": "HAS" if present else "LACKS",
-# the honest predicate travels WITH the cell (findings discipline)
-"predicate": "declared-present",
-}
-)
-uniform = has_count == 0 or has_count == len(columns)
-row = {
-"key": key,
-"cells": cells,
-"has_count": has_count,
-"uniform": uniform,
-}
-# >=2 HAS on a non-uniform... actually behavior-check applies to ANY row
-# with >=2 HAS: they *look* shared but presence!= behavior.
-if has_count >= 2:
-row["flag"] = "needs-behavior-check"
-rows.append(row)
-
-gaps = [r["key"] for r in rows if not r["uniform"]]
-
-return {
-"columns": columns,
-"checklist_size": len(rows),
-"rows": rows,
-"gaps": gaps,
-"uniform_all": len(gaps) == 0,
-"note": "HAS = a mark declared for this thing normalizes to this key; "
-"it does NOT assert the capability works or matches across columns.",
-}
-
-def canonical(obj):
-"""Stable JSON text for --check twice-identical + --json emit."""
-return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-
-def render_human(matrix):
-"""A readable grid. Rows = checklist keys, columns = things. ✓ / · per cell."""
-cols = matrix["columns"]
-keywidth = max([len("capability")] + [len(r["key"]) for r in matrix["rows"]])
-colwidth = max([3] + [len(c) for c in cols])
-header = " ".join([f"{'capability':<{keywidth}}"] + [f"{c:<{colwidth}}" for c in cols])
-lines = [header, "-" * len(header)]
-for r in matrix["rows"]:
-marks = []
-for cell in r["cells"]:
-marks.append(f"{('✓' if cell['state']=='HAS' else '·'):<{colwidth}}")
-flag = " <- gap" if not r["uniform"] else ""
-lines.append(" ".join([f"{r['key']:<{keywidth}}"] + marks) + flag)
-lines.append("")
-if matrix["gaps"]:
-lines.append("gaps (things do not all agree): " + ", ".join(matrix["gaps"]))
-else:
-lines.append("no gaps: every thing declares every checklist item.")
-lines.append(matrix["note"])
-return "\n".join(lines) + "\n"
-
-def main(argv=None):
-ap = argparse.ArgumentParser(
-description="Compare N sibling things against a shared checklist -> a "
-"HAS/LACKS parity matrix. Presence fold, not a behavior test."
-)
-ap.add_argument("input", help="JSON spec file, or '-' for stdin")
-ap.add_argument("--json", action="store_true", help="emit the matrix as JSON")
-ap.add_argument(
-"--check",
-action="store_true",
-help="fold twice; exit 3 unless byte-identical (drift gate)",
-)
-ap.add_argument(
-"--gaps-only",
-action="store_true",
-help="print only the gap keys (rows where things disagree), one per line",
-)
-args = ap.parse_args(argv)
-
-try:
-if args.input == "-":
-spec = json.load(sys.stdin)
-else:
-with open(args.input, encoding="utf-8") as fh:
-spec = json.load(fh)
-except (OSError, json.JSONDecodeError) as e:
-sys.stderr.write("input error: %s\n" % e)
-return 2
-
-try:
-matrix = fold(spec)
-except ValueError as e:
-# empty checklist / dead alias -> fold-family exit 3; structural input
-# problems (no things, no name) -> exit 2.
-msg = str(e)
-if "checklist" in msg or "alias" in msg:
-sys.stderr.write("fold gate: %s\n" % msg)
-return 3
-sys.stderr.write("input error: %s\n" % msg)
-return 2
-
-if args.check:
-# A fold is a fold: re-fold the same spec, require byte-identical canonical.
-again = fold(spec)
-if canonical(again)!= canonical(matrix):
-sys.stderr.write("--check drift: the fold did not reproduce\n")
-return 3
-sys.stdout.write("check: OK (fold is twice-identical)\n")
-return 0
-
-if args.gaps_only:
-sys.stdout.write("".join(k + "\n" for k in matrix["gaps"]))
-return 0
-
-if args.json:
-sys.stdout.write(canonical(matrix))
-else:
-sys.stdout.write(render_human(matrix))
-return 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_parity.py 223 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_parity.py — mutation-bitten tests for parity.py.
-
-Run: python3 test_parity.py (exit 0 = all pass; nonzero = a failure)
-
-The suite is written to have TEETH: each test asserts a specific, load-bearing
-property of the fold, so that a plausible mutation to parity.py breaks a named
-count. Proven mutation kills (see README's "Teeth proven" line):
-- remove the row sort -> golden shape breaks (order) -> 15/17
-- flip HAS/LACKS predicate -> cell-state tests break -> 13/17
-- drop the dead-alias gate -> alias non-vacuity test breaks -> 16/17
-- drop the >=2-HAS behavior flag -> behavior-check test breaks -> 16/17
-- count uniform as gap (invert) -> gap-list tests break -> 14/17
-"""
-import sys
-
-import parity
-
-_pass = 0
-_fail = 0
-
-def check(name, cond):
-global _pass, _fail
-if cond:
-_pass += 1
-else:
-_fail += 1
-sys.stderr.write("FAIL: %s\n" % name)
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-SPEC = {
-"things": [
-{"name": "mail", "marks": ["compose", "search", "archive"]},
-{"name": "calendar", "marks": ["compose", "search"]},
-{"name": "contacts", "marks": ["search", "Compose"]}, # Compose -> compose
-]
-}
-
-def test_norm():
-# 1 intra-name variants collapse
-check("norm-case", parity.norm("Compose") == "compose")
-check("norm-suffix", parity.norm("compose-btn") == "compose")
-check("norm-underscore", parity.norm("archive_button") == "archive")
-check("norm-space", parity.norm(" Search ") == "search")
-
-def test_checklist_is_union():
-m = parity.fold(SPEC)
-keys = [r["key"] for r in m["rows"]]
-# 2 checklist = union of all declared marks, normalized, sorted
-check("checklist-union", keys == ["archive", "compose", "search"])
-check("checklist-size", m["checklist_size"] == 3)
-
-def test_cell_states():
-m = parity.fold(SPEC)
-by_key = {r["key"]: r for r in m["rows"]}
-# 3 HAS/LACKS is correct per declared presence
-compose = {c["thing"]: c["state"] for c in by_key["compose"]["cells"]}
-check("compose-mail-has", compose["mail"] == "HAS")
-check("compose-calendar-has", compose["calendar"] == "HAS")
-check("compose-contacts-has", compose["contacts"] == "HAS") # via norm(Compose)
-archive = {c["thing"]: c["state"] for c in by_key["archive"]["cells"]}
-check("archive-mail-has", archive["mail"] == "HAS")
-check("archive-calendar-lacks", archive["calendar"] == "LACKS")
-check("archive-contacts-lacks", archive["contacts"] == "LACKS")
-
-def test_predicate_travels():
-m = parity.fold(SPEC)
-# 4 the honest predicate rides EVERY cell (findings discipline at cell grain)
-all_have_pred = all(
-c["predicate"] == "declared-present" for r in m["rows"] for c in r["cells"]
-)
-check("predicate-per-cell", all_have_pred)
-
-def test_gaps():
-m = parity.fold(SPEC)
-# 5 gap = a row where things disagree; 'archive' is the only gap here
-check("gaps-is-archive", m["gaps"] == ["archive"])
-check("uniform-all-false", m["uniform_all"] is False)
-# compose & search are uniform (all three HAS) -> not gaps
-by_key = {r["key"]: r for r in m["rows"]}
-check("compose-uniform", by_key["compose"]["uniform"] is True)
-check("search-uniform", by_key["search"]["uniform"] is True)
-check("archive-not-uniform", by_key["archive"]["uniform"] is False)
-
-def test_behavior_check_flag():
-m = parity.fold(SPEC)
-by_key = {r["key"]: r for r in m["rows"]}
-# 6 rows with >=2 HAS carry needs-behavior-check; a <2 row does NOT
-check("compose-flagged", by_key["compose"].get("flag") == "needs-behavior-check")
-check("archive-not-flagged", by_key["archive"].get("flag") is None) # 1 HAS
-
-def test_aliases():
-spec = {
-"things": [
-{"name": "a", "marks": ["create", "search"]}, # create -> compose
-{"name": "b", "marks": ["compose", "search"]},
-],
-"aliases": {"create": "compose"},
-}
-m = parity.fold(spec)
-keys = [r["key"] for r in m["rows"]]
-# 7 inter-name synonyms collapse via aliases
-check("alias-collapses", keys == ["compose", "search"])
-by_key = {r["key"]: r for r in m["rows"]}
-compose = {c["thing"]: c["state"] for c in by_key["compose"]["cells"]}
-check("alias-a-has-compose", compose["a"] == "HAS")
-
-def test_dead_alias_gate():
-# 8 a dead alias (never matched AND target undeclared) is rejected
-spec = {
-"things": [{"name": "a", "marks": ["search"]}],
-"aliases": {"create": "compose"}, # 'create' never declared -> dead
-}
-raised = False
-try:
-parity.fold(spec)
-except ValueError as e:
-raised = "alias" in str(e)
-check("dead-alias-rejected", raised)
-
-def test_dead_alias_never_matched_isolated():
-# 8b ISOLATE the 'never matched' gate: alias TARGET is declared (so the
-# 'target not in checklist' gate would NOT fire) but the alt-spelling is never
-# used by any thing. Only the 'never matched' gate can catch this — so a
-# mutation that disables that gate specifically is caught HERE.
-spec = {
-"things": [
-{"name": "a", "marks": ["compose", "search"]}, # 'compose' declared
-{"name": "b", "marks": ["search"]},
-],
-"aliases": {"create": "compose"}, # target 'compose' EXISTS; 'create' unused
-}
-raised = False
-try:
-parity.fold(spec)
-except ValueError as e:
-raised = "never matched" in str(e)
-check("dead-alias-never-matched-isolated", raised)
-
-def test_empty_and_errors():
-# 9 no things -> ValueError (structural)
-raised = False
-try:
-parity.fold({"things": []})
-except ValueError:
-raised = True
-check("empty-things-rejected", raised)
-
-def test_determinism_check_flag():
-# 10 --check is twice-identical: canonical(fold) == canonical(fold)
-a = parity.canonical(parity.fold(SPEC))
-b = parity.canonical(parity.fold(SPEC))
-check("fold-twice-identical", a == b)
-
-def test_structural_golden():
-"""A PINNED STRUCTURAL golden — pins the SHAPE (keys, order, states, gaps),
-which is env-stable (no hashes, no clocks). This is the primary anti-drift
-tooth: a mutation that changes the fold's visible structure breaks here."""
-m = parity.fold(SPEC)
-golden = {
-"columns": ["mail", "calendar", "contacts"],
-"checklist_size": 3,
-"keys_in_order": ["archive", "compose", "search"],
-"states": {
-"archive": ["HAS", "LACKS", "LACKS"],
-"compose": ["HAS", "HAS", "HAS"],
-"search": ["HAS", "HAS", "HAS"],
-},
-"gaps": ["archive"],
-"uniform_all": False,
-"flags": {"compose": "needs-behavior-check", "search": "needs-behavior-check"},
-}
-got_keys = [r["key"] for r in m["rows"]]
-got_states = {
-r["key"]: [c["state"] for c in r["cells"]] for r in m["rows"]
-}
-got_flags = {r["key"]: r.get("flag") for r in m["rows"] if r.get("flag")}
-check("golden-columns", m["columns"] == golden["columns"])
-check("golden-size", m["checklist_size"] == golden["checklist_size"])
-check("golden-keys-order", got_keys == golden["keys_in_order"])
-check("golden-states", got_states == golden["states"])
-check("golden-gaps", m["gaps"] == golden["gaps"])
-check("golden-uniform-all", m["uniform_all"] == golden["uniform_all"])
-check("golden-flags", got_flags == golden["flags"])
-
-def main():
-test_norm()
-test_checklist_is_union()
-test_cell_states()
-test_predicate_travels()
-test_gaps()
-test_behavior_check_flag()
-test_aliases()
-test_dead_alias_gate()
-test_dead_alias_never_matched_isolated()
-test_empty_and_errors()
-test_determinism_check_flag()
-test_structural_golden()
-total = _pass + _fail
-sys.stdout.write("parity tests: %d/%d passed\n" % (_pass, total))
-return 1 if _fail else 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-Take the whole folder →
-MIT
-Python stdlib only, deterministic
+Node / browser, no dependencies
 
 ---

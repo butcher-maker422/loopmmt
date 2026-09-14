@@ -1,1396 +1,1719 @@
-# Loop MMT — corpus shard 70/74
+# Loop MMT — corpus shard 70/86
 
-> Bundle 70 of 74 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 70 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/the-oracle/, /gifts/timeline/, /gifts/timesheet/)
+Nodes in this shard: 4 (/gifts/jsonl-diff/, /gifts/junction/, /gifts/kv-source/, /gifts/l21x-snapshot/)
 
 ---
 
-# The Oracle — a Loop MMT gift
-https://loopmmt.com/gifts/the-oracle/
+# JSONL-Diff — a Loop MMT gift
+https://loopmmt.com/gifts/jsonl-diff/
 [coverage: optional · branch: gifts]
 
-Which Prompt Variant Did Run #4173 Get? Make It a Fact You Can Recompute. decide ← all gifts
+What Changed Between Two Runs? fold ← all gifts
 
-The Oracle
+JSONL-Diff
 
-A reproducible seeded-decision engine for prompt A/B. Name your variants, commit a seed at a moment, and it deterministically picks one -- writing a replayable receipt so the exact same pick can be re-derived on any machine, forever. The pick is reversal-indexed (the shape borrowed from the dwell gift): the seed and moment define a phase, and the chosen variant is a pure function of that phase (pick = (phase*k)//n, default n=k), integer-exact with no float and no randomness. Every cast emits a receipt (the variant list plus the two integers that made the pick); replay re-derives the pick from the receipt alone, and a --ledger collects a batch of assignments into one replayable file. Waiting a full lap is free -- the winding number is discarded, so an extra lap never changes the pick. Python stdlib only, offline, deterministic.
+You ran the same prompt through a model twice — a new version, a new day — and got two files of JSONL output. What actually changed? jsonl-diff takes an OLD file and a NEW file and tells you what was added, removed, and (when you name a key field) changed — sorted, canonical, and byte-identical on every run, so it drops straight into a CI gate or a review. Two modes: set-diff (default) keys each record by its own canonical form, so a changed record shows as one removed plus one added; keyed diff (--key FIELD) keys by a field, so a same-key record with different content is a CHANGE reported with its field-level deltas. Object keys are sorted and array order is faithful, so a key-reordered record matches and a reordered array does not. Deterministic, fail-closed, zero dependencies, offline.
 
 The honest edge
 
-the-oracle makes an assignment reproducible and auditable; it does not make it fair, uniform, or unbiased -- a chosen (seed, moment, n) can skew which variant wins, and reproducing a skewed pick reproduces the skew. It does not run your prompts, call any model, score a variant, or tell you which is better. It decides which variant, reproducibly; it does not decide whether the experiment was sound. Reproducible, not random.
+jsonl-diff compares STRUCTURE, not MEANING. A reported change may be cosmetic (1 vs 1.0, "a,b" vs ["a","b"]) and an unreported match may still be wrong — semantic equivalence it will miss is a difference here. A human reads the diff; the tool only makes the change visible and exact. It tells you two records differ; it cannot tell you the difference matters, is correct, or is safe.
 
 Run it
 
-python3 the-oracle.py pick --seed 7 --moment 19 --variants A,B,C && python3 the-oracle.py cast --seed 7 --moment 19 --variants A,B --ledger runs.jsonl
-test_the-oracle.py (16/16, mutation-bitten independent reference oracle: reproducible pick, free-hold lap-invariant, replay round-trip, ledger append, the four guard refusals) + --selftest (14/14: deterministic core, byte-identical receipt across runs)
-Python stdlib only, deterministic
+node jsonl-diff.js --key id old.jsonl new.jsonl # exit 0 identical | 1 differs | 2 input error; --out json for a canonical result object
+test_jsonl-diff.js (10/10) + --selftest (10/10: canon idempotence, set-diff added/removed, keyed change, folds-twice-identical, blank-line skip, guard/exit space)
+Zero dependencies, Node or browser, deterministic
 
 The code — every file that ships
 
-the-oracle.py 309 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""the-oracle.py -- a reproducible seeded-decision engine for prompt A/B (and A/B/C/...).
-
-You are testing prompt variants and you want the assignment to be a FACT you can
-reproduce, not a hidden coin-flip that quietly contaminates the experiment. the-oracle
-turns a decision into an audit record: you name your variants, you commit a seed at a
-moment, and it deterministically picks one -- writing a replayable receipt so the exact
-same pick can be re-derived on any machine, forever.
-
-The pick is reversal-indexed, the shape borrowed from `dwell` (the pure router gift):
-the seed and the moment define a phase, and the variant is a pure function of that phase.
-
-phase(seed, moment, n) = (moment - seed) mod n # in [0, n)
-pick_index(seed, moment, n, k) = (phase * k) // n # in [0, k), one of k variants
-
-There is no separate randomness step. Given (seed, moment, n, k) the chosen variant is
-determined -- integer-exact, no float, byte-replayable. A `Ballot` records a decision as
-the variant list plus the two integers that produced it, and `replay(ballot)` recomputes
-the pick from them, so a decision is an audit record you re-derive, never an opinion you
-have to trust. Every decision also carries a run/trace id and lands in a JSONL ledger, so
-a batch of A/B assignments is a replayable receipt file.
-
-HONEST CEILING. the-oracle makes an assignment REPRODUCIBLE and AUDITABLE; it does not
-make it fair, uniform, or unbiased -- a chosen (seed, moment, n) can skew which variant
-wins, and reproducing a skewed pick reproduces the skew. It does not run your prompts,
-call any model, score a variant, or tell you which variant is better. It decides WHICH
-variant, reproducibly; it does not decide whether the experiment was sound. Reproducible,
-not random.
-
-python3 the-oracle.py pick --seed 7 --moment 19 --variants A,B,C # -> the chosen variant
-python3 the-oracle.py cast --seed 7 --moment 19 --variants A,B --trace RUN # -> pick + ledger receipt
-python3 the-oracle.py replay --ballot ballot.json # -> re-derive a recorded pick
-python3 the-oracle.py --selftest # deterministic core, byte-identical
-python3 the-oracle.py --help
-
-Python 3 stdlib only, no dependencies, offline, deterministic core.
-"""
-from __future__ import annotations
-
-import argparse
-import json
-import sys
-from dataclasses import dataclass
-from typing import List, NamedTuple
-
-__all__ = ["phase", "winding", "pick_index", "Ballot", "cast", "replay", "OracleError"]
-
-_LEDGER_DEFAULT = "the-oracle-ledger.jsonl"
-
-class OracleError(ValueError):
-"""A malformed oracle call -- bad resolution, empty variant list, or moment before seed."""
-
-def _validate(seed: int, moment: int, n: int, k: int) -> None:
-for name, val in (("seed", seed), ("moment", moment), ("n", n), ("k", k)):
-if not isinstance(val, int) or isinstance(val, bool):
-raise OracleError(f"{name} must be a plain int, got {val!r}")
-if n < 1:
-raise OracleError(f"n (loop resolution) must be >= 1, got {n}")
-if k < 1:
-raise OracleError(f"k (variant count) must be >= 1, got {k}")
-if k > n:
-# You cannot quantize a loop of n ticks into more than n distinguishable picks.
-raise OracleError(f"k must be <= n (k<=n is a wall), got k={k} n={n}")
-if moment < seed:
-# Seed is committed first; the moment of decision follows it on a monotone clock.
-raise OracleError(f"moment ({moment}) must be >= seed ({seed})")
-
-def phase(seed: int, moment: int, n: int) -> int:
-"""Where on the loop the decision sits, in [0, n). Winding (full laps) is folded out."""
-_validate(seed, moment, n, k=1)
-return (moment - seed) % n
-
-def winding(seed: int, moment: int, n: int) -> int:
-"""
-How many full laps passed between seed and moment -- the coordinate the pick discards.
-Read-only: the pick never depends on it, so waiting a full lap changes nothing (free-hold).
-"""
-_validate(seed, moment, n, k=1)
-return (moment - seed) // n
-
-def pick_index(seed: int, moment: int, n: int, k: int) -> int:
-"""
-The engine. Returns the chosen variant index in [0, k), a pure function of the phase.
-Integer-exact, total, byte-replayable. Adding a full lap (n) to the moment is a no-op.
-"""
-_validate(seed, moment, n, k)
-return ((moment - seed) % n * k) // n
-
-class Ballot(NamedTuple):
-"""An audit record of one decision: the variant list plus the two integers that made it."""
-variants: List[str]
-seed: int
-moment: int
-n: int
-
-def _resolution(n: int, k: int) -> int:
-"""Default loop resolution. If the caller gave an explicit n we honor it (a coarser loop
-lets you dial finer moments before the pick moves). The default is n=k -- the finest
-useful resolution, where each unit of `moment` advances the pick by exactly one variant
-(pick = (moment-seed) mod k) and free-hold still holds (adding k to the moment is a no-op)."""
-return n if n is not None else k
-
-def cast(variants: List[str], seed: int, moment: int, n: int = None) -> dict:
-"""
-Decide which variant, reproducibly, and return a full receipt dict (a Ballot + the pick).
-`n` defaults to k*12 so the phase has room; the pick is exact regardless of n's value.
-"""
-if not variants:
-raise OracleError("variants must be a non-empty list")
-if len(set(variants))!= len(variants):
-raise OracleError(f"variants must be distinct, got {variants!r}")
-k = len(variants)
-nn = _resolution(n, k)
-idx = pick_index(seed, moment, nn, k)
-return {
-"variants": list(variants),
-"seed": seed,
-"moment": moment,
-"n": nn,
-"k": k,
-"phase": phase(seed, moment, nn),
-"winding": winding(seed, moment, nn),
-"pick_index": idx,
-"pick": variants[idx],
-}
-
-def replay(ballot: dict) -> str:
-"""
-Recompute the variant a recorded ballot produced, from the ballot alone. Because the
-engine is pure, replay(ballot) == the pick that produced it -- an audit record you
-re-derive, never an opinion to trust.
-"""
-variants = ballot["variants"]
-k = len(variants)
-idx = pick_index(int(ballot["seed"]), int(ballot["moment"]), int(ballot["n"]), k)
-return variants[idx]
-
-def _append_ledger(path: str, record: dict) -> None:
-"""Append one decision as a sorted-keys compact JSON line -- byte-stable across runs."""
-with open(path, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n")
-
-# ---- CLI ---------------------------------------------------------------------------------------------
-def _parse_variants(s: str) -> List[str]:
-parts = [p.strip() for p in s.split(",")]
-parts = [p for p in parts if p!= ""]
-if not parts:
-raise OracleError("--variants must list at least one non-empty label, comma-separated")
-return parts
-
-def _cmd_pick(args) -> int:
-r = cast(_parse_variants(args.variants), args.seed, args.moment, args.n)
-print(r["pick"])
-return 0
-
-def _cmd_cast(args) -> int:
-r = cast(_parse_variants(args.variants), args.seed, args.moment, args.n)
-record = {"trace": args.trace, **r}
-if args.ledger:
-_append_ledger(args.ledger, record)
-# human line to stdout, receipt shape to the ledger
-sys.stderr.write(
-f"[the-oracle] trace={args.trace} phase={r['phase']} pick_index={r['pick_index']} "
-f"-> {r['pick']} (ledger: {args.ledger or 'none'})\n"
-)
-print(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
-return 0
-
-def _cmd_replay(args) -> int:
-with open(args.ballot, encoding="utf-8") as fh:
-ballot = json.load(fh)
-print(replay(ballot))
-return 0
-
-def _cmd_demo(args) -> int:
-variants = ["A", "B", "C"]
-print(f"variants={variants}, seed=7")
-print("moment | phase winding -> pick")
-for moment in range(7, 7 + 13):
-r = cast(variants, 7, moment, None)
-print(f"{moment:6d} | {r['phase']:5d} {r['winding']:7d} -> {r['pick']}")
-return 0
-
-def _selftest() -> int:
-checks = []
-
-def ck(name, cond):
-checks.append((name, bool(cond)))
-
-# 1. pure + total: same inputs -> same pick, always
-ck("deterministic", pick_index(7, 19, 12, 3) == pick_index(7, 19, 12, 3))
-# 2. free-hold: adding a full lap (n) to moment never changes the pick
-ck("free-hold", pick_index(7, 19, 12, 3) == pick_index(7, 19 + 12, 12, 3))
-# 3. pick in range [0, k)
-ck("in-range", all(0 <= pick_index(3, m, 12, 4) < 4 for m in range(3, 40)))
-# 4. phase in [0, n)
-ck("phase-range", all(0 <= phase(0, m, 10) < 10 for m in range(0, 30)))
-# 5. replay reproduces cast
-r = cast(["A", "B", "C"], 7, 19, None)
-ck("replay-matches", replay(r) == r["pick"])
-# 6. k==1 always picks the sole variant
-ck("k1", cast(["only"], 5, 99, None)["pick"] == "only")
-# 7. integer-exact boundary: (phase*k)//n is floor at a segment edge
-ck("floor-boundary", pick_index(0, 4, 12, 3) == (4 * 3) // 12)
-# 8. distinct-variant guard
-try:
-cast(["A", "A"], 0, 0, None); ck("distinct-guard", False)
-except OracleError:
-ck("distinct-guard", True)
-# 9. moment<seed refused
-try:
-pick_index(10, 3, 12, 2); ck("moment-order-guard", False)
-except OracleError:
-ck("moment-order-guard", True)
-# 10. k>n refused
-try:
-pick_index(0, 0, 3, 4); ck("k-le-n-wall", False)
-except OracleError:
-ck("k-le-n-wall", True)
-# 11. bool rejected as int (True is not a plain int here)
-try:
-pick_index(True, 0, 12, 2); ck("no-bool", False)
-except OracleError:
-ck("no-bool", True)
-# 12. byte-identical receipt across two casts (deterministic serialization)
-a = json.dumps(cast(["A", "B"], 1, 5, None), sort_keys=True, separators=(",", ":"))
-b = json.dumps(cast(["A", "B"], 1, 5, None), sort_keys=True, separators=(",", ":"))
-ck("byte-identical-receipt", a == b)
-# 13. winding discarded from routing but readable
-ck("winding-readable", winding(0, 25, 12) == 2 and pick_index(0, 25, 12, 3) == pick_index(0, 1, 12, 3))
-# 14. empty variants refused
-try:
-cast([], 0, 0, None); ck("empty-guard", False)
-except OracleError:
-ck("empty-guard", True)
-
-passed = sum(1 for _, ok in checks if ok)
-failed = len(checks) - passed
-for name, ok in checks:
-if not ok:
-print(f" FAIL: {name}")
-tag = "GREEN" if failed == 0 else "RED"
-print(f"{tag}: {passed} checks passed, {failed} failed [the-oracle]")
-return 0 if failed == 0 else 1
-
-def main(argv=None) -> int:
-argv = list(sys.argv[1:] if argv is None else argv)
-if "--selftest" in argv:
-return _selftest()
-p = argparse.ArgumentParser(
-prog="the-oracle.py",
-description="a reproducible seeded-decision engine for prompt A/B (reversal-indexed pick)",
-)
-sub = p.add_subparsers(dest="cmd")
-
-pp = sub.add_parser("pick", help="print the chosen variant")
-pp.add_argument("--seed", type=int, required=True)
-pp.add_argument("--moment", type=int, required=True)
-pp.add_argument("--variants", required=True, help="comma-separated labels, e.g. A,B,C")
-pp.add_argument("--n", type=int, default=None, help="loop resolution (default k*12)")
-pp.set_defaults(fn=_cmd_pick)
-
-pc = sub.add_parser("cast", help="pick + emit a replayable receipt (optionally to a ledger)")
-pc.add_argument("--seed", type=int, required=True)
-pc.add_argument("--moment", type=int, required=True)
-pc.add_argument("--variants", required=True)
-pc.add_argument("--n", type=int, default=None)
-pc.add_argument("--trace", default="RUN", help="a run/trace id stamped on the receipt")
-pc.add_argument("--ledger", default=None, help="append the receipt to this JSONL ledger")
-pc.set_defaults(fn=_cmd_cast)
-
-pr = sub.add_parser("replay", help="re-derive a recorded pick from a ballot json")
-pr.add_argument("--ballot", required=True, help="a receipt json (from cast)")
-pr.set_defaults(fn=_cmd_replay)
-
-pd = sub.add_parser("demo", help="a small decision table")
-pd.set_defaults(fn=_cmd_demo)
-
-args = p.parse_args(argv)
-if not getattr(args, "fn", None):
-p.print_help()
-return 0
-try:
-return args.fn(args)
-except OracleError as e:
-sys.stderr.write(f"the-oracle: {e}\n")
-return 2
-
-if __name__ == "__main__":
-raise SystemExit(main())
-
-test_the-oracle.py 122 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_the-oracle.py -- independent mutation-bitten oracle for the-oracle gift.
-
-Invokes the tool as a SUBPROCESS (never imports it), so each check bites a load-bearing
-behavior: deleting the behavior from the tool makes a check fail. The reference picks are
-recomputed here from first principles ((moment-seed) mod k for the default n=k), so this
-file is an independent oracle, not an echo of the implementation.
-"""
-import json
-import subprocess
-import sys
-import os
-import tempfile
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-TOOL = os.path.join(HERE, "the-oracle.py")
-
-_checks = []
-
-def ck(name, cond):
-_checks.append((name, bool(cond)))
-
-def run(args, expect_exit=0):
-r = subprocess.run([sys.executable, TOOL] + args, capture_output=True, text=True)
-if r.returncode!= expect_exit:
-return None, r
-return r.stdout.strip(), r
-
-def ref_pick(variants, seed, moment):
-"""Independent reference: default resolution n=k, pick = (moment-seed) mod k."""
-k = len(variants)
-return variants[((moment - seed) % k * k) // k]
-
-# 1. pick prints the chosen variant, matching the independent reference
-for seed, moment, variants in [(7, 19, ["A", "B", "C"]), (0, 5, ["x", "y"]), (3, 3, ["only-a", "b", "c", "d"])]:
-out, r = run(["pick", "--seed", str(seed), "--moment", str(moment),
-"--variants", ",".join(variants)])
-ck(f"pick {seed},{moment},{variants}", out == ref_pick(variants, seed, moment))
-
-# 2. free-hold: adding a full lap (k) to the moment yields the same pick
-out_a, _ = run(["pick", "--seed", "1", "--moment", "4", "--variants", "A,B,C"])
-out_b, _ = run(["pick", "--seed", "1", "--moment", "7", "--variants", "A,B,C"]) # 7 = 4 + k(3)
-ck("free-hold (lap invariant)", out_a is not None and out_a == out_b)
-
-# 3. determinism: same call twice -> identical output
-o1, _ = run(["pick", "--seed", "9", "--moment", "31", "--variants", "P,Q,R,S"])
-o2, _ = run(["pick", "--seed", "9", "--moment", "31", "--variants", "P,Q,R,S"])
-ck("determinism", o1 is not None and o1 == o2)
-
-# 4. cast emits a valid JSON receipt on stdout, and it round-trips through replay
-out, r = run(["cast", "--seed", "7", "--moment", "20", "--variants", "A,B,C", "--trace", "T1"])
-receipt = None
-try:
-receipt = json.loads(out)
-except Exception:
-receipt = None
-ck("cast emits json receipt", receipt is not None and receipt.get("pick") == ref_pick(["A", "B", "C"], 7, 20))
-ck("cast stamps trace", receipt is not None and receipt.get("trace") == "T1")
-
-# 5. cast receipt is byte-identical across runs (deterministic serialization)
-c1, _ = run(["cast", "--seed", "2", "--moment", "6", "--variants", "A,B"])
-c2, _ = run(["cast", "--seed", "2", "--moment", "6", "--variants", "A,B"])
-ck("cast byte-identical", c1 is not None and c1 == c2)
-
-# 6. replay re-derives the recorded pick from a ballot file alone
-if receipt is not None:
-with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
-json.dump(receipt, fh)
-ballot_path = fh.name
-out, r = run(["replay", "--ballot", ballot_path])
-ck("replay reproduces cast", out == receipt["pick"])
-os.unlink(ballot_path)
-else:
-ck("replay reproduces cast", False)
-
-# 7. ledger receives an appended receipt line when --ledger is given
-with tempfile.TemporaryDirectory() as td:
-ledger = os.path.join(td, "led.jsonl")
-run(["cast", "--seed", "1", "--moment", "5", "--variants", "A,B", "--trace", "L1", "--ledger", ledger])
-run(["cast", "--seed", "1", "--moment", "6", "--variants", "A,B", "--trace", "L2", "--ledger", ledger])
-lines = [l for l in open(ledger).read().splitlines() if l.strip()]
-ck("ledger appends per cast", len(lines) == 2)
-ck("ledger lines are json", all(json.loads(l).get("trace") in ("L1", "L2") for l in lines))
-
-# 8. moment < seed is refused with exit 2 (the monotone-clock guard)
-out, r = run(["pick", "--seed", "10", "--moment", "3", "--variants", "A,B"], expect_exit=2)
-ck("moment<seed refused (exit 2)", r.returncode == 2 and "moment" in r.stderr)
-
-# 9. distinct-variant guard: duplicate labels refused
-out, r = run(["pick", "--seed", "0", "--moment", "0", "--variants", "A,A"], expect_exit=2)
-ck("duplicate variants refused", r.returncode == 2)
-
-# 10. --selftest runs and reports GREEN
-out, r = run(["--selftest"])
-ck("selftest green", r.returncode == 0 and "GREEN" in r.stdout)
-
-# 11. empty variants refused
-out, r = run(["pick", "--seed", "0", "--moment", "0", "--variants", ",,"], expect_exit=2)
-ck("empty variants refused", r.returncode == 2)
-
-# 12. pick is always in the variant set (property over a range)
-allin = True
-for m in range(5, 25):
-o, _ = run(["pick", "--seed", "5", "--moment", str(m), "--variants", "A,B,C,D"])
-if o not in ("A", "B", "C", "D"):
-allin = False
-break
-ck("pick always in set", allin)
-
-passed = sum(1 for _, ok in _checks if ok)
-failed = len(_checks) - passed
-for name, ok in _checks:
-if not ok:
-print(f" FAIL: {name}")
-tag = "GREEN" if failed == 0 else "RED"
-print(f"{tag}: {passed} assertions passed, {failed} failed [test_the-oracle]")
-sys.exit(0 if failed == 0 else 1)
-
-Take the whole folder →
-MIT
-Python stdlib only, deterministic
-
----
-
-# timeline — a Loop MMT gift
-https://loopmmt.com/gifts/timeline/
-[coverage: optional · branch: gifts]
-
-Timeline Artifact Validator validate ← all gifts
-
-timeline
-
-Validate a timeline artifact before you render it. Given {frame, events}, timeline runs eight decidable soundness checks on the DECLARATION — no cycle in the happened-before edges, an explicitly declared measurement scale (Stevens level), operations legal for that scale, no two events colliding on one track at one instant, and a deterministic sort key — and returns a verdict naming exactly which rule each event breaks. It catches the fault at the data, before a single pixel is drawn. A pure function: the same artifact always yields a byte-identical verdict.
-
-The honest edge
-
-it is a PRESENCE checker, not a CORRECTNESS oracle: it confirms a scale is declared and self-consistent with the ops used, never that the declared level is the right one, and it does not prove your renderer is a pure fold — that runtime property stays yours to prove.
-
-Run it
-
-node timeline.js artifact.json # or: cat artifact.json | node timeline.js
-test_timeline.js (22 checks incl. C0-C8 + determinism proof + mutation bite, all green)
-Node.js / browser, standard library only (zero dependencies)
-
-The code — every file that ships
-
-timeline.js 390 lines on GitHub →
-// SPDX-License-Identifier: MIT
-// timeline.js — a standalone, zero-dependency validator for a timeline artifact.
-//
-// WHAT THIS IS
-// ------------
-// You have events you want to place on a timeline — a project history, a log, a
-// story, a schedule. Before you RENDER them, this checks the DECLARATION is
-// sound: no cycle in the "happened-before" edges, the axis names its scale, the
-// operations you use are legal for that scale, no two events collide on one
-// track at one instant, and the sort key is deterministic. It reads one JSON
-// object and returns a verdict. It is a pure function: the same artifact always
-// yields the same verdict.
-//
-// THE ARTIFACT (the shape it checks):
-// {
-// "frame": { "scale": "nominal"|"ordinal"|"interval"|"ratio", // REQUIRED
-// "grain": <ms|null>,
-// "topology": "S1"|null, "period": <number>, // optional circular axis
-// "foliation": { "key": <field|"t">, "dir": "asc"|"desc"}},
-// "events": [ { "id": <str>, "t": <ms int>, "parents": [<id>...],
-// "track": <str>, "kind": <str>, "duration": <ms>,
-// "label": <str>},...]
-//}
-//
-// THE CHECKS (each decidable from the declaration alone):
-// C0 well-formed.... every event is an object with an `id`.
-// C1 real-order..... parent edges form a DAG and resolve (no cycle, no dangling edge).
-// C2 scale-declared. frame.scale is an explicit Stevens level — no implicit gauge.
-// C3 stevens-legal.. ops used are legal for the level (ordering needs ordinal+;
-// a `duration` needs interval+, a difference of points).
-// C4 instant/dur.... a `duration` with no anchoring instant is a length, not a point.
-// C5 no-collision... two events on the same track at the same instant break the
-// overlay obligation (unless a non-`t` foliation orders them).
-// C6 fold-safety.... the foliation key is a real declared field (or "t"), never a
-// nondeterministic sentinel ("now"/"random"/"index"/...).
-// C7 leak-safety.... no event bakes a shared day bucket ("dayKey"/"day"/...);
-// day buckets are render-derived per frame, not authored.
-// C8 cyclic-topology a DECLARED circular axis (S1 + period) has its coordinates
-// reduced into one period (mod the period).
-//
-// THE PRINTED EDGE (what this is NOT):
-// This is a PRESENCE checker, not a CORRECTNESS oracle. C2 checks a scale is
-// DECLARED and self-consistent with the ops used — never that the declared
-// level is the RIGHT one. It does not prove your renderer is a pure fold; that
-// is a runtime property this static check cannot reach. It reports the
-// trajectory; choosing the true scale, and proving the render pure, stay yours.
-//
-// USAGE
-// node timeline.js artifact.json # lint a file
-// cat artifact.json | node timeline.js # lint stdin
-// node timeline.js --help
-// In a browser: window.ForestGifts.timelineLint(artifactObject)
-// In Node code: require('./timeline.js').timelineLint(artifactObject)
-//
-// Exit: 0 CLEAN | 3 FLAG | 2 USAGE (malformed input).
-
-'use strict';
-
-// Stevens' levels as a strict tower — each a superset of the one below.
-var STEVENS = { nominal: 0, ordinal: 1, interval: 2, ratio: 3};
-
-// Foliation keys that are NOT a real, replayable field — a sort on any of these
-// makes the render depend on WHEN it ran, breaking folds-twice-identical.
-var NONDETERMINISTIC_KEYS = {
-'now': 1, 'random': 1, 'rand': 1, 'index': 1, 'render-order': 1,
-'renderorder': 1, 'time()': 1, 'date.now': 1, 'uuid': 1, 'order-of-arrival': 1
-};
-
-// Baked day-bucket field names: a per-event day column is a frame-independent
-// bucket authored into the data — exactly the cross-frame leak the render must
-// derive per-frame instead.
-var BAKED_DAY_FIELDS = { 'daykey': 1, 'day': 1, 'datebucket': 1, 'date_bucket': 1};
-
-function finding(check, eventId, msg) {
-return { check: check, event: eventId, msg: msg};
-}
-
-function has(obj, key) {
-return Object.prototype.hasOwnProperty.call(obj, key);
-}
-
-// --- C1: axis is a real order (DAG + resolvable parents) --------------------
-function checkOrder(events, ids, findings) {
-// dangling parent
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var parents = ev.parents || [];
-for (var j = 0; j < parents.length; j++) {
-if (!ids[String(parents[j])]) {
-findings.push(finding('C1-real-order', ev.id,
-"parent '" + parents[j] + "' resolves to no event (dangling edge)"));
-}
-}
-}
-// cycle (iterative DFS with colouring: 0 unseen, 1 on-stack, 2 done)
-var byId = {};
-for (var k = 0; k < events.length; k++) byId[String(events[k].id)] = events[k];
-var color = {};
-
-function visit(start) {
-var stack = [{ node: start, parents: (byId[start] && byId[start].parents) || [], pos: 0}];
-color[start] = 1;
-while (stack.length) {
-var top = stack[stack.length - 1];
-var advanced = false;
-while (top.pos < top.parents.length) {
-var p = String(top.parents[top.pos]);
-top.pos++;
-if (!has(byId, p)) continue; // dangling already reported above
-var c = color[p] || 0;
-if (c === 1) {
-findings.push(finding('C1-real-order', top.node,
-"parent edge to '" + p + "' closes a cycle (axis is not a poset)"));
-continue;
-}
-if (c === 0) {
-color[p] = 1;
-stack.push({ node: p, parents: (byId[p] && byId[p].parents) || [], pos: 0});
-advanced = true;
-break;
-}
-}
-if (!advanced) {
-color[top.node] = 2;
-stack.pop();
-}
-}
-}
-
-for (var m = 0; m < events.length; m++) {
-var id = String(events[m].id);
-if ((color[id] || 0) === 0) visit(id);
-}
-}
-
-// --- C2: scale is declared (an explicit Stevens level; no implicit gauge) ---
-function checkScaleDeclared(frame, findings) {
-var scale = has(frame, 'scale')? frame.scale: null;
-if (scale === null || scale === undefined) {
-findings.push(finding('C2-scale-declared', null,
-'frame declares no scale -- an implicit gauge is forbidden'));
-return null;
-}
-if (!has(STEVENS, scale)) {
-findings.push(finding('C2-scale-declared', null,
-"frame.scale '" + scale + "' is not a Stevens level (nominal|ordinal|interval|ratio)"));
-return null;
-}
-return scale;
-}
-
-// --- C3: Stevens-legal ops for the declared level ---------------------------
-function checkStevensLegal(scale, frame, events, findings) {
-if (scale === null) return; // C2 already flagged
-var rank = STEVENS[scale];
-var fol = frame.foliation || {};
-var folKey = has(fol, 'key')? fol.key: 't';
-if (rank < STEVENS.ordinal) {
-if (folKey!== null && folKey!== undefined && folKey!== 't') {
-findings.push(finding('C3-stevens-legal', null,
-"foliation orders by '" + folKey + "' but a nominal axis has no order"));
-}
-for (var i = 0; i < events.length; i++) {
-if (events[i].parents && events[i].parents.length) {
-findings.push(finding('C3-stevens-legal', events[i].id,
-'event declares a causal order on a nominal axis'));
-}
-}
-}
-if (rank < STEVENS.interval) {
-for (var j = 0; j < events.length; j++) {
-if (has(events[j], 'duration')) {
-findings.push(finding('C3-stevens-legal', events[j].id,
-'a `duration` needs an interval+ axis (difference of points is undefined at ' + scale + ')'));
-}
-}
-}
-}
-
-// --- C4: Instant / Duration not confused ------------------------------------
-function checkInstantDuration(events, findings) {
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var hasDur = has(ev, 'duration');
-var hasAnchor = (ev.t!== null && ev.t!== undefined) ||
-(ev.start!== null && ev.start!== undefined);
-if (hasDur &&!hasAnchor) {
-findings.push(finding('C4-instant-duration', ev.id,
-'a `duration` with no anchoring instant is a length, not a point'));
-}
-if (ev.t_type === 'duration') {
-findings.push(finding('C4-instant-duration', ev.id,
-'`t` is typed a duration -- the axis coordinate must be an Instant'));
-}
-}
-}
-
-// --- C5: overlay tracks don't collide on a shared instant -------------------
-function checkNoCollision(frame, events, findings) {
-var fol = (frame || {}).foliation || {};
-var folKey = has(fol, 'key')? fol.key: 't';
-var resolves = folKey!== null && folKey!== undefined && String(folKey)!== 't';
-var seen = {}; // "track\x00t" -> array of {id, fv}
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var t = ev.t;
-if (t === null || t === undefined) continue;
-var track = has(ev, 'track')? ev.track: '_default';
-var fv = resolves? (has(ev, folKey)? ev[folKey]: undefined): null;
-var key = String(track) + '\x00' + String(t);
-var bucket = seen[key];
-if (bucket) {
-var unresolved = (!resolves) || (fv === null || fv === undefined);
-if (!unresolved) {
-for (var b = 0; b < bucket.length; b++) {
-var pv = bucket[b].fv;
-if (pv === null || pv === undefined || pv === fv) { unresolved = true; break;}
-}
-}
-if (unresolved) {
-findings.push(finding('C5-no-collision', ev.id,
-"collides with '" + bucket[0].id + "' on track '" + track + "' at instant " + t +
-' (overlay X obligation broken)'));
-}
-bucket.push({ id: ev.id, fv: fv});
-} else {
-seen[key] = [{ id: ev.id, fv: fv}];
-}
-}
-}
-
-// --- C6: fold-safety (static proxy for "render is a pure fold") -------------
-function checkFoldSafety(frame, events, findings) {
-var fol = frame.foliation || {};
-var key = has(fol, 'key')? fol.key: 't';
-if (key === null || key === undefined) return;
-if (NONDETERMINISTIC_KEYS[String(key).trim().toLowerCase()]) {
-findings.push(finding('C6-fold-safety', null,
-"foliation key '" + key + "' is nondeterministic -- breaks folds-twice-identical (the Ink Law)"));
-return;
-}
-if (key!== 't') {
-var carried = false;
-for (var i = 0; i < events.length; i++) {
-if (has(events[i], key)) { carried = true; break;}
-}
-if (!carried) {
-findings.push(finding('C6-fold-safety', null,
-"foliation key '" + key + "' is carried by no event (the declared sort would silently fall back to `t`)"));
-}
-}
-}
-
-// --- C7: leak-safety (static proxy for "no cross-frame day-leak") -----------
-function checkLeakSafety(events, findings) {
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-var keys = Object.keys(ev);
-for (var j = 0; j < keys.length; j++) {
-if (BAKED_DAY_FIELDS[String(keys[j]).trim().toLowerCase()]) {
-findings.push(finding('C7-leak-safety', ev.id,
-"event bakes a day bucket ('" + keys[j] + "') -- day buckets are render-derived per-frame, not authored (cross-frame leak)"));
-break;
-}
-}
-}
-}
-
-// --- C8: cyclic-topology (a DECLARED circular axis is reduced mod period) ---
-function checkCyclicTopology(frame, events, findings) {
-var topo = has(frame, 'topology')? frame.topology: null;
-if (topo === null || topo === undefined) return;
-if (topo!== 'S1') {
-findings.push(finding('C8-cyclic-topology', null,
-"frame.topology '" + topo + "' is not a recognized axis topology (S1 = a periodic circle)"));
-return;
-}
-var period = frame.period;
-if (typeof period!== 'number' || period <= 0 || period!== period) {
-findings.push(finding('C8-cyclic-topology', null,
-'an S1 topology needs a positive numeric `period` (the wrap modulus, e.g. 1440 minutes)'));
-return;
-}
-for (var i = 0; i < events.length; i++) {
-var t = events[i].t;
-if (t === null || t === undefined) continue;
-if (!(t >= 0 && t < period)) {
-findings.push(finding('C8-cyclic-topology', events[i].id,
-'instant ' + t + ' is not reduced into [0,' + period + ') -- a circular coordinate must be taken mod the period'));
-}
-}
-}
-
-// --- the lint ---------------------------------------------------------------
-function timelineLint(artifact) {
-if (artifact === null || typeof artifact!== 'object' || Array.isArray(artifact)) {
-return { verdict: 'USAGE', error: 'artifact is not a JSON object'};
-}
-var frame = artifact.frame;
-var events = artifact.events;
-if (frame === null || typeof frame!== 'object' || Array.isArray(frame) ||!Array.isArray(events)) {
-return { verdict: 'USAGE', error: 'artifact needs a `frame` object and an `events` list'};
-}
-
-var findings = [];
-var valid = [];
-for (var i = 0; i < events.length; i++) {
-var ev = events[i];
-if (ev === null || typeof ev!== 'object' || Array.isArray(ev) ||
-ev.id === null || ev.id === undefined) {
-findings.push(finding('C0-well-formed', 'index ' + i, 'event is not an object with an `id`'));
-} else {
-valid.push(ev);
-}
-}
-var ids = {};
-for (var v = 0; v < valid.length; v++) ids[String(valid[v].id)] = 1;
-
-var scale = checkScaleDeclared(frame, findings);
-checkOrder(valid, ids, findings);
-checkStevensLegal(scale, frame, valid, findings);
-checkInstantDuration(valid, findings);
-checkNoCollision(frame, valid, findings);
-checkFoldSafety(frame, valid, findings);
-checkLeakSafety(valid, findings);
-checkCyclicTopology(frame, valid, findings);
-
-var checksRun = ['C0-well-formed', 'C1-real-order', 'C2-scale-declared',
-'C3-stevens-legal', 'C4-instant-duration', 'C5-no-collision',
-'C6-fold-safety', 'C7-leak-safety', 'C8-cyclic-topology'];
-return {
-verdict: findings.length? 'FLAG': 'CLEAN',
-checks: checksRun,
-findings: findings,
-runtime_owned_by_renderer: ['render-is-a-pure-fold', 'no-cross-frame-day-leak']
-};
-}
-
-var HELP = [
-'timeline.js — validate a timeline artifact before you render it.',
-'',
-'Usage:',
-' node timeline.js artifact.json lint a file',
-' cat artifact.json | node timeline.js lint stdin',
-' node timeline.js --help',
-'',
-'Reads one JSON object {frame, events}; prints a verdict; exits',
-' 0 CLEAN · 3 FLAG · 2 USAGE.',
-'',
-'Edge: this is a PRESENCE checker, not a CORRECTNESS oracle. It confirms a',
-'scale is declared and self-consistent with the ops used — never that the',
-'declared level is the right one, and it does not prove your renderer is pure.'
-].join('\n');
-
-// --- surfaces: browser attach, Node require, Node CLI -----------------------
-if (typeof window!== 'undefined') {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.timelineLint = timelineLint;
-}
-
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { timelineLint: timelineLint};
-}
-
-if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-var argv = process.argv.slice(2);
-if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) {
-process.stdout.write(HELP + '\n');
-process.exit(0);
-}
-var readInput = function (cb) {
-if (argv[0]) {
-try { cb(require('fs').readFileSync(argv[0], 'utf8'));}
-catch (e) { process.stdout.write(JSON.stringify({ verdict: 'USAGE', error: String(e.message || e)}) + '\n'); process.exit(2);}
-} else {
-var chunks = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { chunks += d;});
-process.stdin.on('end', function () { cb(chunks);});
-}
-};
-readInput(function (raw) {
-var artifact;
-try { artifact = JSON.parse(raw);}
-catch (e) { process.stdout.write(JSON.stringify({ verdict: 'USAGE', error: String(e.message || e)}) + '\n'); process.exit(2);}
-var out = timelineLint(artifact);
-process.stdout.write(JSON.stringify(out, null, 2) + '\n');
-process.exit(out.verdict === 'USAGE'? 2: (out.verdict === 'FLAG'? 3: 0));
-});
-}
-
-test_timeline.js 165 lines on GitHub →
-// SPDX-License-Identifier: MIT
-// test_timeline.js — self-test + determinism proof for the timeline gift.
-//
-// node test_timeline.js
-//
-// Exit 0 = all pass. Exit 3 = a check failed. This is the gift's canonicalizer
-// self-test (Gift-Works B7): the determinism assertion IS the proof the render
-// is a pure fold — same artifact in, byte-identical verdict out.
-
-'use strict';
-
-var timelineLint = require('./timeline.js').timelineLint;
-
-var failures = 0;
-function ok(name, cond) {
-if (!cond) { console.error('FAIL: ' + name); failures++;}
-else { console.log('pass: ' + name);}
-}
-
-// helper: does the verdict contain a finding of the given check code?
-function hasCheck(v, code) {
-if (!v.findings) return false;
-for (var i = 0; i < v.findings.length; i++) {
-if (String(v.findings[i].check).indexOf(code) === 0) return true;
-}
-return false;
-}
-
-// --- a known-GOOD artifact: passes clean --------------------------------------
-var GOOD = {
-frame: { scale: 'interval', grain: null, foliation: { key: 't', dir: 'asc'}},
-events: [
-{ id: 'a', t: 0, track: 'main', label: 'start'},
-{ id: 'b', t: 100, parents: ['a'], track: 'main', duration: 50, label: 'work'},
-{ id: 'c', t: 200, parents: ['b'], track: 'main', label: 'end'}
-]
-};
-ok('C-good CLEAN verdict', timelineLint(GOOD).verdict === 'CLEAN');
-
-// --- C0: an event that is not an object with an id ----------------------------
-ok('C0 fires on a junk event', hasCheck(
-timelineLint({ frame: { scale: 'ordinal'}, events: [{ id: 'a', t: 0}, 42]}), 'C0'));
-
-// --- C1: a cycle in the parent edges (real defect: circular happened-before) --
-ok('C1 fires on a cycle', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [
-{ id: 'a', t: 0, parents: ['b']},
-{ id: 'b', t: 1, parents: ['a']}
-]
-}), 'C1'));
-// C1: a dangling parent edge
-ok('C1 fires on a dangling edge', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [{ id: 'a', t: 0, parents: ['ghost']}]
-}), 'C1'));
-
-// --- C2: no scale declared (implicit gauge) -----------------------------------
-ok('C2 fires on undeclared scale', hasCheck(timelineLint({
-frame: { grain: null},
-events: [{ id: 'a', t: 0}]
-}), 'C2'));
-// C2: a non-Stevens scale string
-ok('C2 fires on a bogus scale', hasCheck(timelineLint({
-frame: { scale: 'vibes'},
-events: [{ id: 'a', t: 0}]
-}), 'C2'));
-
-// --- C3: a causal order declared on a nominal (unordered) axis -----------------
-ok('C3 fires on order over a nominal axis', hasCheck(timelineLint({
-frame: { scale: 'nominal'},
-events: [{ id: 'a', t: 0}, { id: 'b', t: 1, parents: ['a']}]
-}), 'C3'));
-// C3: a duration on an ordinal axis (difference of points undefined below interval)
-ok('C3 fires on duration below interval', hasCheck(timelineLint({
-frame: { scale: 'ordinal'},
-events: [{ id: 'a', t: 0, duration: 10}]
-}), 'C3'));
-
-// --- C4: a duration with no anchoring instant ---------------------------------
-ok('C4 fires on unanchored duration', hasCheck(timelineLint({
-frame: { scale: 'interval'},
-events: [{ id: 'a', duration: 30}]
-}), 'C4'));
-
-// --- C5: two events, same track, same instant, no resolving foliation ---------
-ok('C5 fires on a same-track same-instant collision', hasCheck(timelineLint({
-frame: { scale: 'interval', foliation: { key: 't'}},
-events: [
-{ id: 'a', t: 100, track: 'main'},
-{ id: 'b', t: 100, track: 'main'}
-]
-}), 'C5'));
-// C5: the same collision RESOLVED by a non-t foliation is CLEAN for C5
-ok('C5 clear when a seq foliation resolves the pair',!hasCheck(timelineLint({
-frame: { scale: 'interval', foliation: { key: 'seq'}},
-events: [
-{ id: 'a', t: 100, track: 'main', seq: 1},
-{ id: 'b', t: 100, track: 'main', seq: 2}
-]
-}), 'C5'));
-
-// --- C6: a nondeterministic foliation key -------------------------------------
-ok('C6 fires on a nondeterministic key', hasCheck(timelineLint({
-frame: { scale: 'ordinal', foliation: { key: 'random'}},
-events: [{ id: 'a', t: 0}]
-}), 'C6'));
-// C6: a foliation key carried by no event (silent fallback to t)
-ok('C6 fires on a key no event carries', hasCheck(timelineLint({
-frame: { scale: 'ordinal', foliation: { key: 'seq'}},
-events: [{ id: 'a', t: 0}]
-}), 'C6'));
-
-// --- C7: a baked day bucket ---------------------------------------------------
-ok('C7 fires on a baked dayKey', hasCheck(timelineLint({
-frame: { scale: 'interval'},
-events: [{ id: 'a', t: 0, dayKey: '2026-08-31'}]
-}), 'C7'));
-
-// --- C8: a circular axis with an unreduced coordinate -------------------------
-ok('C8 fires on an unreduced circular coord', hasCheck(timelineLint({
-frame: { scale: 'interval', topology: 'S1', period: 1440},
-events: [{ id: 'a', t: 1500}]
-}), 'C8'));
-// C8: a valid circular axis is CLEAN
-ok('C8 clear on a reduced circular coord', timelineLint({
-frame: { scale: 'interval', topology: 'S1', period: 1440},
-events: [{ id: 'a', t: 30}, { id: 'b', t: 720}]
-}).verdict === 'CLEAN');
-
-// --- USAGE verdicts -----------------------------------------------------------
-ok('USAGE on a non-object', timelineLint(42).verdict === 'USAGE');
-ok('USAGE on a missing frame', timelineLint({ events: []}).verdict === 'USAGE');
-ok('USAGE on a missing events list', timelineLint({ frame: {}}).verdict === 'USAGE');
-
-// --- DETERMINISM: the canonicalizer self-test (Gift-Works B7) -----------------
-// Same artifact -> byte-identical serialized verdict, twice. This is the proof
-// the lint is a pure fold (folds-twice-identical).
-var samples = [GOOD, {
-frame: { scale: 'interval', topology: 'S1', period: 1440, foliation: { key: 't'}},
-events: [
-{ id: 'x', t: 100, track: 'a', parents: []},
-{ id: 'y', t: 100, track: 'a', duration: 5, dayKey: 'z'},
-{ id: 'z', t: 200, parents: ['x', 'ghost']}
-]
-}];
-for (var s = 0; s < samples.length; s++) {
-var a = JSON.stringify(timelineLint(samples[s]));
-var b = JSON.stringify(timelineLint(samples[s]));
-ok('determinism: sample ' + s + ' byte-identical across two runs', a === b);
-}
-
-// --- MUTATION BITE: prove the test is non-vacuous -----------------------------
-// If the lint were a no-op returning CLEAN always, C1 (cycle) would not fire.
-// The C1 assertion above already bites that mutation; assert it explicitly here.
-ok('mutation bite: a real cycle is NOT reported CLEAN',
-timelineLint({ frame: { scale: 'ordinal'}, events: [
-{ id: 'a', parents: ['b']}, { id: 'b', parents: ['a']}]}).verdict === 'FLAG');
-
-if (failures) {
-console.error('\nTIMELINE GIFT SELFTEST FAIL: ' + failures + ' failure(s)');
-process.exit(3);
-}
-console.log('\nTIMELINE GIFT SELFTEST PASS: all checks green, determinism proven');
-process.exit(0);
-
-Take the whole folder →
-MIT
-Node.js / browser, standard library only (zero dependencies)
-
----
-
-# Timesheet — a Loop MMT gift
-https://loopmmt.com/gifts/timesheet/
-[coverage: optional · branch: gifts]
-
-How Many Hours Did That Actually Take? fold ← all gifts
-
-Timesheet
-
-Pipe a git log in, get an honest effort estimate out. worked(day) = sum over consecutive commits of min(gap, break-gap) — the day's span minus every gap longer than a break threshold. Floor-biased so it under-counts rather than inflates, deterministic (same input → byte-identical report), and zero-dependency: it folds a piped stdin stream, so it needs no git subprocess and no repo.
-
-The honest edge
-
-Commit timestamps BOUND work, they do not MEASURE it — a floor-biased model output (⊢), never a measured truth (⊨). It under-counts on purpose (isolated commit = 0, invisible thinking = 0). NOT a timeclock: do not bill a client to the minute or adjudicate hours with it. The --break-gap assumption is printed in every report.
-
-Run it
-
-git log --format='%H %at %s' | node timesheet.js
-test_timesheet.js (20/20, hand-computed arithmetic oracle + overnight-gap floor-bias tripwire)
-Node, no dependencies
-
-The code — every file that ships
-
-timesheet.js 220 lines on GitHub →
+jsonl-diff.js 294 lines on GitHub →
 #!/usr/bin/env node
-/*
-* timesheet — a floor-biased time-worked report folded from git commit timestamps.
-* MIT · zero-dependency · standalone gift stripped from Loop MMT's The Timesheet.
+/* SPDX-License-Identifier: MIT */
+/* jsonl-diff.js — what changed between two JSONL files, deterministically.
 *
-* THE PRINTED EDGE (read before trusting a number):
-* Commit timestamps BOUND work; they do NOT MEASURE it. "Hours worked" here is a
-* MODEL OUTPUT, not a measured truth:
-* worked(day) = Σ over consecutive commits of min(gap, breakGap)
-* i.e. day-span minus every inter-commit gap longer than the break threshold.
-* It is FLOOR-BIASED on purpose: a gap over the threshold counts as a break worth
-* zero, and an isolated commit contributes zero span — so it UNDER-counts real time
-* rather than inflating it. It is a derivation (⊢), never a measured truth (⊨). It
-* is NOT a timeclock: do not bill a client to the minute or adjudicate hours with it.
-* The one judgment call, --break-gap (default 30 min), is printed in every report so
-* the number always carries its own assumption.
+* A tiny, dependency-free diff for JSON Lines (one JSON value per line). Give it
+* an OLD file and a NEW file and it tells you what was ADDED, REMOVED, and (when
+* you name a key) CHANGED — sorted, canonical, byte-identical on every run so it
+* drops straight into a CI gate or a review.
 *
-* USAGE:
-* git log --format='%H %at %s' | node timesheet.js
-* git log --format='%H %at %s' | node timesheet.js --break-gap 45 --tz America/New_York
-* node timesheet.js --help
+* old.jsonl, new.jsonl ──▶ diff(old, new, {key})
+* ──▶ { added:[…], removed:[…], changed:[…]}
 *
-* INPUT: one commit per line on stdin: "<sha> <author-epoch-seconds> <subject...>".
-* %at is the AUTHOR epoch (integer seconds, timezone-independent). committer-date
-* (%ct) works too but author-date is the conventional "when the work happened".
+* TWO MODES.
+* set-diff (default) — records are keyed by their own canonical form, so a
+* record either matches exactly or it is added/removed.
+* A changed record shows as one removed + one added.
+* keyed diff (--key F) — records are keyed by the value of field F. A record
+* present on both sides with the same key but different
+* content is a CHANGE, reported with its field deltas.
 *
-* DETERMINISM: the output is a pure function of (input lines, --break-gap, --tz). No
-* wall-clock is read; the report stamps the commit range, not a generation time — so
-* the same input always produces byte-identical output.
+* DETERMINISM (the promise, and the self-test that proves it). Comparison and
+* output both run over a canonical form: object keys sorted, whitespace fixed,
+* no ordering luck. The result is sorted by key. `--selftest` proves the canon
+* is idempotent (canon(canon(x)) === canon(x)) and the diff is stable, so the
+* output is a pure function of the two inputs — the same bytes, every run.
+*
+* THE LINE IT WILL NOT CROSS (the honest ceiling — printed every --help/--list).
+* jsonl-diff compares STRUCTURE, not MEANING. It tells you two records differ; it
+* cannot tell you the difference matters, is correct, or is safe. Semantic
+* equivalence it will miss (1 vs 1.0, "a,b" vs ["a","b"]) is a difference here.
+* A human reads the diff; the tool only makes the change visible and exact.
+*
+* EXIT CODES (diff convention, gate-friendly).
+* 0 the two files are identical (under the chosen mode)
+* 1 they differ (added / removed / changed present)
+* 2 input could not be used (missing file, a directory, unreadable, bad JSON,
+* a duplicate key, or a missing --key field) — always a clean message, never
+* a stack trace.
+*
+* Runs identically in Node and in a browser (no DOM, no deps). MIT.
 */
-'use strict';
 
-const SEC = 1000; // this file works in SECONDS throughout; epochs are integer seconds.
-const DEFAULT_BREAK_GAP_MIN = 30;
-const DEFAULT_TZ = 'UTC';
+var CEILING =
+'ceiling: jsonl-diff compares STRUCTURE, not MEANING. A reported change may be\n' +
+' cosmetic (1 vs 1.0) and an unreported match may still be wrong. A human reads\n' +
+' the diff; the tool only makes the change visible and exact.';
 
-// ---- core fold (the whole gift; pure, exported for require) --------------------
-function computeTimesheet(commits, opts) {
-// commits: [{ sha, epoch (int seconds), subject}]
-// opts: { breakGapMin, tz}
-const breakGap = (opts.breakGapMin!= null? opts.breakGapMin: DEFAULT_BREAK_GAP_MIN) * 60; // seconds
-const tz = opts.tz || DEFAULT_TZ;
-
-// sort by epoch ascending (stable, deterministic)
-const cs = commits.slice().sort((a, b) => a.epoch - b.epoch || (a.sha < b.sha? -1: a.sha > b.sha? 1: 0));
-
-// bucket by calendar day IN the report timezone
-const byDay = new Map();
-for (const c of cs) {
-const day = dayKey(c.epoch, tz);
-if (!byDay.has(day)) byDay.set(day, []);
-byDay.get(day).push(c);
+/* ---- canonical form (the canonicalizer; idempotent + order-faithful) ------ */
+function canon(v) {
+if (v === null || typeof v!== 'object') return JSON.stringify(v);
+if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
+var keys = Object.keys(v).sort();
+var parts = [];
+for (var i = 0; i < keys.length; i++) {
+parts.push(JSON.stringify(keys[i]) + ':' + canon(v[keys[i]]));
+}
+return '{' + parts.join(',') + '}';
 }
 
-const days = [];
-for (const day of Array.from(byDay.keys()).sort()) {
-const dcs = byDay.get(day); // already epoch-ascending (built from sorted cs)
-let worked = 0, brk = 0, runs = 1;
-for (let i = 0; i + 1 < dcs.length; i++) {
-const gap = dcs[i + 1].epoch - dcs[i].epoch;
-if (gap > breakGap) { brk += gap; runs += 1;}
-else { worked += gap;}
+/* ---- parse a JSONL string into records (throws JsonlError on a bad line) --- */
+function JsonlError(msg) { var e = new Error(msg); e.jsonl = true; return e;}
+
+function parseJsonl(text, label) {
+var out = [];
+var lines = text.split('\n');
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+if (line.replace(/\s+/g, '') === '') continue; // skip blank lines
+var obj;
+try { obj = JSON.parse(line);}
+catch (e) {
+throw JsonlError(label + ':' + (i + 1) + ': not valid JSON (' +
+((e && e.message) || 'parse error') + ')');
 }
-days.push({
-date: day,
-startEpoch: dcs[0].epoch,
-endEpoch: dcs[dcs.length - 1].epoch,
-worked, breakTime: brk, runs, nCommits: dcs.length,
+out.push({ value: obj, line: i + 1});
+}
+return out;
+}
+
+/* ---- key a record: by field F (keyed mode) or by its canonical form (set) -- */
+function keyOf(rec, key, label) {
+if (key === null) return canon(rec.value);
+var v = rec.value;
+if (v === null || typeof v!== 'object' || Array.isArray(v) ||
+!Object.prototype.hasOwnProperty.call(v, key)) {
+throw JsonlError(label + ':' + rec.line + ': record has no key field ' +
+JSON.stringify(key));
+}
+return canon(v[key]);
+}
+
+function index(recs, key, label) {
+var map = {};
+for (var i = 0; i < recs.length; i++) {
+var k = keyOf(recs[i], key, label);
+if (Object.prototype.hasOwnProperty.call(map, k)) {
+throw JsonlError(label + ':' + recs[i].line + ': duplicate key ' + k +
+' (first seen at ' + label + ':' + map[k].line + ') — the diff would be ambiguous');
+}
+map[k] = recs[i];
+}
+return map;
+}
+
+/* ---- field-level delta for a CHANGED record (keyed mode) ------------------ */
+function fieldDelta(before, after) {
+var d = { added: {}, removed: {}, changed: {}};
+var bObj = before && typeof before === 'object' &&!Array.isArray(before);
+var aObj = after && typeof after === 'object' &&!Array.isArray(after);
+if (!bObj ||!aObj) return null; // not object-vs-object; whole-value change
+var seen = {};
+var k, keys = Object.keys(before).concat(Object.keys(after));
+for (var i = 0; i < keys.length; i++) {
+k = keys[i];
+if (seen[k]) continue; seen[k] = 1;
+var hb = Object.prototype.hasOwnProperty.call(before, k);
+var ha = Object.prototype.hasOwnProperty.call(after, k);
+if (hb &&!ha) d.removed[k] = before[k];
+else if (!hb && ha) d.added[k] = after[k];
+else if (canon(before[k])!== canon(after[k])) d.changed[k] = { before: before[k], after: after[k]};
+}
+return d;
+}
+
+/* ---- the diff (pure) ------------------------------------------------------ */
+function diff(oldText, newText, opts) {
+opts = opts || {};
+var key = (opts.key === undefined)? null: opts.key;
+var oldRecs = parseJsonl(oldText, 'old');
+var newRecs = parseJsonl(newText, 'new');
+var oldMap = index(oldRecs, key, 'old');
+var newMap = index(newRecs, key, 'new');
+var added = [], removed = [], changed = [];
+var k;
+var allKeys = {};
+for (k in oldMap) if (Object.prototype.hasOwnProperty.call(oldMap, k)) allKeys[k] = 1;
+for (k in newMap) if (Object.prototype.hasOwnProperty.call(newMap, k)) allKeys[k] = 1;
+var sorted = Object.keys(allKeys).sort();
+for (var i = 0; i < sorted.length; i++) {
+k = sorted[i];
+var inOld = Object.prototype.hasOwnProperty.call(oldMap, k);
+var inNew = Object.prototype.hasOwnProperty.call(newMap, k);
+if (inOld &&!inNew) removed.push({ key: k, value: oldMap[k].value});
+else if (!inOld && inNew) added.push({ key: k, value: newMap[k].value});
+else if (canon(oldMap[k].value)!== canon(newMap[k].value)) {
+changed.push({
+key: k,
+before: oldMap[k].value,
+after: newMap[k].value,
+fields: (key === null)? null: fieldDelta(oldMap[k].value, newMap[k].value)
+});
+}
+}
+return { added: added, removed: removed, changed: changed};
+}
+
+/* ---- rendering ------------------------------------------------------------ */
+function renderText(d) {
+var out = [];
+var i;
+for (i = 0; i < d.removed.length; i++) out.push('- ' + d.removed[i].key);
+for (i = 0; i < d.added.length; i++) out.push('+ ' + d.added[i].key);
+for (i = 0; i < d.changed.length; i++) {
+var c = d.changed[i];
+out.push('~ ' + c.key);
+if (c.fields) {
+var f = c.fields, fk;
+var rk = Object.keys(f.removed).sort();
+for (fk = 0; fk < rk.length; fk++) out.push(' - ' + rk[fk] + ': ' + JSON.stringify(f.removed[rk[fk]]));
+var ak = Object.keys(f.added).sort();
+for (fk = 0; fk < ak.length; fk++) out.push(' + ' + ak[fk] + ': ' + JSON.stringify(f.added[ak[fk]]));
+var ck = Object.keys(f.changed).sort();
+for (fk = 0; fk < ck.length; fk++) {
+out.push(' ~ ' + ck[fk] + ': ' + JSON.stringify(f.changed[ck[fk]].before) +
+' -> ' + JSON.stringify(f.changed[ck[fk]].after));
+}
+}
+}
+out.push('# ' + d.added.length + ' added, ' + d.removed.length + ' removed, ' +
+d.changed.length + ' changed');
+return out.join('\n');
+}
+
+function renderJson(d) {
+// canonical, deterministic: sorted keys, stable field order
+return canon({
+added: d.added,
+removed: d.removed,
+changed: d.changed,
+summary: { added: d.added.length, removed: d.removed.length, changed: d.changed.length}
 });
 }
 
-const totalWorked = days.reduce((s, d) => s + d.worked, 0);
-const totalCommits = days.reduce((s, d) => s + d.nCommits, 0);
+/* ---- self-test (determinism + promise proof) ------------------------------ */
+function selftest() {
+var pass = 0, fail = 0;
+function ok(cond, name) { if (cond) pass++; else { fail++; console.error('FAIL: ' + name);}}
 
-return {
-days,
-totalWorked, // seconds
-totalCommits,
-nDays: days.length,
-breakGapMin: breakGap / 60,
-tz,
-firstSha: cs.length? cs[0].sha: null,
-lastSha: cs.length? cs[cs.length - 1].sha: null,
-byWeek: rollup(days, weekKey),
-byMonth: rollup(days, d => d.date.slice(0, 7)),
-};
+// canon is idempotent and order-faithful
+var a = { b: 1, a: [3, { y: 2, x: 1}]};
+ok(canon(JSON.parse(canon(a))) === canon(a), 'canon round-trips through JSON.parse');
+ok(canon({ x: 1, y: 2}) === canon({ y: 2, x: 1}), 'canon is key-order-faithful');
+ok(canon(canon(a)) === canon(canon(a)), 'canon is idempotent');
+
+// set-diff mode
+var oldT = '{"id":1,"v":"a"}\n{"id":2,"v":"b"}\n';
+var newT = '{"id":2,"v":"b"}\n{"id":3,"v":"c"}\n';
+var d1 = diff(oldT, newT, {});
+ok(d1.added.length === 1 && d1.removed.length === 1 && d1.changed.length === 0, 'set-diff add/remove');
+
+// keyed diff: same key, changed content => CHANGE with field delta
+var d2 = diff(oldT, '{"id":1,"v":"A","extra":9}\n{"id":2,"v":"b"}\n', { key: 'id'});
+ok(d2.changed.length === 1 && d2.added.length === 0 && d2.removed.length === 0, 'keyed change is a change, not add+remove');
+ok(d2.changed[0].fields && d2.changed[0].fields.changed.v && d2.changed[0].fields.added.extra!== undefined,
+'keyed change reports field deltas');
+
+// identical inputs => empty diff, byte-stable render
+var d3 = diff(oldT, oldT, { key: 'id'});
+ok(d3.added.length === 0 && d3.removed.length === 0 && d3.changed.length === 0, 'identical => empty');
+ok(renderJson(diff(oldT, newT, {})) === renderJson(diff(oldT, newT, {})), 'render is byte-stable across runs');
+
+// blank lines skipped; whitespace-insensitive comparison
+ok(diff('{"id":1}\n\n', '{ "id": 1}\n', { key: 'id'}).changed.length === 0, 'whitespace-insensitive, blanks skipped');
+
+// duplicate key is an error (ambiguous)
+var threw = false;
+try { diff('{"id":1}\n{"id":1}\n', '{"id":1}\n', { key: 'id'});} catch (e) { threw = e && e.jsonl;}
+ok(threw, 'duplicate key throws a clean JsonlError');
+
+console.log((fail === 0? 'GREEN': 'RED') + ': ' + (pass) + ' checks passed, ' + fail + ' failed [jsonl-diff]');
+return fail === 0;
 }
 
-function rollup(days, keyfn) {
-const buckets = new Map();
-const order = [];
-for (const d of days) {
-const k = keyfn(d);
-if (!buckets.has(k)) { buckets.set(k, { label: k, worked: 0, nCommits: 0, nDays: 0}); order.push(k);}
-const b = buckets.get(k);
-b.worked += d.worked; b.nCommits += d.nCommits; b.nDays += 1;
+/* ---- crashclean read ------------------------------------------------------ */
+function readFileClean(path) {
+var fs = require('fs');
+try {
+return fs.readFileSync(path, 'utf8');
+} catch (e) {
+var why = e && e.code === 'ENOENT'? 'no such file'
+: e && e.code === 'EISDIR'? 'is a directory'
+: e && e.code === 'EACCES'? 'permission denied'
+: (e && e.message) || 'cannot read';
+process.stderr.write('jsonl-diff: cannot read ' + JSON.stringify(path) + ': ' + why + '\n');
+process.exit(2);
 }
-return order.map(k => buckets.get(k));
-}
-
-// ---- timezone-aware day + ISO-week keys, stdlib Intl only (no deps) -------------
-function dayKey(epochSec, tz) {
-// Format the epoch in the target tz as YYYY-MM-DD, deterministically.
-const d = new Date(epochSec * SEC);
-const parts = new Intl.DateTimeFormat('en-CA', {
-timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-}).formatToParts(d);
-const g = t => parts.find(p => p.type === t).value;
-return `${g('year')}-${g('month')}-${g('day')}`;
 }
 
-function weekKey(dayRec) {
-// ISO week from the day's YYYY-MM-DD (tz already applied when the day was bucketed).
-const [y, m, dd] = dayRec.date.split('-').map(Number);
-const dt = new Date(Date.UTC(y, m - 1, dd));
-const dayNum = (dt.getUTCDay() + 6) % 7; // Mon=0..Sun=6
-dt.setUTCDate(dt.getUTCDate() - dayNum + 3); // Thursday of this week
-const firstThu = new Date(Date.UTC(dt.getUTCFullYear(), 0, 4));
-const week = 1 + Math.round(((dt - firstThu) / (7 * 24 * 3600 * SEC)));
-return `${dt.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+/* ---- CLI ------------------------------------------------------------------ */
+function usage() {
+console.log('usage: jsonl-diff.js [--key FIELD] [--out text|json] OLD.jsonl NEW.jsonl');
+console.log(' --key FIELD key records by FIELD; a same-key record that differs is a CHANGE');
+console.log(' (default: key by the whole record — changes show as remove + add)');
+console.log(' --out text - removed, + added, ~ changed, then a summary [default]');
+console.log(' --out json a canonical JSON result object');
+console.log(' --selftest run the built-in checks (exit 0 GREEN, 1 RED)');
+console.log(' exit 0 identical | 1 differs | 2 input could not be used');
+console.error('\n' + CEILING);
 }
 
-// ---- render (plain text, deterministic) ----------------------------------------
-function fmtHM(sec) {
-const t = Math.floor(sec);
-const h = Math.floor(t / 3600);
-const m = Math.floor((t % 3600) / 60);
-return `${h}h ${String(m).padStart(2, '0')}m`;
-}
-function hours(sec) { return Math.round((sec / 3600) * 100) / 100;}
-function grp(n) { return typeof n === 'number' && Number.isInteger(n)? n.toLocaleString('en-US'): String(n);}
-
-function render(ts) {
-if (ts.nDays === 0) return 'Work Timesheet\n\nNo commits in input.\n';
-const L = [];
-L.push('Work Timesheet');
-L.push('');
-L.push(`Span: ${ts.days[0].date}.. ${ts.days[ts.nDays - 1].date} · Days worked: ${grp(ts.nDays)} · Commits: ${grp(ts.totalCommits)}`);
-L.push(`Total time (model): ${fmtHM(ts.totalWorked)} (${hours(ts.totalWorked)} h)`);
-L.push(`Timezone: ${ts.tz} · Break threshold: ${ts.breakGapMin} min · Range: ${ts.firstSha}..${ts.lastSha}`);
-L.push('');
-L.push('What this measures: time bracketed by commits, not time at the keyboard.');
-L.push('worked = day-span − every gap longer than the break threshold. Floor-biased:');
-L.push('it under-counts (isolated commit = 0, invisible thinking = 0), never inflates.');
-L.push('A derivation (⊢), not a truth (⊨). Not a timeclock.');
-L.push('');
-L.push('By month');
-for (const b of ts.byMonth) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
-L.push('');
-L.push('By week');
-for (const b of ts.byWeek) L.push(` ${b.label} · ${fmtHM(b.worked)} · ${grp(b.nDays)} day(s) · ${grp(b.nCommits)} commit(s)`);
-L.push('');
-L.push('By day');
-for (const d of ts.days) L.push(` ${d.date} · ${fmtHM(d.worked)} · ${grp(d.nCommits)} commit(s) · ${d.runs} run(s)`);
-L.push('');
-return L.join('\n') + '\n';
-}
-
-// ---- parse stdin lines ----------------------------------------------------------
-function parseLines(text) {
-const commits = [];
-for (const raw of text.split('\n')) {
-const line = raw.trim();
-if (!line) continue;
-const m = line.match(/^(\S+)\s+(\d+)\s?(.*)$/);
-if (!m) continue;
-commits.push({ sha: m[1], epoch: parseInt(m[2], 10), subject: m[3] || ''});
-}
-return commits;
-}
-
-// ---- CLI ------------------------------------------------------------------------
-function parseArgs(argv) {
-const o = { breakGapMin: DEFAULT_BREAK_GAP_MIN, tz: DEFAULT_TZ, help: false};
-for (let i = 0; i < argv.length; i++) {
-const a = argv[i];
-if (a === '--help' || a === '-h') o.help = true;
-else if (a === '--break-gap') o.breakGapMin = parseInt(argv[++i], 10);
-else if (a === '--tz') o.tz = argv[++i];
-}
-return o;
-}
-
-const HELP = `timesheet — floor-biased time-worked report from git commit timestamps (MIT, zero-dep)
-
-git log --format='%H %at %s' | node timesheet.js [--break-gap MIN] [--tz ZONE]
-
---break-gap MIN gap over MIN minutes counts as a break worth zero (default 30)
---tz ZONE IANA timezone for day bucketing (default UTC)
---help this text
-
-EDGE: commit timestamps BOUND work, they do not MEASURE it. This is a floor-biased
-model output (⊢), never a measured truth (⊨) — it under-counts on purpose. Not a
-timeclock; do not bill or adjudicate hours with it. The --break-gap assumption is
-printed in every report.
-`;
-
-function main() {
-const opts = parseArgs(process.argv.slice(2));
-if (opts.help) { process.stdout.write(HELP); return;}
-let input = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', d => { input += d;});
-process.stdin.on('end', () => {
-const commits = parseLines(input);
-const ts = computeTimesheet(commits, opts);
-process.stdout.write(render(ts));
-});
-}
-
-if (typeof window!== 'undefined') {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.timesheet = { computeTimesheet, render, parseLines};
-}
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { computeTimesheet, render, parseLines, fmtHM, weekKey, dayKey};
-}
 if (typeof require!== 'undefined' && require.main === module) {
-main();
+var argv = process.argv.slice(2);
+var key = null, out = 'text', files = [];
+for (var a = 0; a < argv.length; a++) {
+var t = argv[a];
+if (t === '--selftest') { process.exit(selftest()? 0: 1);}
+else if (t === '-h' || t === '--help') { usage(); process.exit(0);}
+else if (t === '--key') { key = argv[++a]; if (key === undefined) { console.error('jsonl-diff: --key needs a field name'); process.exit(2);}}
+else if (t === '--out') { out = argv[++a]; if (out!== 'text' && out!== 'json') { console.error('jsonl-diff: --out must be text or json'); process.exit(2);}}
+else if (t.charAt(0) === '-') { console.error('jsonl-diff: unknown option ' + JSON.stringify(t)); process.exit(2);}
+else files.push(t);
+}
+if (files.length!== 2) {
+console.error('jsonl-diff: need exactly two files (OLD NEW); got ' + files.length + '. Try --help.');
+process.exit(2);
+}
+var oldText = readFileClean(files[0]);
+var newText = readFileClean(files[1]);
+var d;
+try {
+d = diff(oldText, newText, key === null? {}: { key: key});
+} catch (e) {
+if (e && e.jsonl) { console.error('jsonl-diff: ' + e.message); process.exit(2);}
+throw e; // a non-input bug: let it surface honestly (never masked as clean)
+}
+console.log(out === 'json'? renderJson(d): renderText(d));
+var differs = d.added.length + d.removed.length + d.changed.length > 0;
+process.exit(differs? 1: 0);
 }
 
-test_timesheet.js 109 lines on GitHub →
+/* ---- exports (browser / require) ------------------------------------------ */
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { diff: diff, canon: canon, parseJsonl: parseJsonl, selftest: selftest};
+}
+
+test_jsonl-diff.js 80 lines on GitHub →
 #!/usr/bin/env node
-/*
-* test_timesheet — drift-check battery for the timesheet gift.
-* MIT · zero-dependency · stdlib-only.
+/* SPDX-License-Identifier: MIT */
+/* test_jsonl-diff.js — the house-standard test file for the jsonl-diff gift.
 *
-* THE ORACLE RULE: the oracle here is HAND-COMPUTED ARITHMETIC. The model
-* worked(day) = Σ min(gap, breakGap) over consecutive commits
-* is simple enough that a human computes the expected number independently of the
-* implementation — a stronger out-of-band oracle than a second code path. Each
-* fixture below carries its hand-computed expected value and the arithmetic.
+* Runs the module's own selftest (canon idempotence/order-faithfulness + the
+* diff modes), then adds API-level assertions the CLI selftest doesn't cover:
+* the set-diff vs keyed-diff distinction, deterministic sort order, the JSON
+* render being canonical + byte-stable, and that adversarial input throws a
+* clean JsonlError rather than a raw crash. Exits non-zero on any failure so it
+* drops straight into a CI gate.
 */
 'use strict';
-const { computeTimesheet} = require('./timesheet.js');
+var jd = require('./jsonl-diff.js');
 
-let pass = 0, fail = 0;
-function eq(got, want, msg) {
-if (got === want) { pass++;}
-else { fail++; console.error(`FAIL: ${msg}\n got: ${got}\n want: ${want}`);}
-}
-function ok(cond, msg) { if (cond) pass++; else { fail++; console.error(`FAIL: ${msg}`);}}
+var fails = [];
+function ck(name, cond) { if (!cond) fails.push(name);}
 
-// helper: build commits at given UTC times on one day (2026-01-05, a Monday)
-const BASE = Math.floor(Date.UTC(2026, 0, 5, 0, 0, 0) / 1000); // 2026-01-05 00:00:00Z
-const at = (hh, mm) => BASE + hh * 3600 + mm * 60;
-const C = (n, epoch) => ({ sha: `sha${n}`.padEnd(7, '0'), epoch, subject: `commit ${n}`});
+// 1. the module's own selftest must pass
+ck('module selftest GREEN', jd.selftest() === true);
 
-// ---- 1. Fixed model anchors (hand-computed) -----------------------------------
-// Two commits 10 min apart, same day. gap=600s <= break(1800s) -> worked=600.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 600, 'anchor A: two commits 10min apart -> worked=600s');
-eq(ts.nDays, 1, 'anchor A: one day');
-eq(ts.totalCommits, 2, 'anchor A: two commits');
+// 2. canon: order-faithful + idempotent
+ck('canon order-faithful', jd.canon({ b: 2, a: 1}) === jd.canon({ a: 1, b: 2}));
+ck('canon idempotent', jd.canon(jd.canon({ a: [1, 2]})) === jd.canon(jd.canon({ a: [1, 2]})));
+
+// 3. set-diff (no key): a changed record is one remove + one add, never a change
+var d = jd.diff('{"id":1,"v":"a"}\n', '{"id":1,"v":"b"}\n', {});
+ck('set-diff: change becomes remove+add', d.changed.length === 0 && d.added.length === 1 && d.removed.length === 1);
+
+// 4. keyed diff: same key, different content is a CHANGE with field deltas
+d = jd.diff('{"id":1,"v":"a","gone":1}\n', '{"id":1,"v":"b","new":2}\n', { key: 'id'});
+ck('keyed: same key differing is a change', d.changed.length === 1);
+ck('keyed: field delta names changed/removed/added',
+d.changed[0].fields.changed.v && d.changed[0].fields.removed.gone!== undefined &&
+d.changed[0].fields.added.new!== undefined);
+
+// 5. deterministic sort order (result independent of input line order)
+var A = jd.diff('{"id":2}\n{"id":1}\n', '{"id":3}\n{"id":1}\n', { key: 'id'});
+var B = jd.diff('{"id":1}\n{"id":2}\n', '{"id":1}\n{"id":3}\n', { key: 'id'});
+ck('result independent of input order',
+JSON.stringify(A.removed.map(function (r) { return r.key;})) ===
+JSON.stringify(B.removed.map(function (r) { return r.key;})));
+
+// 6. duplicate key => clean JsonlError (not a raw crash)
+var threw = null;
+try { jd.diff('{"id":1}\n{"id":1}\n', '{"id":1}\n', { key: 'id'});} catch (e) { threw = e;}
+ck('duplicate key throws JsonlError', threw && threw.jsonl === true);
+
+// 7. bad JSON line => clean JsonlError naming file:line
+threw = null;
+try { jd.parseJsonl('{"ok":1}\nnope\n', 'x');} catch (e) { threw = e;}
+ck('bad JSON throws JsonlError with location', threw && threw.jsonl === true && /x:2:/.test(threw.message));
+
+// 8. missing --key field => clean JsonlError, not a silent wrong answer
+threw = null;
+try { jd.diff('{"a":1}\n', '{"a":1}\n', { key: 'id'});} catch (e) { threw = e;}
+ck('missing key field throws JsonlError', threw && threw.jsonl === true);
+
+// 9. blank lines + whitespace are insensitive under canon
+d = jd.diff('{"id":1}\n\n', '{ "id": 1}\n', { key: 'id'});
+ck('whitespace/blank-insensitive', d.added.length === 0 && d.removed.length === 0 && d.changed.length === 0);
+
+// --- the adversarial CLI exits (crashclean; the qualify D4 contract) ---------
+var cp = require('child_process');
+var here = __dirname + '/jsonl-diff.js';
+function run(args) {
+var r = cp.spawnSync('node', [here].concat(args), { encoding: 'utf8'});
+return { code: r.status, err: r.stderr || '', out: r.stdout || ''};
 }
-// Two commits 90 min apart with break-gap 30. gap=5400s > 1800 -> break, worked=0.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(10, 30))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 0, 'anchor B: 90min gap > 30min break -> worked=0 (clamped)');
+var m = run(['/no/such/path_zzz', '/also/missing']);
+ck('missing file => exit 2, no stack trace', m.code === 2 &&!/\bat \w/.test(m.err));
+var one = run(['/no/such/path_zzz']);
+ck('one arg => exit 2, no stack trace', one.code === 2 &&!/\bat \w/.test(one.err));
+var help = run(['--help']);
+ck('--help => exit 0', help.code === 0);
+
+if (fails.length) {
+console.error('RED: ' + fails.length + ' failed: ' + fails.join(', ') + ' [test_jsonl-diff]');
+process.exit(1);
 }
-// A lone commit in a day -> worked=0 (no neighbor).
-{
-const ts = computeTimesheet([C(1, at(14, 0))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 0, 'anchor C: isolated commit -> worked=0');
-eq(ts.nDays, 1, 'anchor C: still one day recorded');
-}
-// Three commits: 9:00, 9:20, 9:35 (gaps 20m, 15m; both <=30) -> worked=35m=2100s.
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 20)), C(3, at(9, 35))], { breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 2100, 'anchor D: 20m+15m consecutive -> worked=2100s');
-eq(ts.days[0].runs, 1, 'anchor D: one run (no break)');
+console.log('GREEN: all checks passed [test_jsonl-diff]');
+
+Take the whole folder →
+MIT
+Zero dependencies, Node or browser, deterministic
+
+---
+
+# Branch Merger — a Loop MMT gift
+https://loopmmt.com/gifts/junction/
+[coverage: optional · branch: gifts]
+
+How Do N Branches Fold Back To One? fold ← all gifts
+
+Branch Merger
+
+Fold the labeled records a fanout produced back into one, under a declared merge policy from a closed set (concat, agree, first, map). It is the close half of a parallel-independent compose (the ⊗ product): fanout splits, junction merges, so fanout | junction round-trips. Zero dependencies, pure fold — same records plus the same policy yield byte-identical output every run, and records are folded in seq order so their arrival order never leaks. Runs in Node or the browser (window.ForestGifts.junction).
+
+The honest edge
+
+junction merges declared branch-records into one under a declared policy; it does not choose the policy for you, run the branches, or resolve a value conflict the policy leaves ambiguous — it refuses (non-zero exit) when no policy is declared or the policy cannot merge cleanly.
+
+Run it
+
+node fanout.js --branches a,b,c "p" | node junction.js --policy concat
+test_junction.js (18/18: policy concat/agree/first/map, seq-order determinism, refusal on no-policy + unmergeable conflict, fanout|junction round-trip)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+junction.js 215 lines on GitHub →
+#!/usr/bin/env node
+/* junction.js — merge declared branch-records into one, under a REQUIRED policy.
+
+WHY THIS EXISTS. It is the close half of a parallel-independent compose (the ⊗
+product): `fanout` splits one input into N declared branches; `junction` folds
+those branch-records back into a single record. The pair gives a pipeline the
+parallel product to sit beside sequential (`|`) composition, so `fanout | junction`
+round-trips.
+
+THE ONE DISCIPLINE (the whole reason to trust it). HOW branches recombine is a
+decision the caller must make EXPLICITLY. There is no default policy. junction
+takes the labeled records and a DECLARED policy from a closed set, and emits one
+merged record — and it FAILS CLOSED the instant it is asked to merge with no
+policy, an unknown policy, malformed input, or a conflict the policy declares
+fatal (an `agree` disagreement). It never silently picks a winner.
+
+THE CLOSED POLICY SET (v1):
+concat -> {"policy":"concat","of":n,"merged":[input_0,...,input_{n-1}]}
+agree -> require every branch input identical; {"policy":"agree","of":n,"value":input}
+(fails closed, naming the two branches, on any disagreement)
+first -> {"policy":"first","of":n,"value":input_0}
+map -> {"policy":"map","of":n,"by_branch":{branch:input,...}}
+
+Pure function of its inputs. No dependencies. Same records + same policy ->
+byte-identical merged output, every run. Records are folded in `seq` order, so
+input line-order never leaks into the result. Runs in a browser (attach junction
+to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node fanout.js --branches a,b,c "p" | node junction.js --policy concat # the braid
+node junction.js --policy agree < records.jsonl
+node junction.js --policy map --input records.jsonl
+node junction.js --help
+
+Released under MIT. Its edge is printed in the README: junction merges declared
+branch-records into one under a declared policy; it does not choose the policy for
+you, run the branches, or resolve a value conflict the policy leaves ambiguous — it
+refuses when no policy is declared or the policy cannot merge cleanly.
+*/
+
+"use strict";
+
+var POLICIES = ["concat", "agree", "first", "map"];
+
+function JunctionError(message) {
+var e = new Error(message);
+e.name = "JunctionError";
+return e;
 }
 
-// ---- 2. Floor-bias tripwire (the known-bad vector) ----------------------------
-// A day with an overnight-shaped 3h gap in the middle. Naive first-to-last span
-// would count the whole ~3h20m as work; the model must clamp the 3h gap to a break.
-// Commits: 9:00, 9:10 (gap 10m -> worked 600), 12:15 (gap 3h05m=11100s > 1800 ->
-// BREAK, worked +0), 12:25 (gap 10m -> worked +600). Hand-computed worked = 1200s.
-// Naive span = 12:25 - 9:00 = 3h25m = 12300s. The gap between them is the test.
-{
-const ts = computeTimesheet(
-[C(1, at(9, 0)), C(2, at(9, 10)), C(3, at(12, 15)), C(4, at(12, 25))],
-{ breakGapMin: 30, tz: 'UTC'});
-eq(ts.totalWorked, 1200, 'TRIPWIRE: floor-biased worked=1200s (not the 12300s naive span)');
-ok(ts.totalWorked < 12300, 'TRIPWIRE: model under-counts the naive first-to-last span');
-eq(ts.days[0].runs, 2, 'TRIPWIRE: the 3h gap splits the day into 2 runs');
+/* parseRecords(text) -> array of fanout records, validated and sorted by seq.
+Fails closed on: no records, a non-record line, an `of` that disagrees with the
+count, a missing/duplicate/out-of-range seq. The corrupted-fan cases are real
+defects (a fan mangled in transit), not warnings. */
+function parseRecords(text) {
+var lines = String(text).split("\n").filter(function (l) { return l.trim().length > 0;});
+if (lines.length === 0) {
+throw JunctionError("no input records (junction folds a fanout's output; it needs at least one record)");
+}
+var recs = [];
+for (var i = 0; i < lines.length; i++) {
+var obj;
+try { obj = JSON.parse(lines[i]);}
+catch (e) { throw JunctionError("input line " + i + " is not valid JSON: " + lines[i]);}
+if (obj === null || typeof obj!== "object" ||
+typeof obj.branch!== "string" ||
+!("input" in obj) ||
+typeof obj.seq!== "number" ||
+typeof obj.of!== "number") {
+throw JunctionError("input line " + i + " is not a fanout record {branch,input,seq,of}: " + lines[i]);
+}
+recs.push(obj);
+}
+var of = recs[0].of;
+if (recs.length!== of) {
+throw JunctionError("record count " + recs.length + " disagrees with declared of=" + of +
+" (the fan was truncated or padded in transit)");
+}
+var seenSeq = Object.create(null);
+for (var j = 0; j < recs.length; j++) {
+var r = recs[j];
+if (r.of!== of) {
+throw JunctionError("record for branch " + JSON.stringify(r.branch) +
+" has of=" + r.of + ", expected " + of + " (mixed fans cannot be merged)");
+}
+if (r.seq < 0 || r.seq >= of || (r.seq | 0)!== r.seq) {
+throw JunctionError("record for branch " + JSON.stringify(r.branch) +
+" has out-of-range seq=" + r.seq + " (expected 0.." + (of - 1) + ")");
+}
+if (seenSeq[r.seq]) {
+throw JunctionError("duplicate seq=" + r.seq + " (the fan is ambiguous — two records claim the same position)");
+}
+seenSeq[r.seq] = true;
+}
+// Fold in declared order: sort by seq (input line-order must not leak).
+recs.sort(function (a, b) { return a.seq - b.seq;});
+return recs;
 }
 
-// ---- 3. Determinism: same input twice -> identical result ----------------------
-{
-const input = [C(1, at(9, 0)), C(2, at(9, 25)), C(3, at(11, 0))];
-const a = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
-const b = JSON.stringify(computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'}));
-eq(a, b, 'determinism: same input -> byte-identical fold');
+/* mergeRecords(records, policy) -> the merged object (not yet serialized).
+`records` may be raw fanout records (already validated) in any input order;
+they are sorted by seq here. Fails closed on an unknown policy or an
+`agree` disagreement. */
+function mergeRecords(records, policy) {
+if (POLICIES.indexOf(policy) === -1) {
+throw JunctionError("unknown merge policy " + JSON.stringify(policy) +
+" (declared set: " + POLICIES.join(", ") + "; there is no default)");
+}
+var recs = records.slice().sort(function (a, b) { return a.seq - b.seq;});
+var of = recs.length;
+if (policy === "concat") {
+return { policy: "concat", of: of, merged: recs.map(function (r) { return r.input;})};
+}
+if (policy === "first") {
+return { policy: "first", of: of, value: recs[0].input};
+}
+if (policy === "map") {
+var by = {};
+for (var i = 0; i < recs.length; i++) { by[recs[i].branch] = recs[i].input;}
+return { policy: "map", of: of, by_branch: by};
+}
+// agree: every branch input must be identical (compared by canonical JSON).
+var ref = JSON.stringify(recs[0].input);
+for (var k = 1; k < recs.length; k++) {
+if (JSON.stringify(recs[k].input)!== ref) {
+throw JunctionError("agree conflict: branch " + JSON.stringify(recs[0].branch) +
+" and branch " + JSON.stringify(recs[k].branch) +
+" disagree (agree refuses a disagreement; it never picks a winner)");
+}
+}
+return { policy: "agree", of: of, value: recs[0].input};
 }
 
-// ---- 4. Break-gap sensitivity (the assumption is live) -------------------------
-// Commits 9:00 and 9:40 (gap 40m=2400s). At break-gap 30 -> break (worked 0).
-// At break-gap 45 -> within threshold (worked 2400). The number moves with --break-gap.
-{
-const input = [C(1, at(9, 0)), C(2, at(9, 40))];
-const at30 = computeTimesheet(input, { breakGapMin: 30, tz: 'UTC'});
-const at45 = computeTimesheet(input, { breakGapMin: 45, tz: 'UTC'});
-eq(at30.totalWorked, 0, 'sensitivity: 40m gap at break-gap 30 -> worked=0');
-eq(at45.totalWorked, 2400, 'sensitivity: 40m gap at break-gap 45 -> worked=2400s');
+/* junction(text, policy) -> the canonical serialized merged record: one JSON
+object, keys in the policy's fixed insertion order, single trailing newline.
+This string IS the gift's canonical output. */
+function junction(text, policy) {
+var recs = parseRecords(text);
+var merged = mergeRecords(recs, policy);
+return JSON.stringify(merged) + "\n";
 }
 
-// ---- 5. Mutation bite: a deliberately-wrong expectation MUST be caught ----------
-// (Proves the harness is not a no-op: assert the RIGHT value is NOT the wrong one.)
-{
-const ts = computeTimesheet([C(1, at(9, 0)), C(2, at(9, 10))], { breakGapMin: 30, tz: 'UTC'});
-ok(ts.totalWorked!== 999, 'mutation-bite: harness rejects a wrong expected value (worked!== 999)');
-ok(ts.totalWorked === 600, 'mutation-bite: harness confirms the right value (worked === 600)');
+// Browser / Node exports.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.junction = junction;
+window.ForestGifts.mergeRecords = mergeRecords;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { junction: junction, mergeRecords: mergeRecords, parseRecords: parseRecords, POLICIES: POLICIES};
 }
 
-// ---- 6. Multi-day rollup + week/month keys -------------------------------------
-{
-const day2 = BASE + 24 * 3600; // 2026-01-06
-const ts = computeTimesheet(
-[C(1, at(9, 0)), C(2, at(9, 15)), { sha: 'sha3000', epoch: day2 + 10 * 3600, subject: 'd2'},
-{ sha: 'sha4000', epoch: day2 + 10 * 3600 + 600, subject: 'd2b'}],
-{ breakGapMin: 30, tz: 'UTC'});
-eq(ts.nDays, 2, 'rollup: two distinct days');
-eq(ts.totalWorked, 900 + 600, 'rollup: day1 15m + day2 10m = 1500s total');
-eq(ts.byMonth.length, 1, 'rollup: both days in one month bucket');
-eq(ts.byMonth[0].label, '2026-01', 'rollup: month key = 2026-01');
+// ---- CLI --------------------------------------------------------------------
+function readPolicy(args) {
+var i = args.indexOf("--policy");
+if (i === -1) {
+throw JunctionError("no merge policy declared: pass --policy <" + POLICIES.join("|") +
+"> (there is no default policy)");
+}
+var p = args[i + 1];
+if (p === undefined) throw JunctionError("--policy needs a value (" + POLICIES.join("|") + ")");
+return p;
 }
 
-console.log(`\ntimesheet drift-check: ${pass} passed, ${fail} failed`);
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"junction.js — merge declared branch-records into one, under a REQUIRED policy.\n\n" +
+" node fanout.js --branches a,b,c \"p\" | node junction.js --policy concat the braid\n" +
+" node junction.js --policy agree < records.jsonl\n" +
+" node junction.js --policy map --input records.jsonl\n" +
+" node junction.js --help\n\n" +
+"Policies (closed set, no default): " + POLICIES.join(", ") + "\n" +
+" concat ordered list of branch inputs\n" +
+" agree require all branches identical (refuses a disagreement, naming the two)\n" +
+" first the seq:0 branch's input\n" +
+" map a branch->input object\n\n" +
+"Fails closed (non-zero exit) on no policy, unknown policy, malformed input, or an\n" +
+"agree conflict. It never silently picks a winner.\n\n" +
+"Edge: junction MERGES under a declared policy; it does not choose the policy, run\n" +
+"the branches, or resolve a conflict the policy leaves ambiguous.\n"
+);
+return 0;
+}
+
+var policy;
+try { policy = readPolicy(args);}
+catch (e) { process.stderr.write("junction: " + e.message + "\n"); return 2;}
+
+function emit(text) {
+try { process.stdout.write(junction(text, policy)); return 0;}
+catch (e) { process.stderr.write("junction: " + e.message + "\n"); return 2;}
+}
+
+var iInput = args.indexOf("--input");
+if (iInput!== -1) {
+var path = args[iInput + 1];
+if (path === undefined) { process.stderr.write("junction: --input needs a path\n"); return 2;}
+var fs = require("fs");
+return emit(fs.readFileSync(path, "utf8"));
+}
+
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_junction.js 149 lines on GitHub →
+#!/usr/bin/env node
+/* test_junction.js — the golden corpus + determinism self-test + non-vacuity
+bites for the junction gift. Zero dependencies (Node assert only). This file
+IS the canonicalizer self-test the Plumb cites (Gift-Works Procedure v1 §2).
+
+Run: node test_junction.js # exit 0 GREEN / 3 RED
+*/
+"use strict";
+var assert = require("assert");
+var J = require("./junction.js");
+
+var pass = 0, fail = 0;
+function check(name, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error("FAIL: " + name + " — " + e.message);}
+}
+
+// A 3-branch fan, as fanout would emit it (records in declared order).
+var FAN3 =
+'{"branch":"a","input":"the prompt","seq":0,"of":3}\n' +
+'{"branch":"b","input":"the prompt","seq":1,"of":3}\n' +
+'{"branch":"c","input":"the prompt","seq":2,"of":3}\n';
+
+// ---- GOLDEN CORPUS: known-good half (one per policy) -----------------------
+var GOLDEN = [
+{
+name: "concat: ordered list of inputs",
+text: FAN3, policy: "concat",
+expect: '{"policy":"concat","of":3,"merged":["the prompt","the prompt","the prompt"]}\n'
+},
+{
+name: "agree: identical branches collapse to the value",
+text: FAN3, policy: "agree",
+expect: '{"policy":"agree","of":3,"value":"the prompt"}\n'
+},
+{
+name: "first: the seq:0 branch's input",
+text: FAN3, policy: "first",
+expect: '{"policy":"first","of":3,"value":"the prompt"}\n'
+},
+{
+name: "map: branch->input object",
+text: FAN3, policy: "map",
+expect: '{"policy":"map","of":3,"by_branch":{"a":"the prompt","b":"the prompt","c":"the prompt"}}\n'
+},
+{
+name: "concat carries DECLARED order faithfully (distinct inputs)",
+text:
+'{"branch":"a","input":"A","seq":0,"of":3}\n' +
+'{"branch":"b","input":"B","seq":1,"of":3}\n' +
+'{"branch":"c","input":"C","seq":2,"of":3}\n',
+policy: "concat",
+expect: '{"policy":"concat","of":3,"merged":["A","B","C"]}\n'
+},
+{
+name: "input line-order does NOT leak (seq-sorted, not line-sorted)",
+// records delivered OUT of seq order; concat must restore seq order.
+text:
+'{"branch":"c","input":"C","seq":2,"of":3}\n' +
+'{"branch":"a","input":"A","seq":0,"of":3}\n' +
+'{"branch":"b","input":"B","seq":1,"of":3}\n',
+policy: "concat",
+expect: '{"policy":"concat","of":3,"merged":["A","B","C"]}\n'
+},
+{
+name: "multibyte payload fidelity through the merge",
+text: '{"branch":"m","input":"café🦌日本語","seq":0,"of":1}\n',
+policy: "agree",
+expect: '{"policy":"agree","of":1,"value":"café🦌日本語"}\n'
+}
+];
+
+GOLDEN.forEach(function (v) {
+check("golden: " + v.name, function () {
+assert.strictEqual(J.junction(v.text, v.policy), v.expect);
+});
+});
+
+// ---- FAIL-CLOSED: known-bad half (real defects) ---------------------------
+var BAD = [
+{ name: "no policy (unknown)", text: FAN3, policy: "", match: /unknown merge policy/},
+{ name: "unknown policy name", text: FAN3, policy: "bogus", match: /unknown merge policy/},
+{ name: "empty input", text: "", policy: "concat", match: /no input records/},
+{ name: "non-record line", text: "not a record\n", policy: "concat", match: /not valid JSON|not a fanout record/},
+{
+name: "of disagrees with count",
+text: '{"branch":"a","input":"A","seq":0,"of":3}\n', // says of:3 but only 1 record
+policy: "concat", match: /disagrees with declared of/
+},
+{
+name: "duplicate seq",
+text:
+'{"branch":"a","input":"A","seq":0,"of":2}\n' +
+'{"branch":"b","input":"B","seq":0,"of":2}\n',
+policy: "concat", match: /duplicate seq/
+},
+{
+name: "agree conflict names the two branches",
+text:
+'{"branch":"a","input":"A","seq":0,"of":2}\n' +
+'{"branch":"b","input":"DIFFERENT","seq":1,"of":2}\n',
+policy: "agree", match: /agree conflict.*"a".*"b"/
+}
+];
+
+BAD.forEach(function (v) {
+check("fail-closed: " + v.name, function () {
+assert.throws(function () { J.junction(v.text, v.policy);}, v.match,
+"expected refusal for " + v.name);
+});
+});
+
+// ---- NON-VACUITY MUTATION BITES -------------------------------------------
+check("mutation bite: a wrong merged value is rejected", function () {
+var wrong = '{"policy":"agree","of":3,"value":"WRONG"}\n';
+assert.notStrictEqual(J.junction(FAN3, "agree"), wrong,
+"the corpus must distinguish a wrong merged value");
+});
+check("mutation bite: agree must actually throw on a disagreement", function () {
+var threw = false;
+try {
+J.junction('{"branch":"a","input":"A","seq":0,"of":2}\n{"branch":"b","input":"B","seq":1,"of":2}\n', "agree");
+} catch (e) { threw = true;}
+assert.strictEqual(threw, true, "agree must refuse a disagreement — a non-throwing refuser has no teeth");
+});
+
+// ---- DETERMINISM SELF-TEST (the canonicalizer self-test, Gift-Works §2) ----
+check("determinism: byte-identical across 25 evaluations", function () {
+var first = J.junction(FAN3, "map");
+for (var i = 0; i < 25; i++) {
+assert.strictEqual(J.junction(FAN3, "map"), first,
+"evaluation " + i + " diverged — merged output is not deterministic");
+}
+});
+check("determinism: input line-order is not faithful, seq order IS", function () {
+// Two line-orderings of the same fan must yield the SAME merged output
+// (the fold is over seq, so line-order is normalized away).
+var forward =
+'{"branch":"a","input":"A","seq":0,"of":2}\n' +
+'{"branch":"b","input":"B","seq":1,"of":2}\n';
+var reversed =
+'{"branch":"b","input":"B","seq":1,"of":2}\n' +
+'{"branch":"a","input":"A","seq":0,"of":2}\n';
+assert.strictEqual(J.junction(forward, "concat"), J.junction(reversed, "concat"),
+"line-order must not leak — the fold is over seq");
+});
+
+console.log((fail === 0? "GREEN": "RED") + ": " + pass + " passed, " + fail + " failed");
+process.exitCode = fail === 0? 0: 3;
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# kv-source — a Loop MMT gift
+https://loopmmt.com/gifts/kv-source/
+[coverage: optional · branch: gifts]
+
+Parse KEY=VALUE Config into a JSONL Record Stream source ← all gifts
+
+kv-source
+
+kv-source reads plain KEY=VALUE text (a FILE arg, or stdin) and emits one uniform JSON object per assignment — {"key":NAME,"value":VALUE}, both strings — the front of a pipe you feed into the fold/filter/transform gifts (kv-source.env | dedup-filter). Lines split on the FIRST '=', full-line # comments and blank lines skipped, outer quotes stripped, CRLF==LF. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+
+The honest edge
+
+kv-source parses PLAIN KEY=VALUE text into uniform string records only — it does not coerce types ("8080" stays a string, never a number), does not interpolate ${VAR}, does not strip an `export ` prefix, does not honor inline comments, and does not process escapes inside quotes. Each of those is a context-dependent guess that would make the same file parse to different bytes across tools. A malformed line (no '='), an illegal/empty key, or --key-field==--value-field is refused (exit 2). An honest, pinnable parse — not a full dotenv runtime.
+
+Run it
+
+printf 'PORT=8080\n' | node kv-source.js # -> {"key":"PORT","value":"8080"}
+test_kv-source.js (50/50, independent regex-route oracle) + Plumb conformance GREEN (28/28, signed 2026-09-12, clock-independent, mutation-bite non-vacuous)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+kv-source.js 239 lines on GitHub →
+#!/usr/bin/env node
+/* kv-source.js — parse plain KEY=VALUE text into a uniform JSONL record stream.
+Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
+
+WHAT IT IS. A SOURCE: it turns non-JSONL text (a.env /.properties / a plain
+key=value config) into the front of a pipe — one JSON object per line (JSONL) that
+the fold/filter/transform gifts consume. Give it a file (or pipe text on stdin) and
+it emits one uniform record per assignment:
+
+PORT=8080 -> {"key":"PORT","value":"8080"}
+# a comment -> (skipped)
+HOST = localhost -> {"key":"HOST","value":"localhost"}
+GREETING="hi there"-> {"key":"GREETING","value":"hi there"}
+
+Every record has the same two string fields, so it drops straight into a generic
+filter or fold: kv-source.env | range-filter... / kv-source.env | dedup-filter.
+
+STRINGS ONLY (the honesty axis). Values are emitted as LITERAL STRINGS — kv-source
+does not guess types. "8080" stays the string "8080"; "true" stays "true"; "" stays
+"". This is deliberate, not a limitation to apologize for: the moment a parser starts
+coercing (is 08 octal? is 1e3 a number? is TRUE a boolean?) the SAME file parses to
+different bytes under different tools, and a source you cannot pin is not a source.
+kv-source emits strings and lets a downstream typed gift decide. For the same reason
+it does NOT interpolate ${VAR}/$VAR, does NOT strip an `export ` prefix, does NOT
+honor inline (trailing) comments, and does NOT process backslash escapes inside a
+quoted value — each of those is a context-dependent guess that would break byte
+determinism. It parses the grammar it was given and REFUSES the rest, loudly.
+
+THE GRAMMAR (declared, so it is pinnable)
+* Lines split on newline; a trailing CR (CRLF files) is stripped, so a file parses
+identically whether it uses LF or CRLF.
+* A whitespace-only line emits nothing.
+* A line whose first non-whitespace character is `#` is a full-line COMMENT and
+emits nothing. (There are no inline/trailing comments — a `#` inside a value is
+part of the value.)
+* Any other line MUST be KEY=VALUE. It is split on the FIRST `=`; everything before
+is the key, everything after is the value.
+- KEY is trimmed and MUST match [A-Za-z_][A-Za-z0-9_.-]* — a non-empty name.
+An empty key, or a key with spaces/illegal characters (e.g. `export FOO`), is
+a hard error (exit 2), not a silent guess.
+- VALUE is trimmed. If, after trimming, it both begins and ends with a matching
+`"` or `'` (length >= 2), those OUTER quotes are stripped and the inner text
+is the literal value (no escape processing). Otherwise the trimmed remainder
+is the literal value.
+* A non-blank, non-comment line with no `=` is a MALFORMED line (exit 2).
+
+THE MODEL
+[FILE] The key=value file to parse. If omitted, read stdin.
+--key-field NAME The object key the parsed KEY is emitted under. Default "key".
+--value-field NAME The object key the parsed VALUE is emitted under. Default
+"value". Must differ from --key-field (else the record would
+collapse) — a collision is exit 2.
+
+Duplicate keys across lines are NOT merged or de-duplicated — each line emits its own
+record, in file order. De-duplication (last-wins, first-wins) is dedup-filter's job
+downstream; kv-source's job is an honest, order-faithful parse.
+
+DETERMINISM. parse(text, opts) is a pure function — no clock, no randomness, no
+network — so the same text yields byte-identical output every run and every machine.
+
+USAGE
+node kv-source.js config.env
+cat.env | node kv-source.js
+node kv-source.js.env --key-field name --value-field val
+node kv-source.js --help
+
+Exit codes: 0 success (including an empty stream from empty input) · 2 input error
+(malformed line, illegal/empty key, key-field==value-field, empty field name, unknown
+option, unreadable file). Always a clean one-line message on stderr, never a stack
+trace.
+
+Released under MIT. Its edge is printed in the README: kv-source parses PLAIN
+KEY=VALUE text into uniform string records only — it does not coerce types, does not
+interpolate ${VAR}, does not strip an `export ` prefix, does not honor inline
+comments, and does not process escapes inside quotes. An honest, pinnable parse.
+*/
+"use strict";
+
+/* ---- the pure core ------------------------------------------------ */
+
+var KEY_RE = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
+
+// Strip one pair of matching outer quotes from an already-trimmed value, if present.
+function stripQuotes(v) {
+if (v.length >= 2) {
+var a = v.charAt(0), b = v.charAt(v.length - 1);
+if ((a === '"' && b === '"') || (a === "'" && b === "'")) {
+return v.slice(1, v.length - 1);
+}
+}
+return v;
+}
+
+// Parse KEY=VALUE text into an array of uniform two-field records. Throws a clean Error
+// on any malformed input — the CLI turns that into exit 2. Pure; no side effects.
+function parse(text, opts) {
+opts = opts || {};
+var keyField = opts.keyField === undefined? "key": opts.keyField;
+var valueField = opts.valueField === undefined? "value": opts.valueField;
+
+if (typeof keyField!== "string" || keyField.length === 0) throw new Error("--key-field must be a non-empty name");
+if (typeof valueField!== "string" || valueField.length === 0) throw new Error("--value-field must be a non-empty name");
+if (keyField === valueField) throw new Error("--key-field and --value-field must differ (both \"" + keyField + "\")");
+if (typeof text!== "string") throw new Error("input must be text");
+
+var out = [];
+var lines = text.split("\n");
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+// strip a trailing CR so CRLF parses identically to LF
+if (line.charAt(line.length - 1) === "\r") line = line.slice(0, line.length - 1);
+
+var trimmed = line.replace(/^\s+/, "").replace(/\s+$/, "");
+if (trimmed.length === 0) continue; // blank line
+if (trimmed.charAt(0) === "#") continue; // full-line comment
+
+var eq = line.indexOf("=");
+if (eq === -1) throw new Error("malformed line " + (i + 1) + " (no '='): " + JSON.stringify(line));
+
+var key = line.slice(0, eq).replace(/^\s+/, "").replace(/\s+$/, "");
+var value = line.slice(eq + 1).replace(/^\s+/, "").replace(/\s+$/, "");
+
+if (!KEY_RE.test(key)) throw new Error("illegal key on line " + (i + 1) + ": " + JSON.stringify(key) + " (keys must match [A-Za-z_][A-Za-z0-9_.-]*)");
+
+value = stripQuotes(value);
+
+var rec = {};
+rec[keyField] = key;
+rec[valueField] = value;
+out.push(rec);
+}
+return out;
+}
+
+// Render records as JSONL text (one JSON object per line, trailing newline if any).
+function toJSONL(records) {
+var s = "";
+for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
+return s;
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.kvSource = { parse: parse, toJSONL: toJSONL};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { parse: parse, toJSONL: toJSONL};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+
+function parseArgs(args) {
+var opts = {};
+var file;
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a === "--key-field") {
+if (args[i + 1] === undefined) throw new Error("--key-field requires a name");
+opts.keyField = args[i + 1];
+i += 2;
+} else if (a === "--value-field") {
+if (args[i + 1] === undefined) throw new Error("--value-field requires a name");
+opts.valueField = args[i + 1];
+i += 2;
+} else if (a.charAt(0) === "-" && a!== "-") {
+throw new Error("unknown option " + a);
+} else {
+if (file!== undefined) throw new Error("only one input file may be given (got a second: " + JSON.stringify(a) + ")");
+file = a;
+i += 1;
+}
+}
+return { file: file, opts: opts};
+}
+
+function readAll(stream) {
+return new Promise(function (resolve, reject) {
+var chunks = [];
+stream.on("data", function (c) { chunks.push(c);});
+stream.on("end", function () { resolve(Buffer.concat(chunks).toString("utf8"));});
+stream.on("error", reject);
+});
+}
+
+function helpText() {
+return (
+"kv-source.js — parse plain KEY=VALUE text into a uniform JSONL record stream.\n\n" +
+" node kv-source.js config.env\n" +
+" cat.env | node kv-source.js\n" +
+" node kv-source.js.env --key-field name --value-field val\n" +
+" node kv-source.js --help\n\n" +
+" [FILE] key=value file to parse (default: read stdin)\n" +
+" --key-field NAME field the parsed KEY is emitted under (default \"key\")\n" +
+" --value-field NAME field the parsed VALUE is emitted under (default \"value\")\n\n" +
+"Emits one JSON object per assignment: { key: NAME, value: VALUE}, one per line.\n" +
+"Full-line # comments and blank lines are skipped; lines split on the first '='.\n\n" +
+"Edge: PLAIN KEY=VALUE only, values are literal STRINGS. It does not coerce types,\n" +
+"does not interpolate ${VAR}, does not strip an `export ` prefix, does not honor\n" +
+"inline comments, and does not process escapes inside quotes. An honest, pinnable parse.\n"
+);
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(helpText());
+return Promise.resolve(0);
+}
+var parsed;
+try { parsed = parseArgs(args);}
+catch (e) { process.stderr.write("kv-source: " + e.message + "\n"); return Promise.resolve(2);}
+
+var getText;
+if (parsed.file!== undefined) {
+getText = new Promise(function (resolve, reject) {
+require("fs").readFile(parsed.file, "utf8", function (err, data) {
+if (err) reject(new Error("cannot read " + JSON.stringify(parsed.file) + ": " + err.code));
+else resolve(data);
+});
+});
+} else {
+getText = readAll(process.stdin);
+}
+
+return getText.then(function (text) {
+var records = parse(text, parsed.opts); // throws -> caught below
+process.stdout.write(toJSONL(records));
+return 0;
+}).catch(function (e) {
+process.stderr.write("kv-source: " + e.message + "\n");
+return 2;
+});
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+main(process.argv).then(function (code) { process.exitCode = code;});
+}
+
+test_kv-source.js 147 lines on GitHub →
+#!/usr/bin/env node
+/* test_kv-source.js — battery for the kv-source gift.
+node test_kv-source.js -> exit 0 PASS / non-zero FAIL. Zero dependencies.
+
+Cross-checks the gift against an INDEPENDENT regex-route oracle (a different parse
+route than the gift's indexOf-split), frozen hand goldens, the uniform-record and
+strings-only contract, determinism, and every fail-closed edge. */
+"use strict";
+var kv = require("./kv-source.js");
+
+var pass = 0, fail = 0;
+function ok(name, cond) { if (cond) { pass++;} else { fail++; console.log(" FAIL " + name);}}
+function eq(name, a, b) {
+var same = JSON.stringify(a) === JSON.stringify(b);
+if (!same) console.log(" FAIL " + name + "\n exp " + JSON.stringify(b) + "\n got " + JSON.stringify(a));
+else pass++;
+if (!same) fail++;
+}
+function throws(name, fn) {
+var threw = false;
+try { fn();} catch (e) { threw = true;}
+if (threw) pass++; else { fail++; console.log(" FAIL " + name + " (expected a throw)");}
+}
+
+/* ---- independent oracle: regex-route (different route than the gift) ---- */
+function oracle(text, opts) {
+opts = opts || {};
+var kf = opts.keyField === undefined? "key": opts.keyField;
+var vf = opts.valueField === undefined? "value": opts.valueField;
+if (!kf ||!vf || kf === vf) throw new Error("bad fields");
+var out = [];
+var lines = text.split(/\r?\n/);
+for (var i = 0; i < lines.length; i++) {
+var ln = lines[i];
+if (/^\s*$/.test(ln)) continue;
+if (/^\s*#/.test(ln)) continue;
+var m = ln.match(/^\s*([A-Za-z_][A-Za-z0-9_.\-]*)\s*=([\s\S]*)$/);
+if (!m) throw new Error("bad line " + (i + 1));
+var val = m[2].replace(/^\s+/, "").replace(/\s+$/, "");
+if (val.length >= 2) {
+var a = val.charAt(0), b = val.charAt(val.length - 1);
+if ((a === '"' && b === '"') || (a === "'" && b === "'")) val = val.slice(1, val.length - 1);
+}
+var r = {}; r[kf] = m[1]; r[vf] = val; out.push(r);
+}
+return out;
+}
+
+/* ---- 1. differential grid: gift == oracle on every good vector ---- */
+var goodVectors = [
+"PORT=8080",
+"A=1\nB=2\nC=3",
+"# a comment\nHOST=localhost\n\n# another\nPORT=80",
+" SPACED = value here ", // trim both sides
+'GREETING="hi there"', // double-quoted, embedded space
+"MSG='single quoted'",
+"URL=http://example.com/path?a=b&c=d", // first-= split; value keeps later '='
+"EMPTY=", // empty value -> ""
+"HASHVAL=a#b#c", // '#' inside a value is literal (no inline comments)
+"K.dotted=1\nk-dashed=2\n_under=3", // legal key charset
+"Q=\"with = and # inside\"", // quotes protect nothing special but are stripped
+"CRLF=one\r\nSECOND=two\r\n", // CRLF parses same as LF
+"", // empty input -> empty stream
+"\n\n \n# only comments and blanks\n", // -> empty stream
+"EQ====", // key EQ, value "===" (first '=' splits)
+];
+for (var gi = 0; gi < goodVectors.length; gi++) {
+var t = goodVectors[gi];
+eq("differential[" + gi + "] gift==oracle", kv.parse(t), oracle(t));
+}
+
+/* ---- 2. hand goldens (frozen) ---- */
+eq("golden: basic", kv.parse("PORT=8080"), [{ key: "PORT", value: "8080"}]);
+eq("golden: three", kv.parse("A=1\nB=2\nC=3"),
+[{ key: "A", value: "1"}, { key: "B", value: "2"}, { key: "C", value: "3"}]);
+eq("golden: comment+blank skipped", kv.parse("# c\n\nHOST=localhost"), [{ key: "HOST", value: "localhost"}]);
+eq("golden: trim both sides", kv.parse(" K = v "), [{ key: "K", value: "v"}]);
+eq("golden: double-quote stripped", kv.parse('G="hi there"'), [{ key: "G", value: "hi there"}]);
+eq("golden: single-quote stripped", kv.parse("G='hi there'"), [{ key: "G", value: "hi there"}]);
+eq("golden: first-= split keeps rest", kv.parse("U=a=b=c"), [{ key: "U", value: "a=b=c"}]);
+eq("golden: empty value", kv.parse("E="), [{ key: "E", value: ""}]);
+eq("golden: hash in value literal", kv.parse("H=a#b"), [{ key: "H", value: "a#b"}]);
+eq("golden: CRLF == LF", kv.parse("A=1\r\nB=2\r\n"), kv.parse("A=1\nB=2\n"));
+eq("golden: empty input empty stream", kv.parse(""), []);
+eq("golden: only comments/blanks empty", kv.parse("\n#x\n \n"), []);
+
+/* ---- 3. uniform 2-field, strings-only ---- */
+var recs = kv.parse("N=8080\nB=true\nF=1.5\nZ=");
+ok("uniform: every record has exactly 2 keys", recs.every(function (r) { return Object.keys(r).length === 2;}));
+ok("uniform: fields are key+value", recs.every(function (r) { return "key" in r && "value" in r;}));
+ok("strings-only: numbers stay strings", recs[0].value === "8080" && typeof recs[0].value === "string");
+ok("strings-only: bool stays string", recs[1].value === "true" && typeof recs[1].value === "string");
+ok("strings-only: float stays string (no coercion/drift)", recs[2].value === "1.5" && typeof recs[2].value === "string");
+
+/* ---- 4. custom field names ---- */
+eq("fields: custom names", kv.parse("A=1", { keyField: "name", valueField: "val"}), [{ name: "A", val: "1"}]);
+eq("fields: order key then value", Object.keys(kv.parse("A=1", { keyField: "k2", valueField: "v2"})[0]), ["k2", "v2"]);
+
+/* ---- 5. no interpolation / no export / no inline comment ---- */
+eq("no interpolation: ${VAR} literal", kv.parse("A=${HOME}/bin"), [{ key: "A", value: "${HOME}/bin"}]);
+eq("no inline comment: trailing # kept", kv.parse("A=v # not a comment"), [{ key: "A", value: "v # not a comment"}]);
+throws("no export: `export FOO` is an illegal key", function () { kv.parse("export FOO=bar");});
+
+/* ---- 6. fail-closed (exit-2 class) ---- */
+throws("bad: line with no '='", function () { kv.parse("JUST_A_LINE");});
+throws("bad: empty key", function () { kv.parse("=value");});
+throws("bad: key with space", function () { kv.parse("bad key=1");});
+throws("bad: key starts with digit", function () { kv.parse("9key=1");});
+throws("bad: key with illegal char", function () { kv.parse("k!=1");});
+throws("bad: key-field == value-field", function () { kv.parse("A=1", { keyField: "x", valueField: "x"});});
+throws("bad: empty key-field", function () { kv.parse("A=1", { keyField: ""});});
+throws("bad: empty value-field", function () { kv.parse("A=1", { valueField: ""});});
+throws("bad: non-string input", function () { kv.parse(123);});
+
+/* ---- 7. determinism: parse twice -> byte-identical JSONL ---- */
+var big = "";
+for (var k = 0; k < 50; k++) big += "K" + k + "=v" + k + "\n";
+ok("determinism: two parses byte-identical", kv.toJSONL(kv.parse(big)) === kv.toJSONL(kv.parse(big)));
+
+/* ---- 8. toJSONL shape ---- */
+ok("toJSONL: one object per line + trailing nl", kv.toJSONL([{ key: "A", value: "1"}]) === '{"key":"A","value":"1"}\n');
+ok("toJSONL: empty records -> empty string", kv.toJSONL([]) === "");
+
+/* ---- 9. mutation tripwire: a LAST-'=' split must diverge on a value containing '=' ---- */
+(function () {
+function mutantLastEq(text) {
+var out = [], lines = text.split("\n");
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+if (line.charAt(line.length - 1) === "\r") line = line.slice(0, -1);
+var tr = line.replace(/^\s+|\s+$/g, "");
+if (!tr || tr.charAt(0) === "#") continue;
+var eqp = line.lastIndexOf("="); // BUG: last instead of first
+if (eqp === -1) throw new Error("no =");
+var key = line.slice(0, eqp).replace(/^\s+|\s+$/g, "");
+var val = line.slice(eqp + 1).replace(/^\s+|\s+$/g, "");
+var r = {}; r.key = key; r.value = val; out.push(r);
+}
+return out;
+}
+var v = "U=a=b";
+ok("mutation: last-= split is CAUGHT (diverges from gift)",
+JSON.stringify(mutantLastEq(v))!== JSON.stringify(kv.parse(v)));
+})();
+
+console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
 process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node, no dependencies
+Node / browser, no dependencies
+
+---
+
+# l21x-snapshot — a Loop MMT gift
+https://loopmmt.com/gifts/l21x-snapshot/
+[coverage: optional · branch: gifts]
+
+Browser Save Layer persist ← all gifts
+
+l21x-snapshot
+
+Encode any document to a self-describing base64 snapshot, keep a catalog of them with pure save/load/validate/sort, and fold a whole catalog into one portable blob — a zero-dependency save-file/catalog/archive layer for apps with no backend. No DOM, no filesystem, no network.
+
+The honest edge
+
+It persists structure, not identity — you supply ids and timestamps; snapshots are base64 (not compressed, not encrypted). It's a layer that hands you strings, not a store: it never touches localStorage, the disk, or the DOM itself.
+
+Run it
+
+node l21x-snapshot.js --demo
+test_l21x-snapshot.js (41/41)
+JavaScript, zero dependencies (Node + browser)
+
+The code — every file that ships
+
+l21x-snapshot.js 332 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+"use strict";
+/* l21x-snapshot.js — a zero-dependency browser document persistence layer.
+
+A save-file / catalog / archive layer for browser apps that hold documents in
+memory and need to persist, list, and move them without a backend. Three tiers,
+all pure functions over values you already hold — no DOM, no filesystem, no fetch:
+
+1. SNAPSHOT CODEC. encodeSnapshot(doc) -> a self-describing base64 string
+(an ".l21x" snapshot); decodeSnapshot(str) -> the document back, verified.
+A document is any JSON-serializable object; the codec stamps a format tag
+and a version so a snapshot names its own shape.
+
+2. CATALOG. An in-memory list of snapshot entries with pure save/load/validate/
+sort operations. catalogSave returns a NEW catalog (never mutates its input),
+keyed by a caller-supplied id; catalogLoad decodes an entry back to a doc;
+catalogValidate reports honest structural errors; catalogSort orders by a
+named field without touching the input.
+
+3. ARCHIVE. archiveExport(catalog) -> ONE base64 blob (a whole catalog as a
+single portable string, for a download-one-file / paste-into-another-tab
+move); archiveImport(blob) -> the catalog back. Round-trips exactly.
+
+The same code runs in Node (module.exports) or a browser
+(window.LoopGifts.l21x). It persists data you already hold as objects; it does
+not fetch, connect, read files, or touch the DOM. Base64 is computed in pure JS
+so the behavior is identical in both runtimes (no atob/btoa, no Buffer needed). */
+
+// ---- UTF-8 <-> bytes (pure; full multibyte) --------------------------------
+function utf8Encode(str) {
+var out = [], i, c;
+for (i = 0; i < str.length; i++) {
+c = str.charCodeAt(i);
+if (c < 0x80) { out.push(c);}
+else if (c < 0x800) {
+out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+} else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+// surrogate pair -> full code point
+var c2 = str.charCodeAt(i + 1);
+if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
+0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+i++;
+} else {
+out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+}
+} else {
+out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+}
+}
+return out;
+}
+function utf8Decode(bytes) {
+var out = "", i = 0, b, cp, n;
+while (i < bytes.length) {
+b = bytes[i];
+if (b < 0x80) { out += String.fromCharCode(b); i += 1; continue;}
+else if ((b & 0xe0) === 0xc0) { cp = b & 0x1f; n = 1;}
+else if ((b & 0xf0) === 0xe0) { cp = b & 0x0f; n = 2;}
+else if ((b & 0xf8) === 0xf0) { cp = b & 0x07; n = 3;}
+else { out += "\ufffd"; i += 1; continue;}
+if (i + n >= bytes.length + 1 && i + n > bytes.length) { out += "\ufffd"; break;}
+var ok = true;
+for (var k = 1; k <= n; k++) {
+var cont = bytes[i + k];
+if (cont === undefined || (cont & 0xc0)!== 0x80) { ok = false; break;}
+cp = (cp << 6) | (cont & 0x3f);
+}
+if (!ok) { out += "\ufffd"; i += 1; continue;}
+if (cp > 0xffff) {
+cp -= 0x10000;
+out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+} else {
+out += String.fromCharCode(cp);
+}
+i += n + 1;
+}
+return out;
+}
+
+// ---- base64 (pure; url-safe-tolerant on decode) ----------------------------
+var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function base64FromBytes(bytes) {
+var out = "", i;
+for (i = 0; i < bytes.length; i += 3) {
+var b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+var t = (b0 << 16) | ((b1 || 0) << 8) | (b2 || 0);
+out += B64.charAt((t >> 18) & 0x3f) + B64.charAt((t >> 12) & 0x3f);
+out += (i + 1 < bytes.length)? B64.charAt((t >> 6) & 0x3f): "=";
+out += (i + 2 < bytes.length)? B64.charAt(t & 0x3f): "=";
+}
+return out;
+}
+function bytesFromBase64(str) {
+var lut = bytesFromBase64._lut;
+if (!lut) {
+lut = bytesFromBase64._lut = {};
+for (var i = 0; i < B64.length; i++) lut[B64.charAt(i)] = i;
+lut["-"] = 62; lut["_"] = 63; // tolerate url-safe alphabet
+}
+var out = [], buffer = 0, bits = 0;
+for (var j = 0; j < str.length; j++) {
+var c = str.charAt(j);
+if (c === "=") break;
+var v = lut[c];
+if (v === undefined) continue; // skip whitespace/newlines
+buffer = (buffer << 6) | v; bits += 6;
+if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff);}
+}
+return out;
+}
+
+// ---- snapshot codec --------------------------------------------------------
+var FORMAT = "l21x";
+var FORMAT_VERSION = 1;
+
+/* encodeSnapshot(doc[, meta]) -> base64 string.
+doc: any JSON-serializable value (the document body).
+meta: optional {title, schema} recorded alongside. */
+function encodeSnapshot(doc, meta) {
+if (doc === undefined) throw new Error("encodeSnapshot: doc is required");
+meta = meta || {};
+var envelope = {
+fmt: FORMAT,
+v: FORMAT_VERSION,
+title: (meta.title === undefined)? null: String(meta.title),
+schema: (meta.schema === undefined)? null: String(meta.schema),
+doc: doc
+};
+var json;
+try { json = JSON.stringify(envelope);}
+catch (e) { throw new Error("encodeSnapshot: doc is not JSON-serializable (" + e.message + ")");}
+return base64FromBytes(utf8Encode(json));
+}
+
+/* decodeSnapshot(str) -> {title, schema, doc, v}. Throws on a malformed or
+foreign-format snapshot rather than returning a half-parsed value. */
+function decodeSnapshot(str) {
+if (typeof str!== "string" || str.length === 0)
+throw new Error("decodeSnapshot: expected a non-empty base64 string");
+var json = utf8Decode(bytesFromBase64(str));
+var env;
+try { env = JSON.parse(json);}
+catch (e) { throw new Error("decodeSnapshot: not a valid l21x snapshot (bad base64/JSON)");}
+if (!env || env.fmt!== FORMAT)
+throw new Error("decodeSnapshot: not an l21x snapshot (fmt=" + (env && env.fmt) + ")");
+if (typeof env.v!== "number" || env.v > FORMAT_VERSION)
+throw new Error("decodeSnapshot: unsupported snapshot version " + (env && env.v));
+return { title: env.title, schema: env.schema, doc: env.doc, v: env.v};
+}
+
+// ---- catalog (pure; never mutates its input) -------------------------------
+/* A catalog is an array of entries: {id, title, schema, updated, snapshot}.
+snapshot is the base64 string; updated is a caller-supplied sortable value. */
+
+/* catalogSave(catalog, id, doc[, meta]) -> a NEW catalog with id saved/replaced.
+meta.updated (optional) is recorded for sorting; defaults to null. */
+function catalogSave(catalog, id, doc, meta) {
+if (!isArray(catalog)) throw new Error("catalogSave: catalog must be an array");
+if (id === undefined || id === null || String(id) === "")
+throw new Error("catalogSave: id is required");
+meta = meta || {};
+var entry = {
+id: String(id),
+title: (meta.title === undefined)? null: String(meta.title),
+schema: (meta.schema === undefined)? null: String(meta.schema),
+updated: (meta.updated === undefined)? null: meta.updated,
+snapshot: encodeSnapshot(doc, meta)
+};
+var out = [], replaced = false, i;
+for (i = 0; i < catalog.length; i++) {
+if (catalog[i] && catalog[i].id === entry.id) { out.push(entry); replaced = true;}
+else { out.push(catalog[i]);}
+}
+if (!replaced) out.push(entry);
+return out;
+}
+
+/* catalogLoad(catalog, id) -> the decoded {title, schema, doc, v}, or null if
+the id is not present. */
+function catalogLoad(catalog, id) {
+if (!isArray(catalog)) throw new Error("catalogLoad: catalog must be an array");
+for (var i = 0; i < catalog.length; i++) {
+if (catalog[i] && catalog[i].id === String(id)) return decodeSnapshot(catalog[i].snapshot);
+}
+return null;
+}
+
+/* catalogValidate(catalog) -> {ok, errors[]}. Honest structural check: each entry
+has a non-empty id, ids are unique, and every snapshot decodes. Reports every
+problem it finds rather than throwing on the first. */
+function catalogValidate(catalog) {
+var errors = [];
+if (!isArray(catalog)) return { ok: false, errors: ["catalog is not an array"]};
+var seen = {};
+for (var i = 0; i < catalog.length; i++) {
+var e = catalog[i];
+if (!e || typeof e!== "object") { errors.push("entry " + i + ": not an object"); continue;}
+if (e.id === undefined || e.id === null || String(e.id) === "")
+errors.push("entry " + i + ": missing id");
+else if (seen[e.id]) errors.push("entry " + i + ": duplicate id '" + e.id + "'");
+else seen[e.id] = true;
+if (typeof e.snapshot!== "string") { errors.push("entry " + i + ": snapshot is not a string");}
+else { try { decodeSnapshot(e.snapshot);} catch (err) { errors.push("entry " + i + ": " + err.message);}}
+}
+return { ok: errors.length === 0, errors: errors};
+}
+
+/* catalogSort(catalog, key[, desc]) -> a NEW sorted catalog. key is an entry
+field ('title'|'id'|'updated'|'schema'). Stable, input untouched. */
+function catalogSort(catalog, key, desc) {
+if (!isArray(catalog)) throw new Error("catalogSort: catalog must be an array");
+key = key || "id";
+var indexed = [], i;
+for (i = 0; i < catalog.length; i++) indexed.push([catalog[i], i]);
+indexed.sort(function (a, b) {
+var av = a[0]? a[0][key]: undefined, bv = b[0]? b[0][key]: undefined;
+var aNull = (av === null || av === undefined), bNull = (bv === null || bv === undefined);
+// nulls ALWAYS last, independent of sort direction
+if (aNull && bNull) return a[1] - b[1];
+if (aNull) return 1;
+if (bNull) return -1;
+var cmp;
+if (av === bv) cmp = a[1] - b[1]; // stable on ties
+else cmp = (av < bv)? -1: 1;
+if (cmp === 0) return 0;
+return desc? -cmp: cmp;
+});
+var out = [];
+for (i = 0; i < indexed.length; i++) out.push(indexed[i][0]);
+return out;
+}
+
+// ---- archive (whole catalog <-> one base64 blob) ---------------------------
+var ARCHIVE_FORMAT = "l21x-archive";
+
+/* archiveExport(catalog) -> ONE base64 blob carrying the whole catalog. */
+function archiveExport(catalog) {
+if (!isArray(catalog)) throw new Error("archiveExport: catalog must be an array");
+var v = catalogValidate(catalog);
+if (!v.ok) throw new Error("archiveExport: refusing to export an invalid catalog (" + v.errors[0] + ")");
+var envelope = { fmt: ARCHIVE_FORMAT, v: FORMAT_VERSION, entries: catalog};
+return base64FromBytes(utf8Encode(JSON.stringify(envelope)));
+}
+
+/* archiveImport(blob) -> the catalog array. Throws on a foreign/malformed blob. */
+function archiveImport(blob) {
+if (typeof blob!== "string" || blob.length === 0)
+throw new Error("archiveImport: expected a non-empty base64 string");
+var env;
+try { env = JSON.parse(utf8Decode(bytesFromBase64(blob)));}
+catch (e) { throw new Error("archiveImport: not a valid l21x archive (bad base64/JSON)");}
+if (!env || env.fmt!== ARCHIVE_FORMAT)
+throw new Error("archiveImport: not an l21x archive (fmt=" + (env && env.fmt) + ")");
+if (!isArray(env.entries)) throw new Error("archiveImport: archive has no entries array");
+var v = catalogValidate(env.entries);
+if (!v.ok) throw new Error("archiveImport: archive failed validation (" + v.errors[0] + ")");
+return env.entries;
+}
+
+// ---- small helper ----------------------------------------------------------
+function isArray(x) { return Object.prototype.toString.call(x) === "[object Array]";}
+
+// ---- dual-runtime export ---------------------------------------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.l21x = {
+encodeSnapshot: encodeSnapshot, decodeSnapshot: decodeSnapshot,
+catalogSave: catalogSave, catalogLoad: catalogLoad,
+catalogValidate: catalogValidate, catalogSort: catalogSort,
+archiveExport: archiveExport, archiveImport: archiveImport
+};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = {
+encodeSnapshot: encodeSnapshot, decodeSnapshot: decodeSnapshot,
+catalogSave: catalogSave, catalogLoad: catalogLoad,
+catalogValidate: catalogValidate, catalogSort: catalogSort,
+archiveExport: archiveExport, archiveImport: archiveImport,
+FORMAT: FORMAT, FORMAT_VERSION: FORMAT_VERSION
+};
+}
+
+// ---- CLI (value-arg + --demo; reads NO files) ------------------------------
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+var DEMO_CATALOG = catalogSave(
+catalogSave([], "note-1", { title: "Groceries", items: ["milk", "eggs"]},
+{ title: "Groceries", updated: "2026-08-01"}),
+"note-2", { title: "Ideas — café ☕", body: "persistence without a backend"},
+{ title: "Ideas", updated: "2026-08-15"});
+
+function printDemo() {
+var archive = archiveExport(DEMO_CATALOG);
+var back = archiveImport(archive);
+var sorted = catalogSort(back, "updated", true);
+process.stdout.write("# l21x-snapshot demo\n");
+process.stdout.write("catalog entries: " + back.length + "\n");
+process.stdout.write("archive blob length (base64): " + archive.length + "\n");
+process.stdout.write("sorted by updated (desc): " +
+sorted.map(function (e) { return e.id;}).join(", ") + "\n");
+var loaded = catalogLoad(back, "note-2");
+process.stdout.write("loaded note-2 title: " + loaded.doc.title + "\n");
+process.stdout.write("round-trip ok: " +
+(archiveExport(archiveImport(archive)) === archive) + "\n");
+process.exit(0);
+}
+
+if (args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"l21x-snapshot — a zero-dependency browser document persistence layer\n\n" +
+" node l21x-snapshot.js --demo build a sample catalog, archive it,\n" +
+" round-trip it, and print the result\n" +
+" node l21x-snapshot.js '<json doc>' encode one JSON document as an.l21x\n" +
+" snapshot and print the base64\n\n" +
+"Library: encodeSnapshot/decodeSnapshot, catalogSave/Load/Validate/Sort,\n" +
+"archiveExport/archiveImport. Pure functions over values — no files, no DOM,\n" +
+"no network. Exit 0.\n");
+process.exit(0);
+}
+if (args[0] === "--demo" || args.length === 0) { printDemo();}
+else {
+// value-arg: treat the argument as a literal JSON document, encode it.
+var doc;
+try { doc = JSON.parse(args[0]);}
+catch (e) { process.stdout.write("not valid JSON; wrapping as a string document\n"); doc = args[0];}
+process.stdout.write(encodeSnapshot(doc, { title: "cli"}) + "\n");
+process.exit(0);
+}
+}
+
+test_l21x-snapshot.js 128 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+/* test_l21x-snapshot.js — proves the persistence layer implements its contract.
+
+THE ORACLE. There is no stdlib that says "is this catalog persisted right?" — so
+the oracle is CURATED VECTORS expressed directly against what the functions
+promise: (1) snapshot encode->decode round-trips an arbitrary document, including
+full multibyte UTF-8; (2) decodeSnapshot REJECTS a foreign/garbage string rather
+than half-parsing; (3) catalogSave returns a NEW catalog, replaces by id, and
+never mutates its input; (4) catalogLoad returns the doc or null; (5)
+catalogValidate reports duplicate-id and bad-snapshot honestly; (6) catalogSort
+is stable, nulls-last, and leaves its input untouched; (7) archiveExport/Import
+round-trips a whole catalog exactly. Plus determinism (encode is a pure function)
+and a mutation-bite so a degenerate core (constant output / ignores input) fails.
+Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var m = require("./l21x-snapshot.js");
+
+var pass = 0, fail = 0;
+function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
+function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
+function threw(label, fn) {
+var did = false;
+try { fn();} catch (e) { did = true;}
+ok(label + " (throws)", did);
+}
+function deepEq(a, b) { return JSON.stringify(a) === JSON.stringify(b);}
+
+// ---- 1. snapshot codec round-trip (incl. multibyte) ------------------------
+var doc1 = { title: "Café ☕ — 日本語", n: 42, list: [1, 2, { deep: true}], nil: null};
+var snap1 = m.encodeSnapshot(doc1, { title: "t", schema: "note"});
+var back1 = m.decodeSnapshot(snap1);
+ok("snapshot round-trips the doc", deepEq(back1.doc, doc1));
+eq("snapshot carries title", back1.title, "t");
+eq("snapshot carries schema", back1.schema, "note");
+ok("snapshot is base64-ish (no raw braces)", snap1.indexOf("{") === -1);
+
+// primitive & array docs also round-trip
+ok("string doc round-trips", m.decodeSnapshot(m.encodeSnapshot("hi")).doc === "hi");
+ok("array doc round-trips", deepEq(m.decodeSnapshot(m.encodeSnapshot([1, "two", 3])).doc, [1, "two", 3]));
+
+// ---- 2. decode REJECTS foreign / malformed input ---------------------------
+threw("decode rejects empty string", function () { m.decodeSnapshot("");});
+threw("decode rejects non-string", function () { m.decodeSnapshot(null);});
+threw("decode rejects garbage base64->json", function () { m.decodeSnapshot("bm90IGpzb24=");}); // "not json"
+threw("decode rejects a foreign-fmt envelope", function () {
+// valid base64 of a JSON object whose fmt is wrong
+var foreign = Buffer? Buffer.from(JSON.stringify({ fmt: "other", v: 1, doc: 1})).toString("base64")
+: m.encodeSnapshot({}); // fallback; still non-l21x-fmt below
+m.decodeSnapshot(foreign);
+});
+threw("encode rejects undefined doc", function () { m.encodeSnapshot(undefined);});
+
+// ---- 3. catalogSave: new catalog, replace-by-id, no mutation ---------------
+var cat0 = [];
+var cat1 = m.catalogSave(cat0, "a", { v: 1}, { title: "A", updated: "2026-01-01"});
+eq("save grows the catalog", cat1.length, 1);
+eq("save does not mutate input", cat0.length, 0);
+ok("saved returns a NEW array", cat1!== cat0);
+var cat2 = m.catalogSave(cat1, "b", { v: 2}, { title: "B", updated: "2026-03-01"});
+eq("second save grows", cat2.length, 2);
+var cat2b = m.catalogSave(cat2, "a", { v: 99}, { title: "A2", updated: "2026-02-01"});
+eq("replace keeps length", cat2b.length, 2);
+eq("replace updates in place by id", m.catalogLoad(cat2b, "a").doc.v, 99);
+eq("replace does not mutate prior catalog", m.catalogLoad(cat2, "a").doc.v, 1);
+threw("save rejects empty id", function () { m.catalogSave([], "", {});});
+
+// ---- 4. catalogLoad --------------------------------------------------------
+ok("load returns null for missing id", m.catalogLoad(cat2b, "zzz") === null);
+ok("load decodes the stored doc", deepEq(m.catalogLoad(cat2b, "b").doc, { v: 2}));
+
+// ---- 5. catalogValidate: honest errors -------------------------------------
+var good = m.catalogValidate(cat2b);
+ok("valid catalog validates ok", good.ok === true && good.errors.length === 0);
+var dupe = cat2b.concat([{ id: "a", snapshot: cat2b[0].snapshot}]);
+var dupeRes = m.catalogValidate(dupe);
+ok("duplicate id is reported", dupeRes.ok === false &&
+dupeRes.errors.join("|").indexOf("duplicate")!== -1);
+var badSnap = [{ id: "x", snapshot: "@@not-base64-json@@"}];
+ok("bad snapshot is reported", m.catalogValidate(badSnap).ok === false);
+var missingId = [{ snapshot: cat2b[0].snapshot}];
+ok("missing id is reported", m.catalogValidate(missingId).ok === false);
+
+// ---- 6. catalogSort: stable, nulls-last, input untouched -------------------
+var sortSrc = [
+{ id: "c", title: "Cherry", updated: "2026-03"},
+{ id: "a", title: "Apple", updated: null},
+{ id: "b", title: "Banana", updated: "2026-01"}
+];
+var byTitle = m.catalogSort(sortSrc, "title");
+eq("sort by title asc first", byTitle[0].id, "a");
+eq("sort by title asc last", byTitle[2].id, "c");
+ok("sort does not mutate input", sortSrc[0].id === "c");
+var byUpdated = m.catalogSort(sortSrc, "updated");
+eq("nulls sort last on updated", byUpdated[2].id, "a");
+var byUpdatedDesc = m.catalogSort(sortSrc, "updated", true);
+eq("desc reverses order", byUpdatedDesc[0].id, "c");
+// stability: equal keys keep input order
+var ties = [{ id: "p", k: 1}, { id: "q", k: 1}, { id: "r", k: 1}];
+var tied = m.catalogSort(ties, "k");
+ok("sort is stable on ties", tied[0].id === "p" && tied[1].id === "q" && tied[2].id === "r");
+
+// ---- 7. archive round-trip -------------------------------------------------
+var arch = m.archiveExport(cat2b);
+ok("archive is one string", typeof arch === "string" && arch.length > 0);
+var imported = m.archiveImport(arch);
+ok("archive round-trips the catalog", deepEq(imported, cat2b));
+eq("imported catalog is usable", m.catalogLoad(imported, "a").doc.v, 99);
+threw("archiveExport refuses an invalid catalog", function () { m.archiveExport(dupe);});
+threw("archiveImport rejects garbage", function () { m.archiveImport("bm90IGFuIGFyY2hpdmU=");});
+threw("archiveImport rejects a snapshot-as-archive", function () { m.archiveImport(snap1);});
+
+// ---- 8. determinism (encode is a pure function of its input) ---------------
+ok("encode is deterministic", m.encodeSnapshot(doc1, { title: "t", schema: "note"}) === snap1);
+ok("archive is deterministic", m.archiveExport(cat2b) === arch);
+
+// ---- 9. mutation-bite ------------------------------------------------------
+// A degenerate encode that ignored its input (constant output) would make two
+// different docs encode identically. Prove they DON'T.
+ok("MUTATION-BITE: different docs encode differently",
+m.encodeSnapshot({ a: 1})!== m.encodeSnapshot({ a: 2}));
+// A degenerate catalogLoad that returned a constant would fail id discrimination.
+ok("MUTATION-BITE: load discriminates by id",
+m.catalogLoad(cat2b, "a").doc.v!== m.catalogLoad(cat2b, "b").doc.v);
+
+// ---- report ----------------------------------------------------------------
+console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+JavaScript, zero dependencies (Node + browser)
 
 ---

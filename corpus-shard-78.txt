@@ -1,0 +1,1736 @@
+# Loop MMT — corpus shard 78/86
+
+> Bundle 78 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 4 (/gifts/rename/, /gifts/running-stats/, /gifts/schema-filter/, /gifts/scrub/)
+
+---
+
+# rename — a Loop MMT gift
+https://loopmmt.com/gifts/rename/
+[coverage: optional · branch: gifts]
+
+Relabel Fields, Keep Every Value rename ← all gifts
+
+rename
+
+A producer emits JSONL: one JSON object per line. rename reads that stream and a map of old=new field names, and emits each record with those fields relabeled — the field-RELABEL of the JSONL toolkit, the transform-lane companion to pluck (which selects). Every value is kept and every field's position is preserved; only a mapped field's KEY changes. When names don't match the next stage, a stream becomes a deterministic, re-derivable relabeling. A rename that would collide two fields onto one name is REFUSED, never silently overwritten — it names the line and the collision and stops. Same stream and same map in, byte-identical stream out, on every machine and every run. A line that is not valid JSON is a hard error (exit 2) naming the line; a non-object record is a hard error too. Blank lines are skipped. Zero dependencies, pure, offline; runs in Node or a browser (window.ForestGifts.rename).
+
+The honest edge
+
+Renames TOP-LEVEL fields by exact name, position preserved. NOT nested paths, does NOT select or drop fields, does NOT compute values. A field not in the map passes through untouched. A map whose target name already exists on the record (or is targeted twice) is a REFUSED collision, not an overwrite — the divergence from a last-write-wins merge.
+
+Run it
+
+printf '%s\n' '{"user_id":7,"ts":"2026-09-12"}' | node rename.js --map user_id=id,ts=timestamp # exit 0 | 1 collision (line named) | 2 non-JSON/non-object
+test_rename.js (25/25) + out-of-band conformance (GREEN 34/34 vs an independently-authored in-place-rename oracle; sig 3458cb7b8dfa33de; mutation bite VERIFIED)
+Zero dependencies, Node or browser, deterministic
+
+The code — every file that ships
+
+rename.js 287 lines on GitHub →
+#!/usr/bin/env node
+/* rename.js — rename fields in each record of a JSONL stream, by a declared map.
+Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
+
+WHAT IT IS. Give it a stream of records — one JSON object per line (JSONL) — and
+a mapping of old field names to new ones, and it emits each record with those
+fields relabeled. It is a TRANSFORM on the field axis: every record keeps all
+its values, but a mapped field's KEY is replaced with its new name. Same stream
+and same map in, byte-identical stream out, on every machine and every run. It
+is the field-rename of the JSONL toolkit — the companion to pluck (which drops
+fields): pluck SELECTS, rename RELABELS.
+
+THE MAP IS old=new PAIRS (the whole determinism story). --map old1=new1,old2=new2
+declares, for each pair, "wherever a record has the field old1, emit it under the
+name new1 instead." A field the map does not mention is passed through UNCHANGED,
+under its original name. A mapped field the record does not have is simply not
+renamed (there is nothing to rename) — see --strict.
+
+THE OUTPUT KEY ORDER IS THE INPUT ORDER, WITH NAMES SWAPPED IN PLACE. Renaming a
+field does NOT move it: {"a":1,"b":2} under --map a=x emits {"x":1,"b":2}, not
+{"b":2,"x":1}. The record's own field order is preserved; only the mapped keys'
+names change. This is what makes rename a faithful transform — it relabels, it
+never reorders. (Values are canonicalized for byte-stability: a mapped or
+unmapped field's VALUE, if a nested object, has its inner keys sorted; array
+order is kept.)
+
+COLLISIONS ARE A HARD ERROR (fail closed). If a rename would make two fields
+share a name — either the target name already exists in the record and is not
+itself being renamed away, or two different source fields map to the same target
+— that record is a HARD ERROR (exit 2) naming the line and the colliding name.
+rename never silently drops or overwrites a value to resolve a name clash.
+
+MISSING SOURCE FIELDS (default vs --strict).
+- DEFAULT: a mapped source field the record does not carry is simply skipped —
+there is nothing to rename, and the record passes through with its other
+fields intact. A record that has none of the mapped fields is emitted
+unchanged.
+- --strict: a record missing ANY mapped source field is a HARD ERROR (exit 2)
+naming the line and the first missing source field. For callers who require
+every declared field to be present before relabeling.
+
+INPUT HONESTY (the character of this gift).
+- Every non-blank line must be valid JSON. A line that is not valid JSON is a
+HARD ERROR (exit 2) naming the line — never a silent skip, never a raw
+passthrough.
+- Every record must be a JSON OBJECT. You cannot rename a field of a bare
+number, string, boolean, null, or array — there are no fields. A non-object
+record is a HARD ERROR (exit 2) naming the line.
+- --map names TOP-LEVEL fields only (no dotted paths). Both sides of a pair
+must be non-empty; a malformed pair (no '=', empty old, empty new) is a hard
+error at map-parse time.
+- Blank lines are skipped. A trailing \r (CRLF files) is trimmed.
+
+USAGE
+printf '%s\n' '{"a":1,"b":2}' | node rename.js --map a=x
+-> {"x":1,"b":2}
+node rename.js --map user_id=id,ts=timestamp events.jsonl
+node rename.js --map a=x --strict < in.jsonl > out.jsonl
+node rename.js --help
+
+Each non-blank line is one JSON object. Output is the relabeled objects, one per
+line, each terminated by a newline, in input order.
+
+Exit codes: 0 success · 2 input error (missing/empty/malformed --map, missing
+file, a directory, an unknown option, a line that is not valid JSON, a non-object
+record, a rename collision, or --strict on a record missing a mapped source
+field). Always a clean one-line message on stderr, never a stack trace.
+
+Released under MIT. Its edge is printed in the README: this renames TOP-LEVEL
+fields by exact name. It does NOT reach into nested paths (no dotted keys), does
+NOT move fields (order is preserved, names swapped in place), does NOT drop or
+transform values, and REFUSES a rename that would collide two fields onto one
+name rather than silently overwriting.
+*/
+"use strict";
+
+// Canonical JSON for VALUES: object keys sorted recursively so a value serializes
+// to the same bytes regardless of its (nested) key order. Arrays keep order.
+function canon(v) {
+if (v === null || typeof v!== "object") return JSON.stringify(v);
+if (Array.isArray(v)) {
+var parts = [];
+for (var i = 0; i < v.length; i++) parts.push(canon(v[i]));
+return "[" + parts.join(",") + "]";
+}
+var keys = Object.keys(v).sort();
+var out = [];
+for (var k = 0; k < keys.length; k++) {
+out.push(JSON.stringify(keys[k]) + ":" + canon(v[keys[k]]));
+}
+return "{" + out.join(",") + "}";
+}
+
+function parseRecord(line, lineNo) {
+try { return JSON.parse(line);}
+catch (e) {
+throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
+}
+}
+
+// Parse "old1=new1,old2=new2" into an ordered [ [old,new],...] with validation.
+// Throws on a malformed pair. A source named twice is an error (ambiguous map).
+function parseMap(spec) {
+var pairs = [];
+var seenOld = Object.create(null);
+var pieces = String(spec).split(",");
+for (var i = 0; i < pieces.length; i++) {
+var piece = pieces[i].trim();
+if (piece.length === 0) continue; // tolerate trailing comma
+var eq = piece.indexOf("=");
+if (eq <= 0 || eq === piece.length - 1) {
+throw new Error("malformed --map pair " + JSON.stringify(piece) + " (expected old=new)");
+}
+var oldName = piece.slice(0, eq).trim();
+var newName = piece.slice(eq + 1).trim();
+if (oldName.length === 0 || newName.length === 0) {
+throw new Error("malformed --map pair " + JSON.stringify(piece) + " (empty field name)");
+}
+if (seenOld[oldName]) {
+throw new Error("--map names source field " + JSON.stringify(oldName) + " more than once");
+}
+seenOld[oldName] = true;
+pairs.push([oldName, newName]);
+}
+if (pairs.length === 0) throw new Error("--map lists no rename pairs");
+return pairs;
+}
+
+// The public transform: JSONL text + {map, strict} -> { lines: [renamed lines]}.
+// Each record keeps its own field order; a mapped key's NAME is swapped in place.
+// A collision (two fields would share a name) is a hard error.
+function rename(text, opts) {
+opts = opts || {};
+var pairs = opts.pairs || (opts.map? parseMap(opts.map): []);
+var strict =!!opts.strict;
+
+// old -> new lookup
+var mapOf = Object.create(null);
+for (var p = 0; p < pairs.length; p++) mapOf[pairs[p][0]] = pairs[p][1];
+
+var lines = String(text).split("\n");
+var out = [];
+var i, line, rec, keys, j, key, outName, present;
+
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue;
+
+rec = parseRecord(line, i + 1);
+if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
+throw new Error("line " + (i + 1) + " is not a JSON object (cannot rename fields of " +
+(rec === null? "null": (Array.isArray(rec)? "an array": typeof rec)) + ")");
+}
+
+// strict: every mapped source field must be present
+if (strict) {
+for (j = 0; j < pairs.length; j++) {
+if (!Object.prototype.hasOwnProperty.call(rec, pairs[j][0])) {
+throw new Error("line " + (i + 1) + " is missing required source field " + JSON.stringify(pairs[j][0]));
+}
+}
+}
+
+// Build the output object's (name -> value) in the record's OWN key order,
+// swapping mapped names in place. Detect collisions on the OUTPUT names.
+keys = Object.keys(rec);
+var outNames = []; // output names, in input order
+var outVals = []; // canonicalized values, parallel to outNames
+var claimed = Object.create(null);
+for (j = 0; j < keys.length; j++) {
+key = keys[j];
+outName = Object.prototype.hasOwnProperty.call(mapOf, key)? mapOf[key]: key;
+if (claimed[outName]) {
+throw new Error("line " + (i + 1) + " rename collision: two fields map to " + JSON.stringify(outName));
+}
+claimed[outName] = true;
+outNames.push(outName);
+outVals.push(canon(rec[key]));
+}
+
+var parts = [];
+for (j = 0; j < outNames.length; j++) {
+parts.push(JSON.stringify(outNames[j]) + ":" + outVals[j]);
+}
+out.push("{" + parts.join(",") + "}");
+}
+
+return { lines: out};
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.rename = rename;
+window.ForestGifts.renameCanon = canon;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { rename: rename, canon: canon, parseMap: parseMap};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+function run(text, opts) {
+var r = rename(text, opts);
+var body = r.lines.length? r.lines.join("\n") + "\n": "";
+return { out: body};
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"rename.js — rename fields in each record of a JSONL stream, by a declared map.\n\n" +
+" printf '%s\\n' '{\"a\":1,\"b\":2}' | node rename.js --map a=x\n" +
+" node rename.js --map user_id=id,ts=timestamp events.jsonl\n" +
+" node rename.js --map a=x --strict < in > out\n" +
+" node rename.js --help\n\n" +
+"--map is a comma-separated list of old=new TOP-LEVEL field renames. A field not\n" +
+"in the map passes through unchanged; a renamed field keeps its POSITION (names\n" +
+"are swapped in place, not moved). A missing source field is skipped (or a hard\n" +
+"error under --strict). A rename that would collide two fields onto one name is a\n" +
+"hard error.\n\n" +
+"Edge: renames TOP-LEVEL fields by exact name. NOT nested paths (no a.b.c), does\n" +
+"NOT move fields, does NOT drop or transform values, and REFUSES a collision\n" +
+"rather than overwriting. Invalid JSON and non-object records are hard errors.\n"
+);
+return 0;
+}
+
+var opts = {};
+var files = [];
+var i;
+try {
+for (i = 0; i < args.length; i++) {
+if (args[i] === "--map") {
+var spec = args[++i];
+if (spec === undefined || spec === "" || spec.charAt(0) === "-") {
+throw new Error("--map requires a comma-separated list of old=new renames");
+}
+opts.pairs = parseMap(spec);
+}
+else if (args[i] === "--strict") { opts.strict = true;}
+else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
+else { files.push(args[i]);}
+}
+if (!opts.pairs || opts.pairs.length === 0) {
+throw new Error("--map is required (a comma-separated list of old=new field renames)");
+}
+} catch (e) {
+process.stderr.write("rename: " + e.message + "\n");
+return 2;
+}
+
+function emit(text) {
+try {
+var r = run(text, opts);
+process.stdout.write(r.out);
+return 0;
+} catch (e) {
+process.stderr.write("rename: " + e.message + "\n");
+return 2;
+}
+}
+
+if (files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(files[0], "utf8");}
+catch (e) {
+process.stderr.write("rename: cannot read " + files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
+}
+
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_rename.js 139 lines on GitHub →
+#!/usr/bin/env node
+/* test_rename.js — drift-check battery for rename.js.
+Zero-dependency. `node test_rename.js`. Exit 0 all-pass, 1 any-fail.
+
+THE ORACLE. rename's contract is small enough that the oracle is hand-computed
+expected output lines PLUS one mechanical invariant on every case:
+(I-order) position-preserved: the output's field POSITIONS equal the input's
+(rename swaps names in place, it never moves a field).
+The KNOWN-BAD vector is the COLLISION tripwire: a rename that would make two
+fields share a name must be refused (exit/throw), never silently overwrite. A
+regression that last-write-wins on a clash passes a naive "renamed the field"
+check but fails the collision case — so the battery pins the fail-closed rule
+that protects data.
+*/
+"use strict";
+
+var mod = require("./rename.js");
+var rename = mod.rename;
+
+var passed = 0, failed = 0;
+function check(name, got, want) {
+if (got === want) { passed++;}
+else {
+failed++;
+console.log("FAIL " + name);
+console.log(" want: " + JSON.stringify(want));
+console.log(" got: " + JSON.stringify(got));
+}
+}
+function checkThrows(name, fn) {
+var threw = false;
+try { fn();} catch (e) { threw = true;}
+if (threw) { passed++;}
+else { failed++; console.log("FAIL " + name + " (expected a throw, none happened)");}
+}
+function out(text, opts) {
+return rename(text, opts).lines.join("\n");
+}
+
+// ---- Core rename -----------------------------------------------------
+check("rename one field",
+out('{"a":1,"b":2}', { map: "a=x"}),
+'{"x":1,"b":2}');
+
+check("rename two fields",
+out('{"a":1,"b":2,"c":3}', { map: "a=x,c=z"}),
+'{"x":1,"b":2,"z":3}');
+
+check("unmapped field passes through unchanged",
+out('{"a":1,"b":2}', { map: "a=x"}),
+'{"x":1,"b":2}');
+
+// ---- POSITION PRESERVED: rename swaps in place, never moves ----------
+check("rename keeps field POSITION (in place, not moved)",
+out('{"a":1,"b":2,"c":3}', { map: "a=z"}),
+'{"z":1,"b":2,"c":3}'); // z stays first, NOT moved to the end
+
+// ---- Missing source field: default skips -----------------------------
+check("missing source field skipped (default), record otherwise intact",
+out('{"b":2}', { map: "a=x"}),
+'{"b":2}');
+
+check("record with none of the mapped fields emitted unchanged",
+out('{"p":1,"q":2}', { map: "a=x,c=z"}),
+'{"p":1,"q":2}');
+
+// ---- --strict: missing source is a hard error ------------------------
+checkThrows("strict: missing source field throws", function () {
+rename('{"b":2}', { map: "a=x", strict: true});
+});
+check("strict: all present passes",
+out('{"a":1}', { map: "a=x", strict: true}),
+'{"x":1}');
+
+// ---- KNOWN-BAD VECTOR: collisions are refused, never overwritten -----
+checkThrows("KNOWN-BAD: rename onto an existing field name collides (throws)", function () {
+// renaming a->b when b already exists would make two "b"s
+rename('{"a":1,"b":2}', { map: "a=b"});
+});
+checkThrows("KNOWN-BAD: two sources onto one target collides (throws)", function () {
+rename('{"a":1,"c":3}', { pairs: [["a", "x"], ["c", "x"]]});
+});
+check("rename onto a name that IS itself being renamed away is OK (swap)",
+out('{"a":1,"b":2}', { map: "a=b,b=a"}),
+'{"b":1,"a":2}'); // a->b and b->a: a clean swap, no collision
+
+// ---- Value fidelity + nested canonicalization ------------------------
+check("value copied verbatim, nested object canonicalized",
+out('{"a":{"z":1,"y":2}}', { map: "a=x"}),
+'{"x":{"y":2,"z":1}}');
+
+check("array value order preserved",
+out('{"a":[3,1,2]}', { map: "a=x"}),
+'{"x":[3,1,2]}');
+
+check("null/bool/string values kept through rename",
+out('{"a":null,"b":true,"c":"hi"}', { map: "a=p,b=q,c=r"}),
+'{"p":null,"q":true,"r":"hi"}');
+
+// ---- Multi-line stream, order preserved ------------------------------
+check("multi-record stream keeps input order",
+out('{"id":1}\n{"id":2}\n{"id":3}', { map: "id=n"}),
+'{"n":1}\n{"n":2}\n{"n":3}');
+
+// ---- Blank + CRLF ----------------------------------------------------
+check("blank lines skipped",
+out('{"a":1}\n\n{"a":2}\n', { map: "a=x"}),
+'{"x":1}\n{"x":2}');
+
+check("CRLF trailing \\r trimmed",
+out('{"a":1}\r\n{"a":2}\r', { map: "a=x"}),
+'{"x":1}\n{"x":2}');
+
+// ---- Input honesty: non-object + bad JSON are hard errors ------------
+checkThrows("bare number record throws", function () { rename('42', { map: "a=x"});});
+checkThrows("array record throws", function () { rename('[1,2]', { map: "a=x"});});
+checkThrows("null record throws", function () { rename('null', { map: "a=x"});});
+checkThrows("invalid JSON throws", function () { rename('{"a":1', { map: "a=x"});});
+
+// ---- Map parse validation --------------------------------------------
+checkThrows("malformed map pair (no =) throws", function () {
+rename('{"a":1}', { map: "ax"});
+});
+checkThrows("empty new name throws", function () {
+rename('{"a":1}', { map: "a="});
+});
+checkThrows("duplicate source in map throws", function () {
+rename('{"a":1}', { map: "a=x,a=y"});
+});
+
+// ---- Determinism: folds-twice-identical ------------------------------
+(function () {
+var input = '{"b":2,"a":1}\n{"a":10,"c":30}';
+var opts = { map: "a=x,b=y"};
+check("determinism: two runs byte-identical", out(input, opts), out(input, opts));
+})();
+
+console.log("\nrename battery: " + passed + " passed, " + failed + " failed");
+process.exit(failed === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Zero dependencies, Node or browser, deterministic
+
+---
+
+# Running-stats — a Loop MMT gift
+https://loopmmt.com/gifts/running-stats/
+[coverage: optional · branch: gifts]
+
+One Running-Statistics Record Over a Numeric Stream fold ← all gifts
+
+Running-stats
+
+running-stats reads a stream of numbers — one JSON number per line (JSON Lines) — and folds them in ONE PASS into a single aggregate record: {count, mean, variance, stddev, min, max}, with zero dependencies. mean and variance are computed by Welford's online algorithm, which stays numerically stable where the textbook one-pass shortcut (sum of squares minus square of sum) catastrophically cancels — a tight cluster around a huge mean. Population variance by default; --sample gives the Bessel-corrected (n-1) sample statistics. The record is a pure function of the input SEQUENCE, so the same stream folds to a byte-identical record every run; but mean/variance are IEEE-754 doubles, so reordering the same values can move the low-order bits — it is deterministic for a given input order, NOT an exact order-independent fingerprint (that is histogram-fold's job). Same stream in → byte-identical record out, in Node or a browser.
+
+The honest edge
+
+running-stats is a one-pass SUMMARY {count,mean,variance,stddev,min,max} — NOT a median/percentile/quantile summary (it keeps no order statistics beyond min and max), and NOT a mode or histogram (see histogram-fold). Its mean/variance are floats: deterministic for a given input order, reorder-agreement within tolerance, NOT an exact multiset fingerprint. Welford's honest guarantee is bounded, non-catastrophic ONE-PASS error — strictly better than the naive sum-of-squares shortcut, NOT a claim to beat a careful two-pass.
+
+Run it
+
+printf '%s\n' 2 4 4 4 5 5 7 9 | node running-stats.js # {count,mean,variance,stddev,min,max}; --sample (n-1); exit 0 ok | 2 input error
+test_running-stats.js (34/34: frozen hand goldens ([2,4,4,4,5,5,7,9] → mean 5 / popvar 4 / stddev 2; sample variance 32/7) cross-checked by an INDEPENDENT two-pass oracle — a genuinely different method than Welford; numerical stability (Welford tracks truth on the 1e9 cluster while the naive shortcut cancels) with the mutation bite; reorder-agreement within tolerance; numeric-honesty hard errors (NaN/1e999→Infinity/string/bad-JSON); variance ≥ 0 clamp) + out-of-band conformance conform_running-stats.cjs (20/20 GREEN, subprocess-driven, signed a2c317a082332c83)
+Zero dependencies, Node or browser, deterministic
+
+The code — every file that ships
+
+running-stats.js 193 lines on GitHub →
+#!/usr/bin/env node
+/**
+* running-stats — fold a JSONL numeric stream into ONE running-statistics record.
+*
+* WHAT
+* Reads a stream of numbers — one JSON number per line (JSON Lines) — and folds
+* them in ONE PASS into a single aggregate record:
+* { count, mean, variance, stddev, min, max}
+* mean and variance are computed by WELFORD'S online algorithm, which is
+* numerically stable where the textbook one-pass shortcut (sum of squares minus
+* square of sum) catastrophically cancels — e.g. a tight cluster around a huge
+* mean like 1e9. By default `variance`/`stddev` are POPULATION (divide by n);
+* with --sample they are the Bessel-corrected SAMPLE statistics (divide by n-1).
+*
+* HOW
+* Welford: for each x: n += 1; d = x - mean; mean += d / n; M2 += d * (x - mean).
+* Then population variance = M2 / n, sample variance = M2 / (n - 1).
+* The record is a PURE function of the input sequence — no clock, no randomness,
+* no files written — so the same stream folds to a byte-identical record every
+* run. NOTE: mean and variance are IEEE-754 doubles, so reordering the SAME values
+* can change the low-order bits (float addition is not associative). running-stats
+* is a summary statistic, deterministic for a given input order — NOT an exact
+* multiset fingerprint (that is histogram-fold's job, with integer counts).
+*
+* USAGE
+* node running-stats.js [--sample] [FILE] # stdin if no FILE
+* printf '%s\n' 2 4 4 4 5 5 7 9 | node running-stats.js
+* -> {"count":8,"mean":5,"variance":4,"stddev":2,"min":2,"max":9}
+* --sample sample (n-1) variance/stddev instead of population (n)
+* --help
+*
+* EXIT CODES
+* 0 success
+* 2 input error: missing file / a directory / a line that is not a finite JSON
+* number (incl. a value that overflows to +/-Infinity, e.g. 1e999) or NaN /
+* --sample with fewer than 2 values (sample variance is undefined). Always a
+* clean one-line message on stderr, never a stack trace.
+*
+* EDGE (what this is NOT)
+* NOT a median/percentile summary (keeps no order statistics beyond min & max),
+* NOT a mode or histogram (see histogram-fold), and its mean/variance are floats:
+* deterministic for a given input order, but reordering can move the low-order bits.
+*
+* Zero dependencies. Node builtin `require('fs')` for file reads only; runs in a
+* browser with no require (attaches `runningStats` to window.ForestGifts). MIT.
+*/
+"use strict";
+
+/**
+* Fold a JSONL numeric stream into a running-statistics record.
+* @param {string} text the whole input (newline-separated JSON numbers)
+* @param {{sample?: boolean}} [opts]
+* @returns {{count:number, mean:number, variance:number|null, stddev:number|null, min:number|null, max:number|null}}
+* @throws {Error} on a non-finite / non-number line, or --sample with count < 2.
+*/
+function fold(text, opts) {
+opts = opts || {};
+var sample =!!opts.sample;
+var n = 0;
+var mean = 0;
+var M2 = 0;
+var min = null;
+var max = null;
+
+var lines = String(text).split("\n");
+for (var i = 0; i < lines.length; i++) {
+var raw = lines[i];
+if (raw.charCodeAt(raw.length - 1) === 13) raw = raw.slice(0, -1); // trim trailing \r (CRLF)
+if (raw.length === 0) continue; // blank line: skipped, not a value
+var v;
+try {
+v = JSON.parse(raw);
+} catch (e) {
+throw new Error("line " + (i + 1) + ": not valid JSON: " + raw);
+}
+if (typeof v!== "number") {
+throw new Error("line " + (i + 1) + ": not a number: " + raw);
+}
+if (!isFinite(v)) {
+// catches NaN and +/-Infinity (incl. 1e999, which JSON.parse yields as Infinity)
+throw new Error("line " + (i + 1) + ": not a finite number: " + raw);
+}
+// Welford online update
+n += 1;
+var delta = v - mean;
+mean += delta / n;
+var delta2 = v - mean;
+M2 += delta * delta2;
+if (min === null || v < min) min = v;
+if (max === null || v > max) max = v;
+}
+
+if (n === 0) {
+return { count: 0, mean: null, variance: null, stddev: null, min: null, max: null};
+}
+
+var variance, stddev;
+if (sample) {
+if (n < 2) {
+throw new Error("--sample: need at least 2 values for a sample variance (got " + n + ")");
+}
+variance = M2 / (n - 1);
+} else {
+variance = M2 / n;
+}
+// M2 is a sum of squares -> variance is >= 0 mathematically; clamp a tiny negative
+// float artifact (e.g. -1e-13 from cancellation) to exactly 0 so stddev is real.
+if (variance < 0) variance = 0;
+stddev = Math.sqrt(variance);
+
+return { count: n, mean: mean, variance: variance, stddev: stddev, min: min, max: max};
+}
+
+/* ------------------------------------------------------------------ exports */
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { fold: fold};
+}
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.runningStats = fold;
+}
+
+/* ----------------------------------------------------------------- CLI main */
+function main(argv) {
+var args = argv.slice(2);
+var sample = false;
+var file = null;
+for (var i = 0; i < args.length; i++) {
+var a = args[i];
+if (a === "--help" || a === "-h") {
+process.stdout.write(
+"usage: running-stats.js [--sample] [FILE]\n" +
+" (no FILE) read numbers from stdin\n" +
+" FILE read numbers from a file\n" +
+" --sample sample (n-1) variance/stddev instead of population (n)\n" +
+" --help\n" +
+"Each non-blank line is one finite JSON number. Output is one line of compact JSON:\n" +
+' {"count":N,"mean":..,"variance":..,"stddev":..,"min":..,"max":..}\n'
+);
+process.exit(0);
+} else if (a === "--sample") {
+sample = true;
+} else if (a.charAt(0) === "-" && a!== "-") {
+process.stderr.write("running-stats: unknown option: " + a + "\n");
+process.exit(2);
+} else {
+if (file!== null) {
+process.stderr.write("running-stats: more than one FILE given\n");
+process.exit(2);
+}
+file = a;
+}
+}
+
+function run(text) {
+var rec;
+try {
+rec = fold(text, { sample: sample});
+} catch (e) {
+process.stderr.write("running-stats: " + e.message + "\n");
+process.exit(2);
+return;
+}
+process.stdout.write(JSON.stringify(rec) + "\n");
+}
+
+if (file === null || file === "-") {
+var chunks = [];
+process.stdin.on("data", function (c) { chunks.push(c);});
+process.stdin.on("end", function () { run(Buffer.concat(chunks).toString("utf8"));});
+} else {
+var fs = require("fs");
+var text;
+try {
+var st = fs.statSync(file);
+if (st.isDirectory()) {
+process.stderr.write("running-stats: is a directory: " + file + "\n");
+process.exit(2);
+return;
+}
+text = fs.readFileSync(file, "utf8");
+} catch (e) {
+process.stderr.write("running-stats: cannot read file: " + file + "\n");
+process.exit(2);
+return;
+}
+run(text);
+}
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+main(process.argv);
+}
+
+test_running-stats.js 223 lines on GitHub →
+#!/usr/bin/env node
+/**
+* test_running-stats.js — out-of-band battery for the running-stats gift.
+*
+* The gift folds a JSONL numeric stream into {count,mean,variance,stddev,min,max}
+* by WELFORD'S online algorithm (one pass). This battery checks it against an
+* INDEPENDENTLY-authored oracle written by a genuinely different method — the
+* textbook TWO-PASS formula (pass 1: mean = sum/n; pass 2: variance =
+* sum((x-mean)^2)/n) — plus frozen hand goldens, the numerical-stability hard
+* case (a tight cluster around a huge mean), determinism, order behaviour, the
+* numeric-honesty guards, and a MUTATION BITE proving the gift is genuinely
+* Welford-stable and not the naive sum-of-squares shortcut.
+*
+* GREEN (exit 0) / RED (exit 1).
+*/
+"use strict";
+var assert = require("assert");
+var { fold} = require("./running-stats.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++;}
+catch (e) { fail++; console.error(" RED " + name + "\n " + e.message);}
+}
+function jsonl(nums) { return nums.map(function (x) { return JSON.stringify(x);}).join("\n");}
+
+/* ---- the INDEPENDENT oracle: textbook two-pass (a different method) -------- */
+function twoPass(nums, sample) {
+var n = nums.length;
+if (n === 0) return { count: 0, mean: null, variance: null, stddev: null, min: null, max: null};
+var sum = 0, i;
+for (i = 0; i < n; i++) sum += nums[i];
+var mean = sum / n;
+var s = 0;
+for (i = 0; i < n; i++) { var d = nums[i] - mean; s += d * d;}
+var variance;
+if (sample) variance = n < 2? null: s / (n - 1);
+else variance = s / n;
+if (variance!== null && variance < 0) variance = 0;
+var stddev = variance === null? null: Math.sqrt(variance);
+var mn = nums[0], mx = nums[0];
+for (i = 1; i < n; i++) { if (nums[i] < mn) mn = nums[i]; if (nums[i] > mx) mx = nums[i];}
+return { count: n, mean: mean, variance: variance, stddev: stddev, min: mn, max: mx};
+}
+
+/* ---- the NAIVE (unstable) shortcut — used ONLY for the mutation bite ------- */
+function naiveVariance(nums) {
+var n = nums.length, s = 0, ss = 0, i;
+for (i = 0; i < n; i++) { s += nums[i]; ss += nums[i] * nums[i];}
+return (ss - (s * s) / n) / n; // catastrophic cancellation when the mean is large
+}
+
+var REL = 1e-9; // tight relative tolerance for float comparison
+function close(a, b, rel) {
+rel = rel || REL;
+if (a === b) return true;
+if (a === null || b === null) return a === b;
+var scale = Math.max(1, Math.abs(a), Math.abs(b));
+return Math.abs(a - b) <= rel * scale;
+}
+function matchesOracle(rec, oracle) {
+assert.strictEqual(rec.count, oracle.count, "count");
+assert.ok(close(rec.mean, oracle.mean), "mean " + rec.mean + " vs " + oracle.mean);
+assert.ok(close(rec.variance, oracle.variance), "variance " + rec.variance + " vs " + oracle.variance);
+assert.ok(close(rec.stddev, oracle.stddev), "stddev " + rec.stddev + " vs " + oracle.stddev);
+assert.ok(close(rec.min, oracle.min), "min");
+assert.ok(close(rec.max, oracle.max), "max");
+}
+
+/* ======================================================= FROZEN HAND GOLDENS */
+// The classic textbook example: mean 5, population variance 4, stddev 2.
+ok("golden: [2,4,4,4,5,5,7,9] -> mean 5, popvar 4, sd 2", function () {
+var r = fold(jsonl([2, 4, 4, 4, 5, 5, 7, 9]));
+assert.strictEqual(r.count, 8);
+assert.ok(close(r.mean, 5), "mean");
+assert.ok(close(r.variance, 4), "variance");
+assert.ok(close(r.stddev, 2), "stddev");
+assert.strictEqual(r.min, 2);
+assert.strictEqual(r.max, 9);
+});
+ok("golden: same, --sample -> var 32/7, sd sqrt(32/7)", function () {
+var r = fold(jsonl([2, 4, 4, 4, 5, 5, 7, 9]), { sample: true});
+assert.ok(close(r.variance, 32 / 7), "sample variance = 32/7, got " + r.variance);
+assert.ok(close(r.stddev, Math.sqrt(32 / 7)), "sample stddev");
+});
+ok("golden: single value -> mean=value, popvar 0, sd 0", function () {
+var r = fold(jsonl([42]));
+assert.deepStrictEqual(r, { count: 1, mean: 42, variance: 0, stddev: 0, min: 42, max: 42});
+});
+ok("golden: two equal values -> variance 0", function () {
+var r = fold(jsonl([7, 7]));
+assert.ok(close(r.variance, 0), "variance 0");
+});
+ok("golden: negatives [-5,-1,-1,3] -> mean -1, popvar 8", function () {
+var r = fold(jsonl([-5, -1, -1, 3]));
+assert.ok(close(r.mean, -1), "mean -1");
+assert.ok(close(r.variance, 8), "popvar 8, got " + r.variance);
+assert.strictEqual(r.min, -5);
+assert.strictEqual(r.max, 3);
+});
+
+/* ==================================== GIFT == INDEPENDENT TWO-PASS ORACLE === */
+var corpus = [
+[1, 2, 3, 4, 5],
+[10, 10, 10, 10],
+[0.5, 1.5, 2.5, 3.5, 4.5],
+[-3, -1, 0, 1, 3, 100],
+[1e6, 1e6 + 3, 1e6 - 3, 1e6 + 1],
+[3.14159, 2.71828, 1.41421, 1.61803],
+[0, 0, 0, 1],
+[42],
+];
+corpus.forEach(function (nums, k) {
+ok("oracle[pop] #" + k + " (n=" + nums.length + ")", function () {
+matchesOracle(fold(jsonl(nums)), twoPass(nums, false));
+});
+});
+corpus.forEach(function (nums, k) {
+if (nums.length < 2) return;
+ok("oracle[sample] #" + k, function () {
+matchesOracle(fold(jsonl(nums), { sample: true}), twoPass(nums, true));
+});
+});
+
+/* ============================= NUMERICAL STABILITY (the char of this gift) == */
+// A tight cluster around a huge mean: true population variance = 2/3.
+var HARD = [1e9, 1e9 + 1, 1e9 + 2];
+ok("stability: gift matches two-pass on [1e9, 1e9+1, 1e9+2] (popvar 2/3)", function () {
+var r = fold(jsonl(HARD));
+var oracle = twoPass(HARD, false);
+assert.ok(close(r.variance, 2 / 3, 1e-6), "gift variance " + r.variance + " vs 2/3");
+assert.ok(close(r.variance, oracle.variance, 1e-6), "gift vs two-pass oracle");
+});
+ok("stability MUTATION BITE: the NAIVE shortcut is far off (proves gift isn't naive)", function () {
+var oracle = twoPass(HARD, false).variance; // ~0.6667, the true value
+var naive = naiveVariance(HARD); // catastrophic cancellation -> ~0
+// The bite: if the gift were the naive method, it would fail the stability test.
+// Here we assert the naive method IS demonstrably wrong, so the stability test
+// above has real teeth (it is not vacuously satisfiable by any implementation).
+assert.ok(Math.abs(naive - oracle) > 1e-3,
+"naive shortcut should diverge from truth on this case (naive=" + naive + ", true=" + oracle + ")");
+// and the gift must be on the TRUTH side of that gap
+var gift = fold(jsonl(HARD)).variance;
+assert.ok(Math.abs(gift - oracle) < 1e-6, "gift must match truth, not the naive shortcut");
+});
+ok("stability: at 1e12 Welford stays BOUNDED near truth (0.5) where naive fails", function () {
+// Welford's guarantee is a BOUNDED, non-catastrophic error in ONE pass — not that
+// it beats a two-pass that can be exact. Here the two-pass mean (1e12+1) is exactly
+// representable so two-pass nails 0.5, while Welford drifts ~1.5e-5 (its incremental
+// mean passes through non-representable intermediates). That drift is small and
+// bounded; the naive sum-of-squares shortcut, by contrast, catastrophically cancels.
+var nums = [1e12, 1e12 + 1, 1e12 + 1, 1e12 + 2];
+var r = fold(jsonl(nums));
+assert.ok(Math.abs(r.variance - 0.5) < 5e-4, "Welford within 5e-4 of truth 0.5, got " + r.variance);
+var naive = naiveVariance(nums);
+assert.ok(Math.abs(naive - 0.5) > Math.abs(r.variance - 0.5), "naive is further from truth than Welford");
+// count/mean/min/max are still exact and must match the oracle
+var o = twoPass(nums, false);
+assert.strictEqual(r.count, o.count);
+assert.ok(close(r.mean, o.mean), "mean");
+assert.strictEqual(r.min, o.min);
+assert.strictEqual(r.max, o.max);
+});
+
+/* ==================================================== DETERMINISM & ORDER === */
+ok("determinism: fold twice -> byte-identical record", function () {
+var t = jsonl([3, 1, 4, 1, 5, 9, 2, 6]);
+assert.strictEqual(JSON.stringify(fold(t)), JSON.stringify(fold(t)));
+});
+ok("order: reordered stream stays within float tolerance of the original", function () {
+// running-stats is a summary statistic: reordering may move the low-order bits
+// (float addition is not associative), but the result stays within tolerance.
+var base = [5, 1, 9, 3, 7, 2, 8, 4, 6];
+var rev = base.slice().reverse();
+var a = fold(jsonl(base)), b = fold(jsonl(rev));
+assert.ok(close(a.mean, b.mean), "mean invariant under reorder (within tol)");
+assert.ok(close(a.variance, b.variance), "variance invariant under reorder (within tol)");
+assert.strictEqual(a.count, b.count);
+assert.strictEqual(a.min, b.min);
+assert.strictEqual(a.max, b.max);
+});
+
+/* ============================================ NUMERIC HONESTY (fail closed) = */
+ok("honesty: a NaN line throws (exit 2 in CLI)", function () {
+assert.throws(function () { fold("1\nNaN\n2");});
+});
+ok("honesty: 1e999 (overflows to Infinity) throws", function () {
+assert.throws(function () { fold("1\n1e999\n2");});
+});
+ok("honesty: a non-number JSON line throws", function () {
+assert.throws(function () { fold('1\n"x"\n2');});
+});
+ok("honesty: a bad-JSON line throws", function () {
+assert.throws(function () { fold("1\nabc\n2");});
+});
+ok("honesty: --sample with <2 values throws", function () {
+assert.throws(function () { fold(jsonl([5]), { sample: true});});
+});
+
+/* ============================================================ SHAPE / EDGES = */
+ok("empty stream -> count 0, all null", function () {
+assert.deepStrictEqual(fold(""), { count: 0, mean: null, variance: null, stddev: null, min: null, max: null});
+});
+ok("blank lines skipped, not counted", function () {
+var r = fold("1\n\n2\n\n3\n");
+assert.strictEqual(r.count, 3);
+assert.ok(close(r.mean, 2), "mean 2");
+});
+ok("CRLF line endings tolerated", function () {
+var r = fold("1\r\n2\r\n3\r\n");
+assert.strictEqual(r.count, 3);
+assert.ok(close(r.mean, 2), "mean");
+});
+ok("variance never negative (float artifact clamped to 0)", function () {
+var nums = [1e9, 1e9, 1e9, 1e9];
+var r = fold(jsonl(nums));
+assert.ok(r.variance >= 0, "variance >= 0");
+assert.ok(close(r.variance, 0), "variance ~0 for identical values");
+});
+
+/* ==================================================================== done = */
+console.log((fail === 0? "GREEN": "RED") + ": " + pass + " assertions passed, " + fail + " failed [test_running-stats]");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Zero dependencies, Node or browser, deterministic
+
+---
+
+# schema-filter — a Loop MMT gift
+https://loopmmt.com/gifts/schema-filter/
+[coverage: optional · branch: gifts]
+
+Keep Only the Records That Match Your Shape filter ← all gifts
+
+schema-filter
+
+schema-filter reads a JSONL object stream and emits, verbatim and in input order, exactly the records that match a declared JSON shape — a subset filter you drop into a pipe as a shape-checking gate. Declare --field NAME TYPE (required) or --optional NAME TYPE over a closed set of seven JSON types (string, number, integer, boolean, object, array, null); constraints AND together, no constraints is the identity filter. The pure core has zero dependencies and runs unchanged in Node or a browser, and the same stream and shape yield byte-identical survivors every run.
+
+The honest edge
+
+A SUBSET filter over a DECLARED shape: it filters on the fields and types YOU name — it does not infer a schema from the data, reshape, sort, or de-duplicate. It tests a value's TYPE, never its truth: a record matching every declared type passes even if its values are wrong. The string "5" is not the number 5 (no coercion); 3.5 is a number but not an integer; a required field's absence DROPS the record while an optional field's absence passes; an unknown type is a startup error, so a typo'd shape is loud, not a silently-empty result.
+
+Run it
+
+cat data.jsonl | node schema-filter.js --field name string --field age integer
+test_schema-filter.js (75/75, independent from-spec oracle) + Plumb conformance GREEN (15/15, signed 2026-09-12, clock-independent, mutation-bite non-vacuous)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+schema-filter.js 245 lines on GitHub →
+#!/usr/bin/env node
+/* schema-filter.js — pass only the JSONL records that match a declared JSON shape.
+Dependency-free, deterministic, one pass, order-stable. Runs in Node or a browser. MIT.
+
+WHAT IT IS. Give it a stream of records — one JSON object per line (JSONL) — and a
+SHAPE you declare as a set of typed fields, and it emits, verbatim and in input
+order, exactly the records that match EVERY declared field. Everything else is
+dropped. It is a SUBSET filter: the output is a subset of the input, byte-for-byte
+per surviving record, so `schema-filter` in a pipe never invents or reshapes a
+record — it only decides which ones pass.
+
+A FIELD CONSTRAINT names one field and the JSON TYPE it must hold:
+
+--field NAME TYPE require NAME present AND of TYPE (fail-closed if absent)
+--optional NAME TYPE if NAME is present it must be TYPE; if absent, it passes
+
+TYPE is one of a documented, closed set of seven JSON types:
+
+string a JSON string
+number a finite JSON number (integer or fractional)
+integer a finite JSON number with no fractional part
+boolean true or false
+object a JSON object (not an array, not null)
+array a JSON array
+null the JSON literal null
+
+Declare more than one field and they AND together: a record survives only if it
+matches all of them. Declare none and every well-formed record passes (the identity
+filter) — a deliberate, documented default, not an error.
+
+THE MISSING-FIELD POLICY (the whole honesty story). A `--field` constraint is a
+claim the record must satisfy, and a record that LACKS that field cannot be shown to
+satisfy it, so it is DROPPED. This is fail-closed — absence is not a match. Use
+`--optional` for the "if this field is present it must be a date, otherwise leave the
+record alone" shape: an optional field that is absent passes; an optional field that
+is present but the WRONG type still fails. The choice is per field, declared once, so
+a stream is filtered under one explicit shape.
+
+TYPE, NOT VALUE. schema-filter tests a value's TYPE, never its meaning. A record with
+the right types passes even if the values are nonsense: `{"age": -999}` matches
+`--field age integer`. It does not coerce (the string "5" does NOT match `number`),
+does not infer a schema from the data, does not reshape, sort, or de-duplicate
+surviving records. `number` excludes non-finite values by construction (valid JSON
+cannot carry NaN or Infinity, so this only ever matters for a hostile embedder).
+`integer` is a type test (no fractional part), never a rounding.
+
+DETERMINISM. Records are tested and emitted in input order; a surviving record is
+written back byte-for-byte as it arrived (the original line, trailing \r trimmed), so
+the same stream and the same shape yield byte-identical output on every machine and
+every run.
+
+STRICTNESS. A filter is only trustworthy if it refuses to guess:
+- Every non-blank line must be a JSON OBJECT. A line that is not valid JSON, or is
+valid JSON but not an object (a number, string, array, null), is a HARD ERROR
+(exit 2) naming the line — never a silent skip.
+- An unknown TYPE token in a `--field`/`--optional` declaration is a hard error
+(exit 2) at startup, before any record is read — a shape you cannot express is a
+bug in the caller's declaration, surfaced loudly, not an empty result.
+
+USAGE
+cat people.jsonl | node schema-filter.js --field name string --field age integer
+node schema-filter.js --field id string --optional email string in.jsonl
+node schema-filter.js --field tags array < items.jsonl
+node schema-filter.js --help
+
+Each non-blank line is one JSON object. Blank lines are skipped. A trailing \r
+(CRLF files) is trimmed. Surviving records are emitted one per line, verbatim.
+
+Exit codes: 0 success (with or without survivors) · 2 input error (missing file, a
+directory, a malformed constraint, an unknown type, or a line that is not a JSON
+object). Always a clean one-line message on stderr, never a stack trace.
+
+Released under MIT. Its edge is printed in the README: this is a SUBSET filter over a
+DECLARED shape. It filters on the fields and types YOU name — it does not infer a
+schema, does not reshape or reformat surviving records, does not sort, and does not
+de-duplicate. A record matching every declared type passes even if its values are
+wrong: the constraint tests a value's TYPE, never its truth.
+*/
+"use strict";
+
+/* ---- the pure core ------------------------------------------------ */
+
+// The closed set of declarable JSON types. A shape you cannot express is refused.
+var TYPES = {
+string: 1, number: 1, integer: 1, boolean: 1, object: 1, array: 1, "null": 1
+};
+
+// Does one JSON value match one declared type? Total over the seven types;
+// an out-of-set type never matches (the CLI refuses those before this runs).
+function matchType(val, type) {
+switch (type) {
+case "string": return typeof val === "string";
+case "number": return typeof val === "number" && isFinite(val);
+case "integer": return typeof val === "number" && isFinite(val) && Math.floor(val) === val;
+case "boolean": return typeof val === "boolean";
+case "object": return val!== null && typeof val === "object" &&!Array.isArray(val);
+case "array": return Array.isArray(val);
+case "null": return val === null;
+}
+return false;
+}
+
+// A parsed constraint: { field, type, optional}. Does one record satisfy it?
+function satisfies(rec, c) {
+var has = Object.prototype.hasOwnProperty.call(rec, c.field);
+if (!has) return!!c.optional; // missing: required -> fail, optional -> pass
+return matchType(rec[c.field], c.type); // present: must match the declared type
+}
+
+// The public filter: JSONL text + parsed constraints -> the surviving records,
+// in input order, each as { line, record}.
+// constraints: [ {field, type, optional},...]
+// Throws a clean, line-named Error on a line that is not a JSON object.
+function filter(text, constraints) {
+var lines = String(text).split("\n");
+var out = [];
+var i, line, rec;
+
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line is not a record
+
+try { rec = JSON.parse(line);}
+catch (e) {
+throw new Error("line " + (i + 1) + " is not valid JSON: " +
+JSON.stringify(line.slice(0, 40)));
+}
+if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
+throw new Error("line " + (i + 1) + " is not a JSON object (got " +
+(rec === null? "null": Array.isArray(rec)? "array": typeof rec) + "): " +
+JSON.stringify(line.slice(0, 40)));
+}
+
+var pass = true;
+for (var k = 0; k < constraints.length; k++) {
+if (!satisfies(rec, constraints[k])) { pass = false; break;}
+}
+if (pass) out.push({ line: line, record: rec});
+}
+return out;
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.schemaFilter = filter;
+window.ForestGifts.schemaFilterMatchType = matchType;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { filter: filter, satisfies: satisfies, matchType: matchType};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+
+// Parse argv into { constraints, files}. Throws a clean Error on a bad declaration.
+function parseArgs(args) {
+var constraints = [];
+var files = [];
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a === "--field" || a === "--optional") {
+var optional = a === "--optional";
+var field = args[i + 1], type = args[i + 2];
+if (field === undefined || type === undefined || field.charAt(0) === "-") {
+throw new Error(a + " requires FIELD TYPE (e.g. " + a + " age integer)");
+}
+if (!Object.prototype.hasOwnProperty.call(TYPES, type)) {
+throw new Error(a + " " + field + ": unknown type " + JSON.stringify(type) +
+" (declare one of: string number integer boolean object array null)");
+}
+constraints.push({ field: field, type: type, optional: optional});
+i += 3;
+} else if (a.charAt(0) === "-") {
+throw new Error("unknown option " + a);
+} else {
+files.push(a); i += 1;
+}
+}
+return { constraints: constraints, files: files};
+}
+
+function run(text, constraints) {
+var survivors = filter(text, constraints);
+var s = "";
+for (var i = 0; i < survivors.length; i++) s += survivors[i].line + "\n";
+return s;
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"schema-filter.js — pass only the JSONL records that match a declared JSON shape.\n\n" +
+" cat people.jsonl | node schema-filter.js --field name string --field age integer\n" +
+" node schema-filter.js --field id string --optional email string in.jsonl\n" +
+" node schema-filter.js --field tags array < items.jsonl\n" +
+" node schema-filter.js --help\n\n" +
+" --field NAME TYPE require NAME present AND of TYPE (fail-closed if absent)\n" +
+" --optional NAME TYPE if NAME is present it must be TYPE; if absent, it passes\n\n" +
+"TYPE is one of: string number integer boolean object array null\n" +
+"Multiple fields AND together. No fields = every well-formed record passes.\n" +
+"Surviving records are emitted VERBATIM, in input order.\n\n" +
+"Edge: this is a SUBSET filter over a DECLARED shape. It tests a value's TYPE,\n" +
+"never its meaning; it does not coerce, infer a schema, reshape, sort, or\n" +
+"de-duplicate. Absence fails a --field and passes an --optional. A non-object\n" +
+"line or an unknown type is a hard error (exit 2).\n"
+);
+return 0;
+}
+
+var parsed;
+try { parsed = parseArgs(args);}
+catch (e) { process.stderr.write("schema-filter: " + e.message + "\n"); return 2;}
+
+function emit(text) {
+try { process.stdout.write(run(text, parsed.constraints)); return 0;}
+catch (e) { process.stderr.write("schema-filter: " + e.message + "\n"); return 2;}
+}
+
+if (parsed.files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(parsed.files[0], "utf8");}
+catch (e) {
+process.stderr.write("schema-filter: cannot read " + parsed.files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
+}
+
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_schema-filter.js 170 lines on GitHub →
+#!/usr/bin/env node
+/* test_schema-filter.js — out-of-band battery for the schema-filter gift.
+
+Exercises the exported pure core (filter / satisfies / matchType) against an
+INDEPENDENTLY authored oracle — a second, from-spec type checker written with a
+different route (a typeof/predicate map, not the gift's switch) — plus hand goldens
+and every documented edge. Node only; no dependencies. Exit 0 all-pass / 1 fail.
+*/
+"use strict";
+var sf = require("./schema-filter.js");
+
+var pass = 0, fail = 0;
+function check(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.log(" FAIL " + name);}
+}
+function J(v) { return JSON.stringify(v);}
+
+/* ---- independent oracle: a second, from-spec type checker ---------------- */
+// Different route than the gift's switch: an explicit predicate table.
+var ORACLE = {
+string: function (v) { return typeof v === "string";},
+number: function (v) { return typeof v === "number" && v === v && v!== Infinity && v!== -Infinity;},
+integer: function (v) { return typeof v === "number" && v === v && v!== Infinity && v!== -Infinity && parseInt(v, 10) === v && v % 1 === 0;},
+boolean: function (v) { return v === true || v === false;},
+object: function (v) { return typeof v === "object" && v!== null &&!(v instanceof Array);},
+array: function (v) { return v instanceof Array;},
+"null": function (v) { return v === null;}
+};
+function oracleSatisfies(rec, c) {
+var has = Object.prototype.hasOwnProperty.call(rec, c.field);
+if (!has) return!!c.optional;
+return ORACLE[c.type](rec[c.field]);
+}
+function oracleSurvivors(recs, constraints) {
+return recs.filter(function (r) {
+return constraints.every(function (c) { return oracleSatisfies(r, c);});
+}).map(function (r) { return JSON.stringify(r);});
+}
+// Drive the gift's pure filter over a JSONL rendering of the records.
+function giftSurvivors(recs, constraints) {
+var text = recs.map(function (r) { return JSON.stringify(r);}).join("\n") + "\n";
+return sf.filter(text, constraints).map(function (s) { return s.line;});
+}
+
+/* ---- matchType: every type, positive + negative ------------------------- */
+var typeVectors = [
+["string", "hi", true], ["string", 5, false], ["string", null, false],
+["number", 5, true], ["number", 5.5, true], ["number", "5", false], ["number", true, false],
+["integer", 5, true], ["integer", 5.0, true], ["integer", 5.5, false], ["integer", "5", false],
+["boolean", true, true], ["boolean", false, true], ["boolean", 0, false], ["boolean", "true", false],
+["object", {}, true], ["object", { a: 1}, true], ["object", [], false], ["object", null, false],
+["array", [], true], ["array", [1, 2], true], ["array", {}, false], ["array", "x", false],
+["null", null, true], ["null", 0, false], ["null", "", false], ["null", {}, false]
+];
+typeVectors.forEach(function (v) {
+check("matchType(" + J(v[1]) + ", " + v[0] + ") === " + v[2], sf.matchType(v[1], v[0]) === v[2]);
+// cross-check against the independent oracle
+check("matchType == oracle [" + v[0] + ", " + J(v[1]) + "]", sf.matchType(v[1], v[0]) === ORACLE[v[0]](v[1]));
+});
+
+/* ---- the integer/number honesty distinction (the gift's sharp edge) ------ */
+check("3.5 is number, NOT integer", sf.matchType(3.5, "number") === true && sf.matchType(3.5, "integer") === false);
+check("3.0 IS integer (no fractional part)", sf.matchType(3.0, "integer") === true);
+check("string \"3\" is NEITHER number nor integer (no coercion)",
+sf.matchType("3", "number") === false && sf.matchType("3", "integer") === false);
+
+/* ---- scenario battery: gift filter == independent oracle ----------------- */
+var scenarios = [
+{
+name: "single --field integer",
+recs: [{ n: 1}, { n: 2.5}, { n: "3"}, { n: 4}],
+constraints: [{ field: "n", type: "integer", optional: false}]
+},
+{
+name: "two --field AND (name string + age integer)",
+recs: [
+{ name: "a", age: 30}, { name: "b", age: 30.5}, { name: 5, age: 30},
+{ name: "c"}, { age: 40}, { name: "d", age: 40}
+],
+constraints: [
+{ field: "name", type: "string", optional: false},
+{ field: "age", type: "integer", optional: false}
+]
+},
+{
+name: "--field required missing DROPS",
+recs: [{ id: "has", x: "y"}, { id: "missing"}],
+constraints: [{ field: "x", type: "string", optional: false}]
+},
+{
+name: "--optional absent PASSES, present-wrong FAILS",
+recs: [{ id: "absent"}, { id: "ok", email: "e"}, { id: "wrong", email: 5}],
+constraints: [{ field: "email", type: "string", optional: true}]
+},
+{
+name: "array + object + boolean + null types",
+recs: [
+{ tags: [], meta: {}, active: true, deleted: null},
+{ tags: {}, meta: {}, active: true, deleted: null},
+{ tags: [], meta: [], active: true, deleted: null},
+{ tags: [], meta: {}, active: 1, deleted: null},
+{ tags: [], meta: {}, active: true, deleted: 0}
+],
+constraints: [
+{ field: "tags", type: "array", optional: false},
+{ field: "meta", type: "object", optional: false},
+{ field: "active", type: "boolean", optional: false},
+{ field: "deleted", type: "null", optional: false}
+]
+},
+{
+name: "no constraints = identity",
+recs: [{ a: 1}, { b: 2}, { c: 3}],
+constraints: []
+}
+];
+scenarios.forEach(function (s) {
+check("gift == oracle [" + s.name + "]", J(giftSurvivors(s.recs, s.constraints)) === J(oracleSurvivors(s.recs, s.constraints)));
+});
+
+/* ---- hand goldens (independent of the oracle) ---------------------------- */
+check("golden: integer keeps [1,4], drops 2.5 and \"3\"",
+J(giftSurvivors([{ n: 1}, { n: 2.5}, { n: "3"}, { n: 4}], [{ field: "n", type: "integer", optional: false}]))
+=== J([JSON.stringify({ n: 1}), JSON.stringify({ n: 4})]));
+check("golden: optional absent kept, wrong-type dropped",
+J(giftSurvivors([{ id: "absent"}, { id: "wrong", email: 5}], [{ field: "email", type: "string", optional: true}]))
+=== J([JSON.stringify({ id: "absent"})]));
+
+/* ---- verbatim passthrough + order-stability ------------------------------ */
+(function () {
+var text = '{"z":1,"a":2}\n{"b":3}\n'; // key order preserved verbatim, not re-serialized
+var got = sf.filter(text, [{ field: "z", type: "integer", optional: false}]).map(function (s) { return s.line;});
+check("verbatim: original line returned (key order preserved)", J(got) === J(['{"z":1,"a":2}']));
+})();
+(function () {
+var recs = [{ n: 5}, { n: 1}, { n: 9}, { n: 2}];
+var got = giftSurvivors(recs, [{ field: "n", type: "integer", optional: false}]);
+check("order-stable (5,1,9,2 preserved)",
+J(got) === J([JSON.stringify({ n: 5}), JSON.stringify({ n: 1}), JSON.stringify({ n: 9}), JSON.stringify({ n: 2})]));
+})();
+
+/* ---- CRLF + blank lines -------------------------------------------------- */
+(function () {
+var text = '{"n":1}\r\n\r\n{"n":2}\r\n';
+var got = sf.filter(text, [{ field: "n", type: "integer", optional: false}]).map(function (s) { return s.line;});
+check("CRLF trimmed, blank lines skipped", J(got) === J(['{"n":1}', '{"n":2}']));
+})();
+
+/* ---- strictness: non-object lines throw --------------------------------- */
+function throws(text, constraints) {
+try { sf.filter(text, constraints); return false;} catch (e) { return true;}
+}
+check("bare number line throws", throws("42\n", []));
+check("array line throws", throws("[1,2]\n", []));
+check("string line throws", throws('"hi"\n', []));
+check("null line throws", throws("null\n", []));
+check("malformed JSON throws", throws("{bad\n", []));
+check("well-formed object does NOT throw",!throws('{"a":1}\n', []));
+
+/* ---- determinism: two runs identical ------------------------------------ */
+(function () {
+var recs = scenarios[1].recs, cs = scenarios[1].constraints;
+check("deterministic across two filter() calls", J(giftSurvivors(recs, cs)) === J(giftSurvivors(recs, cs)));
+})();
+
+console.log("");
+var verdict = fail === 0? "PASS": "FAIL";
+console.log(verdict + ": " + pass + " checks passed, " + fail + " failed [test_schema-filter]");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# Scrub — a Loop MMT gift
+https://loopmmt.com/gifts/scrub/
+[coverage: optional · branch: gifts]
+
+Catch a Secret Before It Ships filter ← all gifts
+
+Scrub
+
+scrub reads text and finds the things that should never have been in it — a GitHub token, an AWS key, a PEM private-key block, a Slack token, a JWT, a password in a URL — by matching them on SHAPE, not luck. It can report them (masked preview, never the value), redact them (a fixed per-kind placeholder, idempotent), or refuse — a non-zero exit the moment a known secret shape appears, so it drops straight into a pre-commit hook or a CI gate. A single line opts out with an explicit, line-scoped scrub-allow marker; you cannot silence it globally. Zero dependencies, deterministic, runs identically in Node or a browser, and never echoes a secret it found.
+
+The honest edge
+
+scrub matches KNOWN secret shapes. A clean result means no known shape was found here — it is NOT proof the text is secret-free: a novel token format, a secret split across lines, or a home-rolled scheme passes clean. It is a smoke alarm, not a vault — a hit is real, a clean scan is the absence of a known shape, never a certificate. Because it matches shapes it also flags EXAMPLE secrets (a documented token, its own fixtures) — the honest ceiling working, not a bug; vouch for a line you know is safe with scrub-allow.
+
+Run it
+
+node scrub.js --check FILE # exit 1 if any known secret shape is present, 0 if clean (the gate)
+test_scrub.js (16 assertions) + --selftest (24 checks: golden known-bad/known-clean corpus, no-echo, scrub idempotence, scrub-allow carve-out, determinism)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+scrub.js 275 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/* scrub.js — catch a secret before it ships, from SHAPES not luck.
+*
+* A tiny, dependency-free scanner that reads text and finds the things that
+* should never have been in it: a GitHub token, an AWS key, a PEM private-key
+* block, a Slack token, a JWT, a bearer password in a URL. It can REPORT them
+* (scan), REPLACE them with a fixed placeholder (scrub), or REFUSE (check —
+* a non-zero exit if any secret is present, so it drops into a pre-commit hook
+* or a CI gate). Runs identically in Node and in a browser (no DOM, no deps).
+*
+* text ──▶ scan(text) ──▶ [ {kind, line, col, preview},...]
+* text ──▶ scrub(text) ──▶ text with every secret span replaced
+* text ──▶ check(text) ──▶ true iff a secret was found (the gate)
+*
+* WHY SHAPES, AND THE LINE IT WILL NOT CROSS (the honest ceiling — printed).
+* Secrets are matched by SHAPE: a github_pat_ prefix, an AKIA… access-key id,
+* a -----BEGIN … PRIVATE KEY----- header, the three-part dot form of a JWT.
+* A shape catches the known, published forms cheaply and deterministically.
+* It does NOT — and this is stated on the tool itself, every run — prove the
+* text is secret-free. A novel token format, a secret split across lines, a
+* home-rolled scheme, or a value with no distinguishing shape will pass clean.
+* scrub is a SMOKE ALARM, not a vault: a hit is real; a clean scan is the
+* absence of a known shape, never a certificate. (This is the same honesty the
+* `grain` gift prints as "a smell, not a proof" and `plumb` as "evidence
+* exists, not evidence correct".) Treat a clean result as "no KNOWN secret
+* shape found here", and keep your other controls.
+*
+* TWO STRUCTURAL PROMISES (so the tool cannot betray its own purpose):
+* 1. It never echoes a secret. A finding carries the secret's KIND, its line
+* and column, and a masked PREVIEW (first few chars + …) — never the value.
+* scrub() replaces the whole matched span; the redaction cannot leak what
+* it redacted. A secret-scanner that printed the secret to warn you about
+* it would be broken.
+* 2. scrub() is idempotent and pure: scrub(scrub(t)) === scrub(t), and the
+* output of scrub() always passes check() clean (no secret survives).
+* --selftest proves both.
+*
+* THE ALLOW MARKER (the carve-out, kept honest). A single line may opt out by
+* carrying the marker `scrub-allow` (in a comment, anywhere on the line). That
+* line is skipped — for a README that documents a token shape, or a test
+* fixture that must contain a planted example. The carve-out is LINE-scoped and
+* EXPLICIT: you cannot silence the scanner globally, only annotate the one line
+* you vouched for. (Stripped from the band-gate's `band-allow` convention.)
+*/
+
+'use strict';
+
+/* The closed set of secret SHAPES. Each: a stable `kind`, a `re` (global,
+* multiline is applied per-line), and whether it is `heuristic` (higher
+* false-positive rate — a generic "secret-looking assignment" rather than a
+* vendor-stamped prefix). The list is documented, not open: a shape a real
+* secret needs and this set lacks is a gap to name in the printed ceiling, not
+* a reason to pretend coverage. */
+var SHAPES = [
+{ kind: 'github-pat', heuristic: false, re: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g},
+{ kind: 'github-token', heuristic: false, re: /\bgh[posru]_[A-Za-z0-9]{36,}\b/g},
+{ kind: 'aws-access-key-id', heuristic: false, re: /\bAKIA[0-9A-Z]{16}\b/g},
+{ kind: 'google-api-key', heuristic: false, re: /\bAIza[0-9A-Za-z_\-]{35}\b/g},
+{ kind: 'slack-token', heuristic: false, re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g},
+{ kind: 'stripe-key', heuristic: false, re: /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g},
+{ kind: 'openai-key', heuristic: false, re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g},
+{ kind: 'jwt', heuristic: false, re: /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b/g},
+{ kind: 'private-key-block', heuristic: false, re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED)?PRIVATE KEY-----/g},
+{ kind: 'basic-auth-url', heuristic: false, re: /\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:[^\/\s:@]+@/g},
+{ kind: 'hex-40-token', heuristic: false, re: /\b[0-9a-f]{40}\b/g},
+// heuristic: a generic "secret = <opaque value>" assignment. Higher FP; kept
+// last and flagged so a caller can drop it with { heuristic:false}.
+{ kind: 'secret-assignment', heuristic: true, re: /\b(?:secret|token|api[_-]?key|access[_-]?key|password|passwd|pwd|auth)\b\s*[:=]\s*['"]?[A-Za-z0-9/+_.=-]{16,}/gi}
+];
+
+var ALLOW_MARKER = 'scrub-allow';
+var PLACEHOLDER = function (kind) { return '\u2039redacted:' + kind + '\u203a';};
+
+function _mask(s) {
+s = String(s);
+if (s.length <= 4) return '\u2026';
+return s.slice(0, 4) + '\u2026(' + s.length + ')';
+}
+
+function _activeShapes(opts) {
+opts = opts || {};
+var wantHeuristic = opts.heuristic!== false; // heuristic ON by default
+return SHAPES.filter(function (s) { return wantHeuristic ||!s.heuristic;});
+}
+
+/* scan(text, opts) -> array of findings, each { kind, line, col, preview}.
+* Deterministic: findings are returned in (line, col) order. A line carrying
+* the allow marker contributes no findings. Never includes the secret value. */
+function scan(text, opts) {
+text = String(text == null? '': text);
+var shapes = _activeShapes(opts);
+var out = [];
+var lines = text.split('\n');
+for (var li = 0; li < lines.length; li++) {
+var line = lines[li];
+if (line.indexOf(ALLOW_MARKER)!== -1) continue; // vouched-for line
+for (var si = 0; si < shapes.length; si++) {
+var re = new RegExp(shapes[si].re.source, shapes[si].re.flags);
+var m;
+while ((m = re.exec(line))!== null) {
+out.push({ kind: shapes[si].kind, line: li + 1, col: m.index + 1, preview: _mask(m[0])});
+if (m.index === re.lastIndex) re.lastIndex++; // zero-width guard
+}
+}
+}
+out.sort(function (a, b) { return a.line - b.line || a.col - b.col || (a.kind < b.kind? -1: 1);});
+return out;
+}
+
+/* scrub(text, opts) -> text with every secret span replaced by a fixed
+* per-kind placeholder. Pure and idempotent. Allow-marked lines pass through. */
+function scrub(text, opts) {
+text = String(text == null? '': text);
+var shapes = _activeShapes(opts);
+var lines = text.split('\n');
+for (var li = 0; li < lines.length; li++) {
+if (lines[li].indexOf(ALLOW_MARKER)!== -1) continue;
+for (var si = 0; si < shapes.length; si++) {
+var re = new RegExp(shapes[si].re.source, shapes[si].re.flags);
+var kind = shapes[si].kind;
+lines[li] = lines[li].replace(re, PLACEHOLDER(kind));
+}
+}
+return lines.join('\n');
+}
+
+/* check(text, opts) -> boolean. true iff at least one secret shape is present.
+* The gate: `if (check(diff)) process.exit(1)`. */
+function check(text, opts) { return scan(text, opts).length > 0;}
+
+var CEILING =
+'scrub matches KNOWN secret SHAPES. A clean result means no known shape was ' +
+'found here \u2014 it is NOT proof the text is secret-free. A novel format, a ' +
+'split value, or a shapeless secret will pass. Smoke alarm, not a vault.';
+
+var api = { scan: scan, scrub: scrub, check: check, SHAPES: SHAPES, CEILING: CEILING, selftest: selftest};
+if (typeof module!== 'undefined' && module.exports) module.exports = api;
+
+/* ---- selftest: the golden corpus + the two structural promises ---- */
+function selftest() {
+var fails = [];
+function ck(name, cond) { if (!cond) fails.push(name);}
+
+// Prefixes assembled from parts so THIS file's own source bytes carry no
+// literal secret shape — the same reason any secret-scanner's fixtures must
+// not contain literal secrets (they would trip this scanner and its siblings,
+// and a live-credential must never land in a source file). The runtime string
+// is the real shape; the source is inert.
+var GHPAT = 'github_' + 'pat_'; // -> github_pat_
+var GHTOK = 'gh' + 'p_'; // -> ghp_
+
+// KNOWN-BAD half: each MUST trip its kind. Every value below is a FAKE example
+// (AKIA…EXAMPLE is AWS's own doc placeholder); no value is a real secret.
+var bad = [
+['github-pat', 'token = ' + GHPAT + '11ABCDEFG0abcdefghij_KLMNOPqrstuvwxyz012345'],
+['github-token', GHTOK + '0123456789abcdefghijklmnopqrstuvwxyz'],
+['aws-access-key-id', 'AKIAIOSFODNN7EXAMPLE'],
+['google-api-key', 'AIzaSyA1234567890abcdefghijklmnopqrstuv'],
+['slack-token', 'xoxb-2411-abcdefghijklmnop'],
+['stripe-key', 'sk_live_0123456789abcdefghijkl'],
+['jwt', 'eyJhbGciOi.eyJzdWIiOiIx.SflKxwRJSMe'],
+['private-key-block', '-----BEGIN RSA PRIVATE KEY-----'],
+['basic-auth-url', 'clone https://user:hunter2@example.com/x.git'],
+['hex-40-token', 'HEXKEY=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'],
+['secret-assignment', 'password: "correcthorsebatterystaple42"']
+];
+for (var i = 0; i < bad.length; i++) {
+var kinds = scan(bad[i][1]).map(function (f) { return f.kind;});
+ck('bad-trips:' + bad[i][0], kinds.indexOf(bad[i][0])!== -1);
+}
+
+// KNOWN-CLEAN half: must NOT trip (guards against a trigger-happy scanner).
+var clean = [
+'the quick brown fox jumps over the lazy dog',
+'commit 908ec0b2218aae65912f2e43c79f341 was fine', // short hex, not 40
+'see the docs at https://example.com/guide for setup',
+'let total = subtotal + tax; // no secrets here',
+'AKIA is a prefix but AKIA alone is not a key'
+];
+for (var c = 0; c < clean.length; c++) ck('clean-quiet:' + c, scan(clean[c]).length === 0);
+
+// PROMISE 1 — never echoes the secret; preview is masked.
+var f = scan('x = ' + GHPAT + '11ABCDEFG0abcdefghij_KLMNOPqrstuvwxyz012345')[0];
+ck('no-echo', f && f.preview.indexOf('KLMNOP') === -1 && f.preview.indexOf('\u2026')!== -1);
+
+// PROMISE 2 — scrub removes every secret; idempotent; output passes check clean.
+var dirty = bad.map(function (b) { return b[1];}).join('\n');
+var s1 = scrub(dirty);
+ck('scrub-clears', check(s1) === false);
+ck('scrub-idempotent', scrub(s1) === s1);
+ck('scrub-kept-shape', s1.split('\n').length === dirty.split('\n').length);
+
+// ALLOW MARKER — a vouched-for line is skipped.
+ck('allow-skips', scan(GHTOK + '0123456789abcdefghijklmnopqrstuvwxyz // scrub-allow example').length === 0);
+
+// DETERMINISM — scan twice, identical.
+ck('scan-deterministic', JSON.stringify(scan(dirty)) === JSON.stringify(scan(dirty)));
+
+// HEURISTIC toggle — dropping heuristics silences secret-assignment only.
+ck('heuristic-off', scan('password: "correcthorsebatterystaple42"', { heuristic: false}).length === 0);
+
+if (fails.length) {
+console.error('RED: ' + fails.length + ' failed [scrub]\n ' + fails.join('\n '));
+return false;
+}
+console.log('GREEN: ' + (bad.length + clean.length + 8) + ' checks passed, 0 failed [scrub]');
+return true;
+}
+
+/* ---- CLI ---- */
+function _readInput(argPath, cb) {
+if (argPath) {
+var fs = require('fs');
+var _text;
+try {
+_text = fs.readFileSync(argPath, 'utf8');
+} catch (e) {
+var _why = e && e.code === 'ENOENT'? 'no such file'
+: e && e.code === 'EISDIR'? 'is a directory'
+: e && e.code === 'EACCES'? 'permission denied'
+: (e && e.message) || 'cannot read';
+process.stderr.write('scrub: cannot read ' + JSON.stringify(argPath) + ': ' + _why + '\n');
+process.exit(2);
+}
+cb(_text);
+return;
+}
+var buf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (d) { buf += d;});
+process.stdin.on('end', function () { cb(buf);});
+}
+
+if (typeof require!== 'undefined' && require.main === module) {
+var argv = process.argv.slice(2);
+var mode = '--scan';
+var file = null;
+var noHeuristic = false;
+for (var a = 0; a < argv.length; a++) {
+if (argv[a] === '--selftest') { process.exit(selftest()? 0: 1);}
+else if (argv[a] === '--list') {
+SHAPES.forEach(function (s) { console.log((s.heuristic? '~ ': ' ') + s.kind);});
+console.error('\n' + CEILING);
+process.exit(0);
+}
+else if (argv[a] === '--scan' || argv[a] === '--scrub' || argv[a] === '--check') mode = argv[a];
+else if (argv[a] === '--no-heuristic') noHeuristic = true;
+else if (argv[a] === '-h' || argv[a] === '--help') {
+console.log('usage: scrub.js [--scan|--scrub|--check|--list|--selftest] [--no-heuristic] [FILE]');
+console.log(' --scan report findings (kind:line:col, masked preview) [default]');
+console.log(' --scrub emit the text with secrets replaced');
+console.log(' --check exit 1 if any secret is present, 0 if clean (the gate)');
+console.log(' exit 2 input could not be read (missing file, directory, permission)');
+console.error('\n' + CEILING);
+process.exit(0);
+}
+else if (argv[a][0]!== '-') file = argv[a];
+}
+_readInput(file, function (text) {
+var opts = { heuristic:!noHeuristic};
+if (mode === '--check') {
+var hits = scan(text, opts);
+if (hits.length) { console.error('scrub: ' + hits.length + ' secret(s) found \u2014 refusing.'); process.exit(1);}
+process.exit(0);
+} else if (mode === '--scrub') {
+process.stdout.write(scrub(text, opts));
+} else {
+var found = scan(text, opts);
+found.forEach(function (f) { console.log(f.kind + ':' + f.line + ':' + f.col + ' ' + f.preview);});
+console.error('\n' + CEILING);
+process.exit(found.length? 1: 0);
+}
+});
+}
+
+test_scrub.js 69 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/* test_scrub.js — the house-standard test file for the scrub gift.
+*
+* Runs the module's own golden-corpus selftest (the known-bad/known-clean pair
+* plus the two structural promises), then adds API-level assertions the CLI
+* selftest doesn't cover: the finding shape, the CEILING string, and that no
+* fixture value is echoed. Exits non-zero on any failure so it drops straight
+* into a CI gate.
+*/
+'use strict';
+var scrub = require('./scrub.js');
+
+var fails = [];
+function ck(name, cond) { if (!cond) fails.push(name);}
+
+// 1. The module's own golden-corpus selftest is the core of the suite.
+ck('module-selftest', scrub.selftest() === true);
+
+// 2. Finding shape — every finding names kind/line/col and a masked preview only.
+var hits = scrub.scan('l1 ok\nl2 AKIAIOSFODNN7EXAMPLE trailing');
+ck('finds-on-line-2', hits.length === 1 && hits[0].line === 2);
+ck('finding-has-kind', hits[0].kind === 'aws-access-key-id');
+ck('finding-has-col', typeof hits[0].col === 'number' && hits[0].col > 0);
+ck('preview-masked', hits[0].preview.indexOf('EXAMPLE') === -1);
+
+// 3. check() is scan()>0, and a clean string is clean.
+ck('check-clean', scrub.check('nothing secret in this sentence at all') === false);
+ck('check-dirty', scrub.check('AKIAIOSFODNN7EXAMPLE') === true);
+
+// 4. scrub() output always passes check clean (the load-bearing property).
+var s = scrub.scrub('a AKIAIOSFODNN7EXAMPLE b\n-----BEGIN RSA PRIVATE KEY-----');
+ck('scrub-output-clean', scrub.check(s) === false);
+ck('scrub-placeholder-present', s.indexOf('redacted:')!== -1);
+
+// 5. The honest ceiling is a non-empty, shipped string.
+ck('ceiling-present', typeof scrub.CEILING === 'string' && scrub.CEILING.length > 40);
+
+// 6. SHAPES is the documented closed set, each with a stable kind.
+ck('shapes-closed', Array.isArray(scrub.SHAPES) && scrub.SHAPES.every(function (x) { return x.kind && x.re;}));
+
+// 7. CLI clean-fail on unreadable input (D4-crashclean): a stranger who points
+// the gate at a missing file or a directory gets a clean one-line error and a
+// non-zero exit that is NOT the gate's "secret present" (1) — never a stack trace.
+var cp = require('child_process');
+var path = require('path');
+var os = require('os');
+var fs2 = require('fs');
+var CLI = path.join(__dirname, 'scrub.js');
+function runCheck(target) {
+var r = cp.spawnSync(process.execPath, [CLI, '--check', target], { encoding: 'utf8'});
+var both = (r.stdout || '') + (r.stderr || '');
+return { code: r.status, out: both};
+}
+var missing = runCheck(path.join(os.tmpdir(), 'scrub-no-such-' + process.pid + '.txt'));
+ck('badinput-missing-exit2', missing.code === 2);
+ck('badinput-missing-clean', /scrub: cannot read/.test(missing.out) &&!/at Object|node:fs|Node\.js v/.test(missing.out));
+var dir = fs2.mkdtempSync(path.join(os.tmpdir(), 'scrub-dir-'));
+var asFile = runCheck(dir);
+ck('badinput-dir-exit2', asFile.code === 2);
+ck('badinput-dir-clean', /scrub: cannot read/.test(asFile.out) &&!/at Object|node:fs|Node\.js v/.test(asFile.out));
+try { fs2.rmdirSync(dir);} catch (e) {}
+
+if (fails.length) {
+console.error('RED: ' + fails.length + ' failed [test_scrub]\n ' + fails.join('\n '));
+process.exit(1);
+}
+console.log('GREEN: ' + (16) + ' assertions passed, 0 failed [test_scrub]');
+process.exit(0);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---

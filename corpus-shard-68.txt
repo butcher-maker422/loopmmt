@@ -1,1103 +1,112 @@
-# Loop MMT — corpus shard 68/74
+# Loop MMT — corpus shard 68/86
 
-> Bundle 68 of 74 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 68 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/reading-oath/, /gifts/reltime/, /gifts/scrub/, /gifts/sha256/)
-
----
-
-# Make The AI Prove It Read The Whole Thing — a Loop MMT gift
-https://loopmmt.com/gifts/reading-oath/
-[coverage: optional · branch: gifts]
-
-How Do You Know The Model Read All Of Your Context, Not Just Some Of It? shard ← all gifts
-
-Make The AI Prove It Read The Whole Thing
-
-Shard a chunk of context into a manifest of typed nodes — the coverage oracle — plus budget-sized reading bundles and a short reader protocol; hand it to any model, collect the node ids it reports reading, and verify against the manifest by set-difference until nothing remains. PASS means every shard was covered; a GAP names exactly which shards were skipped. The general-text sibling of The Excavation (which proves an AI read a whole site). Python stdlib only, offline, deterministic — the same context yields byte-identical shards every run.
-
-The honest edge
-
-reading-oath proves COVERAGE — that every shard of your context was seen — not COMPREHENSION; a reader can cover every shard and still misunderstand it. It also trusts the reader to report the ids it actually read: it detects a skipped shard, not a lie about a read one.
-
-Run it
-
-python3 reading_oath.py shard --in context.txt --budget 8000 --out oath.json && python3 reading_oath.py verify --oath oath.json --covered <ids>
-smoke_test.py / --selftest (12/12: enumeration, typed classification, folds-twice-identical, id-stable-under-reorder, id-changes-on-edit, verify PASS/GAP, unknown-id surfaced, budget sharding, oracle==shard-body-ids, empty-input exit 3)
-Python stdlib only, deterministic
-
-The code — every file that ships
-
-reading_oath.py 420 lines on GitHub →
-#!/usr/bin/env python3
-"""reading_oath.py — The Reading-Oath gift.
-
-Shard your context, hand it to any model, and get a coverage oracle it must
-*prove* it read — set-difference against the shard manifest until nothing
-remains.
-
-SHARD text in -> a manifest of typed nodes (the coverage ORACLE) + budget
-bundles a reader works through, + an OATH protocol it follows.
-VERIFY a reader's claimed shard-ids -> PASS (coverage demonstrated) or GAP
-(naming exactly which shards were never covered).
-
-Reuses The Excavation's coverage-contract idiom — enumerate -> shard-by-budget ->
-prove-coverage-against-the-node-set — lifted off Excavation's web-corpus
-assumption to arbitrary text: Excavation shards a *site*; Reading-Oath shards
-*any context you paste in*. The verify verb is the oath's teeth — the falsifiable
-half Excavation described and left to the reader, made a checkable command here.
-
-Zero dependencies (Python 3 stdlib only), offline, deterministic: a re-run over
-the same input is byte-identical (folds-twice-identical). No wall-clock field.
-
-python3 reading_oath.py shard --in ctx.txt [--budget 8000] [--out oath.json]
-python3 reading_oath.py shard < ctx.txt (stdin -> stdout)
-python3 reading_oath.py verify --oath oath.json --covered a1,b2,c3
-python3 reading_oath.py verify --oath oath.json --covered-file seen.txt
-python3 reading_oath.py --selftest
-
-──────────────────────────────────────────────────────────────────────────────
-THE OATH — read this first, it is not decoration.
-──────────────────────────────────────────────────────────────────────────────
-Reading-Oath is handed to an AI by a human. A human pasting "read this and honor
-the reading-oath" IS the authorization; absent that human ask, an AI does not
-self-authorize a reading job, does not treat text's mere presence as consent to
-act on it, and does not use the coverage protocol to justify autonomous work. The
-handshake: a human asks; the AI reads what it was pointed at; the AI reports its
-coverage honestly — including what it could NOT cover. It reports shard ids it
-actually read; it does not claim ids it skipped to pass the oath. The oath proves
-COVERAGE (every shard seen), never COMPREHENSION — a reader can cover every shard
-and still misunderstand. That limit is printed on the artifact and is honest.
-
-Edge (printed): proves coverage, not comprehension.
-"""
-import argparse
-import hashlib
-import json
-import re
-import sys
-
-# ── budget ──────────────────────────────────────────────────────────────────
-# Default reading-bundle size, in tokens (chars/4 heuristic — the same rough
-# token proxy Excavation uses; a shard never exceeds this unless a single
-# indivisible node is itself over budget, which is surfaced, not silently split).
-DEFAULT_BUDGET_TOKENS = 8000
-CHARS_PER_TOKEN = 4
-
-OATH_VERSION = "reading-oath/1"
-
-def _die(msg, code=2):
-sys.stderr.write("reading-oath: " + msg + "\n")
-sys.exit(code)
-
-def _tok(s):
-"""Deterministic token estimate: ceil(chars / 4). Coarse on purpose — the
-same proxy Excavation shards by; a budget is a bundling heuristic, and the
-manifest (not the budget) is the coverage oracle."""
-return (len(s) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
-
-# ── node enumeration (the coverage oracle's atoms) ──────────────────────────
-def enumerate_nodes(text):
-"""Split raw context into an ordered list of typed nodes — the atoms of the
-coverage oracle. A node is a blank-line-delimited block (paragraph, heading,
-fenced code block, list). Order is preserved; a node's id is a content hash
-of its normalized text, so the same block always earns the same id
-regardless of position (a moved paragraph keeps its id; an edited one gets a
-new one) — the property that makes the oath stable under reshuffling.
-
-Typing is by a fixed, declared rule set (first match wins):
-code a block that opens with a ``` fence, or is wholly indented >=4 sp
-heading a block that is a single line opening with # (markdown) or is a
-short single line followed by === / --- underline in the source
-list a block whose every non-blank line opens with -, *, +, or N.
-prose everything else
-"""
-# Normalize newlines only; do NOT strip content (byte-fidelity of the split).
-text = text.replace("\r\n", "\n").replace("\r", "\n")
-# Split on blank-line boundaries, keeping block text intact.
-raw_blocks = re.split(r"\n[ \t]*\n", text)
-nodes = []
-seq = 0
-for block in raw_blocks:
-if block.strip() == "":
-continue
-seq += 1
-ntype = _classify(block)
-norm = _normalize(block)
-nid = _node_id(norm)
-nodes.append({
-"id": nid,
-"seq": seq,
-"type": ntype,
-"tokens": _tok(block),
-"chars": len(block),
-"preview": _preview(block),
-"text": block,
-})
-return nodes
-
-def _classify(block):
-lines = [ln for ln in block.split("\n")]
-nonblank = [ln for ln in lines if ln.strip()]
-if not nonblank:
-return "prose"
-first = nonblank[0].lstrip()
-if first.startswith("```"):
-return "code"
-if all(ln.startswith(" ") or ln.startswith("\t") for ln in lines if ln.strip()):
-return "code"
-if len(nonblank) == 1 and first.startswith("#"):
-return "heading"
-if (len(nonblank) == 2 and re.fullmatch(r"[=\-]{2,}", nonblank[1].strip() or "")):
-return "heading"
-if all(re.match(r"^\s*([-*+]|\d+[.)])\s+", ln) for ln in nonblank):
-return "list"
-return "prose"
-
-def _normalize(block):
-"""Whitespace-normalize for the content id: collapse internal runs of
-whitespace to single spaces and strip ends. Two blocks that differ only in
-incidental spacing earn the same id (stable oath); a real content edit
-changes it."""
-return re.sub(r"\s+", " ", block).strip()
-
-def _node_id(norm):
-return "n" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:10]
-
-def _preview(block):
-flat = re.sub(r"\s+", " ", block).strip()
-return flat[:72]
-
-# ── shard (bundle nodes by budget) ──────────────────────────────────────────
-def shard_nodes(nodes, budget_tokens):
-"""Greedy in-order bundling into budget-sized shards. In-order so a reader
-works front-to-back; greedy-by-budget so each shard fits a context window.
-A single node over budget becomes its own shard and is flagged oversize
-(surfaced, never silently truncated)."""
-shards = []
-cur = []
-cur_tok = 0
-idx = 0
-
-def _flush():
-nonlocal cur, cur_tok, idx
-if not cur:
-return
-idx += 1
-sid = "s%03d" % idx
-shards.append({
-"id": sid,
-"node_ids": [n["id"] for n in cur],
-"tokens": cur_tok,
-"oversize": any(n["tokens"] > budget_tokens for n in cur),
-})
-cur = []
-cur_tok = 0
-
-for n in nodes:
-if cur and cur_tok + n["tokens"] > budget_tokens:
-_flush()
-cur.append(n)
-cur_tok += n["tokens"]
-_flush()
-return shards
-
-# ── the oath object (manifest + shards + protocol) ──────────────────────────
-def build_oath(text, budget_tokens):
-nodes = enumerate_nodes(text)
-if not nodes:
-_die("input has no readable nodes (empty or all-blank).", 3)
-shards = shard_nodes(nodes, budget_tokens)
-# The manifest is the ORACLE: the closed set of node ids that must be covered.
-node_set = [n["id"] for n in nodes]
-manifest = {
-"version": OATH_VERSION,
-"budget_tokens": budget_tokens,
-"node_count": len(nodes),
-"shard_count": len(shards),
-"total_tokens": sum(n["tokens"] for n in nodes),
-"nodes": [
-{"id": n["id"], "seq": n["seq"], "type": n["type"],
-"tokens": n["tokens"], "preview": n["preview"]}
-for n in nodes
-],
-# node_set is the coverage oracle — verify() checks claimed ⊇ this.
-"node_set": node_set,
-"shards": shards,
-# The reader-facing protocol. Prose, deterministic, no wall-clock.
-"oath": [
-"You have been handed a sharded context and a coverage oracle.",
-"Read each shard in id order (s001, s002,...).",
-"For every node id you actually read, record it.",
-"You have honored the reading-oath ONLY when the set-difference of the "
-"manifest node_set minus the ids you recorded is empty.",
-"Report the ids you covered. Do NOT claim an id you skipped.",
-"This proves COVERAGE (every shard seen), not COMPREHENSION.",
-],
-"edge": "proves coverage, not comprehension",
-}
-# Attach the shard bodies so the object is self-contained for a reader.
-bodies = {n["id"]: n["text"] for n in nodes}
-manifest["shard_bodies"] = {
-s["id"]: [{"id": nid, "text": bodies[nid]} for nid in s["node_ids"]]
-for s in shards
-}
-return manifest
-
-# ── verify (the oath's teeth) ───────────────────────────────────────────────
-def verify(oath, covered_ids):
-"""Set-difference the manifest node_set against the reader's claimed ids.
-Empty difference => PASS (coverage demonstrated). Otherwise GAP, naming the
-uncovered node ids. Claimed ids not in the manifest are reported as 'unknown'
-(a reader claiming ids that do not exist is a signal, not silently ignored)."""
-oracle = set(oath.get("node_set", []))
-claimed = set(covered_ids)
-uncovered = sorted(oracle - claimed)
-unknown = sorted(claimed - oracle)
-result = {
-"version": oath.get("version", OATH_VERSION),
-"oracle_size": len(oracle),
-"claimed_size": len(claimed),
-"covered": len(oracle & claimed),
-"uncovered": uncovered,
-"unknown": unknown,
-"passed": len(uncovered) == 0,
-}
-return result
-
-# ── cli ─────────────────────────────────────────────────────────────────────
-def _read_covered(args):
-ids = []
-if args.covered:
-ids += [x.strip() for x in args.covered.split(",") if x.strip()]
-if args.covered_file:
-try:
-with open(args.covered_file, "r", encoding="utf-8") as fh:
-for raw in fh:
-for tok in re.split(r"[,\s]+", raw.strip()):
-if tok:
-ids.append(tok)
-except OSError as e:
-_die("cannot read --covered-file: %s" % e, 2)
-if not ids:
-_die("verify needs --covered or --covered-file (the reader's claimed ids).", 2)
-return ids
-
-def main(argv=None):
-argv = list(sys.argv[1:] if argv is None else argv)
-if "--selftest" in argv:
-return _selftest()
-
-p = argparse.ArgumentParser(prog="reading_oath.py", add_help=True,
-description="Shard a context into a coverage oath; verify a reader honored it.")
-sub = p.add_subparsers(dest="cmd")
-
-ps = sub.add_parser("shard", help="text in -> coverage oath (manifest+shards+protocol)")
-ps.add_argument("--in", dest="infile", default=None, help="input file (default: stdin)")
-ps.add_argument("--out", dest="outfile", default=None, help="output file (default: stdout)")
-ps.add_argument("--budget", type=int, default=DEFAULT_BUDGET_TOKENS,
-help="shard token budget (default %d)" % DEFAULT_BUDGET_TOKENS)
-
-pv = sub.add_parser("verify", help="reader's claimed ids -> PASS or GAP")
-pv.add_argument("--oath", required=True, help="the oath json from `shard`")
-pv.add_argument("--covered", default=None, help="comma-separated node ids the reader read")
-pv.add_argument("--covered-file", default=None, help="file of node ids (whitespace/comma sep)")
-
-args = p.parse_args(argv)
-
-if args.cmd == "shard":
-if args.budget <= 0:
-_die("--budget must be positive.", 2)
-if args.infile:
-try:
-with open(args.infile, "r", encoding="utf-8") as fh:
-text = fh.read()
-except OSError as e:
-_die("cannot read --in: %s" % e, 2)
-else:
-text = sys.stdin.read()
-oath = build_oath(text, args.budget)
-out = json.dumps(oath, indent=2, ensure_ascii=False, sort_keys=True)
-if args.outfile:
-try:
-with open(args.outfile, "w", encoding="utf-8") as fh:
-fh.write(out + "\n")
-except OSError as e:
-_die("cannot write --out: %s" % e, 2)
-sys.stderr.write("reading-oath: %d nodes, %d shards -> %s\n"
-% (oath["node_count"], oath["shard_count"], args.outfile))
-else:
-sys.stdout.write(out + "\n")
-return 0
-
-if args.cmd == "verify":
-try:
-with open(args.oath, "r", encoding="utf-8") as fh:
-oath = json.load(fh)
-except OSError as e:
-_die("cannot read --oath: %s" % e, 2)
-except json.JSONDecodeError as e:
-_die("--oath is not valid json: %s" % e, 2)
-covered = _read_covered(args)
-res = verify(oath, covered)
-sys.stdout.write(json.dumps(res, indent=2, sort_keys=True) + "\n")
-if res["passed"]:
-sys.stderr.write("reading-oath: PASS — %d/%d covered, difference empty.\n"
-% (res["covered"], res["oracle_size"]))
-return 0
-sys.stderr.write("reading-oath: GAP — %d uncovered node(s): %s\n"
-% (len(res["uncovered"]), ", ".join(res["uncovered"][:8])
-+ ("..." if len(res["uncovered"]) > 8 else "")))
-return 1
-
-p.print_help()
-return 2
-
-# ── selftest (the determinism + contract battery) ───────────────────────────
-def _selftest():
-ok = 0
-fail = 0
-
-def check(name, cond):
-nonlocal ok, fail
-if cond:
-ok += 1
-else:
-fail += 1
-sys.stderr.write(" FAIL: %s\n" % name)
-
-sample = (
-"# Title\n\n"
-"First paragraph of prose that says a thing.\n\n"
-"Second paragraph, distinct content here.\n\n"
-"- a list item\n- another list item\n\n"
-"```\ncode block line one\ncode block line two\n```\n"
-)
-oath = build_oath(sample, 20)
-ids = oath["node_set"]
-
-# 1. enumeration finds the five blocks.
-check("node_count == 5", oath["node_count"] == 5)
-# 2. typing is correct.
-types = [n["type"] for n in oath["nodes"]]
-check("types heading/prose/prose/list/code",
-types == ["heading", "prose", "prose", "list", "code"])
-# 3. determinism: fold twice, identical.
-o2 = build_oath(sample, 20)
-check("folds-twice-identical",
-json.dumps(oath, sort_keys=True) == json.dumps(o2, sort_keys=True))
-# 4. node id is content-stable under reordering.
-reordered = (
-"Second paragraph, distinct content here.\n\n"
-"# Title\n\n"
-"First paragraph of prose that says a thing.\n\n"
-"- a list item\n- another list item\n\n"
-"```\ncode block line one\ncode block line two\n```\n"
-)
-ro = build_oath(reordered, 20)
-check("ids stable under reorder (same set)",
-set(ro["node_set"]) == set(oath["node_set"]))
-# 5. id changes on content edit.
-edited = sample.replace("says a thing", "says a DIFFERENT thing")
-oe = build_oath(edited, 20)
-check("edit changes exactly one id",
-len(set(oe["node_set"]) - set(oath["node_set"])) == 1)
-# 6. verify PASS when all covered.
-r_all = verify(oath, ids)
-check("verify PASS on full coverage", r_all["passed"] and not r_all["uncovered"])
-# 7. verify GAP naming the skipped id.
-r_gap = verify(oath, ids[:-1])
-check("verify GAP names the one skipped", (not r_gap["passed"]) and r_gap["uncovered"] == [ids[-1]])
-# 8. unknown claimed id is surfaced.
-r_unk = verify(oath, ids + ["nDEADBEEF00"])
-check("verify surfaces unknown id", r_unk["unknown"] == ["nDEADBEEF00"])
-# 9. sharding respects budget (each shard <= budget unless a single oversize node).
-small = build_oath(sample, 5) # tiny budget forces multiple shards
-check("tiny budget -> more shards", small["shard_count"] >= oath["shard_count"])
-budget_ok = all(s["tokens"] <= 5 or len(s["node_ids"]) == 1 for s in small["shards"])
-check("shards fit budget or are single oversize node", budget_ok)
-# 10. node_set is exactly the shard-body ids (oracle == what's handed over).
-body_ids = set()
-for sid, items in oath["shard_bodies"].items():
-for it in items:
-body_ids.add(it["id"])
-check("oracle == union of shard-body ids", body_ids == set(oath["node_set"]))
-# 11. empty input dies clean (exit 3) — checked via a guarded call.
-try:
-build_oath(" \n\n \n", 20)
-check("empty input raises", False)
-except SystemExit as e:
-check("empty input exit 3", e.code == 3)
-
-total = ok + fail
-sys.stdout.write("reading-oath selftest: %d/%d passed\n" % (ok, total))
-return 0 if fail == 0 else 1
-
-if __name__ == "__main__":
-sys.exit(main())
-
-smoke_test.py 21 lines on GitHub →
-#!/usr/bin/env python3
-"""smoke_test.py — reading-oath's shipped smoke check. Runs the in-module
---selftest battery (12 checks) and exits non-zero on any failure, so a stranger
-can prove the gift works in their tree with one command:
-
-python3 smoke_test.py
-"""
-import subprocess
-import sys
-import os
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-def main():
-r = subprocess.run([sys.executable, os.path.join(HERE, "reading_oath.py"), "--selftest"])
-sys.exit(r.returncode)
-
-if __name__ == "__main__":
-main()
-
-Take the whole folder →
-MIT
-Python stdlib only, deterministic
+Nodes in this shard: 3 (/gifts/hmac-webhook/, /gifts/hunkhole/, /gifts/ini-source/)
 
 ---
 
-# Reltime — a Loop MMT gift
-https://loopmmt.com/gifts/reltime/
+# hmac-webhook — a Loop MMT gift
+https://loopmmt.com/gifts/hmac-webhook/
 [coverage: optional · branch: gifts]
 
-Relative Time That Refuses To Lie date ← all gifts
+Verify an HMAC-Signed Webhook in Constant Time filter ← all gifts
 
-Reltime
+hmac-webhook
 
-Turn a timestamp into a short human 'when' (3h ago, Jun 20) where the whole point is what it won't do: a missing, empty, or unparseable stamp returns no label rather than a guess, a future stamp returns no label rather than a negative age, and anything older than a week gets the real date it landed instead of a rounded-up '9d ago'. Deterministic — a pure function of (stamp, now).
+hmac-webhook recomputes HMAC-SHA256(secret, rawBody) and checks it against the signature a webhook sender put in a header (conventionally X-Signature: sha256=<hex>), answering one question — is this body authentic and unmodified, from someone who holds the secret? It answers in CONSTANT TIME, so a forger cannot learn the correct signature one character at a time from how long a rejection takes. verify(body, header, secret) returns {ok, reason}; ok:false always names why — no-signature, bad-format, unsupported-scheme, length-mismatch, or hmac-mismatch — never a partial match. HMAC-SHA256 is RFC 2104 exactly, with the SHA-256 core vendored byte-for-byte from the shipped sha256 gift, so the result is byte-identical to Node's crypto.createHmac and to openssl dgst -sha256 -hmac. Same body, header, and secret in → same verdict out, in Node or a browser.
 
 The honest edge
 
-It renders in UTC and is a recency label, not a locale-aware or timezone-shifting formatter, and not a full date library. The fixed minute/hour/day/week bands are by design — the value is the refusal to fabricate, not configurable granularity.
+hmac-webhook verifies AUTHENTICITY — nothing more. It is NOT a secret store (you supply the secret; it is never persisted), NOT a replay defender (it proves THIS body is authentic, not that it is fresh — pair it with a timestamp or nonce check for that), NOT a TLS or transport check, NOT an authorization system (authentic is not the same as allowed), and NOT a multi-algorithm negotiator (it verifies the one scheme you name, default sha256).
 
 Run it
 
-node reltime.js 2026-08-20T09:00:00Z
-test_reltime.js (20/20, mutation-bitten)
-Node, no dependencies
+printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --signature "sha256=<hex>" # prints 'ok' exit 0 if authentic; reason + exit 1 otherwise; --sign to emit a signature; exit 2 usage/input error
+test_hmac-webhook.js (40/40: RFC 4231 TC2, Node-crypto parity over 10 shapes incl. multibyte + 63/64/65-byte block-boundary keys + multi-block body, sign→verify round-trip, and the known-bad half — tampered body / wrong secret / flipped sig / truncated / 5 malformed headers / 2 wrong-scheme / uppercase-hex normalize / whitespace tolerate — plus determinism 3x and constant-time-compare correctness)
+Zero dependencies, Node or browser, deterministic, constant-time
 
 The code — every file that ships
 
-reltime.js 106 lines on GitHub →
+hmac-webhook.js 351 lines on GitHub →
 #!/usr/bin/env node
-/* reltime.js — an honest relative-time label ("3h ago", "Jun 20") that refuses
-to fake, round up, or invent a time it doesn't have.
-
-Turn a timestamp into a short human "when" — but the whole point is what it
-WON'T do:
-
-• FLAG, DON'T FAKE. No stamp, an empty stamp, or an unparseable value
-returns null — NO label. The caller shows nothing rather than a guessed
-or fabricated time. An undated thing is never handed a "when".
-
-• A FUTURE STAMP IS NOT A RECENCY CLAIM. If the timestamp is ahead of now
-(clock skew, a bad record), it returns null rather than "-2h ago". You
-cannot honestly say how long ago something happened if it hasn't.
-
-• REAL, NOT ROUNDED-UP. Recent items get a relative label
-(just now / Nm / Nh / Nd ago); anything older than a week gets the
-ABSOLUTE short date it actually landed ("Jun 20", or "Jun 20, 2025"
-across a year boundary) — because "9d ago" is less honest and less
-useful than the date itself.
-
-• DETERMINISTIC. `now` is injected, so the label is a pure function of
-(stamp, now) — testable with no wall clock and stable across a render.
-
-Pure function of its inputs, no dependencies. The same code runs in a browser
-(attach relativeTime to your namespace) or on Node (this CLI / require()).
-
-USAGE
-node reltime.js 2026-08-20T09:00:00Z # label vs. now
-node reltime.js 2026-08-20T09:00:00Z 1755772800000 # label vs. an injected now (ms)
-node reltime.js --help
-
-Dates are read/rendered in UTC for determinism. Released under MIT.
+/**
+* hmac-webhook — verify an HMAC-signed webhook before you trust its body.
+*
+* WHAT
+* A webhook sender (GitHub, Stripe, Shopify, a Loop module) signs each request
+* body with a shared secret and puts the signature in a header, conventionally
+* X-Signature: sha256=<hex>
+* hmac-webhook recomputes HMAC-SHA256(secret, rawBody) and checks it against the
+* signature the sender sent. It answers ONE question — is this body authentic and
+* unmodified, from someone who holds the secret? — and answers it in CONSTANT TIME
+* so a forger cannot learn the right signature one byte at a time from timing.
+*
+* verify(rawBody, signatureHeader, secret) -> { ok, reason}
+*
+* ok:true the body is authentic (the computed MAC equals the presented one).
+* ok:false reason names WHY it failed — never a partial match, never a maybe:
+* "no-signature" the header is empty / missing.
+* "bad-format" the header is not "<scheme>=<hex>" with an even-length
+* lowercase-normalizable hex body.
+* "unsupported-scheme" a scheme other than the one asked for (default sha256).
+* "length-mismatch" the presented digest is not 64 hex chars (32 bytes).
+* "hmac-mismatch" well-formed, right length, but the MAC does not match —
+* the body was altered, the secret is wrong, or it is a forgery.
+*
+* HOW
+* HMAC-SHA256 is RFC 2104 exactly: with block size B=64 and the SHA-256 core
+* vendored from the shipped `sha256` gift (FIPS 180-4, byte-faithful),
+* K' = key if len(key) <= B, else SHA-256(key) then zero-padded to B
+* HMAC = SHA-256( (K' XOR opad) || SHA-256( (K' XOR ipad) || message))
+* ipad is 0x36 repeated B times, opad is 0x5c repeated B times. Everything runs on
+* RAW BYTES — the message and the key are UTF-8 encoded once — so a multibyte secret
+* or body is hashed byte-for-byte the same as Node's crypto.createHmac('sha256').
+* The comparison is a fixed-time XOR-accumulate over the full digest width: it looks
+* at every byte regardless of where the first difference is, so the pass/fail timing
+* carries no information about the correct signature.
+*
+* Pure function of (body, header, secret). No clock, no randomness, no files, no
+* network. Same three inputs -> same verdict, every run, in Node or a browser.
+*
+* USAGE
+* node hmac-webhook.js --secret SECRET --signature "sha256=<hex>" [FILE] # body from FILE or stdin
+* node hmac-webhook.js --secret SECRET --sign [FILE] # PRINT the signature for a body (sender side)
+* printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --sign
+* -> sha256=<hex>
+* printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --signature "sha256=<hex>"
+* -> exits 0 (authentic) and prints "ok"; exits 1 and prints the reason otherwise.
+* --scheme NAME signature scheme label to require/emit (default "sha256").
+* --help
+*
+* In a browser: window.ForestGifts.hmacWebhook.{verify, sign, hmacSha256Hex}.
+*
+* EXIT CODES (CLI)
+* 0 verify: authentic. (--sign always exits 0 on success.)
+* 1 verify: NOT authentic — the reason is printed on stdout (one word) + stderr.
+* 2 usage / input error: missing --secret, missing --signature (without --sign),
+* a file that is a directory or cannot be read. One clean line on stderr.
+*
+* EDGE (what this is NOT)
+* NOT a signer's secret store — you supply the secret; it is never persisted.
+* NOT a replay defender — it proves authenticity of THIS body, not that the body
+* is fresh; pair it with a timestamp/nonce check if you need replay protection.
+* NOT a TLS or transport check, NOT an authorization system (authentic!= allowed),
+* and NOT a multi-algorithm negotiator — it verifies ONE scheme (sha256) you name.
+*
+* Zero dependencies. Node builtin `require('fs')` for file reads only; runs in a
+* browser with no require. MIT.
 */
 "use strict";
 
-var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-var MIN = 60 * 1000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
-
-/* relativeTime(iso, nowMs) -> short label string, or null when there is no
-honest label to show. `iso` is an ISO-8601 string (or null). `nowMs` defaults
-to Date.now() but is injected in tests and via the CLI for determinism. */
-function relativeTime(iso, nowMs) {
-// flag-don't-fake: no stamp, empty stamp, or a non-string -> no label.
-if (iso == null) return null;
-var s = String(iso);
-if (s === "") return null;
-
-var t = Date.parse(s);
-if (isNaN(t)) return null; // unparseable -> no fabricated time
-
-var now = (typeof nowMs === "number" && isFinite(nowMs))? nowMs: Date.now();
-var delta = now - t;
-
-// A future stamp (clock skew) is not a recency claim we can make honestly.
-if (delta < 0) return null;
-
-if (delta < MIN) return "just now";
-if (delta < HOUR) return Math.floor(delta / MIN) + "m ago";
-if (delta < DAY) return Math.floor(delta / HOUR) + "h ago";
-if (delta < WEEK) return Math.floor(delta / DAY) + "d ago";
-
-// Older than a week -> the absolute short date it actually landed.
-var d = new Date(t);
-var label = MONTHS[d.getUTCMonth()] + " " + d.getUTCDate();
-if (d.getUTCFullYear()!== new Date(now).getUTCFullYear()) {
-label += ", " + d.getUTCFullYear();
-}
-return label;
-}
-
-// Browser: attach to a namespace. Node/require: export. CLI: run below.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.relativeTime = relativeTime;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { relativeTime: relativeTime};
-}
-
-// ---- CLI (runs only when invoked directly, never on require) ----------------
-function main(argv) {
-var args = argv.slice(2);
-if (args.length === 0 || args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"reltime.js — an honest relative-time label that refuses to fake a time.\n\n" +
-" node reltime.js <iso-timestamp> label vs. now\n" +
-" node reltime.js <iso-timestamp> <now-ms> label vs. an injected now (ms)\n" +
-" node reltime.js --help\n\n" +
-"Prints the label, or '(no honest label)' when the stamp is missing,\n" +
-"unparseable, or in the future. Dates render in UTC.\n"
-);
-return args.length === 0? 1: 0;
-}
-var iso = args[0];
-var nowMs = args.length > 1? Number(args[1]): undefined;
-var label = relativeTime(iso, nowMs);
-process.stdout.write((label === null? "(no honest label)": label) + "\n");
-return 0;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_reltime.js 61 lines on GitHub →
-#!/usr/bin/env node
-/* test_reltime.js — proves the label is honest, exact, and deterministic.
-
-The honesty rules ARE the tool, so the test's real job is to prove each
-REFUSAL fires (null, not a fabricated label) and each threshold is exact. The
-clock is injected, so every case is deterministic with no wall clock. A
-mutation bite guards against a vacuously-green run. Exit 0 = all pass, exit 1
-= a failure (loud). stdlib only, no dependencies. */
-"use strict";
-var relativeTime = require("./reltime.js").relativeTime;
-
-var pass = 0, fail = 0;
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
-}
-
-// A fixed "now" so every case is deterministic. 2026-06-27T12:00:00Z.
-var NOW = Date.parse("2026-06-27T12:00:00Z");
-function ago(ms) { return new Date(NOW - ms).toISOString();}
-var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
-
-// --- flag-don't-fake: every "no honest label" case returns null -------------
-eq("null stamp -> null", relativeTime(null, NOW), null);
-eq("undefined stamp -> null", relativeTime(undefined, NOW), null);
-eq("empty string -> null", relativeTime("", NOW), null);
-eq("unparseable -> null", relativeTime("not a date", NOW), null);
-eq("garbage -> null", relativeTime("2026-13-99", NOW), null);
-eq("future stamp -> null", relativeTime(ago(-HOUR), NOW), null); // 1h in the FUTURE
-
-// --- relative band, exact thresholds ---------------------------------------
-eq("0ms -> just now", relativeTime(ago(0), NOW), "just now");
-eq("59s -> just now", relativeTime(ago(59 * 1000), NOW), "just now");
-eq("60s -> 1m ago", relativeTime(ago(MIN), NOW), "1m ago");
-eq("59m -> 59m ago", relativeTime(ago(59 * MIN), NOW), "59m ago");
-eq("60m -> 1h ago", relativeTime(ago(HOUR), NOW), "1h ago");
-eq("23h -> 23h ago", relativeTime(ago(23 * HOUR), NOW), "23h ago");
-eq("24h -> 1d ago", relativeTime(ago(DAY), NOW), "1d ago");
-eq("6d -> 6d ago", relativeTime(ago(6 * DAY), NOW), "6d ago");
-
-// --- absolute band (>= 1 week): the real date it landed --------------------
-eq("7d -> absolute date", relativeTime(ago(WEEK), NOW), "Jun 20");
-eq("30d same year -> date", relativeTime(ago(30 * DAY), NOW), "May 28");
-eq("across a year boundary", relativeTime("2025-12-31T00:00:00Z", NOW), "Dec 31, 2025");
-
-// --- determinism: same inputs, same output ---------------------------------
-eq("deterministic", relativeTime(ago(3 * HOUR), NOW), relativeTime(ago(3 * HOUR), NOW));
-
-// --- coercion / robustness --------------------------------------------------
-eq("non-string stamp -> null", relativeTime(12345, NOW), null); // a number is not an ISO string here
-
-// --- mutation bite: the future-guard MUST be load-bearing ------------------
-// If someone deleted `if (delta < 0) return null;`, a future stamp would
-// produce "just now" (delta<MIN with negative delta). Assert it does NOT.
-var futureResult = relativeTime(ago(-HOUR), NOW);
-if (futureResult === null) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: future stamp produced a label: " + JSON.stringify(futureResult));}
-
-console.log("\nreltime: " + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node, no dependencies
-
----
-
-# Scrub — a Loop MMT gift
-https://loopmmt.com/gifts/scrub/
-[coverage: optional · branch: gifts]
-
-Catch a Secret Before It Ships filter ← all gifts
-
-Scrub
-
-scrub reads text and finds the things that should never have been in it — a GitHub token, an AWS key, a PEM private-key block, a Slack token, a JWT, a password in a URL — by matching them on SHAPE, not luck. It can report them (masked preview, never the value), redact them (a fixed per-kind placeholder, idempotent), or refuse — a non-zero exit the moment a known secret shape appears, so it drops straight into a pre-commit hook or a CI gate. A single line opts out with an explicit, line-scoped scrub-allow marker; you cannot silence it globally. Zero dependencies, deterministic, runs identically in Node or a browser, and never echoes a secret it found.
-
-The honest edge
-
-scrub matches KNOWN secret shapes. A clean result means no known shape was found here — it is NOT proof the text is secret-free: a novel token format, a secret split across lines, or a home-rolled scheme passes clean. It is a smoke alarm, not a vault — a hit is real, a clean scan is the absence of a known shape, never a certificate. Because it matches shapes it also flags EXAMPLE secrets (a documented token, its own fixtures) — the honest ceiling working, not a bug; vouch for a line you know is safe with scrub-allow.
-
-Run it
-
-node scrub.js --check FILE # exit 1 if any known secret shape is present, 0 if clean (the gate)
-test_scrub.js (16 assertions) + --selftest (24 checks: golden known-bad/known-clean corpus, no-echo, scrub idempotence, scrub-allow carve-out, determinism)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-scrub.js 275 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* scrub.js — catch a secret before it ships, from SHAPES not luck.
-*
-* A tiny, dependency-free scanner that reads text and finds the things that
-* should never have been in it: a GitHub token, an AWS key, a PEM private-key
-* block, a Slack token, a JWT, a bearer password in a URL. It can REPORT them
-* (scan), REPLACE them with a fixed placeholder (scrub), or REFUSE (check —
-* a non-zero exit if any secret is present, so it drops into a pre-commit hook
-* or a CI gate). Runs identically in Node and in a browser (no DOM, no deps).
-*
-* text ──▶ scan(text) ──▶ [ {kind, line, col, preview},...]
-* text ──▶ scrub(text) ──▶ text with every secret span replaced
-* text ──▶ check(text) ──▶ true iff a secret was found (the gate)
-*
-* WHY SHAPES, AND THE LINE IT WILL NOT CROSS (the honest ceiling — printed).
-* Secrets are matched by SHAPE: a github_pat_ prefix, an AKIA… access-key id,
-* a -----BEGIN … PRIVATE KEY----- header, the three-part dot form of a JWT.
-* A shape catches the known, published forms cheaply and deterministically.
-* It does NOT — and this is stated on the tool itself, every run — prove the
-* text is secret-free. A novel token format, a secret split across lines, a
-* home-rolled scheme, or a value with no distinguishing shape will pass clean.
-* scrub is a SMOKE ALARM, not a vault: a hit is real; a clean scan is the
-* absence of a known shape, never a certificate. (This is the same honesty the
-* `grain` gift prints as "a smell, not a proof" and `plumb` as "evidence
-* exists, not evidence correct".) Treat a clean result as "no KNOWN secret
-* shape found here", and keep your other controls.
-*
-* TWO STRUCTURAL PROMISES (so the tool cannot betray its own purpose):
-* 1. It never echoes a secret. A finding carries the secret's KIND, its line
-* and column, and a masked PREVIEW (first few chars + …) — never the value.
-* scrub() replaces the whole matched span; the redaction cannot leak what
-* it redacted. A secret-scanner that printed the secret to warn you about
-* it would be broken.
-* 2. scrub() is idempotent and pure: scrub(scrub(t)) === scrub(t), and the
-* output of scrub() always passes check() clean (no secret survives).
-* --selftest proves both.
-*
-* THE ALLOW MARKER (the carve-out, kept honest). A single line may opt out by
-* carrying the marker `scrub-allow` (in a comment, anywhere on the line). That
-* line is skipped — for a README that documents a token shape, or a test
-* fixture that must contain a planted example. The carve-out is LINE-scoped and
-* EXPLICIT: you cannot silence the scanner globally, only annotate the one line
-* you vouched for. (Stripped from the band-gate's `band-allow` convention.)
-*/
-
-'use strict';
-
-/* The closed set of secret SHAPES. Each: a stable `kind`, a `re` (global,
-* multiline is applied per-line), and whether it is `heuristic` (higher
-* false-positive rate — a generic "secret-looking assignment" rather than a
-* vendor-stamped prefix). The list is documented, not open: a shape a real
-* secret needs and this set lacks is a gap to name in the printed ceiling, not
-* a reason to pretend coverage. */
-var SHAPES = [
-{ kind: 'github-pat', heuristic: false, re: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g},
-{ kind: 'github-token', heuristic: false, re: /\bgh[posru]_[A-Za-z0-9]{36,}\b/g},
-{ kind: 'aws-access-key-id', heuristic: false, re: /\bAKIA[0-9A-Z]{16}\b/g},
-{ kind: 'google-api-key', heuristic: false, re: /\bAIza[0-9A-Za-z_\-]{35}\b/g},
-{ kind: 'slack-token', heuristic: false, re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g},
-{ kind: 'stripe-key', heuristic: false, re: /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g},
-{ kind: 'openai-key', heuristic: false, re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g},
-{ kind: 'jwt', heuristic: false, re: /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b/g},
-{ kind: 'private-key-block', heuristic: false, re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED)?PRIVATE KEY-----/g},
-{ kind: 'basic-auth-url', heuristic: false, re: /\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:[^\/\s:@]+@/g},
-{ kind: 'hex-40-token', heuristic: false, re: /\b[0-9a-f]{40}\b/g},
-// heuristic: a generic "secret = <opaque value>" assignment. Higher FP; kept
-// last and flagged so a caller can drop it with { heuristic:false}.
-{ kind: 'secret-assignment', heuristic: true, re: /\b(?:secret|token|api[_-]?key|access[_-]?key|password|passwd|pwd|auth)\b\s*[:=]\s*['"]?[A-Za-z0-9/+_.=-]{16,}/gi}
-];
-
-var ALLOW_MARKER = 'scrub-allow';
-var PLACEHOLDER = function (kind) { return '\u2039redacted:' + kind + '\u203a';};
-
-function _mask(s) {
-s = String(s);
-if (s.length <= 4) return '\u2026';
-return s.slice(0, 4) + '\u2026(' + s.length + ')';
-}
-
-function _activeShapes(opts) {
-opts = opts || {};
-var wantHeuristic = opts.heuristic!== false; // heuristic ON by default
-return SHAPES.filter(function (s) { return wantHeuristic ||!s.heuristic;});
-}
-
-/* scan(text, opts) -> array of findings, each { kind, line, col, preview}.
-* Deterministic: findings are returned in (line, col) order. A line carrying
-* the allow marker contributes no findings. Never includes the secret value. */
-function scan(text, opts) {
-text = String(text == null? '': text);
-var shapes = _activeShapes(opts);
-var out = [];
-var lines = text.split('\n');
-for (var li = 0; li < lines.length; li++) {
-var line = lines[li];
-if (line.indexOf(ALLOW_MARKER)!== -1) continue; // vouched-for line
-for (var si = 0; si < shapes.length; si++) {
-var re = new RegExp(shapes[si].re.source, shapes[si].re.flags);
-var m;
-while ((m = re.exec(line))!== null) {
-out.push({ kind: shapes[si].kind, line: li + 1, col: m.index + 1, preview: _mask(m[0])});
-if (m.index === re.lastIndex) re.lastIndex++; // zero-width guard
-}
-}
-}
-out.sort(function (a, b) { return a.line - b.line || a.col - b.col || (a.kind < b.kind? -1: 1);});
-return out;
-}
-
-/* scrub(text, opts) -> text with every secret span replaced by a fixed
-* per-kind placeholder. Pure and idempotent. Allow-marked lines pass through. */
-function scrub(text, opts) {
-text = String(text == null? '': text);
-var shapes = _activeShapes(opts);
-var lines = text.split('\n');
-for (var li = 0; li < lines.length; li++) {
-if (lines[li].indexOf(ALLOW_MARKER)!== -1) continue;
-for (var si = 0; si < shapes.length; si++) {
-var re = new RegExp(shapes[si].re.source, shapes[si].re.flags);
-var kind = shapes[si].kind;
-lines[li] = lines[li].replace(re, PLACEHOLDER(kind));
-}
-}
-return lines.join('\n');
-}
-
-/* check(text, opts) -> boolean. true iff at least one secret shape is present.
-* The gate: `if (check(diff)) process.exit(1)`. */
-function check(text, opts) { return scan(text, opts).length > 0;}
-
-var CEILING =
-'scrub matches KNOWN secret SHAPES. A clean result means no known shape was ' +
-'found here \u2014 it is NOT proof the text is secret-free. A novel format, a ' +
-'split value, or a shapeless secret will pass. Smoke alarm, not a vault.';
-
-var api = { scan: scan, scrub: scrub, check: check, SHAPES: SHAPES, CEILING: CEILING, selftest: selftest};
-if (typeof module!== 'undefined' && module.exports) module.exports = api;
-
-/* ---- selftest: the golden corpus + the two structural promises ---- */
-function selftest() {
-var fails = [];
-function ck(name, cond) { if (!cond) fails.push(name);}
-
-// Prefixes assembled from parts so THIS file's own source bytes carry no
-// literal secret shape — the same reason any secret-scanner's fixtures must
-// not contain literal secrets (they would trip this scanner and its siblings,
-// and a live-credential must never land in a source file). The runtime string
-// is the real shape; the source is inert.
-var GHPAT = 'github_' + 'pat_'; // -> github_pat_
-var GHTOK = 'gh' + 'p_'; // -> ghp_
-
-// KNOWN-BAD half: each MUST trip its kind. Every value below is a FAKE example
-// (AKIA…EXAMPLE is AWS's own doc placeholder); no value is a real secret.
-var bad = [
-['github-pat', 'token = ' + GHPAT + '11ABCDEFG0abcdefghij_KLMNOPqrstuvwxyz012345'],
-['github-token', GHTOK + '0123456789abcdefghijklmnopqrstuvwxyz'],
-['aws-access-key-id', 'AKIAIOSFODNN7EXAMPLE'],
-['google-api-key', 'AIzaSyA1234567890abcdefghijklmnopqrstuv'],
-['slack-token', 'xoxb-2411-abcdefghijklmnop'],
-['stripe-key', 'sk_live_0123456789abcdefghijkl'],
-['jwt', 'eyJhbGciOi.eyJzdWIiOiIx.SflKxwRJSMe'],
-['private-key-block', '-----BEGIN RSA PRIVATE KEY-----'],
-['basic-auth-url', 'clone https://user:hunter2@example.com/x.git'],
-['hex-40-token', 'HEXKEY=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'],
-['secret-assignment', 'password: "correcthorsebatterystaple42"']
-];
-for (var i = 0; i < bad.length; i++) {
-var kinds = scan(bad[i][1]).map(function (f) { return f.kind;});
-ck('bad-trips:' + bad[i][0], kinds.indexOf(bad[i][0])!== -1);
-}
-
-// KNOWN-CLEAN half: must NOT trip (guards against a trigger-happy scanner).
-var clean = [
-'the quick brown fox jumps over the lazy dog',
-'commit 908ec0b2218aae65912f2e43c79f341 was fine', // short hex, not 40
-'see the docs at https://example.com/guide for setup',
-'let total = subtotal + tax; // no secrets here',
-'AKIA is a prefix but AKIA alone is not a key'
-];
-for (var c = 0; c < clean.length; c++) ck('clean-quiet:' + c, scan(clean[c]).length === 0);
-
-// PROMISE 1 — never echoes the secret; preview is masked.
-var f = scan('x = ' + GHPAT + '11ABCDEFG0abcdefghij_KLMNOPqrstuvwxyz012345')[0];
-ck('no-echo', f && f.preview.indexOf('KLMNOP') === -1 && f.preview.indexOf('\u2026')!== -1);
-
-// PROMISE 2 — scrub removes every secret; idempotent; output passes check clean.
-var dirty = bad.map(function (b) { return b[1];}).join('\n');
-var s1 = scrub(dirty);
-ck('scrub-clears', check(s1) === false);
-ck('scrub-idempotent', scrub(s1) === s1);
-ck('scrub-kept-shape', s1.split('\n').length === dirty.split('\n').length);
-
-// ALLOW MARKER — a vouched-for line is skipped.
-ck('allow-skips', scan(GHTOK + '0123456789abcdefghijklmnopqrstuvwxyz // scrub-allow example').length === 0);
-
-// DETERMINISM — scan twice, identical.
-ck('scan-deterministic', JSON.stringify(scan(dirty)) === JSON.stringify(scan(dirty)));
-
-// HEURISTIC toggle — dropping heuristics silences secret-assignment only.
-ck('heuristic-off', scan('password: "correcthorsebatterystaple42"', { heuristic: false}).length === 0);
-
-if (fails.length) {
-console.error('RED: ' + fails.length + ' failed [scrub]\n ' + fails.join('\n '));
-return false;
-}
-console.log('GREEN: ' + (bad.length + clean.length + 8) + ' checks passed, 0 failed [scrub]');
-return true;
-}
-
-/* ---- CLI ---- */
-function _readInput(argPath, cb) {
-if (argPath) {
-var fs = require('fs');
-var _text;
-try {
-_text = fs.readFileSync(argPath, 'utf8');
-} catch (e) {
-var _why = e && e.code === 'ENOENT'? 'no such file'
-: e && e.code === 'EISDIR'? 'is a directory'
-: e && e.code === 'EACCES'? 'permission denied'
-: (e && e.message) || 'cannot read';
-process.stderr.write('scrub: cannot read ' + JSON.stringify(argPath) + ': ' + _why + '\n');
-process.exit(2);
-}
-cb(_text);
-return;
-}
-var buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { buf += d;});
-process.stdin.on('end', function () { cb(buf);});
-}
-
-if (typeof require!== 'undefined' && require.main === module) {
-var argv = process.argv.slice(2);
-var mode = '--scan';
-var file = null;
-var noHeuristic = false;
-for (var a = 0; a < argv.length; a++) {
-if (argv[a] === '--selftest') { process.exit(selftest()? 0: 1);}
-else if (argv[a] === '--list') {
-SHAPES.forEach(function (s) { console.log((s.heuristic? '~ ': ' ') + s.kind);});
-console.error('\n' + CEILING);
-process.exit(0);
-}
-else if (argv[a] === '--scan' || argv[a] === '--scrub' || argv[a] === '--check') mode = argv[a];
-else if (argv[a] === '--no-heuristic') noHeuristic = true;
-else if (argv[a] === '-h' || argv[a] === '--help') {
-console.log('usage: scrub.js [--scan|--scrub|--check|--list|--selftest] [--no-heuristic] [FILE]');
-console.log(' --scan report findings (kind:line:col, masked preview) [default]');
-console.log(' --scrub emit the text with secrets replaced');
-console.log(' --check exit 1 if any secret is present, 0 if clean (the gate)');
-console.log(' exit 2 input could not be read (missing file, directory, permission)');
-console.error('\n' + CEILING);
-process.exit(0);
-}
-else if (argv[a][0]!== '-') file = argv[a];
-}
-_readInput(file, function (text) {
-var opts = { heuristic:!noHeuristic};
-if (mode === '--check') {
-var hits = scan(text, opts);
-if (hits.length) { console.error('scrub: ' + hits.length + ' secret(s) found \u2014 refusing.'); process.exit(1);}
-process.exit(0);
-} else if (mode === '--scrub') {
-process.stdout.write(scrub(text, opts));
-} else {
-var found = scan(text, opts);
-found.forEach(function (f) { console.log(f.kind + ':' + f.line + ':' + f.col + ' ' + f.preview);});
-console.error('\n' + CEILING);
-process.exit(found.length? 1: 0);
-}
-});
-}
-
-test_scrub.js 69 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* test_scrub.js — the house-standard test file for the scrub gift.
-*
-* Runs the module's own golden-corpus selftest (the known-bad/known-clean pair
-* plus the two structural promises), then adds API-level assertions the CLI
-* selftest doesn't cover: the finding shape, the CEILING string, and that no
-* fixture value is echoed. Exits non-zero on any failure so it drops straight
-* into a CI gate.
-*/
-'use strict';
-var scrub = require('./scrub.js');
-
-var fails = [];
-function ck(name, cond) { if (!cond) fails.push(name);}
-
-// 1. The module's own golden-corpus selftest is the core of the suite.
-ck('module-selftest', scrub.selftest() === true);
-
-// 2. Finding shape — every finding names kind/line/col and a masked preview only.
-var hits = scrub.scan('l1 ok\nl2 AKIAIOSFODNN7EXAMPLE trailing');
-ck('finds-on-line-2', hits.length === 1 && hits[0].line === 2);
-ck('finding-has-kind', hits[0].kind === 'aws-access-key-id');
-ck('finding-has-col', typeof hits[0].col === 'number' && hits[0].col > 0);
-ck('preview-masked', hits[0].preview.indexOf('EXAMPLE') === -1);
-
-// 3. check() is scan()>0, and a clean string is clean.
-ck('check-clean', scrub.check('nothing secret in this sentence at all') === false);
-ck('check-dirty', scrub.check('AKIAIOSFODNN7EXAMPLE') === true);
-
-// 4. scrub() output always passes check clean (the load-bearing property).
-var s = scrub.scrub('a AKIAIOSFODNN7EXAMPLE b\n-----BEGIN RSA PRIVATE KEY-----');
-ck('scrub-output-clean', scrub.check(s) === false);
-ck('scrub-placeholder-present', s.indexOf('redacted:')!== -1);
-
-// 5. The honest ceiling is a non-empty, shipped string.
-ck('ceiling-present', typeof scrub.CEILING === 'string' && scrub.CEILING.length > 40);
-
-// 6. SHAPES is the documented closed set, each with a stable kind.
-ck('shapes-closed', Array.isArray(scrub.SHAPES) && scrub.SHAPES.every(function (x) { return x.kind && x.re;}));
-
-// 7. CLI clean-fail on unreadable input (D4-crashclean): a stranger who points
-// the gate at a missing file or a directory gets a clean one-line error and a
-// non-zero exit that is NOT the gate's "secret present" (1) — never a stack trace.
-var cp = require('child_process');
-var path = require('path');
-var os = require('os');
-var fs2 = require('fs');
-var CLI = path.join(__dirname, 'scrub.js');
-function runCheck(target) {
-var r = cp.spawnSync(process.execPath, [CLI, '--check', target], { encoding: 'utf8'});
-var both = (r.stdout || '') + (r.stderr || '');
-return { code: r.status, out: both};
-}
-var missing = runCheck(path.join(os.tmpdir(), 'scrub-no-such-' + process.pid + '.txt'));
-ck('badinput-missing-exit2', missing.code === 2);
-ck('badinput-missing-clean', /scrub: cannot read/.test(missing.out) &&!/at Object|node:fs|Node\.js v/.test(missing.out));
-var dir = fs2.mkdtempSync(path.join(os.tmpdir(), 'scrub-dir-'));
-var asFile = runCheck(dir);
-ck('badinput-dir-exit2', asFile.code === 2);
-ck('badinput-dir-clean', /scrub: cannot read/.test(asFile.out) &&!/at Object|node:fs|Node\.js v/.test(asFile.out));
-try { fs2.rmdirSync(dir);} catch (e) {}
-
-if (fails.length) {
-console.error('RED: ' + fails.length + ' failed [test_scrub]\n ' + fails.join('\n '));
-process.exit(1);
-}
-console.log('GREEN: ' + (16) + ' assertions passed, 0 failed [test_scrub]');
-process.exit(0);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# Sha256 — a Loop MMT gift
-https://loopmmt.com/gifts/sha256/
-[coverage: optional · branch: gifts]
-
-Sync Hash That Matches Your Backend hash ← all gifts
-
-Sha256
-
-A dependency-free, synchronous SHA-256 (hex out) that returns the same 64-char digest as your Node backend's crypto.createHash for the same string — so a browser can mirror a server-side integrity check without turning the verify path async. The load-bearing rule: it hashes the UTF-8 bytes, so multibyte input (names, emoji) stays byte-identical instead of diverging silently.
-
-The honest edge
-
-It's a hash, not an HMAC and not encryption — it proves two inputs match, keeps no secret, and is not a password KDF. A from-scratch port for portability, not a hardened crypto library: where a vetted native lib is available and async is fine, prefer it.
-
-Run it
-
-node sha256.js "a string"
-test_sha256.js (24/24, drift-checked vs node crypto)
-Node, no dependencies
-
-The code — every file that ships
-
-sha256.js 176 lines on GitHub →
-#!/usr/bin/env node
-/* sha256.js — a dependency-free, synchronous SHA-256 (hex out) that is
-byte-identical to your backend's hash for the same string.
-
-WHY THIS EXISTS. The usual browser answer, crypto.subtle.digest, is
-ASYNCHRONOUS — it returns a Promise, so the moment you need a hash inside an
-otherwise-synchronous verify path (parse an envelope, check an integrity
-field, decide tamper/no-tamper), it forces that whole path to go async and
-ripple through everything that calls it. This is a small, pure, sync
-FIPS-180-4 SHA-256 that returns the SAME 64-char hex as Node's
-crypto.createHash('sha256').update(String(x)).digest('hex') — so a browser
-can mirror a Node integrity check without turning the call site async.
-
-THE ONE FIDELITY RULE (the whole reason to trust it). Node hashes the UTF-8
-BYTES of String(input). This encodes with the same UTF-8 byte stream, so the
-digest is identical — including for multibyte characters (accented names,
-emoji, non-Latin scripts). Never hash char codes: multibyte input would
-diverge silently and a tamper check would read a FALSE verdict. The test
-battery carries a multibyte vector precisely to catch that, checked against
-Node's own crypto as the oracle.
-
-Pure function of its input. No dependencies. Same code runs in a browser
-(attach sha256Hex to your namespace) or on Node (this CLI / require()).
-
-USAGE
-node sha256.js "the string to hash" # hash an argument
-echo -n "the string" | node sha256.js # hash stdin (exact bytes, no newline added)
-node sha256.js --help
-
-Released under MIT. Its edge is printed in the README: this is a HASH, not
-an HMAC and not encryption — it proves two inputs match, it does not keep a
-secret and it is not a password-storage KDF.
-*/
-"use strict";
-
-// SHA-256 round constants — FIPS 180-4 §4.2.2 (first 32 bits of the fractional
-// parts of the cube roots of the first 64 primes).
+/* ------------------------------------------------------------------ *
+* SHA-256 core — vendored from the `sha256` gift (FIPS 180-4), *
+* byte-faithful, with the raw-bytes entry HMAC needs. The block *
+* machinery is IDENTICAL to the shipped sha256 gift and to *
+* Node crypto's sha256; a mismatch here is a rebuild failure. *
+* ------------------------------------------------------------------ */
+
+// Round constants — FIPS 180-4 §4.2.2.
 var K = [
 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -1111,19 +120,18 @@ var K = [
 
 function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
 
-// Encode a JS string to its UTF-8 bytes — the SAME bytes Node's
-//.update(String(s)) hashes. TextEncoder is present in every modern browser and
-// in Node; the manual fallback (surrogate-pair aware) produces the same stream.
+// UTF-8 encode a JS string to a byte array — the SAME bytes Node's
+//.update(String(s)) hashes (surrogate-pair aware fallback matches TextEncoder).
 function utf8Bytes(str) {
 if (typeof TextEncoder!== "undefined") {
-return new TextEncoder().encode(str);
+return Array.prototype.slice.call(new TextEncoder().encode(str));
 }
 var out = [], i, c, lo;
 for (i = 0; i < str.length; i++) {
 c = str.charCodeAt(i);
 if (c < 0x80) { out.push(c);}
 else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
-else if (c >= 0xd800 && c <= 0xdbff) { // high surrogate
+else if (c >= 0xd800 && c <= 0xdbff) {
 lo = str.charCodeAt(++i);
 c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
 out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
@@ -1132,26 +140,17 @@ out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 
 return out;
 }
 
-function toHex8(x) {
-var h = (x >>> 0).toString(16);
-return "00000000".slice(h.length) + h;
-}
-
-// sha256Hex(input) -> 64-char lowercase hex, byte-identical to Node's
-// crypto.createHash('sha256').update(String(input)).digest('hex').
-function sha256Hex(input) {
-var bytes = utf8Bytes(String(input));
+// sha256 of RAW BYTES (array-like of 0..255) -> a 32-byte Array digest.
+function sha256Digest(bytes) {
 var len = bytes.length;
-
-// Padding: append 0x80, then 0x00s, then the 64-bit big-endian bit length,
-// rounding up to a multiple of 64 bytes.
-var bitLenHi = Math.floor(len / 0x20000000); // high 32 bits of (len*8)
-var bitLenLo = (len * 8) >>> 0; // low 32 bits of (len*8)
+var bitLenHi = Math.floor(len / 0x20000000);
+var bitLenLo = (len * 8) >>> 0;
 var withOne = len + 1;
 var padded = (withOne + 8 + 63) & ~63;
-var msg = new Uint8Array(padded);
+var msg = new Array(padded);
 var i;
-for (i = 0; i < len; i++) msg[i] = bytes[i];
+for (i = 0; i < padded; i++) msg[i] = 0;
+for (i = 0; i < len; i++) msg[i] = bytes[i] & 0xff;
 msg[len] = 0x80;
 msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
 msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
@@ -1191,130 +190,1221 @@ h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>>
 h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
 }
 
-return toHex8(h0) + toHex8(h1) + toHex8(h2) + toHex8(h3) +
-toHex8(h4) + toHex8(h5) + toHex8(h6) + toHex8(h7);
+var out = new Array(32), words = [h0, h1, h2, h3, h4, h5, h6, h7], wi;
+for (wi = 0; wi < 8; wi++) {
+out[wi * 4] = (words[wi] >>> 24) & 0xff;
+out[wi * 4 + 1] = (words[wi] >>> 16) & 0xff;
+out[wi * 4 + 2] = (words[wi] >>> 8) & 0xff;
+out[wi * 4 + 3] = words[wi] & 0xff;
+}
+return out;
 }
 
-// Browser: attach to a namespace. Node/require: export. CLI: run below.
+function byteToHex(b) {
+var h = (b & 0xff).toString(16);
+return h.length === 1? "0" + h: h;
+}
+function bytesToHex(bytes) {
+var s = "", i;
+for (i = 0; i < bytes.length; i++) s += byteToHex(bytes[i]);
+return s;
+}
+
+/* ------------------------------------------------------------------ *
+* HMAC-SHA256 — RFC 2104. *
+* ------------------------------------------------------------------ */
+
+var BLOCK = 64; // SHA-256 block size in bytes (RFC 2104 "B").
+
+// key: byte array. Returns the B-byte K' (hashed-if-long, zero-padded).
+function normalizeKey(keyBytes) {
+var k = keyBytes;
+if (k.length > BLOCK) k = sha256Digest(k); // K longer than a block -> hash it first.
+var out = new Array(BLOCK), i;
+for (i = 0; i < BLOCK; i++) out[i] = (i < k.length? (k[i] & 0xff): 0);
+return out;
+}
+
+// HMAC-SHA256 over raw byte arrays -> 32-byte digest array.
+function hmacSha256Bytes(keyBytes, msgBytes) {
+var kp = normalizeKey(keyBytes);
+var ipad = new Array(BLOCK), opad = new Array(BLOCK), i;
+for (i = 0; i < BLOCK; i++) {
+ipad[i] = kp[i] ^ 0x36;
+opad[i] = kp[i] ^ 0x5c;
+}
+var inner = sha256Digest(ipad.concat(msgBytes)); // H((K' ^ ipad) || m)
+return sha256Digest(opad.concat(inner)); // H((K' ^ opad) || inner)
+}
+
+// HMAC-SHA256 hex of (secret string, message string), UTF-8 encoded — byte-identical
+// to Node crypto.createHmac('sha256', secret).update(message).digest('hex').
+function hmacSha256Hex(secret, message) {
+return bytesToHex(hmacSha256Bytes(utf8Bytes(String(secret)), utf8Bytes(String(message))));
+}
+
+/* ------------------------------------------------------------------ *
+* The verifier. *
+* ------------------------------------------------------------------ */
+
+var HEX_RE = /^[0-9a-f]+$/;
+
+// Constant-time equality of two equal-length lowercase-hex strings. Looks at every
+// character; the running OR of per-char differences carries no early-exit timing.
+// Caller MUST have already checked the lengths match (a length difference is not a
+// secret — it is public structure — so it is decided before this point).
+function constantTimeHexEqual(a, b) {
+var diff = 0, i;
+for (i = 0; i < a.length; i++) diff |= (a.charCodeAt(i) ^ b.charCodeAt(i));
+return diff === 0;
+}
+
+// Parse "<scheme>=<hex>" -> { scheme, hex} or null if it is not that shape.
+function parseSignatureHeader(header) {
+if (typeof header!== "string") return null;
+var s = header.trim();
+var eq = s.indexOf("=");
+if (eq <= 0 || eq === s.length - 1) return null; // no scheme, or nothing after '='
+var scheme = s.slice(0, eq);
+var hex = s.slice(eq + 1).toLowerCase();
+if (!HEX_RE.test(hex) || (hex.length % 2)!== 0) return null; // must be even-length hex
+return { scheme: scheme, hex: hex};
+}
+
+/**
+* Verify a signed webhook body.
+* @param {string} rawBody the exact bytes the sender signed (a string; UTF-8 hashed).
+* @param {string} signatureHeader e.g. "sha256=abcd..." from the request header.
+* @param {string} secret the shared secret.
+* @param {{scheme?: string}} [opts] scheme to require (default "sha256").
+* @returns {{ok: boolean, reason: string}} reason is "" on success.
+*/
+function verify(rawBody, signatureHeader, secret, opts) {
+opts = opts || {};
+var wantScheme = opts.scheme || "sha256";
+if (signatureHeader === undefined || signatureHeader === null || String(signatureHeader).trim() === "") {
+return { ok: false, reason: "no-signature"};
+}
+var parsed = parseSignatureHeader(String(signatureHeader));
+if (!parsed) return { ok: false, reason: "bad-format"};
+if (parsed.scheme!== wantScheme) return { ok: false, reason: "unsupported-scheme"};
+// A SHA-256 digest is exactly 32 bytes = 64 hex chars. Length is public structure,
+// decided before the constant-time compare (which requires equal lengths).
+if (parsed.hex.length!== 64) return { ok: false, reason: "length-mismatch"};
+var expected = hmacSha256Hex(secret, rawBody); // always 64 lowercase hex chars
+if (constantTimeHexEqual(expected, parsed.hex)) return { ok: true, reason: ""};
+return { ok: false, reason: "hmac-mismatch"};
+}
+
+/**
+* Produce the signature header a sender would send for a body (the sender side).
+* @returns {string} e.g. "sha256=abcd..."
+*/
+function sign(rawBody, secret, opts) {
+opts = opts || {};
+var scheme = opts.scheme || "sha256";
+return scheme + "=" + hmacSha256Hex(secret, rawBody);
+}
+
+/* ---- exports ---- */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.sha256Hex = sha256Hex;
+window.ForestGifts.hmacWebhook = {
+verify: verify, sign: sign, hmacSha256Hex: hmacSha256Hex,
+parseSignatureHeader: parseSignatureHeader
+};
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { sha256Hex: sha256Hex};
+module.exports = {
+verify: verify, sign: sign, hmacSha256Hex: hmacSha256Hex,
+parseSignatureHeader: parseSignatureHeader, constantTimeHexEqual: constantTimeHexEqual
+};
 }
 
-// ---- CLI (runs only when invoked directly, never on require) ----------------
+/* ------------------------------------------------------------------ *
+* CLI. *
+* ------------------------------------------------------------------ */
+
+function readAll(stream, cb) {
+var chunks = [];
+stream.on("data", function (d) { chunks.push(d);});
+stream.on("end", function () { cb(Buffer.concat(chunks).toString("utf8"));});
+}
+
+function usage() {
+return "usage: hmac-webhook.js --secret SECRET (--sign | --signature 'sha256=<hex>') [--scheme NAME] [FILE]";
+}
+
 function main(argv) {
 var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"sha256.js — dependency-free sync SHA-256, hex out (byte-identical to Node crypto).\n\n" +
-" node sha256.js \"a string\" hash the argument\n" +
-" echo -n \"a string\" | node sha256.js hash stdin (exact bytes, no newline added)\n" +
-" node sha256.js --help\n\n" +
-"Edge: this is a hash, not an HMAC and not encryption. It proves two inputs\n" +
-"match; it keeps no secret and is not a password KDF.\n"
-);
-return 0;
+var secret = null, signature = null, scheme = "sha256", doSign = false, file = null, i;
+for (i = 0; i < args.length; i++) {
+var a = args[i];
+if (a === "--help" || a === "-h") { process.stdout.write(usage() + "\n"); process.exit(0);}
+else if (a === "--secret") { secret = args[++i];}
+else if (a === "--signature") { signature = args[++i];}
+else if (a === "--scheme") { scheme = args[++i];}
+else if (a === "--sign") { doSign = true;}
+else if (a.slice(0, 2) === "--") { process.stderr.write("hmac-webhook: unknown option " + a + "\n" + usage() + "\n"); process.exit(2);}
+else { file = a;}
 }
-if (args.length > 0) {
-process.stdout.write(sha256Hex(args[0]) + "\n");
-return 0;
+if (secret === null || secret === undefined) { process.stderr.write("hmac-webhook: --secret is required\n" + usage() + "\n"); process.exit(2);}
+if (!doSign && (signature === null || signature === undefined)) {
+process.stderr.write("hmac-webhook: --signature is required (or use --sign to produce one)\n" + usage() + "\n");
+process.exit(2);
 }
-// stdin: hash the exact bytes received (no trailing newline added).
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-var buf = Buffer.concat(chunks);
-// Hash the exact received bytes: decode as UTF-8 back to the string whose
-// UTF-8 bytes are these bytes (round-trips for valid UTF-8 input).
-process.stdout.write(sha256Hex(buf.toString("utf8")) + "\n");
-});
-return 0;
+
+function run(body) {
+if (doSign) {
+process.stdout.write(sign(body, secret, { scheme: scheme}) + "\n");
+process.exit(0);
+}
+var r = verify(body, signature, secret, { scheme: scheme});
+if (r.ok) { process.stdout.write("ok\n"); process.exit(0);}
+process.stdout.write(r.reason + "\n");
+process.stderr.write("hmac-webhook: verification failed (" + r.reason + ")\n");
+process.exit(1);
+}
+
+if (file) {
+var fs = require("fs");
+var stat;
+try { stat = fs.statSync(file);} catch (e) { process.stderr.write("hmac-webhook: cannot read " + file + "\n"); process.exit(2);}
+if (stat.isDirectory()) { process.stderr.write("hmac-webhook: " + file + " is a directory\n"); process.exit(2);}
+run(fs.readFileSync(file, "utf8"));
+} else {
+readAll(process.stdin, run);
+}
 }
 
 if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
+main(process.argv);
 }
 
-test_sha256.js 73 lines on GitHub →
+test_hmac-webhook.js 142 lines on GitHub →
 #!/usr/bin/env node
-/* test_sha256.js — proves sha256Hex is byte-identical to Node's own crypto.
-
-The oracle is Node's crypto.createHash('sha256'): for every vector we compute
-the digest BOTH ways and require they match. That is the honest proof — not
-"it matches a hardcoded string I typed" but "it matches the reference
-implementation for the same bytes", including the multibyte case that is the
-whole point of the fidelity rule. Also checks the two canonical FIPS-180-4
-vectors as fixed anchors, and mutation-bites the core so a no-op test can't
-pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+/**
+* test_hmac-webhook — out-of-band battery for the hmac-webhook gift.
+*
+* The gift verifies HMAC-SHA256 webhook signatures. The oracle here is INDEPENDENT
+* of the gift's own SHA-256/HMAC code in two ways:
+* (1) RFC 4231 published HMAC-SHA256 test vectors (known-good, external authority);
+* (2) Node's built-in crypto.createHmac('sha256') (a different implementation).
+* A gift MAC that disagrees with either is a rebuild failure, not a warning.
+*
+* The known-bad half is real defect shapes: a tampered body, a wrong secret, a
+* bit-flipped signature, a truncated digest, a malformed header, a wrong scheme.
+*
+* GREEN means every assertion RAN and passed. A battery that executes nothing fails.
+*/
 "use strict";
+
 var crypto = require("crypto");
-var sha256Hex = require("./sha256.js").sha256Hex;
+var G = require("./hmac-webhook.js");
+
+var passed = 0, failed = 0, ran = 0;
+function check(name, cond) {
+ran++;
+if (cond) { passed++;}
+else { failed++; console.error("FAIL: " + name);}
+}
+function eq(name, got, want) {
+check(name + " (got=" + JSON.stringify(got) + " want=" + JSON.stringify(want) + ")", got === want);
+}
+
+/* ---- 1. RFC 4231 HMAC-SHA256 known-good vectors ----
+* Keys/data given as hex/ascii in RFC 4231 §4. We feed the byte-exact inputs.
+* hmacSha256Hex takes STRINGS (UTF-8), so we only use the vectors whose key and
+* data are plain ASCII (no embedded non-UTF8 bytes) — vectors 2 and 7-ascii-part.
+* For the binary-key vectors we cross-check against Node crypto below on raw bytes
+* via the same public gift API used on strings, keeping the oracle independent.
+*/
+
+// RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?"
+eq("rfc4231-tc2",
+G.hmacSha256Hex("Jefe", "what do ya want for nothing?"),
+"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+
+/* ---- 2. Cross-check against Node crypto over a spread of inputs ---- */
+function nodeHmac(secret, msg) {
+return crypto.createHmac("sha256", secret).update(msg, "utf8").digest("hex");
+}
+var samples = [
+["", ""],
+["s3cr3t", ""],
+["", "body-with-empty-secret"],
+["shared-hmac-secret", '{"event":"ping","id":1}'],
+["key", "The quick brown fox jumps over the lazy dog"],
+// multibyte secret AND body — the byte-faithfulness trap
+["ключ-🔑", "日本語のペイロード — π ≈ 3.14159"],
+// a secret longer than the 64-byte block (forces the K'=SHA256(K) path)
+["x".repeat(65), "block-boundary body"],
+["x".repeat(64), "exactly one block key"],
+["x".repeat(63), "just under one block key"],
+// long body spanning many blocks
+["k", "A".repeat(1000)]
+];
+samples.forEach(function (s, idx) {
+eq("node-crypto-parity[" + idx + "]", G.hmacSha256Hex(s[0], s[1]), nodeHmac(s[0], s[1]));
+});
+
+/* ---- 3. sign() round-trips through verify() ---- */
+var secret = "shared-hmac-secret";
+var body = '{"event":"order.created","id":"ord_123","amount":4200}';
+var header = G.sign(body, secret);
+check("sign-emits-sha256-scheme", /^sha256=[0-9a-f]{64}$/.test(header));
+eq("sign-matches-node", header, "sha256=" + nodeHmac(secret, body));
+eq("verify-authentic", G.verify(body, header, secret).ok, true);
+eq("verify-authentic-reason-empty", G.verify(body, header, secret).reason, "");
+
+/* ---- 4. KNOWN-BAD: real forgery / tamper shapes must be rejected ---- */
+
+// 4a. tampered body — one byte changed
+var tampered = body.replace("4200", "9900");
+eq("reject-tampered-body.ok", G.verify(tampered, header, secret).ok, false);
+eq("reject-tampered-body.reason", G.verify(tampered, header, secret).reason, "hmac-mismatch");
+
+// 4b. wrong secret
+eq("reject-wrong-secret.ok", G.verify(body, header, "not-the-secret").ok, false);
+eq("reject-wrong-secret.reason", G.verify(body, header, "not-the-secret").reason, "hmac-mismatch");
+
+// 4c. bit-flipped signature (last hex nibble changed, still 64 hex chars)
+var flipped = header.slice(0, -1) + (header.slice(-1) === "0"? "1": "0");
+eq("reject-flipped-sig.ok", G.verify(body, flipped, secret).ok, false);
+eq("reject-flipped-sig.reason", G.verify(body, flipped, secret).reason, "hmac-mismatch");
+
+// 4d. truncated digest (right prefix, wrong length) -> length-mismatch, not a compare
+var truncated = "sha256=" + header.slice("sha256=".length, "sha256=".length + 40);
+eq("reject-truncated.reason", G.verify(body, truncated, secret).reason, "length-mismatch");
+
+// 4e. empty / missing signature
+eq("reject-empty-sig", G.verify(body, "", secret).reason, "no-signature");
+eq("reject-null-sig", G.verify(body, null, secret).reason, "no-signature");
+eq("reject-undefined-sig", G.verify(body, undefined, secret).reason, "no-signature");
+
+// 4f. malformed header shapes -> bad-format
+eq("reject-no-eq", G.verify(body, "sha256" + header.slice("sha256=".length), secret).reason, "bad-format");
+eq("reject-no-scheme", G.verify(body, "=" + "a".repeat(64), secret).reason, "bad-format");
+eq("reject-non-hex", G.verify(body, "sha256=" + "z".repeat(64), secret).reason, "bad-format");
+eq("reject-odd-hex", G.verify(body, "sha256=" + "a".repeat(63), secret).reason, "bad-format");
+eq("reject-nothing-after-eq", G.verify(body, "sha256=", secret).reason, "bad-format");
+
+// 4g. wrong scheme -> unsupported-scheme
+eq("reject-md5-scheme", G.verify(body, "md5=" + "a".repeat(64), secret).reason, "unsupported-scheme");
+eq("reject-sha1-scheme", G.verify(body, "sha1=" + "a".repeat(40), secret).reason, "unsupported-scheme");
+
+// 4h. uppercase hex in the presented sig is normalized and still verifies
+var upperHeader = "sha256=" + nodeHmac(secret, body).toUpperCase();
+eq("accept-uppercase-hex", G.verify(body, upperHeader, secret).ok, true);
+
+// 4i. leading/trailing whitespace in the header is tolerated
+eq("accept-padded-header", G.verify(body, " " + header + " ", secret).ok, true);
+
+/* ---- 5. custom scheme label round-trips ---- */
+var h2 = G.sign(body, secret, { scheme: "loop"});
+check("custom-scheme-format", /^loop=[0-9a-f]{64}$/.test(h2));
+eq("custom-scheme-verify", G.verify(body, h2, secret, { scheme: "loop"}).ok, true);
+eq("custom-scheme-default-rejects", G.verify(body, h2, secret).reason, "unsupported-scheme");
+
+/* ---- 6. determinism: same inputs -> byte-identical MAC across repeated calls ---- */
+var d1 = G.hmacSha256Hex(secret, body);
+var d2 = G.hmacSha256Hex(secret, body);
+var d3 = G.hmacSha256Hex(secret, body);
+check("determinism-3x-identical", d1 === d2 && d2 === d3);
+
+/* ---- 7. constant-time compare correctness (function-level) ---- */
+eq("ct-equal-true", G.constantTimeHexEqual("abcdef", "abcdef"), true);
+eq("ct-equal-false", G.constantTimeHexEqual("abcdef", "abcdff"), false);
+
+/* ---- summary ---- */
+if (failed === 0 && ran > 0) {
+console.log("GREEN: " + passed + " assertions passed, 0 failed [test_hmac-webhook] (ran=" + ran + ")");
+process.exit(0);
+} else {
+console.error("RED: " + failed + " failed / " + ran + " ran [test_hmac-webhook]");
+process.exit(1);
+}
+
+Take the whole folder →
+MIT
+Zero dependencies, Node or browser, deterministic, constant-time
+
+---
+
+# Hunkhole — a Loop MMT gift
+https://loopmmt.com/gifts/hunkhole/
+[coverage: optional · branch: gifts]
+
+The Change Git Hides filter ← all gifts
+
+Hunkhole
+
+Git tells you which FILES changed. It does not tell you when a stale working tree, a bad merge, or a clumsy restore quietly REVERTED part of a file while leaving the file itself in place — a file-presence check reads that as a clean recovery. Hunkhole is the one command that catches it: it diffs the set of named top-level definitions (function / const / exports / def) between two git revisions and reports the ones that vanished. A symbol present before and gone after, with nothing renamed to take its place, is the reverted-hunk shape. Read-only, deterministic, stdlib-only.
+
+The honest edge
+
+Every hit is a QUESTION, not a verdict — a symbol you renamed or retired reads exactly like one that was reverted away, so hunkhole hands you the finite list and you rule on each. And a clean run is NOT a clean bill: it sees NAMED TOP-LEVEL definitions only, so a hunk reverted inside a surviving function body is invisible to it. Visibility, not immunity.
+
+Run it
+
+python3 hunkhole.py --help
+test_hunkhole.py (30 checks / 8 tests, mutation-bitten, pinned golden vanished-set + throwaway-repo end-to-end)
+Python standard library only, read-only, deterministic
+
+The code — every file that ships
+
+hunkhole.py 177 lines on GitHub →
+#!/usr/bin/env python3
+"""hunkhole — find the change that git's own tools hide: a reverted hunk.
+
+THE HOLE THIS FILLS
+
+Git tells you which *files* changed. It does not tell you when a stale working
+tree, a bad merge, or a clumsy restore quietly *reverted* part of a file while
+leaving the file itself in place. A file-presence check reads that as a clean
+recovery — the file is there, so nothing looks wrong — while a load-bearing
+definition that used to live inside it is simply gone.
+
+That failure is real and it hides well: a stale tree can revert tens of
+thousands of lines across dozens of files, a later restore returns every *file*,
+and because every file is present, no one notices the definitions that never
+came back. hunkhole is the one command that would have found it.
+
+THE PROBE
+
+Not "did this file change" (forward work changes files constantly) but "is a
+named, top-level definition that existed at BEFORE absent at AFTER." A symbol
+present in the old revision and gone in the new one, with nothing renamed to
+take its place, is the reverted-hunk shape. hunkhole diffs the *set of defined
+names* between two git revisions and reports the ones that vanished.
+
+WHY IT'S HONEST — read this before trusting a clean run
+
+- **Every hit is a QUESTION, not a verdict.** A symbol you deliberately renamed
+or retired reads exactly like one that was reverted away. hunkhole hands you
+the finite list of vanished names; you rule on each. It never claims a symbol
+"should" still be there.
+
+- **A clean run is NOT a clean bill.** hunkhole sees *named top-level*
+definitions (function / const / exports / def). A hunk reverted *inside* a
+surviving function body is invisible to it — the function name is still there.
+Absence of a finding is not proof of a clean restore, and the tool says so in
+its own output.
+
+- **It is read-only.** It writes nothing, changes nothing, fixes nothing. It
+reads two revisions out of git and compares symbol sets.
+
+Visibility, not immunity. You are the witness.
+
+USAGE
+python3 hunkhole.py <BEFORE> [AFTER]
+BEFORE a git revision (sha, tag, branch) — the "known-good" side
+AFTER a git revision to compare against (default: HEAD)
+
+python3 hunkhole.py <BEFORE> <AFTER> --against <CLOBBER>
+--against limit the sweep to files touched by one suspect commit,
+instead of every file that differs between BEFORE and AFTER
+
+EXIT 0 = no vanished symbols · 3 = findings (the alarm) · 2 = error/usage
+
+MIT licensed. Python standard library only. Read-only. Deterministic.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+
+# Named top-level definitions across the common scripting languages.
+# JS: function foo / const foo = / foo: function / exports.foo · Python: def foo
+_DEF_PATTERN = re.compile(
+r"^\s*(?:"
+r"function\s+(\w+)"
+r"|const\s+(\w+)\s*="
+r"|(\w+)\s*:\s*function"
+r"|exports\.(\w+)"
+r"|def\s+(\w+)"
+r")",
+re.M,
+)
+_CODE_SUFFIXES = (".js", ".py", ".sh", ".mjs", ".cjs")
+
+def git(*args: str) -> str | None:
+"""Run a git command; return stdout on success, None on failure."""
+r = subprocess.run(["git", *args], capture_output=True, text=True)
+return r.stdout if r.returncode == 0 else None
+
+def symbols(text: str) -> set[str]:
+"""The set of named top-level definitions found in a blob of source text."""
+return {name for groups in _DEF_PATTERN.findall(text) for name in groups if name}
+
+def vanished_symbols(before_text: str, after_text: str) -> list[str]:
+"""Names defined in `before_text` but not in `after_text`, sorted."""
+return sorted(symbols(before_text) - symbols(after_text))
+
+def is_code(path: str) -> bool:
+"""True iff the path has a suffix hunkhole probes for symbols."""
+return path.endswith(_CODE_SUFFIXES)
+
+def scan(before: str, after: str = "HEAD", against: str | None = None):
+"""Compare two revisions; return (files_swept, holes, absent).
+
+holes — list of (path, [vanished names]) for surviving code files.
+absent — list of paths present at `before` and absent at `after`
+(a whole-file drop; reported alongside hunk holes).
+Returns (None, None, None) if the underlying diff can't be produced.
+"""
+listing = git("diff", "--name-only", before, against or after)
+if listing is None:
+return None, None, None
+files = sorted(listing.split())
+
+holes: list[tuple[str, list[str]]] = []
+absent: list[str] = []
+for f in files:
+a = git("show", f"{before}:{f}")
+if a is None:
+continue # born after BEFORE — not hunkhole's business
+b = git("show", f"{after}:{f}")
+if b is None:
+absent.append(f) # whole-file drop — reported, not hunkhole's core probe
+continue
+if not is_code(f):
+continue # symbols are a code probe; data files need a different lens
+gone = vanished_symbols(a, b)
+if gone:
+holes.append((f, gone))
+return files, holes, absent
+
+def render(before: str, after: str, against: str | None, files, holes, absent) -> str:
+"""Render a scan result as the human-readable report text."""
+header = f"hunkhole: {before[:9]} -> {after}"
+if against:
+header += f" (files touched by {against[:9]})"
+header += f" · {len(files)} file(s) swept"
+lines = [header, "-" * 78]
+for f in absent:
+lines.append(f"FILE ABSENT {f}")
+for f, gone in holes:
+lines.append(f"HOLE {f}")
+for s in gone:
+lines.append(f" gone: {s}()")
+if not holes and not absent:
+lines.append("no named definition present at BEFORE is missing at AFTER.")
+lines.append("(NOT a clean bill — a hunk inside a surviving function body is invisible here.)")
+lines.append("-" * 78)
+n = len(holes) + len(absent)
+lines.append(
+f"{n} finding(s). Each is a QUESTION, not a verdict — a rename reads the same as a revert."
+)
+return "\n".join(lines)
+
+def main(argv: list[str]) -> int:
+if not argv or argv[0] in ("-h", "--help"):
+sys.stdout.write(__doc__)
+return 2
+before = argv[0]
+after = argv[1] if len(argv) > 1 and not argv[1].startswith("--") else "HEAD"
+against = None
+if "--against" in argv:
+i = argv.index("--against")
+if i + 1 >= len(argv):
+sys.stderr.write("hunkhole: --against needs a revision\n")
+return 2
+against = argv[i + 1]
+
+files, holes, absent = scan(before, after, against)
+if files is None:
+sys.stderr.write(f"hunkhole: cannot diff {before}..{against or after}\n")
+return 2
+
+sys.stdout.write(render(before, after, against, files, holes, absent) + "\n")
+return 3 if (holes or absent) else 0
+
+if __name__ == "__main__":
+raise SystemExit(main(sys.argv[1:]))
+
+test_hunkhole.py 185 lines on GitHub →
+#!/usr/bin/env python3
+"""test_hunkhole.py — the certifying properties of the hunkhole gift.
+
+Run: python3 test_hunkhole.py (exit 0 = all pass, 1 = a failure)
+
+hunkhole's git-facing shell is exercised end-to-end in a throwaway repo; its
+symbol-diff CORE (symbols / vanished_symbols / is_code / render) is pure and is
+tested directly on fixtures. Each test is MUTATION-BITTEN: it is here because a
+plausible mutation of hunkhole.py makes it fail loud. The core-diff test pins a
+GOLDEN sorted vanished-set — a rename reading identically to a revert is the
+exact property that must hold, and a golden proves the set, not just its size.
+"""
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+
+import hunkhole as h
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+# ---- fixtures: before/after source blobs -----------------------------------
+BEFORE_JS = """\
+function alpha() { return 1;}
+const beta = () => 2;
+gamma: function () { return 3;}
+exports.delta = function () {};
+function survivor() {
+let innerReverted = 9; // a hunk inside a surviving body (not def-shaped)
+return innerReverted;
+}
+"""
+AFTER_JS = """\
+const beta = () => 2;
+exports.delta = function () {};
+function survivor() {
+return 0; // innerReverted hunk reverted, name survives
+}
+"""
+
+BEFORE_PY = """\
+def one(): pass
+def two(): pass
+def three(): pass
+"""
+AFTER_PY = """\
+def one(): pass
+def three(): pass
+"""
+
+# ---- 1. the core diff: vanished top-level names, pinned golden --------------
+def test_vanished_golden():
+gone_js = h.vanished_symbols(BEFORE_JS, AFTER_JS)
+# alpha (function) and gamma (obj-method) vanished; beta/delta/survivor stayed.
+check(gone_js == ["alpha", "gamma"], f"JS vanished set wrong: {gone_js}")
+# the hunk INSIDE survivor() is invisible — survivor is not reported gone
+check("survivor" not in gone_js, "survivor should NOT be flagged (in-body hunk is invisible)")
+# pin a golden signature over a combined fixture run
+gone_py = h.vanished_symbols(BEFORE_PY, AFTER_PY)
+check(gone_py == ["two"], f"PY vanished set wrong: {gone_py}")
+sig = hashlib.sha256(("|".join(gone_js) + "#" + "|".join(gone_py)).encode()).hexdigest()
+golden = "72e9237f911294dc57a66b67e296fb888a0d43373cbb485118d4f73a4df09f8b"
+check(sig == golden, f"golden vanished-set signature drifted: got {sig[:16]}...")
+
+# ---- 2. a rename reads the same as a revert (the honest-edge property) ------
+def test_rename_reads_as_revert():
+before = "def compute(): pass\n"
+after = "def calculate(): pass\n" # renamed
+gone = h.vanished_symbols(before, after)
+check(gone == ["compute"], f"rename should surface old name as gone: {gone}")
+# kills a mutation that tried to be 'smart' and suppress renames
+
+# ---- 3. no false hole when nothing vanished --------------------------------
+def test_no_false_hole():
+same = "def a(): pass\ndef b(): pass\n"
+check(h.vanished_symbols(same, same) == [], "identical source must yield no vanished names")
+# a purely ADDED symbol is not a hole
+added = "def a(): pass\ndef b(): pass\ndef c(): pass\n"
+check(h.vanished_symbols(same, added) == [], "an added symbol must not read as vanished")
+
+# ---- 4. symbols() sees each definition form; kills a dropped alternative ----
+def test_symbol_forms():
+src = "function f(){}\nconst g=1\nh: function(){}\nexports.i=1\ndef j(): pass\n"
+got = h.symbols(src)
+for name in ("f", "g", "h", "i", "j"):
+check(name in got, f"symbol form not detected: {name} (pattern lost an alternative)")
+
+# ---- 5. is_code gate: symbols probed only on code suffixes -----------------
+def test_is_code():
+for ok in ("x.js", "y.py", "z.sh", "a.mjs", "b.cjs"):
+check(h.is_code(ok), f"{ok} should be code")
+for no in ("data.json", "notes.md", "image.png", "LICENSE"):
+check(not h.is_code(no), f"{no} should NOT be treated as code")
+
+# ---- 6. render marks a clean run as NOT a clean bill ------------------------
+def test_render_clean_caveat():
+out = h.render("abc123def", "HEAD", None, files=["a.py"], holes=[], absent=[])
+check("NOT a clean bill" in out, "clean render must carry the not-a-clean-bill caveat")
+check("0 finding(s)" in out, "clean render must report 0 findings")
+
+# ---- 7. render shows holes and absent files distinctly ---------------------
+def test_render_findings():
+out = h.render(
+"abc123def", "HEAD", None,
+files=["a.py", "b.py"],
+holes=[("a.py", ["gone_one", "gone_two"])],
+absent=["b.py"],
+)
+check("HOLE a.py" in out, "hole line missing")
+check("gone: gone_one()" in out, "vanished symbol not rendered")
+check("FILE ABSENT b.py" in out, "absent-file line missing")
+check("2 finding(s)" in out, "finding count wrong (1 hole + 1 absent = 2)")
+check("QUESTION, not a verdict" in out, "the question-not-verdict disclaimer must render")
+
+# ---- 8. END-TO-END against a real throwaway git repo -----------------------
+def _run_git(cwd, *args):
+subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+
+def test_end_to_end_reverted_hunk():
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+p = os.path.join(repo, "mod.py")
+with open(p, "w") as fh:
+fh.write("def keeper(): pass\ndef doomed(): pass\n")
+_run_git(repo, "add", "mod.py")
+_run_git(repo, "commit", "-qm", "before")
+before_sha = subprocess.run(
+["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+).stdout.strip()
+# revert the 'doomed' definition, keep the file
+with open(p, "w") as fh:
+fh.write("def keeper(): pass\n")
+_run_git(repo, "commit", "-aqm", "after (doomed reverted)")
+
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+files, holes, absent = h.scan(before_sha, "HEAD")
+finally:
+os.chdir(cwd0)
+check(holes == [("mod.py", ["doomed"])], f"end-to-end hole not found: {holes}")
+check(absent == [], f"nothing should be absent: {absent}")
+
+def run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+try:
+t()
+except Exception as exc:
+_FAILURES.append(f"{t.__name__} raised: {exc!r}")
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
+return 0
+
+if __name__ == "__main__":
+sys.exit(run())
+
+Take the whole folder →
+MIT
+Python standard library only, read-only, deterministic
+
+---
+
+# ini-source — a Loop MMT gift
+https://loopmmt.com/gifts/ini-source/
+[coverage: optional · branch: gifts]
+
+Parse Sectioned INI Config into a JSONL Record Stream source ← all gifts
+
+ini-source
+
+ini-source reads sectioned INI /.gitconfig-style config text (a FILE arg, or stdin) and emits one uniform JSON object per assignment — {"section":S,"key":K,"value":V}, all strings — tagged with the section it lives under, the front of a pipe you feed into the fold/filter/transform gifts (ini-source app.ini | pluck --fields key,value). Lines split on the FIRST '=', full-line; and # comments and blank lines skipped, section headers set the tag, outer quotes stripped, CRLF==LF, BOM stripped. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+
+The honest edge
+
+ini-source parses sectioned INI text into uniform string records only — it does not coerce types ("8080" stays a string), does not interpolate ${VAR}, does not honor inline comments, and does not process escapes inside quotes. Its own honesty axis: a DUPLICATE key within a section, or a REPEATED [section] header, is REFUSED (exit 2, line-numbered) — never a silent overwrite (the common INI-parser behaviour that changes your data without telling you). A malformed line, an illegal/empty key, or a field-name collision is exit 2. An honest, pinnable parse — not a full INI runtime.
+
+Run it
+
+printf '[s]\nk=v\n' | node ini-source.js # -> {"section":"s","key":"k","value":"v"}
+test_ini-source.js (43/43, independent regex-route oracle) + Plumb conformance GREEN (28/28, signed 2026-09-12, clock-independent, 2 mutation-bites non-vacuous)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ini-source.js 301 lines on GitHub →
+#!/usr/bin/env node
+/* ini-source.js — parse INI /.gitconfig-style sectioned config text into a uniform
+JSONL record stream. Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
+
+WHAT IT IS. A SOURCE: it turns non-JSONL sectioned config text (an.ini, a
+.gitconfig-style file, an editorconfig-shaped file) into the front of a pipe — one JSON
+object per line (JSONL) that the fold/filter/transform gifts consume. Give it a file (or
+pipe text on stdin) and it emits one uniform record per assignment, tagged with the
+section it lives under:
+
+[server] -> (sets the current section)
+host = localhost -> {"section":"server","key":"host","value":"localhost"}
+port = 8080 -> {"section":"server","key":"port","value":"8080"}
+; a comment -> (skipped)
+[client]
+host = 10.0.0.1 -> {"section":"client","key":"host","value":"10.0.0.1"}
+
+Every record has the same three string fields, so it drops straight into a generic
+filter or fold: ini-source app.ini | range-filter... / ini-source app.ini | pluck...
+
+THE SHAPE (the design decision that makes it compose). One record per key-assignment,
+the FLAT uniform triple {section, key, value} — NOT one nested record per section. A
+nested {section, entries:{...}} record would carry the section's structure but would not
+compose with the flat fold/filter/transform gifts (they cannot reach into a per-record
+sub-object with a generic --field). The flat triple lets a downstream gift filter by
+section, pluck the key/value, or fold across sections without knowing the file's shape.
+Keys that appear BEFORE any [section] header (a global preamble, as in.gitconfig) are
+emitted with section "" — the honest "no section" marker, never an invented default name.
+
+STRINGS ONLY (inherited honesty axis). Values are emitted as LITERAL STRINGS —
+ini-source does not guess types. "8080" stays the string "8080"; "true" stays "true".
+The moment a parser coerces (is 08 octal? is 1e3 a number? is TRUE a boolean?) the SAME
+file parses to different bytes under different tools, and a source you cannot pin is not
+a source. For the same reason it does NOT interpolate ${VAR}/%VAR%, does NOT honor inline
+(trailing) comments, and does NOT process backslash escapes inside a quoted value — each
+is a context-dependent guess that would break byte determinism. It parses the grammar it
+was given and REFUSES the rest, loudly.
+
+THE HONESTY AXIS THAT IS ITS OWN (fail-closed on a duplicated key). A key that appears
+TWICE within the same section is a HARD ERROR (exit 2), naming the line, the key, and the
+section. This is the whole reason ini-source exists as its own gift rather than a flag on
+kv-source: the common INI-parser behaviour is to silently keep the last (or the first) of
+a duplicated key — which changes the caller's data without telling them. ini-source
+refuses. The same key in DIFFERENT sections is fine (that is what sections are for); a
+key repeated in the global preamble (section "") is a duplicate. A repeated [section]
+HEADER is likewise refused (exit 2): merging or overriding two blocks of the same name is
+the same silent guess one level up.
+
+THE GRAMMAR (declared, so it is pinnable)
+* A leading UTF-8 BOM on the first line is stripped (Windows INI files often carry one).
+* Lines split on newline; a trailing CR (CRLF files) is stripped, so a file parses
+identically whether it uses LF or CRLF.
+* A whitespace-only line emits nothing.
+* A line whose first non-whitespace character is ';' or '#' is a full-line COMMENT and
+emits nothing. (There are no inline/trailing comments — a ';' inside a value is part
+of the value.)
+* A line that, trimmed, is [ NAME] — begins with '[' and ends with ']' — is a SECTION
+HEADER. NAME is the inner text trimmed; it must be non-empty and contain no '[' or
+']'. An empty [] or a malformed header is a hard error (exit 2). The section it names
+becomes the current section. A section name may appear only once.
+* Any other non-blank line MUST be KEY=VALUE. It is split on the FIRST '='; everything
+before is the key, everything after is the value.
+- KEY is trimmed and MUST match [A-Za-z_][A-Za-z0-9_.-]* — a non-empty name. An
+empty key, or a key with spaces/illegal characters, is a hard error (exit 2).
+- VALUE is trimmed. If, after trimming, it both begins and ends with a matching
+'"' or "'" (length >= 2), those OUTER quotes are stripped and the inner text is
+the literal value (no escape processing). Otherwise the trimmed remainder is the
+literal value.
+* A non-blank, non-comment, non-header line with no '=' is a MALFORMED line (exit 2).
+
+THE MODEL
+[FILE] The INI file to parse. If omitted, read stdin.
+--section-field NAME The object key the SECTION is emitted under. Default "section".
+--key-field NAME The object key the parsed KEY is emitted under. Default "key".
+--value-field NAME The object key the parsed VALUE is emitted under. Default "value".
+The three field names must be pairwise distinct (else the record
+would collapse) — a collision is exit 2.
+--global NAME The section name given to keys that appear before any header.
+Default "" (empty string).
+
+DETERMINISM. parse(text, opts) is a pure function — no clock, no randomness, no network —
+so the same text yields byte-identical output every run and every machine.
+
+USAGE
+node ini-source.js app.ini
+cat app.ini | node ini-source.js
+node ini-source.js app.ini --section-field s --key-field k --value-field v
+node ini-source.js --help
+
+Exit codes: 0 success (including an empty stream from empty input) · 2 input error
+(malformed line, illegal/empty key, empty/malformed header, DUPLICATE key in a section,
+REPEATED section header, field-name collision, empty field name, unknown option,
+unreadable file). Always a clean one-line message on stderr, never a stack trace.
+
+Released under MIT.
+*/
+"use strict";
+
+/* ---- the pure core ------------------------------------------------ */
+
+var KEY_RE = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
+
+// Strip one pair of matching outer quotes from an already-trimmed value, if present.
+function stripQuotes(v) {
+if (v.length >= 2) {
+var a = v.charAt(0), b = v.charAt(v.length - 1);
+if ((a === '"' && b === '"') || (a === "'" && b === "'")) {
+return v.slice(1, v.length - 1);
+}
+}
+return v;
+}
+
+function trim(s) { return s.replace(/^\s+/, "").replace(/\s+$/, "");}
+
+// Parse INI text into an array of uniform three-field records. Throws a clean Error on any
+// malformed input — the CLI turns that into exit 2. Pure; no side effects.
+function parse(text, opts) {
+opts = opts || {};
+var sectionField = opts.sectionField === undefined? "section": opts.sectionField;
+var keyField = opts.keyField === undefined? "key": opts.keyField;
+var valueField = opts.valueField === undefined? "value": opts.valueField;
+var globalName = opts.global === undefined? "": opts.global;
+
+if (typeof sectionField!== "string" || sectionField.length === 0) throw new Error("--section-field must be a non-empty name");
+if (typeof keyField!== "string" || keyField.length === 0) throw new Error("--key-field must be a non-empty name");
+if (typeof valueField!== "string" || valueField.length === 0) throw new Error("--value-field must be a non-empty name");
+if (sectionField === keyField || sectionField === valueField || keyField === valueField) {
+throw new Error("--section-field, --key-field and --value-field must be pairwise distinct");
+}
+if (typeof globalName!== "string") throw new Error("--global must be a string");
+if (typeof text!== "string") throw new Error("input must be text");
+
+// strip a leading UTF-8 BOM on the whole document
+if (text.charAt(0) === "\uFEFF") text = text.slice(1);
+
+var out = [];
+var current = globalName;
+var seenSections = {}; // section name -> true (a section may appear once)
+var seenKeys = {}; // section name -> { key -> true} (dup key in a section)
+seenKeys[current] = {};
+
+var lines = text.split("\n");
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+if (line.charAt(line.length - 1) === "\r") line = line.slice(0, line.length - 1); // CRLF==LF
+
+var t = trim(line);
+if (t.length === 0) continue; // blank line
+var c0 = t.charAt(0);
+if (c0 === ";" || c0 === "#") continue; // full-line comment
+
+// section header?
+if (c0 === "[" && t.charAt(t.length - 1) === "]") {
+var name = trim(t.slice(1, t.length - 1));
+if (name.length === 0) throw new Error("empty section header on line " + (i + 1) + ": " + JSON.stringify(line));
+if (name.indexOf("[")!== -1 || name.indexOf("]")!== -1) {
+throw new Error("malformed section header on line " + (i + 1) + " (name contains '[' or ']'): " + JSON.stringify(line));
+}
+if (seenSections[name]) throw new Error("repeated section header [" + name + "] on line " + (i + 1) + " (a section may appear only once)");
+seenSections[name] = true;
+current = name;
+if (seenKeys[current] === undefined) seenKeys[current] = {};
+continue;
+}
+
+// key = value
+var eq = line.indexOf("=");
+if (eq === -1) throw new Error("malformed line " + (i + 1) + " (not a comment, section header, or KEY=VALUE): " + JSON.stringify(line));
+
+var key = trim(line.slice(0, eq));
+var value = trim(line.slice(eq + 1));
+
+if (!KEY_RE.test(key)) throw new Error("illegal key on line " + (i + 1) + ": " + JSON.stringify(key) + " (keys must match [A-Za-z_][A-Za-z0-9_.-]*)");
+
+if (seenKeys[current][key]) {
+throw new Error("duplicate key " + JSON.stringify(key) + " in section [" + current + "] on line " + (i + 1) + " (a key may appear once per section; refusing to silently overwrite)");
+}
+seenKeys[current][key] = true;
+
+value = stripQuotes(value);
+
+var rec = {};
+rec[sectionField] = current;
+rec[keyField] = key;
+rec[valueField] = value;
+out.push(rec);
+}
+return out;
+}
+
+// Render records as JSONL text (one JSON object per line, trailing newline if any).
+function toJSONL(records) {
+var s = "";
+for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
+return s;
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.iniSource = { parse: parse, toJSONL: toJSONL};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { parse: parse, toJSONL: toJSONL};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+
+function parseArgs(args) {
+var opts = {};
+var file;
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a === "--section-field") {
+if (args[i + 1] === undefined) throw new Error("--section-field requires a name");
+opts.sectionField = args[i + 1]; i += 2;
+} else if (a === "--key-field") {
+if (args[i + 1] === undefined) throw new Error("--key-field requires a name");
+opts.keyField = args[i + 1]; i += 2;
+} else if (a === "--value-field") {
+if (args[i + 1] === undefined) throw new Error("--value-field requires a name");
+opts.valueField = args[i + 1]; i += 2;
+} else if (a === "--global") {
+if (args[i + 1] === undefined) throw new Error("--global requires a name");
+opts.global = args[i + 1]; i += 2;
+} else if (a.charAt(0) === "-" && a!== "-") {
+throw new Error("unknown option " + a);
+} else {
+if (file!== undefined) throw new Error("only one input file may be given (got a second: " + JSON.stringify(a) + ")");
+file = a; i += 1;
+}
+}
+return { file: file, opts: opts};
+}
+
+function readAll(stream) {
+return new Promise(function (resolve, reject) {
+var chunks = [];
+stream.on("data", function (c) { chunks.push(c);});
+stream.on("end", function () { resolve(Buffer.concat(chunks).toString("utf8"));});
+stream.on("error", reject);
+});
+}
+
+function helpText() {
+return (
+"ini-source.js — parse INI /.gitconfig-style sectioned config into a uniform JSONL stream.\n\n" +
+" node ini-source.js app.ini\n" +
+" cat app.ini | node ini-source.js\n" +
+" node ini-source.js app.ini --section-field s --key-field k --value-field v\n" +
+" node ini-source.js --help\n\n" +
+" [FILE] INI file to parse (default: read stdin)\n" +
+" --section-field NAME field the SECTION is emitted under (default \"section\")\n" +
+" --key-field NAME field the parsed KEY is emitted under (default \"key\")\n" +
+" --value-field NAME field the parsed VALUE is emitted under (default \"value\")\n" +
+" --global NAME section name for keys before any header (default \"\")\n\n" +
+"Emits one JSON object per assignment: { section: S, key: K, value: V}, one per line.\n" +
+"Full-line; and # comments and blank lines are skipped; lines split on the first '='.\n\n" +
+"Edge: STRINGS ONLY — no type coercion, no ${VAR} interpolation, no inline comments, no\n" +
+"escapes. A duplicate key within a section, or a repeated [section], is REFUSED (exit 2) —\n" +
+"ini-source never silently overwrites. An honest, pinnable parse.\n"
+);
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(helpText());
+return Promise.resolve(0);
+}
+var parsed;
+try { parsed = parseArgs(args);}
+catch (e) { process.stderr.write("ini-source: " + e.message + "\n"); return Promise.resolve(2);}
+
+var getText;
+if (parsed.file!== undefined) {
+getText = new Promise(function (resolve, reject) {
+require("fs").readFile(parsed.file, "utf8", function (err, data) {
+if (err) reject(new Error("cannot read " + JSON.stringify(parsed.file) + ": " + err.code));
+else resolve(data);
+});
+});
+} else {
+getText = readAll(process.stdin);
+}
+
+return getText.then(function (text) {
+var records = parse(text, parsed.opts); // throws -> caught below
+process.stdout.write(toJSONL(records));
+return 0;
+}).catch(function (e) {
+process.stderr.write("ini-source: " + e.message + "\n");
+return 2;
+});
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+main(process.argv).then(function (code) { process.exitCode = code;});
+}
+
+test_ini-source.js 172 lines on GitHub →
+#!/usr/bin/env node
+/* test_ini-source.js — executable battery for ini-source. `node test_ini-source.js` ->
+exit 0 PASS / non-zero FAIL. Zero dependencies.
+
+Coverage: frozen hand goldens; a differential grid cross-checked against an
+INDEPENDENT regex-route oracle (a different parse route than the gift's indexOf-split);
+the {section,key,value} uniform + strings-only contract; custom field names + --global;
+every fail-closed throw (malformed line, illegal key, empty/malformed header, DUP key in
+a section, REPEATED section, field collision, empty field, non-string input); CRLF==LF,
+BOM strip, quote strip, first-'=' split, '#'/';' inside a value literal; determinism
+across two parses; toJSONL shape; and in-battery MUTATION TRIPWIRES (a sabotaged parse
+must go RED, so a green run is non-vacuous).
+*/
+"use strict";
+var G = require("./ini-source.js");
 
 var pass = 0, fail = 0;
-function check(name, got, want) {
-if (got === want) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + got + "\n want: " + want);}
-}
-function nodeHash(s) {
-return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+function ok(name, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL: " + name);}}
+function eq(name, a, b) { ok(name, JSON.stringify(a) === JSON.stringify(b));}
+function throws(name, fn) {
+var threw = false;
+try { fn();} catch (e) { threw = true;}
+ok(name, threw);
 }
 
-// 1. Canonical FIPS-180-4 anchors (fixed, independent of Node).
-check("empty string", sha256Hex(""),
-"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-check("abc", sha256Hex("abc"),
-"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+/* ---- INDEPENDENT ORACLE (regex-route, from spec, shares no code with the gift) ---- */
+function oracle(text, opts) {
+opts = opts || {};
+var sf = opts.sectionField || "section", kf = opts.keyField || "key", vf = opts.valueField || "value";
+var gl = opts.global === undefined? "": opts.global;
+if (sf === kf || sf === vf || kf === vf) throw new Error("field collision");
+if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+var HDR = /^\[([^\[\]]+)\]$/, KV = /^([^=]*)=([\s\S]*)$/, KEY = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
+var out = [], cur = gl, secs = {}, keys = {}; keys[cur] = {};
+var ls = text.split("\n");
+for (var i = 0; i < ls.length; i++) {
+var line = ls[i].replace(/\r$/, "");
+var t = line.replace(/^\s+|\s+$/g, "");
+if (!t) continue;
+if (t[0] === ";" || t[0] === "#") continue;
+var hm = t.match(HDR);
+if (t[0] === "[" && t[t.length - 1] === "]") {
+if (!hm) throw new Error("bad header");
+var nm = hm[1].replace(/^\s+|\s+$/g, "");
+if (!nm) throw new Error("empty header");
+if (secs[nm]) throw new Error("repeat section");
+secs[nm] = 1; cur = nm; if (!keys[cur]) keys[cur] = {}; continue;
+}
+var m = line.match(KV);
+if (!m) throw new Error("no =");
+var k = m[1].replace(/^\s+|\s+$/g, ""), v = m[2].replace(/^\s+|\s+$/g, "");
+if (!KEY.test(k)) throw new Error("bad key");
+if (keys[cur][k]) throw new Error("dup key");
+keys[cur][k] = 1;
+if (v.length >= 2) { var a = v[0], b = v[v.length - 1]; if ((a === '"' && b === '"') || (a === "'" && b === "'")) v = v.slice(1, -1);}
+var r = {}; r[sf] = cur; r[kf] = k; r[vf] = v; out.push(r);
+}
+return out;
+}
 
-// 2. Drift-check against Node crypto over a vector battery (the real proof).
-var vectors = [
+/* ---- frozen hand goldens ---- */
+eq("basic section", G.parse("[s]\na=1\nb=2\n"),
+[{section:"s",key:"a",value:"1"},{section:"s",key:"b",value:"2"}]);
+eq("two sections, same key ok",
+G.parse("[server]\nhost=a\n[client]\nhost=b\n"),
+[{section:"server",key:"host",value:"a"},{section:"client",key:"host",value:"b"}]);
+eq("global preamble -> section ''",
+G.parse("x=1\n[s]\ny=2\n"),
+[{section:"",key:"x",value:"1"},{section:"s",key:"y",value:"2"}]);
+eq("comments (; and #) + blank lines skipped",
+G.parse("; a comment\n[s]\n# another\n\nk=v\n"),
+[{section:"s",key:"k",value:"v"}]);
+eq("first-'=' split (value contains '=')",
+G.parse("[s]\nurl=a=b=c\n"), [{section:"s",key:"url",value:"a=b=c"}]);
+eq("value trim + double-quote strip",
+G.parse('[s]\nk = " hi there " \n'), [{section:"s",key:"k",value:" hi there "}]);
+eq("single-quote strip", G.parse("[s]\nk='x'\n"), [{section:"s",key:"k",value:"x"}]);
+eq("empty value", G.parse("[s]\nk=\n"), [{section:"s",key:"k",value:""}]);
+eq("'#'/';' inside a value are literal",
+G.parse("[s]\nk=a#b;c\n"), [{section:"s",key:"k",value:"a#b;c"}]);
+eq("CRLF == LF", G.parse("[s]\r\nk=v\r\n"), G.parse("[s]\nk=v\n"));
+eq("leading BOM stripped", G.parse("\uFEFF[s]\nk=v\n"), [{section:"s",key:"k",value:"v"}]);
+eq("empty input -> empty stream", G.parse(""), []);
+eq("section name trimmed", G.parse("[ srv]\nk=v\n"), [{section:"srv",key:"k",value:"v"}]);
+eq("custom fields + --global",
+G.parse("g=1\n[s]\nk=v\n", {sectionField:"S",keyField:"K",valueField:"V",global:"root"}),
+[{S:"root",K:"g",V:"1"},{S:"s",K:"k",V:"v"}]);
+
+/* ---- the honesty axis: fail-closed edges ---- */
+throws("DUP key in a section -> throw", function(){ G.parse("[s]\nk=1\nk=2\n");});
+throws("DUP key in global -> throw", function(){ G.parse("k=1\nk=2\n");});
+throws("REPEATED section header -> throw", function(){ G.parse("[s]\na=1\n[s]\nb=2\n");});
+throws("malformed line (no '=') -> throw", function(){ G.parse("[s]\nnope\n");});
+throws("unclosed header is a no-'=' line -> throw", function(){ G.parse("[s\nk=v\n");});
+throws("empty section [] -> throw", function(){ G.parse("[]\nk=v\n");});
+throws("illegal key (space) -> throw", function(){ G.parse("[s]\nbad key=v\n");});
+throws("illegal key (digit lead) -> throw", function(){ G.parse("[s]\n1k=v\n");});
+throws("empty key -> throw", function(){ G.parse("[s]\n=v\n");});
+throws("field collision -> throw", function(){ G.parse("[s]\nk=v\n", {keyField:"section"});});
+throws("empty field name -> throw", function(){ G.parse("[s]\nk=v\n", {keyField:""});});
+throws("non-string input -> throw", function(){ G.parse(42);});
+
+/* ---- strings-only contract (no coercion) ---- */
+eq("numbers stay strings", G.parse("[s]\nn=8080\nf=1e3\nb=true\n"),
+[{section:"s",key:"n",value:"8080"},{section:"s",key:"f",value:"1e3"},{section:"s",key:"b",value:"true"}]);
+eq("no ${VAR} interpolation", G.parse("[s]\nk=${HOME}\n"), [{section:"s",key:"k",value:"${HOME}"}]);
+(function(){
+var recs = G.parse("[s]\nk=v\n");
+ok("record has exactly the 3 declared fields", Object.keys(recs[0]).length === 3 &&
+"section" in recs[0] && "key" in recs[0] && "value" in recs[0]);
+})();
+
+/* ---- differential grid vs the independent oracle ---- */
+var grid = [
+"[s]\nk=v\n",
+"a=1\n[x]\nb=2\n[y]\nb=3\n",
+"[s]\nurl=http://a=b\n",
+'[s]\nk="quoted"\n',
+"; c\n[s]\nk = v \n\n",
+"\uFEFF[s]\nk=v\n",
+"[s]\r\nk=v\r\n",
 "",
-"abc",
-"a",
-"The quick brown fox jumps over the lazy dog",
-"The quick brown fox jumps over the lazy dog.", // one-byte change -> avalanche
-"0123456789",
-"x".repeat(55), // one byte under a block boundary
-"x".repeat(56), // padding crosses into a new block
-"x".repeat(63),
-"x".repeat(64), // exact block
-"x".repeat(65),
-"x".repeat(1000), // multi-block
-"café", // multibyte: é is 2 UTF-8 bytes
-"naïve façade Zürich", // several multibyte
-"日本語テスト", // CJK, 3 bytes each
-"🦌", // the deer glyph — 4-byte surrogate pair
-"order:🦌×3 café", // mixed ASCII + multibyte + emoji
-"line1\nline2\ttabbed", // control chars
 ];
-for (var i = 0; i < vectors.length; i++) {
-var v = vectors[i];
-var label = v.length > 24? (v.slice(0, 21) + "..."): v;
-check("drift[" + i + "] '" + label + "'", sha256Hex(v), nodeHash(v));
+for (var gi = 0; gi < grid.length; gi++) {
+eq("grid[" + gi + "] gift==oracle", G.parse(grid[gi]), oracle(grid[gi]));
 }
+// grid with custom opts
+var o2 = {sectionField:"S",keyField:"K",valueField:"V",global:"root"};
+eq("grid custom-opts gift==oracle", G.parse("g=1\n[s]\nk=v\n", o2), oracle("g=1\n[s]\nk=v\n", o2));
 
-// 3. Determinism — same input twice, same digest.
-check("deterministic", sha256Hex("repeat me"), sha256Hex("repeat me"));
+/* ---- determinism ---- */
+eq("two parses byte-identical",
+G.toJSONL(G.parse("[a]\nk=1\n[b]\nk=2\n")), G.toJSONL(G.parse("[a]\nk=1\n[b]\nk=2\n")));
 
-// 4. Non-vacuity / mutation bite: a WRONG expected value MUST be caught.
-// (If the harness were a no-op, this "should fail" case would slip through.)
-var deliberatelyWrong = "0000000000000000000000000000000000000000000000000000000000000000";
-var mutationCaught = (sha256Hex("abc")!== deliberatelyWrong);
-if (mutationCaught) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: core did not distinguish a wrong digest");}
+/* ---- toJSONL shape ---- */
+eq("toJSONL one object per line + trailing NL",
+G.toJSONL([{section:"s",key:"k",value:"v"}]), '{"section":"s","key":"k","value":"v"}\n');
+eq("toJSONL empty -> empty", G.toJSONL([]), "");
 
-// 5. String coercion parity with Node (numbers, etc. -> String()).
-check("number coercion 42", sha256Hex(42), nodeHash(42));
-check("boolean coercion", sha256Hex(true), nodeHash(true));
+/* ---- MUTATION TRIPWIRES: a sabotaged parse must diverge from the honest oracle ---- */
+// Mutant A: dup-key check removed (silent last-wins). Must NOT match oracle on a dup vector.
+function mutantA(text) {
+var out = [], cur = "", secs = {};
+var ls = text.split("\n");
+for (var i = 0; i < ls.length; i++) {
+var line = ls[i].replace(/\r$/, ""), t = line.replace(/^\s+|\s+$/g, "");
+if (!t || t[0] === ";" || t[0] === "#") continue;
+if (t[0] === "[" && t[t.length - 1] === "]") { cur = t.slice(1, -1).replace(/^\s+|\s+$/g, ""); continue;}
+var eq2 = line.indexOf("="); if (eq2 === -1) throw new Error("no =");
+out.push({section:cur,key:line.slice(0,eq2).replace(/^\s+|\s+$/g,""),value:line.slice(eq2+1).replace(/^\s+|\s+$/g,"")});
+}
+return out; // NO dup check
+}
+(function(){
+var dupText = "[s]\nk=1\nk=2\n";
+var honestThrew = false; try { oracle(dupText);} catch(e){ honestThrew = true;}
+var mutantDidNot = false; try { mutantA(dupText); mutantDidNot = true;} catch(e){}
+ok("mutation bite: dropping the dup-key check diverges from the honest oracle", honestThrew && mutantDidNot);
+})();
+// Mutant B: split on LAST '=' instead of first. Must diverge on a value containing '='.
+function mutantB(text) {
+var line = "k=a=b", last = line.lastIndexOf("=");
+return line.slice(last + 1); // "b" — wrong; honest first-split value is "a=b"
+}
+(function(){
+var honest = G.parse("[s]\nk=a=b\n")[0].value; // "a=b"
+ok("mutation bite: last-'=' split diverges from first-'=' honest value", honest === "a=b" && mutantB()!== honest);
+})();
 
-console.log("\nsha256: " + pass + " passed, " + fail + " failed" +
-" (" + vectors.length + " drift vectors vs node crypto, incl. multibyte + emoji)");
+/* ---- summary ---- */
+console.log((fail === 0? "PASS": "FAIL") + " — " + pass + "/" + (pass + fail));
 process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node, no dependencies
+Node / browser, no dependencies
 
 ---

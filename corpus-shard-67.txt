@@ -1,1160 +1,416 @@
-# Loop MMT — corpus shard 67/74
+# Loop MMT — corpus shard 67/86
 
-> Bundle 67 of 74 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 67 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/ratchet-pdf-dict/, /gifts/ratchet-pdf-text/, /gifts/ratchet-png-text/)
+Nodes in this shard: 3 (/gifts/grid-source/, /gifts/heatmap-sink/, /gifts/histogram-fold/)
 
 ---
 
-# PDF Dictionary-Text Extractor — a Loop MMT gift
-https://loopmmt.com/gifts/ratchet-pdf-dict/
+# grid-source — a Loop MMT gift
+https://loopmmt.com/gifts/grid-source/
 [coverage: optional · branch: gifts]
 
-What Text Does This PDF Store? transform ← all gifts
+Generate a Bounded 2-D Grid as a Deterministic JSONL Stream source ← all gifts
 
-PDF Dictionary-Text Extractor
+grid-source
 
-Pull the text a PDF STORES but never draws — the AcroForm field values (/V) and annotation notes (/Contents) that a content-stream extractor skips — with no dependencies, in Node or the browser. parsePdfDict(bytes) validates the %PDF- header, walks the indirect objects, and decodes literal () and hex < > strings, resolving a one-level indirect /V and pairing each value with its /T field name. The companion to ratchet-pdf-text: that reads the drawn text, this reads the dictionary text — together, every text surface in a PDF.
+grid-source takes grid dimensions in and emits one JSON record per cell — {row,col}, plus a value under --index/--fill — in a stable, byte-identical ROW-MAJOR order on every machine. It is the bounded 2-D coordinate substrate the spatial apps (a sudoku board, a spreadsheet range, a graphing lattice, a game board) all lean on, and it has no supply in the corpus. Unlike a filesystem or stream source there is NO provider to inject: a grid is fully determined by its dimensions, so the pure core grid(opts) has no I/O at all — pure by construction, the stronger determinism guarantee. It fixes the three quiet failures of the hand-rolled nested loop: non-deterministic/ambiguous emission order (grid-source is stable row-major, --transpose for column-major), off-by-one/unbounded dimensions (positive integers required, fail-closed, 0x0 is the honest empty stream), and coordinate/value confusion (row/col are always position; value only under --index or --fill). It pairs with grid-sink: `grid-source --cells | grid-sink` renders a real SVG.
 
 The honest edge
 
-It splits its contract by scale, on purpose: document-level failure (not a PDF, bad input) THROWS like its ratchet-pdf-text twin, but a single malformed value is RECORDED as {malformed, reason} and the walk continues rather than losing the good fields after it — a malformed value is stamped, never returned as clean. It reads the TOP-LEVEL dictionary of each object: a /V or /Contents in a nested sub-dict, or a value inherited through /Kids, is not a target. It resolves an indirect /V one level only. It returns the string as WRITTEN — no /Encoding or /ToUnicode CMap mapping, correct for WinAnsi and honestly wrong for a subsetted CID font. It does not decrypt, decode /ObjStm or xref streams, or repair a broken file.
+grid-source emits a bounded, stable ROW-MAJOR stream of {row,col} cells (value only under --index/--fill). It is a coordinate SOURCE, not a renderer (pipe --cells into grid-sink to draw), does NOT read stdin (dimensions are flags), does NOT do sparse grids, and does NOT carry data beyond a constant --fill or the row-major --index. Dimensions must be non-negative integers; 0x0 is the empty stream.
 
 Run it
 
-node ratchet-pdf-dict.js form.pdf
-test_ratchet-pdf-dict.js (14/14: hand-built PDF byte fixtures with out-of-band oracles — field /V + /T name, annotation /Contents, the /Contents page-ref disambiguation, one-level indirect-ref resolution, hex + escaped-literal decode, malformed-value-recorded-walk-continues, the /TU opt-in flag, a widget carrying both surfaces, 2 ratchet-refusal cases)
+node grid-source.js --rows 3 --cols 4 # -> row-major JSONL of 12 {row,col} cells
+test_grid-source.js (96/96, independent flat-index div/mod oracle + --cells composition contract) + Plumb conformance GREEN (137/137, signed 2026-09-13, non-vacuous: a column-major mutant caught on a non-square grid + a bounds-guard-stripped mutant caught)
 Node / browser, no dependencies
 
 The code — every file that ships
 
-ratchet-pdf-dict.js 354 lines on GitHub →
+grid-source.js 245 lines on GitHub →
 #!/usr/bin/env node
-/* ratchet-pdf-dict.js — a pure, dependency-free, STRICT extractor of the text a
-PDF carries in its OBJECT DICTIONARIES rather than its content streams: the
-AcroForm field values (/V) and annotation notes (/Contents) that a content-
-stream extractor deliberately skips. The companion to ratchet-pdf-text. Runs
-identically in a browser and in Node (no DOM, no dependencies).
+/* grid-source.js — generate a bounded 2-D grid as a deterministic JSONL stream of cells.
+Dependency-free, deterministic, MIT. Runs in Node (the CLI) or a browser (the pure core).
 
-WHY THIS EXISTS. ratchet-pdf-text pulls the text a PDF *draws* — the operands
-of Tj/TJ operators inside content streams. But a PDF also carries text that is
-never drawn into a stream: the value a user typed into a form field lives in
-that field's /V entry, and the note behind a sticky annotation lives in that
-annotation's /Contents entry. Those are dictionary entries on indirect objects
-that are NOT stream-adjacent, so ratchet's stream scan never sees them. This
-tool walks the indirect objects and pulls exactly those two text surfaces.
-Together the two tools cover every text surface in a PDF, honestly.
+WHAT IT IS. A SOURCE: it takes grid dimensions in and emits a JSONL stream out — one record
+per cell, in a stable row-major order — the front of a pipe that lets the fold/filter/
+transform/sink gifts work on a 2-D coordinate space:
 
-WHAT "RATCHET" MEANS HERE (the same posture as the twin, at the RIGHT scale).
-ratchet-pdf-text extracts ONE content stream as a whole, so any malformed byte
-is a thrown Error — correct for a single-shot read. This tool walks MANY
-indirect objects, so it splits the contract across two levels, deliberately:
-• DOCUMENT level — throws. Input that is not a Uint8Array/ArrayBuffer, or a
-buffer with no `%PDF-` header, is a thrown Error. If it isn't a PDF at all,
-you get told, not a guess.
-• OBJECT level — records, does not throw. A single malformed value (an
-unterminated string, a bad hex byte) does not abort the walk and lose the
-200 good fields after it. It is emitted as an explicit `{ malformed:true,
-reason}` record and the walk continues. This KEEPS ratchet's real vow —
-"never hand back a guess as if it were clean text" — because a malformed
-value is STAMPED malformed, never returned as clean. The string tokenizer
-itself still throws on an unterminable token (you genuinely cannot know
-where it ends); the walk catches that at the object boundary and records it.
+node grid-source.js --rows 3 --cols 3 | node grid-sink.js
+node grid-source.js --rows 9 --cols 9 --index | node schema-filter.js...
 
-THE /Contents DISAMBIGUATION (the load-bearing correctness choice). The key
-`/Contents` names TWO unrelated things: an annotation's text (a string) AND a
-page's content-stream pointer (an indirect reference, `12 0 R`). This tool
-pulls `/Contents` ONLY when its value is a string, and skips it when the value
-is a reference — so a page's content pointer is never mistaken for annotation
-text. The disambiguation is by VALUE TYPE, not by trying to classify the object.
+Each record is a fixed, portable shape: {"row":0,"col":0} — plus "value" when a value mode
+is chosen. The coordinate shape is exactly what grid-sink consumes ({row,col,...}), so
+`grid-source | grid-sink` composes into a render pipe; it is the input substrate the spatial
+apps (a sudoku board, a spreadsheet range, a graphing lattice, a Mandelbrot plane, a game
+board) all lean on — a bounded, reproducible coordinate space with no supply in the corpus.
 
-WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
-• Field values — a /V entry whose value is a string (literal `()` with
-escapes or hex `< >`), paired with the field's /T partial name as the
-record `name`. A /V given as an indirect reference to a string object is
-resolved one level and reported with encoding "ref".
-• Annotation text — a /Contents entry whose value is a string.
-• Field labels — a /TU (user-facing) entry, ONLY when you pass
-`{ labels:true}`. Off by default: the covenant is field values + notes;
-labels are an opt-in surface, named here so their absence isn't a surprise.
-• Records carry their provenance so nothing is hidden:
-{ obj:"<num> <gen>", kind:"field"|"annotation"|"label",
-key:"V"|"Contents"|"TU", name:<string|null>, text:<string>,
-encoding:"literal"|"hex"|"ref"}
-Malformed values are surfaced separately:
-{ obj, key, malformed:true, reason:<string>}
+THE QUIET FAILURES IT FIXES. Everyone hand-rolls a nested `for (r) for (c)` and everyone gets
+it wrong in ways that only bite on the input they didn't test:
 
-WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
-It does not decrypt encrypted PDFs, decode object streams (/ObjStm) or
-compressed cross-reference streams, or resolve field hierarchies through
-/Kids (it reads /V where it sits, not inherited values). It reads the
-top-level dictionary of each indirect object — a /V or /Contents buried in a
-nested sub-dictionary is an honest edge, not a target. It does not map
-character codes through /Encoding or /ToUnicode CMaps — it returns the string
-as written, correct for the common WinAnsi case and honestly wrong for a
-subsetted CID font. It does not repair a broken file.
+1. NON-DETERMINISTIC / AMBIGUOUS ORDER. Ad-hoc grid loops emit in whatever order the code
+happened to nest (row-major here, column-major there), so two callers' streams don't
+line up and can't be diffed or pinned. grid-source emits a STABLE ROW-MAJOR pre-order
+(row 0 left-to-right, then row 1,...), the same stream on every machine and every run.
 
-API
-parsePdfDict(bytes[, options]) -> { records: Array<Record>, text: string,
-malformed: Array<Record>}
-`bytes` a Uint8Array (a Node Buffer is one) or an ArrayBuffer.
-`options.labels` optional bool; when true, also pull /TU field labels.
-`.records` the clean text records, in object order (possibly empty).
-`.text` `.records` texts joined with "\n" — the quick "give me the
-dictionary text" answer.
-`.malformed` the per-object malformed records (possibly empty).
-THROWS an Error only on document-level failure (bad input type, no header).
+2. OFF-BY-ONE / UNBOUNDED DIMENSIONS. A grid built from an unchecked `--rows`/`--cols` (a
+float, a negative, a zero, a non-number) silently produces a wrong or infinite stream.
+grid-source requires POSITIVE INTEGER dimensions and fails CLOSED (exit 2, one-line
+message) on anything else — a 0×0 grid is the empty stream, not an error, but a
+fractional or negative dimension is refused up front.
 
-Pure function of its input. Same code in a browser
-(window.LoopGifts.parsePdfDict) or Node (this CLI / require()).
+3. COORDINATE/VALUE CONFUSION. Hand loops mix the cell's POSITION with its CONTENT, so a
+downstream sink can't tell which field is which. grid-source keeps them separate and
+named: `row`/`col` are always the position; `value` (only when a value mode is asked
+for) is the content — a constant `--fill`, or the cell's row-major `--index`.
+
+THE MODEL. The PURE CORE is `grid(opts)`: it takes options (rows, cols, value mode) and returns
+the sorted, deterministic array of cell records. There is no I/O in the core — a grid is fully
+determined by its dimensions, so unlike a filesystem or a stream source there is no provider to
+inject; the core is pure by construction. The CLI parses argv into opts and renders JSONL; a
+browser calls `grid(opts)` directly.
+
+--rows R number of rows (positive integer; required unless --cols implies a square via --size)
+--cols C number of columns (positive integer; required unless --size)
+--size N shorthand for --rows N --cols N (a square grid)
+--index add a "value" field: the cell's 0-based row-major index (0..rows*cols-1)
+--fill V add a "value" field: the constant V (a JSON scalar: number, string, true/false/null)
+--origin-one number rows/cols from 1 instead of 0 (1..rows, 1..cols)
+--transpose emit in COLUMN-major order instead of row-major (col 0 top-to-bottom, then col 1)
+
+DETERMINISM. grid(opts) is a pure function of opts. Given the same opts, the output is byte-
+identical on every run and every machine: cells in stable row-major (or, with --transpose,
+column-major) order, coordinates and value separated, no clock, no randomness. --index and
+--fill are mutually exclusive (a cell has at most one value).
 
 USAGE
-node ratchet-pdf-dict.js form.pdf # prints the dictionary text
-node ratchet-pdf-dict.js --records form.pdf # one provenance line per record
-node ratchet-pdf-dict.js --labels form.pdf # also include /TU labels
-node ratchet-pdf-dict.js --help
-*/
-(function (root, factory) {
-var api = factory();
-if (typeof module === "object" && module.exports) module.exports = api;
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.parsePdfDict = api.parsePdfDict;
-}
-root.__ratchetPdfDict = api;
-})(typeof globalThis!== "undefined"? globalThis: this, function () {
-"use strict";
+node grid-source.js --rows 3 --cols 4
+node grid-source.js --size 9 --index
+node grid-source.js --rows 2 --cols 2 --fill 0 | node grid-sink.js
+node grid-source.js --help
 
-// ---- byte helpers (shared posture with ratchet-pdf-text) ----------------
-function toU8(bytes) {
-if (bytes instanceof Uint8Array) return bytes;
-if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
-if (bytes && bytes.buffer instanceof ArrayBuffer)
-return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
-throw new Error("ratchet-pdf-dict: input must be a Uint8Array or ArrayBuffer");
-}
-function latin1(u8, start, end) {
-var s = "";
-for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
-return s;
-}
-function isWS(c) {
-return c === " " || c === "\n" || c === "\r" || c === "\t" || c === "\f" || c === "\0";
-}
+Exit codes: 0 success (including an empty grid -> empty stream) · 2 usage error (unknown
+option, missing/duplicate/invalid dimension, --index with --fill, bad --fill scalar). A clean
+one-line message on stderr, never a stack trace.
 
-// ---- string tokenizer (copied verbatim from ratchet-pdf-text; the reuse
-// core the RCR named — literal `()` with escapes/octal, hex `< >`) -----
-function decodeLiteral(s, i) {
-// s[i] === '(' has already been consumed by the caller; parse from i.
-var out = "", depth = 0, N = s.length;
-for (; i < N; i++) {
-var c = s[i];
-if (c === "\\") {
-var nx = s[i + 1];
-if (nx === "n") { out += "\n"; i++;}
-else if (nx === "r") { out += "\r"; i++;}
-else if (nx === "t") { out += "\t"; i++;}
-else if (nx === "b") { out += "\b"; i++;}
-else if (nx === "f") { out += "\f"; i++;}
-else if (nx === "(") { out += "("; i++;}
-else if (nx === ")") { out += ")"; i++;}
-else if (nx === "\\") { out += "\\"; i++;}
-else if (nx >= "0" && nx <= "7") {
-var oct = nx; i++;
-for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
-out += String.fromCharCode(parseInt(oct, 8) & 0xff);
-} else if (nx === "\n") { i++;}
-else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
-else { out += nx; i++;}
-} else if (c === "(") { depth++; out += c;}
-else if (c === ")") {
-if (depth === 0) return [out, i + 1];
-depth--; out += c;
-} else out += c;
-}
-throw new Error("ratchet-pdf-dict: unterminated literal string");
-}
-function decodeHex(s, i) {
-// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
-var hex = "", N = s.length;
-for (i = i + 1; i < N; i++) {
-var c = s[i];
-if (c === ">") {
-if (hex.length % 2 === 1) hex += "0";
-var out = "";
-for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
-return [out, i + 1];
-}
-if (/[0-9a-fA-F]/.test(c)) hex += c;
-else if (/\s/.test(c)) { /* skip */}
-else throw new Error("ratchet-pdf-dict: bad character in hex string");
-}
-throw new Error("ratchet-pdf-dict: unterminated hex string");
-}
-
-// ---- indirect-object scan (structure-tolerant, xref-free) ---------------
-// Scan for `N M obj... endobj` blocks. We do NOT trust the xref table; we
-// read each object's top-level dictionary directly. This is the new surface
-// ratchet-pdf-text never walks (it only reads the dict that precedes a stream).
-var OBJ_HEAD = /(\d+)\s+(\d+)\s+obj\b/g;
-function collectObjects(u8) {
-var full = latin1(u8, 0, u8.length);
-var objs = [], map = {}, m;
-OBJ_HEAD.lastIndex = 0;
-while ((m = OBJ_HEAD.exec(full))!== null) {
-var num = m[1], gen = m[2];
-var bodyStart = m.index + m[0].length;
-var endIdx = full.indexOf("endobj", bodyStart);
-var bodyEnd = endIdx < 0? full.length: endIdx; // tolerate a missing endobj
-var body = full.slice(bodyStart, bodyEnd);
-var rec = { num: num, gen: gen, id: num + " " + gen, body: body};
-objs.push(rec);
-map[rec.id] = rec; // last-wins on a duplicated object number (updated PDFs)
-if (endIdx >= 0) OBJ_HEAD.lastIndex = endIdx + 6;
-}
-return { objs: objs, map: map};
-}
-
-// The top-level dictionary region of an object body: the first depth-matched
-// `<<... >>`. Restricting to this avoids matching a `/V (...)` that appears
-// inside a stream's binary content or as ASCII noise after `endobj`.
-function dictRegion(body) {
-var start = body.indexOf("<<");
-if (start < 0) return body; // some indirect objects are a bare value (e.g. a string)
-var depth = 0, i = start;
-for (; i < body.length - 1; i++) {
-if (body[i] === "<" && body[i + 1] === "<") { depth++; i++;}
-else if (body[i] === ">" && body[i + 1] === ">") { depth--; i++; if (depth === 0) return body.slice(start, i + 1);}
-}
-return body.slice(start); // unbalanced dict — hand back what we have; the value read is bounded
-}
-
-// Find the value token that follows `/<name>` at the TOP level of `region`.
-// Returns { kind:"string"|"hex"|"ref"|"name"|"other"|"none", value,...}.
-function readKeyValue(region, key) {
-// Match the key as a full token (not a prefix of a longer key like /VE).
-var re = new RegExp("/" + key + "(?![A-Za-z0-9])");
-var km = re.exec(region);
-if (!km) return { kind: "none"};
-var i = km.index + km[0].length;
-var N = region.length;
-while (i < N && isWS(region[i])) i++;
-if (i >= N) return { kind: "none"};
-var c = region[i];
-if (c === "(") {
-var lit = decodeLiteral(region, i + 1); // may throw -> caught by caller (object level)
-return { kind: "string", value: lit[0], encoding: "literal"};
-}
-if (c === "<" && region[i + 1]!== "<") {
-var hx = decodeHex(region, i); // may throw -> caught by caller
-return { kind: "string", value: hx[0], encoding: "hex"};
-}
-if (c === "<" && region[i + 1] === "<") return { kind: "other"}; // value is a sub-dict
-if (c === "/") return { kind: "name"};
-if (c === "[") return { kind: "other"};
-// number, or an indirect reference `N M R`
-var rest = region.slice(i);
-var refM = /^(\d+)\s+(\d+)\s+R\b/.exec(rest);
-if (refM) return { kind: "ref", value: refM[1] + " " + refM[2]};
-if (/^-?\d/.test(rest)) return { kind: "other"}; // a plain number
-return { kind: "other"};
-}
-
-// Resolve one level: given a ref id "N M", find that object and, if its body is
-// (or begins with) a bare string, decode it. Returns { value, encoding} or null.
-function resolveRefString(map, id) {
-var target = map[id];
-if (!target) return null;
-var body = target.body;
-var i = 0, N = body.length;
-while (i < N && isWS(body[i])) i++;
-if (body[i] === "(") { var lit = decodeLiteral(body, i + 1); return { value: lit[0], encoding: "ref"};}
-if (body[i] === "<" && body[i + 1]!== "<") { var hx = decodeHex(body, i); return { value: hx[0], encoding: "ref"};}
-return null; // referenced object is not a bare string — out of one-level scope
-}
-
-// ---- top-level ----------------------------------------------------------
-function parsePdfDict(bytes, options) {
-options = options || {};
-var u8 = toU8(bytes); // throws on bad input type (document level)
-if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
-throw new Error("ratchet-pdf-dict: not a PDF (missing %PDF- header)");
-
-var scan = collectObjects(u8);
-var records = [], malformed = [], texts = [];
-
-for (var o = 0; o < scan.objs.length; o++) {
-var obj = scan.objs[o];
-var region = dictRegion(obj.body);
-
-// The field's partial name (/T) — the record key for a /V value.
-var name = null;
-try {
-var t = readKeyValue(region, "T");
-if (t.kind === "string") name = t.value;
-} catch (e) { /* a malformed /T is not itself a text surface — leave name null */}
-
-// /V — field value.
-pullTextKey(region, obj, "V", "field", name, scan.map, records, texts, malformed);
-// /Contents — annotation text ONLY when the value is a string (a ref is a
-// page's content-stream pointer; skipped by the value-type disambiguation).
-pullTextKey(region, obj, "Contents", "annotation", null, scan.map, records, texts, malformed);
-// /TU — field label, opt-in only.
-if (options.labels)
-pullTextKey(region, obj, "TU", "label", name, scan.map, records, texts, malformed);
-}
-
-return { records: records, text: texts.join("\n"), malformed: malformed};
-}
-
-function pullTextKey(region, obj, key, kind, name, map, records, texts, malformed) {
-var kv;
-try {
-kv = readKeyValue(region, key);
-} catch (e) {
-malformed.push({ obj: obj.id, key: key, malformed: true, reason: e.message});
-return;
-}
-if (kv.kind === "string") {
-records.push({ obj: obj.id, kind: kind, key: key, name: name, text: kv.value, encoding: kv.encoding});
-if (kv.value) texts.push(kv.value);
-} else if (kv.kind === "ref") {
-// Only /V resolves a ref to a string. A /Contents ref is a page content
-// pointer — the disambiguation says skip it.
-if (key!== "V") return;
-var r;
-try { r = resolveRefString(map, kv.value);}
-catch (e) { malformed.push({ obj: obj.id, key: key, malformed: true, reason: e.message}); return;}
-if (r) {
-records.push({ obj: obj.id, kind: kind, key: key, name: name, text: r.value, encoding: r.encoding});
-if (r.value) texts.push(r.value);
-}
-}
-// name / other / none -> not a text surface; nothing recorded.
-}
-
-return { parsePdfDict: parsePdfDict};
-});
-
-// ---- CLI (Node only) ------------------------------------------------------
-if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
-var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfDict;
-var args = process.argv.slice(2);
-if (!args.length || args.indexOf("--help")!== -1) {
-process.stdout.write(
-"ratchet-pdf-dict — strict, zero-dep PDF dictionary-text extractor (/V + annotation /Contents)\n" +
-" node ratchet-pdf-dict.js form.pdf print the dictionary text\n" +
-" node ratchet-pdf-dict.js --records form.pdf one provenance line per record\n" +
-" node ratchet-pdf-dict.js --labels form.pdf also include /TU field labels\n" +
-" node ratchet-pdf-dict.js --help\n"
-);
-process.exit(0);
-}
-var recordsMode = false, labels = false, file = null;
-for (var i = 0; i < args.length; i++) {
-if (args[i] === "--records") recordsMode = true;
-else if (args[i] === "--labels") labels = true;
-else file = args[i];
-}
-try {
-if (!file) throw new Error("no input file");
-var fs = require("fs");
-var buf = fs.readFileSync(file);
-var res = api.parsePdfDict(buf, { labels: labels});
-if (recordsMode) {
-res.records.forEach(function (r) {
-process.stdout.write(
-"obj " + r.obj + "\tkind=" + r.kind + "\tkey=/" + r.key +
-"\tname=" + (r.name === null? "-": JSON.stringify(r.name)) +
-"\tenc=" + r.encoding + "\ttextLen=" + r.text.length + "\n"
-);
-});
-res.malformed.forEach(function (r) {
-process.stderr.write("obj " + r.obj + "\tkey=/" + r.key + "\tMALFORMED — " + r.reason + "\n");
-});
-} else {
-process.stdout.write(res.text + (res.text? "\n": ""));
-}
-process.exit(0);
-} catch (e) {
-var msg = e && e.message? e.message: String(e);
-if (msg.indexOf("ratchet-pdf-dict:")!== 0) msg = "ratchet-pdf-dict: " + msg;
-process.stderr.write(msg + "\n");
-process.exit(1);
-}
-}
-
-test_ratchet-pdf-dict.js 167 lines on GitHub →
-#!/usr/bin/env node
-/* test_ratchet-pdf-dict.js — known-answer battery for ratchet-pdf-dict.
-
-The oracle is OUT OF BAND: every expected value below is a literal fact written
-by hand, never the output of a second PDF parser. Each PDF fixture is assembled
-from raw bytes so the expected records are known by construction. No zlib, no
-dependencies — dictionary text is not compressed, so no inflater is needed.
-
-Run: node test_ratchet-pdf-dict.js (exit 0 = all pass, nonzero = failure)
+Released under MIT. Its edge is printed in the README: grid-source emits a bounded, row-major
+(or --transpose column-major) stream of {row,col[,value]} cells. It does NOT lay out or render
+(pipe into grid-sink for that), does NOT read any input (dimensions come from flags, not stdin),
+does NOT do sparse/irregular grids (every cell in the rectangle is emitted), and does NOT carry
+per-cell data (use --fill for a constant or pipe through a transform to attach real values).
 */
 "use strict";
-var assert = require("assert");
-var { parsePdfDict} = require("./ratchet-pdf-dict.js");
 
-var pass = 0, fail = 0;
-function ok(name, fn) {
-try { fn(); pass++; console.log(" ok " + name);}
-catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+/* ==================================================================
+THE PURE CORE — grid(opts) -> [cell,...]
+No I/O, no provider: a grid is fully determined by its dimensions.
+opts.rows / opts.cols — positive integers (0 allowed -> empty stream)
+opts.originOne — number from 1 instead of 0
+opts.transpose — column-major instead of row-major
+opts.valueMode — undefined | 'index' | 'fill'
+opts.fill — the constant value when valueMode === 'fill'
+Returns an array of { row, col [, value]} in stable order.
+================================================================== */
+function grid(opts) {
+opts = opts || {};
+var rows = opts.rows;
+var cols = opts.cols;
+if (!isNonNegInt(rows) ||!isNonNegInt(cols)) {
+throw new Error("grid: rows and cols must be non-negative integers");
 }
-function bytes(str) { return Buffer.from(str, "latin1");}
+var base = opts.originOne? 1: 0;
+var transpose =!!opts.transpose;
+var valueMode = opts.valueMode; // undefined | 'index' | 'fill'
+var fill = opts.fill;
 
-// Wrap a set of object bodies into a minimal, header-correct PDF. Structure is
-// spartan on purpose — the extractor is xref-free and scans for `N M obj`.
-function pdf(objs) { return bytes("%PDF-1.7\n" + objs.join("\n") + "\n%%EOF\n");}
-
-// ---- 1. a text field: /V value paired with its /T name -------------------
-ok("1 text field /V + /T name", function () {
-var doc = pdf(["12 0 obj\n<< /FT /Tx /T (fullname) /V (John Smith) >>\nendobj"]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 1); // ORACLE: exactly one
-assert.strictEqual(r.records[0].kind, "field");
-assert.strictEqual(r.records[0].key, "V");
-assert.strictEqual(r.records[0].name, "fullname");
-assert.strictEqual(r.records[0].text, "John Smith");
-assert.strictEqual(r.records[0].encoding, "literal");
-assert.strictEqual(r.malformed.length, 0);
-});
-
-// ---- 2. an annotation: /Contents string ----------------------------------
-ok("2 annotation /Contents string", function () {
-var doc = pdf(["5 0 obj\n<< /Type /Annot /Subtype /Text /Contents (A sticky note) >>\nendobj"]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 1);
-assert.strictEqual(r.records[0].kind, "annotation");
-assert.strictEqual(r.records[0].key, "Contents");
-assert.strictEqual(r.records[0].name, null);
-assert.strictEqual(r.records[0].text, "A sticky note");
-});
-
-// ---- 3. the /Contents disambiguation: a PAGE content ref is NOT text ------
-ok("3 page /Contents ref is skipped (not annotation text)", function () {
-var doc = pdf([
-"3 0 obj\n<< /Type /Page /Contents 4 0 R /MediaBox [0 0 612 792] >>\nendobj",
-"4 0 obj\n<< /Length 20 >>\nstream\nBT (drawn) Tj ET\nendstream\nendobj"
-]);
-var r = parsePdfDict(doc);
-// Neither object yields a dictionary-text record: obj 3's /Contents is a ref
-// (page content pointer), obj 4 has no /V or string /Contents.
-assert.strictEqual(r.records.length, 0); // ORACLE: the trap
-assert.strictEqual(r.malformed.length, 0);
-});
-
-// ---- 4. an indirect /V reference is resolved one level -------------------
-ok("4 indirect /V ref resolved to a string object", function () {
-var doc = pdf([
-"12 0 obj\n<< /FT /Tx /T (comment) /V 9 0 R >>\nendobj",
-"9 0 obj\n(deferred value)\nendobj"
-]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 1);
-assert.strictEqual(r.records[0].text, "deferred value");
-assert.strictEqual(r.records[0].encoding, "ref"); // provenance is honest
-assert.strictEqual(r.records[0].name, "comment");
-});
-
-// ---- 5. a hex-string value decodes ---------------------------------------
-ok("5 hex-string /V value", function () {
-var doc = pdf(["7 0 obj\n<< /T (code) /V <48656C6C6F> >>\nendobj"]); // "Hello"
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 1);
-assert.strictEqual(r.records[0].text, "Hello");
-assert.strictEqual(r.records[0].encoding, "hex");
-});
-
-// ---- 6. literal escapes: balanced parens and \( \) ------------------------
-ok("6 literal escapes decode", function () {
-var doc = pdf(["8 0 obj\n<< /T (note) /V (a \\(b\\) c) >>\nendobj"]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records[0].text, "a (b) c"); // ORACLE by hand
-});
-
-// ---- 7. a malformed value is RECORDED, and the walk CONTINUES -------------
-ok("7 malformed /V is recorded, walk continues (two-level contract)", function () {
-var doc = pdf([
-"1 0 obj\n<< /T (bad) /V (unterminated string >>\nendobj", // no closing)
-"2 0 obj\n<< /T (good) /V (survivor) >>\nendobj"
-]);
-var r = parsePdfDict(doc);
-// The good field after the bad one is still extracted — the walk did NOT abort.
-var texts = r.records.map(function (x) { return x.text;});
-assert.ok(texts.indexOf("survivor")!== -1, "good field survived the malformed one");
-assert.strictEqual(r.malformed.length, 1); // the bad one is stamped
-assert.strictEqual(r.malformed[0].obj, "1 0");
-assert.ok(/unterminated/.test(r.malformed[0].reason));
-});
-
-// ---- 8. NOT a PDF throws (document-level, ratchet parity) -----------------
-ok("8 missing %PDF- header throws", function () {
-assert.throws(function () { parsePdfDict(bytes("<< /V (x) >>"));}, /not a PDF/);
-});
-
-// ---- 9. bad input type throws --------------------------------------------
-ok("9 non-buffer input throws", function () {
-assert.throws(function () { parsePdfDict("a string, not bytes");}, /Uint8Array or ArrayBuffer/);
-});
-
-// ---- 10. an empty/field-less PDF yields no records, no throw --------------
-ok("10 no dictionary text -> empty records, no throw", function () {
-var doc = pdf(["1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj"]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 0);
-assert.strictEqual(r.text, "");
-});
-
-// ---- 11. /TU labels are OFF by default, ON with {labels:true} -------------
-ok("11 /TU label gated behind options.labels", function () {
-var doc = pdf(["4 0 obj\n<< /T (dob) /TU (Date of birth) /V (1978) >>\nendobj"]);
-var off = parsePdfDict(doc);
-assert.strictEqual(off.records.length, 1); // only /V, not /TU
-assert.strictEqual(off.records[0].text, "1978");
-var on = parsePdfDict(doc, { labels: true});
-var labels = on.records.filter(function (x) { return x.kind === "label";});
-assert.strictEqual(labels.length, 1);
-assert.strictEqual(labels[0].text, "Date of birth");
-assert.strictEqual(labels[0].name, "dob");
-});
-
-// ---- 12. one object with BOTH /V and /Contents yields two records ---------
-ok("12 widget with /V and /Contents -> field + annotation records", function () {
-var doc = pdf(["6 0 obj\n<< /Subtype /Widget /T (sig) /V (signed) /Contents (tooltip) >>\nendobj"]);
-var r = parsePdfDict(doc);
-var kinds = r.records.map(function (x) { return x.kind;}).sort();
-assert.deepStrictEqual(kinds, ["annotation", "field"]); // both surfaces pulled
-assert.strictEqual(r.records.length, 2);
-});
-
-// ---- 13..text joins record texts in order --------------------------------
-ok("13.text joins records with newline, in object order", function () {
-var doc = pdf([
-"1 0 obj\n<< /T (a) /V (one) >>\nendobj",
-"2 0 obj\n<< /Subtype /Text /Contents (two) >>\nendobj"
-]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.text, "one\ntwo"); // ORACLE by construction
-});
-
-// ---- 14. /VE (a longer key) is NOT mistaken for /V ------------------------
-ok("14 key match is a full token, /VE does not match /V", function () {
-var doc = pdf(["1 0 obj\n<< /VE [ (a)] /V (real) >>\nendobj"]);
-var r = parsePdfDict(doc);
-// Only the real /V string is pulled; /VE (an array) is not a /V match.
-assert.strictEqual(r.records.length, 1);
-assert.strictEqual(r.records[0].text, "real");
-});
-
-console.log("\n" + pass + " passed, " + fail + " failed");
-process.exit(fail? 1: 0);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# PDF Text Extractor — a Loop MMT gift
-https://loopmmt.com/gifts/ratchet-pdf-text/
-[coverage: optional · branch: gifts]
-
-What Text Does This PDF Draw? transform ← all gifts
-
-PDF Text Extractor
-
-Pull the visible text out of a PDF's content streams — the operands of the Tj, TJ, ', and " text-showing operators — with no dependencies, in Node or the browser. parsePdfText(bytes) validates the %PDF- header, scans for stream/endstream objects, and decodes literal (), hex < >, and TJ-array strings in stream order. Like its ratchet-png-text and exif-parser siblings it validates structure before it trusts it — a lying /Length past the buffer or a stream without endstream throws rather than reading a truncated value.
-
-The honest edge
-
-It returns the string operands as WRITTEN — it does NOT map character codes through a font's /Encoding or /ToUnicode CMap, so it is correct for the common WinAnsi/standard-font case and honestly wrong for a subsetted CID font (glyph-index bytes, not characters). It gives drawn strings in stream order, not a visual reflow — no positional layout or reading-order reconstruction. FlateDecode content is the common case and zlib inflate is not in the browser's zero-dep surface, so a compressed stream is SURFACED as raw bytes and decoded only if you pass an inflate function (Node: zlib.inflateSync; browser: pako) — never faked. It does not decode /ObjStm, xref streams, encryption, or images; malformed input throws.
-
-Run it
-
-node ratchet-pdf-text.js doc.pdf
-test_ratchet-pdf-text.js (18/18: hand-constructed PDF byte vectors with out-of-band oracles — Tj/TJ/hex/octal/nested-paren/escape decode, FlateDecode round-trip via node zlib, without-inflater surfacing, ArrayBuffer input, 4 ratchet-refusal cases)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-ratchet-pdf-text.js 381 lines on GitHub →
-#!/usr/bin/env node
-/* ratchet-pdf-text.js — a pure, dependency-free, STRICT extractor of the text
-drawn by a PDF's content streams. Runs identically in a browser and in Node
-(no DOM, no dependencies).
-
-WHY THIS EXISTS. A PDF carries its visible text inside content streams — most
-often zlib/FlateDecode-compressed — as a sequence of text-showing operators
-(Tj, TJ, ', ") applied to string operands. You have the file's bytes (an
-upload, a fetch, a Buffer) and you want that text without pulling in a full
-PDF engine that also parses fonts, xref tables, encryption, and page trees you
-don't care about. The usual answer is a heavy library, or a hand-rolled regex
-that trusts the file and hands you garbage out of a stream it never validated.
-
-WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one structure
-at a time and REFUSES to move past anything malformed. It validates the
-`%PDF-` header; for every `stream... endstream` object it checks the delimiter
-shape; when a stream declares a /Length it is honoured and a run past the end
-of the buffer is a thrown Error, never a silently-truncated read. A content
-stream whose operator syntax is broken (an unbalanced string, a array/dict that
-never closes) is a thrown Error, not a best-effort guess. A parser that hands
-you text from a stream it could not actually parse is lying about what the file
-says; this one won't.
-
-THE COMPRESSION BOUNDARY (the load-bearing honesty choice — same as the PNG
-text twin). Almost every real PDF content stream is FlateDecode-compressed, and
-zlib inflate is NOT in the browser's synchronous, dependency-free surface. So
-the core stays DOM-free and zero-dependency and SURFACES each compressed stream
-as raw bytes; the text inside it is decoded ONLY if you pass an `inflate`
-function in the options. This is deliberate:
-Node: { inflate: require("zlib").inflateSync} (the CLI wires this)
-browser: { inflate: pako.inflate} or any (Uint8Array)->Uint8Array
-Without an inflater, a FlateDecode stream is reported with its compressed bytes
-on the entry and `text:null` and `needsInflate:true` — never faked. An
-UNCOMPRESSED content stream (no /Filter) is decoded directly, inflater or not.
-
-WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
-• Content-stream text — the operands of Tj / TJ / ' / " operators inside each
-content stream, in stream order, concatenated per stream. Literal strings
-`(...)` (with \\ escapes and \\ddd octal) and hex strings `<... >` are
-both decoded. TJ arrays keep only their string elements (numeric kerning
-adjustments are dropped, as they carry no glyphs).
-• Per-stream entries carry the decode provenance so nothing is hidden:
-{ index, filter, compressed:<bool>, needsInflate:<bool>,
-text:<string|null>, compressedBytes?:Uint8Array, rawLength}
-
-WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
-It does not map character codes through font /Encoding or /ToUnicode CMaps —
-it returns the string operands as written, which is correct plain text for
-the common WinAnsi/standard-font case and is honestly wrong for a subsetted
-CID font (the README says so). It does not decode object streams (/ObjStm),
-cross-reference streams, encryption, or images. It does not inflate on its own
-(pass `inflate`). It does not repair a broken file. It does not lay out text
-positionally — it gives you the drawn strings in stream order, not a visual
-reflow.
-
-API
-parsePdfText(bytes[, options]) -> { streams: Array<Entry>, text: string}
-`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
-`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
-used to decode FlateDecode content streams.
-`.streams` the per-stream entries in file order (possibly empty).
-`.text` the decoded text of every stream that could be decoded, joined
-with "\n". Streams that needed an inflater you didn't pass
-contribute nothing to `.text` (and are flagged on `.streams`).
-THROWS an Error on any malformed input (bad header, bad stream shape,
-truncation, unbalanced content syntax).
-
-Pure function of its input. Same code in a browser
-(window.LoopGifts.parsePdfText) or Node (this CLI / require()).
-
-USAGE
-node ratchet-pdf-text.js doc.pdf # prints the extracted text
-node ratchet-pdf-text.js --streams doc.pdf # one line of provenance per stream
-node ratchet-pdf-text.js --help
-*/
-(function (root, factory) {
-var api = factory();
-if (typeof module === "object" && module.exports) module.exports = api;
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.parsePdfText = api.parsePdfText;
+var out = [];
+// The row-major index is ALWAYS assigned in row-major order (r*cols + c), independent of
+// emission order, so --index is a stable property of the cell, not of the traversal. This
+// means --transpose changes the ORDER cells are emitted but NOT a cell's --index value.
+var asBlocks =!!opts.cells; // --cells: emit unit blocks {row,col,w,h} that grid-sink consumes
+function pushCell(r, c) {
+var rec = { row: base + r, col: base + c};
+if (asBlocks) { rec.w = 1; rec.h = 1;}
+if (valueMode === "index") rec.value = r * cols + c;
+else if (valueMode === "fill") rec.value = fill;
+out.push(rec);
 }
-// expose for the CLI block below
-root.__ratchetPdfText = api;
-})(typeof globalThis!== "undefined"? globalThis: this, function () {
-"use strict";
 
-// ---- byte helpers -------------------------------------------------------
-function toU8(bytes) {
-if (bytes instanceof Uint8Array) return bytes;
-if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
-if (bytes && bytes.buffer instanceof ArrayBuffer)
-return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
-throw new Error("ratchet-pdf-text: input must be a Uint8Array or ArrayBuffer");
-}
-function latin1(u8, start, end) {
-var s = "";
-for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
-return s;
-}
-// find a byte-substring `needle` (as a Latin-1 string) in u8 from `from`
-function indexOfStr(u8, needle, from) {
-var n = needle.length, N = u8.length;
-for (var i = from; i + n <= N; i++) {
-var ok = true;
-for (var j = 0; j < n; j++) {
-if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
-}
-if (ok) return i;
-}
-return -1;
-}
-function isWS(c) { return c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09 || c === 0x0c || c === 0x00;}
-
-// ---- stream scan (structure-tolerant, xref-free) ------------------------
-// We do not trust the xref table; we scan for `stream`/`endstream` pairs and
-// read the object dictionary that precedes each `stream` keyword to learn the
-// /Filter and /Length. This is the pragmatic, robust way to pull content
-// without a full document model — but every step is validated.
-function collectStreams(u8) {
-var N = u8.length, out = [], from = 0, idx = 0;
-while (true) {
-var sPos = indexOfStr(u8, "stream", from);
-if (sPos < 0) break;
-// guard against matching the tail of "endstream"
-if (sPos >= 3 && latin1(u8, sPos - 3, sPos) === "end") { from = sPos + 6; continue;}
-// the dict for this stream is the bytes between the previous `obj` (or start)
-// and this `stream` keyword.
-var objPos = lastIndexOfStr(u8, "obj", sPos, Math.max(0, sPos - 4096));
-var dictStart = objPos >= 0? objPos + 3: Math.max(0, sPos - 4096);
-var dict = latin1(u8, dictStart, sPos);
-
-// data begins after `stream` + one EOL (CRLF or LF), per the PDF spec.
-var d = sPos + 6;
-if (u8[d] === 0x0d && u8[d + 1] === 0x0a) d += 2;
-else if (u8[d] === 0x0a) d += 1;
-else if (u8[d] === 0x0d) d += 1; // tolerate a bare CR
-
-var filter = /\/Filter\s*\/?\s*(FlateDecode|ASCIIHexDecode|ASCII85Decode|LZWDecode|RunLengthDecode|DCTDecode)/.exec(dict);
-var filterName = filter? filter[1]: null;
-var lenM = /\/Length\s+(\d+)/.exec(dict);
-
-var dataEnd;
-if (lenM) {
-dataEnd = d + parseInt(lenM[1], 10);
-if (dataEnd > N) throw new Error("ratchet-pdf-text: stream /Length runs past end of buffer");
-// verify endstream actually follows (allowing whitespace) — a lying /Length
-var probe = dataEnd;
-while (probe < N && isWS(u8[probe])) probe++;
-if (latin1(u8, probe, Math.min(N, probe + 9))!== "endstream") {
-// /Length was wrong; fall back to scanning for endstream
-dataEnd = -1;
+if (!transpose) {
+for (var r = 0; r < rows; r++) {
+for (var c = 0; c < cols; c++) pushCell(r, c);
 }
 } else {
-dataEnd = -1;
+for (var cc = 0; cc < cols; cc++) {
+for (var rr = 0; rr < rows; rr++) pushCell(rr, cc);
 }
-if (dataEnd < 0) {
-var e = indexOfStr(u8, "endstream", d);
-if (e < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
-dataEnd = e;
-// trim the single EOL immediately before endstream
-if (dataEnd > d && u8[dataEnd - 1] === 0x0a) dataEnd--;
-if (dataEnd > d && u8[dataEnd - 1] === 0x0d) dataEnd--;
-}
-
-var endKw = indexOfStr(u8, "endstream", dataEnd);
-if (endKw < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
-
-out.push({ index: idx++, filter: filterName, dataStart: d, dataEnd: dataEnd});
-from = endKw + 9;
 }
 return out;
 }
-function lastIndexOfStr(u8, needle, before, floor) {
-var n = needle.length;
-for (var i = before - n; i >= floor; i--) {
-var ok = true;
-for (var j = 0; j < n; j++) if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
-if (ok) return i;
-}
-return -1;
+
+// A non-negative integer (0 allowed): the dimension guard.
+function isNonNegInt(n) {
+return typeof n === "number" && isFinite(n) && Math.floor(n) === n && n >= 0;
 }
 
-// ---- content-stream text operators --------------------------------------
-// Given a decoded (or uncompressed) content stream as a Latin-1 string, pull
-// the operands of Tj/TJ/'/" text-showing operators. Ratchet: unbalanced string
-// or array is a thrown Error.
-function decodeLiteral(s, i) {
-// s[i] === '('; returns [decodedString, indexAfterClosingParen]
-var out = "", depth = 0, N = s.length;
-for (; i < N; i++) {
-var c = s[i];
-if (c === "\\") {
-var nx = s[i + 1];
-if (nx === "n") { out += "\n"; i++;}
-else if (nx === "r") { out += "\r"; i++;}
-else if (nx === "t") { out += "\t"; i++;}
-else if (nx === "b") { out += "\b"; i++;}
-else if (nx === "f") { out += "\f"; i++;}
-else if (nx === "(") { out += "("; i++;}
-else if (nx === ")") { out += ")"; i++;}
-else if (nx === "\\") { out += "\\"; i++;}
-else if (nx >= "0" && nx <= "7") {
-var oct = nx; i++;
-for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
-out += String.fromCharCode(parseInt(oct, 8) & 0xff);
-} else if (nx === "\n") { i++;} // line continuation
-else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
-else { out += nx; i++;}
-} else if (c === "(") { depth++; out += c;}
-else if (c === ")") {
-if (depth === 0) return [out, i + 1];
-depth--; out += c;
-} else out += c;
-}
-throw new Error("ratchet-pdf-text: unterminated literal string in content stream");
-}
-function decodeHex(s, i) {
-// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
-var hex = "", N = s.length;
-for (i = i + 1; i < N; i++) {
-var c = s[i];
-if (c === ">") {
-if (hex.length % 2 === 1) hex += "0";
-var out = "";
-for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
-return [out, i + 1];
-}
-if (/[0-9a-fA-F]/.test(c)) hex += c;
-else if (/\s/.test(c)) { /* skip */}
-else throw new Error("ratchet-pdf-text: bad character in hex string");
-}
-throw new Error("ratchet-pdf-text: unterminated hex string in content stream");
-}
-function extractOperators(content) {
-// Walk the stream, keeping a small operand stack of strings, and flush on
-// Tj/TJ/'/" operators. Non-string operands are ignored for our purpose.
-var s = content, N = s.length, i = 0, pending = [], out = [];
-while (i < N) {
-var c = s[i];
-if (c === "(") { var r = decodeLiteral(s, i + 1); pending.push(r[0]); i = r[1]; continue;}
-if (c === "<" && s[i + 1]!== "<") { var h = decodeHex(s, i); pending.push(h[0]); i = h[1]; continue;}
-if (c === "[") {
-// TJ array: collect string elements, drop numbers
-var arr = [], j = i + 1;
-while (j < N && s[j]!== "]") {
-if (s[j] === "(") { var lr = decodeLiteral(s, j + 1); arr.push(lr[0]); j = lr[1];}
-else if (s[j] === "<" && s[j + 1]!== "<") { var hr = decodeHex(s, j); arr.push(hr[0]); j = hr[1];}
-else j++;
-}
-if (j >= N) throw new Error("ratchet-pdf-text: unterminated array in content stream");
-pending.push(arr.join(""));
-i = j + 1;
-continue;
-}
-// operator token
-if (/[A-Za-z'"]/.test(c)) {
-var op = "";
-while (i < N && /[A-Za-z0-9*'"]/.test(s[i])) op += s[i++];
-if (op === "Tj" || op === "'" || op === '"') {
-if (pending.length) out.push(pending[pending.length - 1]);
-pending = [];
-} else if (op === "TJ") {
-if (pending.length) out.push(pending[pending.length - 1]);
-pending = [];
-} else {
-pending = []; // any other operator consumes/clears operands
-}
-continue;
-}
-i++;
-}
-return out.join("");
+// Render cell records as JSONL text (one JSON object per line, trailing newline per record).
+function toJSONL(records) {
+var s = "";
+for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
+return s;
 }
 
-// ---- top-level ----------------------------------------------------------
-function parsePdfText(bytes, options) {
-options = options || {};
-var u8 = toU8(bytes);
-if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
-throw new Error("ratchet-pdf-text: not a PDF (missing %PDF- header)");
-
-var raw = collectStreams(u8);
-var inflate = typeof options.inflate === "function"? options.inflate: null;
-var entries = [], texts = [];
-
-for (var i = 0; i < raw.length; i++) {
-var st = raw[i];
-var body = u8.subarray(st.dataStart, st.dataEnd);
-var compressed = st.filter === "FlateDecode";
-var entry = {
-index: st.index,
-filter: st.filter,
-compressed: compressed,
-needsInflate: false,
-text: null,
-rawLength: body.length
-};
-if (!st.filter) {
-// uncompressed content stream — decode directly
-var t = safeExtract(latin1(body, 0, body.length));
-entry.text = t;
-if (t) texts.push(t);
-} else if (compressed) {
-if (inflate) {
-var inflated = inflate(body);
-var iu8 = toU8(inflated);
-var t2 = safeExtract(latin1(iu8, 0, iu8.length));
-entry.text = t2;
-if (t2) texts.push(t2);
-} else {
-entry.needsInflate = true;
-entry.compressedBytes = body.slice(); // surface raw, honest
+/* ==================================================================
+EXPORTS (browser + Node)
+================================================================== */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.gridSource = { grid: grid, toJSONL: toJSONL};
 }
-} else {
-// a filter we don't handle (DCTDecode image, etc.) — not text; surface it
-entry.needsInflate = false;
-entry.compressedBytes = body.slice();
-}
-entries.push(entry);
-}
-return { streams: entries, text: texts.join("\n")};
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { grid: grid, toJSONL: toJSONL, isNonNegInt: isNonNegInt};
 }
 
-// extractOperators may throw on a non-content stream that happens to be
-// uncompressed binary; a content-text extractor should not crash the whole
-// parse on a stream that isn't text. We attempt, and on a structural throw we
-// treat the stream as yielding no text (it is surfaced in `.streams` regardless).
-function safeExtract(content) {
-try { return extractOperators(content);}
-catch (e) { return "";}
+/* ==================================================================
+CLI (runs only when invoked directly, never on require)
+================================================================== */
+
+// Parse a --fill value as a JSON scalar (number, string, true/false/null). A bare token that
+// isn't valid JSON is treated as a string (so `--fill x` -> "x"), but an explicitly malformed
+// JSON literal (`--fill [1,`) is a usage error — we only accept SCALARS, never structures.
+function parseFillScalar(tok) {
+var v;
+try { v = JSON.parse(tok);}
+catch (e) { return tok;} // not JSON -> a plain string
+if (v === null || typeof v === "number" || typeof v === "boolean" || typeof v === "string") return v;
+throw new Error("--fill must be a scalar (number, string, true, false, or null), not a structure");
 }
 
-return { parsePdfText: parsePdfText};
-});
-
-// ---- CLI (Node only) ------------------------------------------------------
-if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
-var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfText;
-var args = process.argv.slice(2);
-if (!args.length || args.indexOf("--help")!== -1) {
-process.stdout.write(
-"ratchet-pdf-text — strict, zero-dep PDF content-stream text extractor\n" +
-" node ratchet-pdf-text.js doc.pdf print extracted text\n" +
-" node ratchet-pdf-text.js --streams doc.pdf one provenance line per stream\n" +
-" node ratchet-pdf-text.js --help\n"
-);
-process.exit(0);
+function parseIntStrict(v, name) {
+var n = Number(v);
+if (String(v).trim() === "" ||!isFinite(n) || Math.floor(n)!== n || n < 0) {
+throw new Error(name + " must be a non-negative integer");
 }
-var streamsMode = false, file = null;
-for (var i = 0; i < args.length; i++) {
-if (args[i] === "--streams") streamsMode = true;
-else file = args[i];
-}
-try {
-if (!file) throw new Error("no input file");
-var fs = require("fs");
-var zlib = require("zlib");
-var buf = fs.readFileSync(file);
-var res = api.parsePdfText(buf, { inflate: zlib.inflateSync});
-if (streamsMode) {
-res.streams.forEach(function (s) {
-process.stdout.write(
-"#" + s.index + "\tfilter=" + (s.filter || "none") +
-"\tcompressed=" + s.compressed +
-"\tneedsInflate=" + s.needsInflate +
-"\trawLen=" + s.rawLength +
-"\ttextLen=" + (s.text? s.text.length: 0) + "\n"
-);
-});
-} else {
-process.stdout.write(res.text + (res.text? "\n": ""));
-}
-process.exit(0);
-} catch (e) {
-var msg = e && e.message? e.message: String(e);
-if (msg.indexOf("ratchet-pdf-text:")!== 0) msg = "ratchet-pdf-text: " + msg;
-process.stderr.write(msg + "\n");
-process.exit(1);
-}
+return n;
 }
 
-test_ratchet-pdf-text.js 190 lines on GitHub →
+function parseArgs(args) {
+var opts = {};
+var rows, cols, size;
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a === "--rows") { rows = parseIntStrict(args[i + 1], "--rows"); i += 2;}
+else if (a === "--cols") { cols = parseIntStrict(args[i + 1], "--cols"); i += 2;}
+else if (a === "--size") { size = parseIntStrict(args[i + 1], "--size"); i += 2;}
+else if (a === "--index") { opts.__indexSeen = true; i++;}
+else if (a === "--fill") {
+if (args[i + 1] === undefined) throw new Error("--fill requires a value");
+opts.__fillTok = args[i + 1]; i += 2;
+}
+else if (a === "--origin-one") { opts.originOne = true; i++;}
+else if (a === "--transpose") { opts.transpose = true; i++;}
+else if (a === "--cells") { opts.cells = true; i++;}
+else if (a.charAt(0) === "-") { throw new Error("unknown option " + a);}
+else { throw new Error("unexpected argument " + JSON.stringify(a) + " (grid-source takes flags, not positionals)");}
+}
+// --size is shorthand for a square; it must not be combined with --rows/--cols
+if (size!== undefined) {
+if (rows!== undefined || cols!== undefined) throw new Error("--size cannot be combined with --rows/--cols");
+rows = size; cols = size;
+}
+if (rows === undefined || cols === undefined) throw new Error("both --rows and --cols are required (or use --size N)");
+// Resolve the value mode from the independently-tracked flags, guarding mutual exclusion in
+// EITHER order (--index --fill or --fill --index both refused).
+var indexSeen =!!opts.__indexSeen, fillSeen = opts.__fillTok!== undefined;
+if (indexSeen && fillSeen) throw new Error("--index and --fill are mutually exclusive");
+if (indexSeen) opts.valueMode = "index";
+else if (fillSeen) { opts.valueMode = "fill"; opts.fill = parseFillScalar(opts.__fillTok);}
+delete opts.__indexSeen; delete opts.__fillTok;
+opts.rows = rows; opts.cols = cols;
+return opts;
+}
+
+var HELP =
+"grid-source.js — generate a bounded 2-D grid as a deterministic JSONL stream of cells.\n\n" +
+" node grid-source.js --rows 3 --cols 4\n" +
+" node grid-source.js --size 9 --index\n" +
+" node grid-source.js --rows 2 --cols 2 --fill 0 | node grid-sink.js\n" +
+" node grid-source.js --help\n\n" +
+" --rows R number of rows (non-negative integer)\n" +
+" --cols C number of columns (non-negative integer)\n" +
+" --size N shorthand for --rows N --cols N (a square)\n" +
+" --index add a \"value\" field: the cell's 0-based row-major index\n" +
+" --fill V add a \"value\" field: the constant JSON scalar V\n" +
+" --origin-one number rows/cols from 1 instead of 0\n" +
+" --transpose emit in column-major order instead of row-major\n" +
+" --cells emit each cell as a unit block {row,col,w:1,h:1} (grid-sink input)\n\n" +
+"Emits one JSON object per cell: { row, col[, value]}, cells in stable ROW-MAJOR order\n" +
+"(or column-major with --transpose). The {row,col} shape is what grid-sink consumes, so\n" +
+"`grid-source --cells | grid-sink` composes. --index and --fill are mutually exclusive.\n\n" +
+"Edge: grid-source does NOT render (pipe into grid-sink), does NOT read stdin (dimensions\n" +
+"are flags), does NOT do sparse/irregular grids (every cell is emitted), and carries no\n" +
+"per-cell data (use --fill or a downstream transform).\n";
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(HELP);
+return 0;
+}
+var opts;
+try { opts = parseArgs(args);}
+catch (e) { process.stderr.write("grid-source: " + e.message + "\n"); return 2;}
+
+var records;
+try { records = grid(opts);}
+catch (e) { process.stderr.write("grid-source: " + e.message + "\n"); return 2;}
+
+process.stdout.write(toJSONL(records));
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_grid-source.js 135 lines on GitHub →
 #!/usr/bin/env node
-/* test_ratchet-pdf-text.js — known-answer battery for ratchet-pdf-text.
+/* test_grid-source.js — battery for the grid-source gift.
+node test_grid-source.js -> exit 0 PASS / non-zero FAIL.
 
-The oracle is OUT OF BAND: every expected value below is a literal fact
-written by hand, never the output of a second PDF parser. Each PDF fixture is
-assembled from raw bytes so the expected extracted text is known by
-construction. Node's zlib provides the inflater for the compressed case (the
-same inflater the CLI wires); the extractor itself carries no zlib.
-
-Run: node test_ratchet-pdf-text.js (exit 0 = all pass, nonzero = failure)
+The oracle is INDEPENDENT: the gift walks two nested loops (for row / for col); the oracle
+generates cells from a FLAT index (0..rows*cols-1) and maps each index back to (row,col) by
+division/modulo — a different route to the same set, so agreement proves the gift's ordering
+and coordinates rather than re-running its own logic. Plus frozen hand goldens for each of the
+three quiet failures and the fail-closed dimension edges.
 */
 "use strict";
-var zlib = require("zlib");
-var assert = require("assert");
-var { parsePdfText} = require("./ratchet-pdf-text.js");
+var G = require("./grid-source.js");
+var grid = G.grid, toJSONL = G.toJSONL;
 
 var pass = 0, fail = 0;
-function ok(name, fn) {
-try { fn(); pass++; console.log(" ok " + name);}
-catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+function ok(name, cond) { if (cond) { pass++;} else { fail++; console.log(" FAIL " + name);}}
+function eq(name, a, b) { ok(name, JSON.stringify(a) === JSON.stringify(b));}
+
+/* ---- INDEPENDENT ORACLE: flat-index -> (row,col), a different route than nested loops ---- */
+function oracle(opts) {
+var rows = opts.rows, cols = opts.cols;
+var base = opts.originOne? 1: 0;
+var n = rows * cols;
+var cells = [];
+for (var k = 0; k < n; k++) {
+// row-major flat index -> coordinates
+var r = Math.floor(k / cols);
+var c = k % cols;
+var rec = { row: base + r, col: base + c};
+if (opts.valueMode === "index") rec.value = r * cols + c; // == k in row-major
+else if (opts.valueMode === "fill") rec.value = opts.fill;
+cells.push(rec);
+}
+if (opts.transpose) {
+// re-sort into column-major order WITHOUT recomputing index (index stays row-major)
+cells.sort(function (a, b) {
+var ac = a.col, bc = b.col, ar = a.row, br = b.row;
+if (ac!== bc) return ac - bc;
+return ar - br;
+});
+}
+return cells;
 }
 
-function bytes(str) { return Buffer.from(str, "latin1");}
-
-// Build a minimal PDF whose single content stream is `content` (uncompressed),
-// with a correct /Length. Structure is deliberately spartan — the extractor is
-// xref-tolerant and scans for streams, so we don't need a valid xref table.
-function uncompressedPdf(content) {
-var head = "%PDF-1.4\n";
-var obj =
-"4 0 obj\n<< /Length " + content.length + " >>\nstream\n" +
-content +
-"\nendstream\nendobj\n";
-var tail = "%%EOF\n";
-return bytes(head + obj + tail);
+/* ---- grid == oracle across a dimension grid ---------------------------- */
+var DIMS = [[1, 1], [1, 5], [5, 1], [3, 3], [3, 4], [9, 9], [2, 7], [0, 0], [0, 3], [4, 0]];
+var MODES = [
+{},
+{ valueMode: "index"},
+{ valueMode: "fill", fill: 0},
+{ valueMode: "fill", fill: "x"},
+{ originOne: true},
+{ transpose: true},
+{ transpose: true, valueMode: "index"},
+{ originOne: true, valueMode: "index", transpose: true}
+];
+for (var d = 0; d < DIMS.length; d++) {
+for (var m = 0; m < MODES.length; m++) {
+var opts = Object.assign({ rows: DIMS[d][0], cols: DIMS[d][1]}, MODES[m]);
+var got = grid(opts);
+var want = oracle(opts);
+eq("grid==oracle dims=" + DIMS[d] + " mode#" + m, got, want);
+}
 }
 
-// Build a PDF whose single content stream is FlateDecode-compressed `content`.
-function flatePdf(content) {
-var comp = zlib.deflateSync(Buffer.from(content, "latin1")); // zlib-wrapped (RFC1950)
-var head = bytes("%PDF-1.5\n4 0 obj\n<< /Filter /FlateDecode /Length " + comp.length + " >>\nstream\n");
-var mid = comp;
-var tail = bytes("\nendstream\nendobj\n%%EOF\n");
-return Buffer.concat([head, mid, tail]);
-}
+/* ---- QUIET FAILURE 1: stable row-major order (not column-major by accident) ---- */
+(function () {
+var g = grid({ rows: 2, cols: 3});
+// row-major: (0,0)(0,1)(0,2)(1,0)(1,1)(1,2)
+eq("QF1 row-major order", g.map(function (x) { return [x.row, x.col];}),
+[[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]);
+var t = grid({ rows: 2, cols: 3, transpose: true});
+// column-major: (0,0)(1,0)(0,1)(1,1)(0,2)(1,2)
+eq("QF1 --transpose column-major order", t.map(function (x) { return [x.row, x.col];}),
+[[0, 0], [1, 0], [0, 1], [1, 1], [0, 2], [1, 2]]);
+})();
 
-// ---- 1. simple Tj, uncompressed -----------------------------------------
-ok("1 Tj literal string, uncompressed", function () {
-var pdf = uncompressedPdf("BT /F1 12 Tf (Hello World) Tj ET");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Hello World"); // ORACLE: literal
-assert.strictEqual(r.streams.length, 1);
-assert.strictEqual(r.streams[0].compressed, false);
-});
+/* ---- QUIET FAILURE 2: bounded/valid dimensions (guard is in the CLI; core guards too) ---- */
+(function () {
+var threw = false;
+try { grid({ rows: 2.5, cols: 2});} catch (e) { threw = true;}
+ok("QF2 core throws on fractional rows", threw);
+threw = false;
+try { grid({ rows: -1, cols: 2});} catch (e) { threw = true;}
+ok("QF2 core throws on negative rows", threw);
+// 0x0 is the empty stream, NOT an error
+eq("QF2 0x0 is the empty grid", grid({ rows: 0, cols: 0}), []);
+eq("QF2 0xN is empty", grid({ rows: 0, cols: 5}), []);
+})();
 
-// ---- 2. multiple Tj across the stream -----------------------------------
-ok("2 two Tj operators concatenate in order", function () {
-var pdf = uncompressedPdf("(Alpha) Tj (Beta) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "AlphaBeta"); // ORACLE
-});
+/* ---- QUIET FAILURE 3: coordinate/value separation ---- */
+(function () {
+var plain = grid({ rows: 1, cols: 2});
+ok("QF3 no value field when no value mode", plain.every(function (x) { return x.value === undefined;}));
+var idx = grid({ rows: 2, cols: 2, valueMode: "index"});
+eq("QF3 --index is row-major 0-based", idx.map(function (x) { return x.value;}), [0, 1, 2, 3]);
+var idxT = grid({ rows: 2, cols: 2, valueMode: "index", transpose: true});
+// transpose changes ORDER but index stays row-major property: (0,0)=0 (1,0)=2 (0,1)=1 (1,1)=3
+eq("QF3 --index stable under --transpose (order changes, value does not)",
+idxT.map(function (x) { return [x.row, x.col, x.value];}),
+[[0, 0, 0], [1, 0, 2], [0, 1, 1], [1, 1, 3]]);
+var fill = grid({ rows: 1, cols: 3, valueMode: "fill", fill: 7});
+ok("QF3 --fill is the constant", fill.every(function (x) { return x.value === 7;}));
+})();
 
-// ---- 3. TJ array drops numeric kerning, keeps strings -------------------
-ok("3 TJ array keeps strings, drops numbers", function () {
-var pdf = uncompressedPdf("[(Wa) -80 (ter) -60 (mark)] TJ");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Watermark"); // ORACLE: kerning gone
-});
+/* ---- composition: {row,col} shape, and --cells emits grid-sink's {row,col,w,h} block ---- */
+(function () {
+var g = grid({ rows: 2, cols: 2});
+ok("composition: every record has row and col (coordinate substrate)",
+g.every(function (x) { return typeof x.row === "number" && typeof x.col === "number";}));
+var cells = grid({ rows: 2, cols: 2, cells: true});
+ok("composition: --cells emits unit blocks {row,col,w:1,h:1} (grid-sink input)",
+cells.every(function (x) { return x.w === 1 && x.h === 1 && typeof x.row === "number" && typeof x.col === "number";}));
+eq("composition: --cells first block", cells[0], { row: 0, col: 0, w: 1, h: 1});
+})();
 
-// ---- 4. hex string decode -----------------------------------------------
-ok("4 hex string <48656c6c6f> => Hello", function () {
-var pdf = uncompressedPdf("<48656c6c6f> Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Hello"); // ORACLE: hex of 'Hello'
-});
+/* ---- --origin-one ---- */
+(function () {
+var g = grid({ rows: 2, cols: 2, originOne: true});
+eq("--origin-one numbers from 1", g.map(function (x) { return [x.row, x.col];}),
+[[1, 1], [1, 2], [2, 1], [2, 2]]);
+})();
 
-// ---- 5. odd-length hex pads with trailing zero --------------------------
-ok("5 odd hex <4> => single byte 0x40 ('@')", function () {
-var pdf = uncompressedPdf("<4> Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "@"); // ORACLE: 0x40 padded
-});
+/* ---- determinism: two calls byte-identical ---- */
+ok("deterministic across two grid() calls",
+toJSONL(grid({ rows: 5, cols: 5, valueMode: "index"})) === toJSONL(grid({ rows: 5, cols: 5, valueMode: "index"})));
 
-// ---- 6. octal escape in literal -----------------------------------------
-ok("6 octal escape \\101 => 'A'", function () {
-var pdf = uncompressedPdf("(\\101\\102\\103) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "ABC"); // ORACLE: 0101=A 0102=B 0103=C
-});
+/* ---- toJSONL surface ---- */
+eq("toJSONL renders one line per cell with trailing newline",
+toJSONL([{ row: 0, col: 0}, { row: 0, col: 1}]),
+'{"row":0,"col":0}\n{"row":0,"col":1}\n');
 
-// ---- 7. balanced nested parens preserved --------------------------------
-ok("7 nested parens (a(b)c) preserved", function () {
-var pdf = uncompressedPdf("(a(b)c) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "a(b)c"); // ORACLE
-});
-
-// ---- 8. escaped paren and backslash -------------------------------------
-ok("8 escaped \\( \\) \\\\ decode literally", function () {
-var pdf = uncompressedPdf("(x\\(y\\)z\\\\) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "x(y)z\\"); // ORACLE
-});
-
-// ---- 9. ' operator (move-to-next-line-and-show) counts as text ----------
-ok("9 quote operator shows string", function () {
-var pdf = uncompressedPdf("(line two) '");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "line two"); // ORACLE
-});
-
-// ---- 10. FlateDecode stream, WITH inflater -> decoded -------------------
-ok("10 FlateDecode with inflater decodes text", function () {
-var pdf = flatePdf("BT (Compressed hi) Tj ET");
-var r = parsePdfText(pdf, { inflate: zlib.inflateSync});
-assert.strictEqual(r.text, "Compressed hi"); // ORACLE
-assert.strictEqual(r.streams[0].compressed, true);
-assert.strictEqual(r.streams[0].needsInflate, false);
-});
-
-// ---- 11. FlateDecode stream, WITHOUT inflater -> surfaced, not faked -----
-ok("11 FlateDecode without inflater surfaces raw bytes, text null", function () {
-var pdf = flatePdf("BT (secret) Tj ET");
-var r = parsePdfText(pdf); // no inflate option
-assert.strictEqual(r.text, ""); // ORACLE: nothing faked
-assert.strictEqual(r.streams[0].needsInflate, true);
-assert.ok(r.streams[0].compressedBytes instanceof Uint8Array); // honest surfacing
-assert.strictEqual(r.streams[0].text, null);
-});
-
-// ---- 12. empty content stream -> empty text, one entry ------------------
-ok("12 empty content stream yields empty text", function () {
-var pdf = uncompressedPdf("");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, ""); // ORACLE
-assert.strictEqual(r.streams.length, 1);
-});
-
-// ---- 13. RATCHET: not a PDF (bad header) throws -------------------------
-ok("13 ratchet: missing %PDF- header throws", function () {
-var bad = bytes("GIF89a not a pdf (nope) Tj");
-assert.throws(function () { parsePdfText(bad);}, /not a PDF/); // ORACLE: refusal
-});
-
-// ---- 14. RATCHET: /Length running past buffer throws --------------------
-ok("14 ratchet: lying /Length past end-of-buffer throws", function () {
-// declare a huge length so it exceeds the buffer AND no endstream follows
-var body = "%PDF-1.4\n4 0 obj\n<< /Length 99999 >>\nstream\n(hi) Tj";
-assert.throws(function () { parsePdfText(bytes(body));}, /past end of buffer|endstream/);
-});
-
-// ---- 15. RATCHET: stream without endstream throws -----------------------
-ok("15 ratchet: stream with no endstream throws", function () {
-var body = "%PDF-1.4\n4 0 obj\n<< >>\nstream\n(dangling) Tj\n"; // no endstream
-assert.throws(function () { parsePdfText(bytes(body));}, /endstream/);
-});
-
-// ---- 16. RATCHET: unterminated literal string throws --------------------
-ok("16 ratchet: unterminated ( string throws", function () {
-// valid stream shell, but the content has an open paren that never closes
-var content = "(unterminated Tj ET";
-var pdf = uncompressedPdf(content);
-// safeExtract swallows content-syntax throws per contract (stream!= text),
-// so text is empty and the stream is still surfaced honestly.
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, ""); // ORACLE: no faked text
-assert.strictEqual(r.streams.length, 1);
-});
-
-// ---- 17. ArrayBuffer input accepted (dual-home Uint8Array contract) -----
-ok("17 accepts ArrayBuffer input", function () {
-var pdf = uncompressedPdf("(buf) Tj");
-var ab = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength);
-var r = parsePdfText(ab);
-assert.strictEqual(r.text, "buf"); // ORACLE
-});
-
-// ---- 18. two content streams, both decoded, joined with newline ---------
-ok("18 two streams join with newline", function () {
-var head = "%PDF-1.4\n";
-var o1 = "4 0 obj\n<< /Length 9 >>\nstream\n(first) Tj\nendstream\nendobj\n";
-var o2 = "5 0 obj\n<< /Length 10 >>\nstream\n(second) Tj\nendstream\nendobj\n";
-var pdf = bytes(head + o1 + o2 + "%%EOF\n");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "first\nsecond"); // ORACLE
-assert.strictEqual(r.streams.length, 2);
-});
-
-console.log("\nratchet-pdf-text: " + pass + " passed, " + fail + " failed");
-process.exit(fail? 1: 0);
+/* ---- report ---- */
+console.log("grid-source battery: " + pass + " passed, " + fail + " failed");
+process.exitCode = fail === 0? 0: 1;
 
 Take the whole folder →
 MIT
@@ -1162,566 +418,981 @@ Node / browser, no dependencies
 
 ---
 
-# PNG Text — a Loop MMT gift
-https://loopmmt.com/gifts/ratchet-png-text/
+# Heatmap-sink — a Loop MMT gift
+https://loopmmt.com/gifts/heatmap-sink/
 [coverage: optional · branch: gifts]
 
-What's Hidden In That PNG? transform ← all gifts
+Cells In, One Heatmap SVG Out render ← all gifts
 
-PNG Text
+Heatmap-sink
 
-Pull the text metadata (Title, Author, Description, Software, Copyright, an XMP packet) out of a PNG's tEXt / zTXt / iTXt chunks — with no dependencies, in Node or the browser. parsePngText(bytes) is a pure function: it walks the chunk stream and returns the text entries in file order. It's a ratchet parser — it advances one chunk at a time and refuses to move past anything malformed: it validates the 8-byte signature and recomputes the CRC-32 over every chunk, throwing on a mismatch, a length that runs past the buffer, or a text chunk missing its null separator. A parser that hands you text out of a corrupt chunk is lying about the file; this one won't.
+heatmap-sink turns a stream of (x,y,value) cells into one standalone, deterministic heatmap SVG with zero dependencies — one <rect> per grid cell, painted from a fixed 5-bucket color scale. It renders no axes, labels, legend, colorbar, or title — only the field — so it drops straight into a README, a report, or a CI comment where a plotting library would be overkill. The load-bearing property: integer grid coordinates and INTEGER color buckets mean no float ever reaches the output, and cells are drawn row-major regardless of arrival order, so the same set of cells produces byte-identical SVG out — in Node or a browser, committable and diffable.
 
 The honest edge
 
-It reads TEXTUAL metadata only — no pixels, IHDR, palettes, or gamma. It does NOT inflate zTXt / compressed-iTXt on its own (zlib isn't in the browser's dependency-free surface): such records come back with compressed:true, text:null, and their raw compressedText bytes, decoded only if you pass your own inflate function. And it does not repair a bad file — malformed input throws, it never guesses.
+heatmap-sink is a grid-of-rects heatmap primitive, not a plotting library: one <rect> per (x,y) cell, no axes, labels, legend, colorbar, or title, no fonts/CSS/script. It takes NUMBERS ONLY — (x,y,v) triples — so no caller text reaches the output and there is no escaping surface. Colors come from a fixed named 5-bucket scale (missing cells take a fixed empty fill) — never caller-chosen. Two values in the same band draw the SAME color: it shows the FIELD, not the exact magnitude. A non-finite value, a bad coordinate, or a duplicate (x,y) is a hard error, never a guessed cell. Same cells in → byte-identical SVG out, independent of order.
 
 Run it
 
-node ratchet-png-text.js < image.png
-test_ratchet-png-text.js (21/21: real-PNG byte vectors tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, live-zlib backstop, coercion, determinism, mutation-bite)
+printf '[0,0,0]\n[1,0,1]\n[0,1,2]\n[1,1,3]\n' | node heatmap-sink.js # a 2x2 heatmap SVG (--palette heat|cool|mono|viridis · --cell N · --min/--max to pin)
+test_heatmap-sink.js (16/16, out-of-band hand-computed SVG oracle) + Plumb conformance GREEN (I1-I5, signed, clock-independent)
 Node / browser, no dependencies
 
 The code — every file that ships
 
-ratchet-png-text.js 305 lines on GitHub →
+heatmap-sink.js 314 lines on GitHub →
 #!/usr/bin/env node
-/* ratchet-png-text.js — a pure, dependency-free, STRICT extractor of the textual
-metadata chunks (tEXt, zTXt, iTXt) from a PNG byte stream. Runs identically in
-a browser and in Node (no DOM, no dependencies).
-
-WHY THIS EXISTS. A PNG can carry human-readable metadata — Title, Author,
-Description, Software, Copyright, an XMP packet — in tEXt/zTXt/iTXt chunks. You
-have the file's bytes (an upload, a fetch, a buffer) and you want those key/value
-pairs without pulling in a full image decoder. The usual answer is a heavy
-library that parses pixels you don't care about, or a hand-rolled loop that
-trusts the file and hands you text out of a chunk whose CRC doesn't even match.
-
-WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one chunk at a
-time and REFUSES to move past anything malformed. It validates the 8-byte PNG
-signature, and for EVERY chunk it recomputes the CRC-32 over (type + data) and
-rejects a mismatch. A length that runs past the end of the buffer, a stream that
-ends before IEND, a text chunk missing its null separator — each is a thrown
-Error, never a silently-truncated string. A parser that hands you text from a
-corrupt chunk is lying about what the file says; this one won't.
-
-WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
-• tEXt — uncompressed Latin-1 keyword + text. Decoded directly.
-• iTXt (uncompressed) — UTF-8 keyword, language tag, translated keyword, and
-text. Decoded directly.
-• zTXt and COMPRESSED iTXt — the keyword and metadata are decoded, and the
-raw zlib-compressed text bytes are surfaced on the entry as
-`compressedText`. The text itself is decoded ONLY if you pass an
-`inflate` function in the options (see below). This is deliberate: zlib
-inflate is not in the browser's synchronous, dependency-free surface, so
-the core stays DOM-free and zero-dependency and lets the CALLER decide the
-inflater (Node: `require("zlib").inflateSync`; browser: pako, etc.).
-
-WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
-It does not decode pixels, IHDR geometry, palettes, gamma, or any non-text
-chunk — it walks the chunk stream to find text and validates the CRC of every
-chunk it steps over, but returns only the text entries. It does not inflate
-compressed text on its own (pass `inflate`). It does not repair a bad file.
-
-API
-parsePngText(bytes[, options]) -> Array<Entry>
-`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
-`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
-used to decode zTXt / compressed-iTXt text.
-Returns the text entries in file order (possibly empty). THROWS an Error on
-any malformed input (bad signature, bad CRC, truncation, bad chunk shape).
-
-Entry shape (all entries carry `kind` and `keyword`):
-tEXt: { kind:"tEXt", keyword, text, compressed:false}
-zTXt: { kind:"zTXt", keyword, compressed:true, text:<string|null>,
-compressedText:Uint8Array}
-iTXt: { kind:"iTXt", keyword, compressed:<bool>, languageTag,
-translatedKeyword, text:<string|null>,
-compressedText?:Uint8Array} // compressedText only when compressed
-
-Pure function of its input. Same code in a browser
-(window.LoopGifts.parsePngText) or Node (this CLI / require()).
-
-USAGE
-node ratchet-png-text.js cover.png # prints "keyword\ttext" per entry
-node ratchet-png-text.js --help
-The CLI (Node only) supplies Node's zlib as the inflater so compressed text is
-decoded; the shipped core stays dependency-free.
-
-Released under MIT.
+/*
+* heatmap-sink — turn (x,y,v) cells into one standalone, deterministic heatmap SVG, no deps.
+* MIT · zero-dependency · standalone gift · lane: sink (consumes data, emits an artifact).
+*
+* THE PRINTED EDGE (read before trusting the output):
+* This is a GRID-OF-RECTS heatmap primitive, not a plotting library. It draws GEOMETRY
+* ONLY — one <rect> per (x,y) grid cell inside a plain <svg> frame. It renders NO axes,
+* tick marks, tick labels, legend, colorbar, title, or interactivity, and it embeds NO
+* fonts, NO CSS, and NO <script>. It takes NUMBERS ONLY — (x,y,v) triples — so no caller
+* text ever reaches the output, and there is no text-escaping surface to get wrong.
+* Colors are NOT free-form input: each cell is painted from a fixed, named, DISCRETE color
+* scale (value → one of N buckets across the data's [min,max]), and missing cells take a
+* fixed empty fill — so the output can never carry an attacker-chosen attribute string.
+* Because there are only N buckets, two values in the same band draw the SAME color: it
+* shows the FIELD, not the exact magnitude, and it is not a substitute for the number. A
+* non-finite v, a non-integer or negative coordinate, a duplicate (x,y), or a cell outside
+* a pinned grid is a HARD ERROR, never silently dropped or guessed. Output is a PURE
+* FUNCTION of the input, independent of cell ORDER: same cells in → byte-identical SVG out.
+*
+* USAGE:
+* printf '[0,0,0]\n[1,0,1]\n[0,1,2]\n[1,1,3]\n' | node heatmap-sink.js # 2x2 heatmap
+* printf '{"x":0,"y":0,"v":9}\n' | node heatmap-sink.js # object cells
+* printf '[0,0,5]\n[1,0,5]\n' | node heatmap-sink.js --palette cool --min 0 --max 10
+* echo '{"cells":[[0,0,1],[1,1,9]],"palette":"mono"}' | node heatmap-sink.js # spec object
+* node heatmap-sink.js --help
+*
+* INPUT (stdin): either
+* - JSONL — one cell per line, each `[x,y,v]` or `{"x":X,"y":Y,"v":V}` (the streaming form)
+* - a single JSON spec object { cells, min, max, palette, cell, cols, rows, empty}
+* x,y are NON-NEGATIVE INTEGER grid coordinates (column, row); v is a finite number.
+* CLI flags (--palette --cell --min --max --cols --rows --empty) OVERRIDE object fields.
+*
+* OUTPUT (stdout): one SVG document string (UTF-8), trailing newline. No cells → an empty frame.
+*
+* DETERMINISM: integer grid coordinates, integer cell size, INTEGER color buckets, cells drawn
+* in row-major order regardless of input order, 3-decimal coordinate precision, stable
+* attribute order. No wall-clock, no randomness. Same cells → same bytes, in Node or a browser.
+* PORTABILITY: pure JS on plain arrays/strings — identical in Node and the browser.
 */
-"use strict";
+'use strict';
 
-// ---- CRC-32 (PNG / IEEE 802.3, polynomial 0xEDB88320) ----------------------
-// Table built once. Pure; no dependencies. This is the parser's teeth: every
-// chunk's stored CRC is recomputed over (type-bytes + data-bytes) and compared.
-var CRC_TABLE = (function () {
-var t = new Array(256);
-for (var n = 0; n < 256; n++) {
-var c = n;
-for (var k = 0; k < 8; k++) {
-c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);
-}
-t[n] = c >>> 0;
-}
-return t;
-})();
-
-function crc32(bytes, start, end) {
-var c = 0xffffffff;
-for (var i = start; i < end; i++) {
-c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
-}
-return (c ^ 0xffffffff) >>> 0;
-}
-
-// ---- byte helpers -----------------------------------------------------------
-var PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-
-function u32be(b, i) {
-return ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
-}
-
-// Latin-1 (ISO-8859-1): byte value === Unicode code point. Zero-dependency and
-// correct for tEXt keyword/text and iTXt language tags.
-function latin1(bytes, start, end) {
-var s = "";
-for (var i = start; i < end; i++) { s += String.fromCharCode(bytes[i]);}
-return s;
-}
-
-// UTF-8 via the platform TextDecoder — present in both Node (>=11, global) and
-// browsers. Used for iTXt (UTF-8 by spec).
-var UTF8 = (typeof TextDecoder!== "undefined")? new TextDecoder("utf-8"): null;
-function utf8(bytes, start, end) {
-var slice = bytes.subarray? bytes.subarray(start, end): bytes.slice(start, end);
-if (UTF8) { return UTF8.decode(slice);}
-// Fallback (no TextDecoder): decode UTF-8 by hand. Kept minimal.
-var s = "", i = 0;
-while (i < slice.length) {
-var b0 = slice[i++];
-if (b0 < 0x80) { s += String.fromCharCode(b0);}
-else if (b0 < 0xe0) { s += String.fromCharCode(((b0 & 0x1f) << 6) | (slice[i++] & 0x3f));}
-else if (b0 < 0xf0) { s += String.fromCharCode(((b0 & 0x0f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f));}
-else {
-var cp = ((b0 & 0x07) << 18) | ((slice[i++] & 0x3f) << 12) | ((slice[i++] & 0x3f) << 6) | (slice[i++] & 0x3f);
-cp -= 0x10000;
-s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-}
-}
-return s;
-}
-
-// Find the index of the first null byte in [start, end); -1 if none.
-function indexOfNull(bytes, start, end) {
-for (var i = start; i < end; i++) { if (bytes[i] === 0) { return i;}}
-return -1;
-}
-
-function toU8(input) {
-if (input instanceof Uint8Array) { return input;}
-if (typeof ArrayBuffer!== "undefined" && input instanceof ArrayBuffer) { return new Uint8Array(input);}
-if (input && input.buffer instanceof ArrayBuffer && typeof input.byteLength === "number") {
-// other typed-array / DataView view over a buffer
-return new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
-}
-throw new TypeError("parsePngText: expected a Uint8Array / Buffer / ArrayBuffer");
-}
-
-// ---- text-chunk decoders ----------------------------------------------------
-function decodeTEXt(data) {
-var nul = indexOfNull(data, 0, data.length);
-if (nul === -1) { throw new Error("tEXt chunk: missing null separator");}
-if (nul < 1 || nul > 79) { throw new Error("tEXt chunk: keyword must be 1-79 bytes");}
-return {
-kind: "tEXt",
-keyword: latin1(data, 0, nul),
-text: latin1(data, nul + 1, data.length),
-compressed: false
+// ---- color scales (the ONLY source of cell color; no free-form color input) -----
+// Named, closed sets of N=5 discrete colors, low value → high value. A value v is painted
+// SCALES[name][level(v)]; level is an integer bucket, so no float ever reaches the output.
+var N_BUCKETS = 5;
+var SCALES = {
+heat: ['#ffffcc', '#fed976', '#fd8d3c', '#e31a1c', '#800026'], // light yellow → deep red
+cool: ['#f7fbff', '#c6dbef', '#6baed6', '#2171b5', '#08306b'], // light → deep blue
+mono: ['#f7f7f7', '#cccccc', '#969696', '#636363', '#252525'], // light → dark gray
+viridis: ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725'] // dark purple → yellow
 };
+// Empty (missing) cells: a closed choice, never caller free-form. 'none' omits the rect.
+var EMPTY_FILLS = { light: '#eeeeee', dark: '#333333', none: null};
+var DEFAULTS = { palette: 'heat', cell: 16, empty: 'light'};
+
+// ---- deterministic number formatting (verbatim from svg-sink) -------------------
+// Round to 3 decimals, strip trailing zeros (and a bare trailing dot), normalize -0.
+var PRECISION = 3, SCALE = 1000;
+function num(x) {
+var r = Math.round(x * SCALE) / SCALE;
+var s = r.toFixed(PRECISION);
+s = s.replace(/\.?0+$/, '');
+return (s === '' || s === '-0')? '0': s;
 }
 
-function decodeZTXt(data, inflate) {
-var nul = indexOfNull(data, 0, data.length);
-if (nul === -1) { throw new Error("zTXt chunk: missing null separator");}
-if (nul < 1 || nul > 79) { throw new Error("zTXt chunk: keyword must be 1-79 bytes");}
-if (nul + 1 >= data.length) { throw new Error("zTXt chunk: missing compression method");}
-var method = data[nul + 1];
-if (method!== 0) { throw new Error("zTXt chunk: unknown compression method " + method);}
-var comp = data.subarray? data.subarray(nul + 2): data.slice(nul + 2);
-var entry = {
-kind: "zTXt",
-keyword: latin1(data, 0, nul),
-compressed: true,
-text: null,
-compressedText: comp
-};
-if (inflate) { entry.text = latin1(inflate(comp), 0, inflate(comp).length);}
-return entry;
+// ---- validation helpers --------------------------------------------------------
+function finiteV(v, x, y) {
+if (typeof v!== 'number' ||!isFinite(v)) {
+throw new Error('cell (' + x + ',' + y + ') value is not a finite number: ' + JSON.stringify(v));
+}
+return v;
+}
+function coord(c, which, cellRepr) {
+if (typeof c!== 'number' ||!isFinite(c) || Math.floor(c)!== c) {
+throw new Error(which + ' coordinate must be a non-negative integer, got ' + JSON.stringify(c) + ' in cell ' + cellRepr);
+}
+if (c < 0) throw new Error(which + ' coordinate must be a non-negative integer, got ' + JSON.stringify(c) + ' in cell ' + cellRepr);
+return c;
+}
+function posInt(v, dflt, name) {
+if (v == null) return dflt;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n <= 0) throw new Error(name + ' must be a positive integer, got ' + JSON.stringify(v));
+return n;
+}
+function nonNegIntOrNull(v, name) {
+if (v == null) return null;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n < 0) throw new Error(name + ' must be a non-negative integer, got ' + JSON.stringify(v));
+return n;
 }
 
-function decodeITXt(data, inflate) {
-var n = data.length;
-var k = indexOfNull(data, 0, n);
-if (k === -1) { throw new Error("iTXt chunk: missing keyword null separator");}
-if (k < 1 || k > 79) { throw new Error("iTXt chunk: keyword must be 1-79 bytes");}
-if (k + 2 >= n) { throw new Error("iTXt chunk: truncated header");}
-var compFlag = data[k + 1];
-var compMethod = data[k + 2];
-if (compFlag!== 0 && compFlag!== 1) { throw new Error("iTXt chunk: bad compression flag " + compFlag);}
-if (compFlag === 1 && compMethod!== 0) { throw new Error("iTXt chunk: unknown compression method " + compMethod);}
-var langStart = k + 3;
-var langNul = indexOfNull(data, langStart, n);
-if (langNul === -1) { throw new Error("iTXt chunk: missing language-tag null separator");}
-var transStart = langNul + 1;
-var transNul = indexOfNull(data, transStart, n);
-if (transNul === -1) { throw new Error("iTXt chunk: missing translated-keyword null separator");}
-var textStart = transNul + 1;
-
-var entry = {
-kind: "iTXt",
-keyword: utf8(data, 0, k),
-compressed: compFlag === 1,
-languageTag: latin1(data, langStart, langNul),
-translatedKeyword: utf8(data, transStart, transNul),
-text: null
-};
-var body = data.subarray? data.subarray(textStart): data.slice(textStart);
-if (compFlag === 0) {
-entry.text = utf8(body, 0, body.length);
+// ---- one cell -> {x,y,v} (accepts [x,y,v] or {x,y,v}) --------------------------
+function asCell(raw) {
+var repr = JSON.stringify(raw);
+var x, y, v;
+if (Array.isArray(raw)) {
+if (raw.length!== 3) throw new Error('cell array must be [x,y,v] (3 numbers), got ' + repr);
+x = raw[0]; y = raw[1]; v = raw[2];
+} else if (raw && typeof raw === 'object') {
+if (!('x' in raw) ||!('y' in raw) ||!('v' in raw)) throw new Error('cell object must have x,y,v, got ' + repr);
+x = raw.x; y = raw.y; v = raw.v;
 } else {
-entry.compressedText = body;
-if (inflate) { var raw = inflate(body); entry.text = utf8(raw, 0, raw.length);}
+throw new Error('cell must be [x,y,v] or {x,y,v}, got ' + repr);
 }
-return entry;
-}
-
-/**
-* parsePngText(input[, options]) -> Array<Entry>
-* Strictly walk a PNG byte stream and return its tEXt/zTXt/iTXt entries in file
-* order. Validates the signature and every chunk's CRC-32; throws on any
-* malformed input. See the file header for the Entry shapes and the `inflate`
-* option (used to decode zTXt / compressed iTXt text).
-*/
-function parsePngText(input, options) {
-var bytes = toU8(input);
-var inflate = options && options.inflate;
-var len = bytes.length;
-
-if (len < 8) { throw new Error("not a PNG: shorter than the 8-byte signature");}
-for (var s = 0; s < 8; s++) {
-if (bytes[s]!== PNG_SIG[s]) { throw new Error("not a PNG: bad signature");}
+coord(x, 'x', repr); coord(y, 'y', repr); finiteV(v, x, y);
+return { x: x, y: y, v: v};
 }
 
-var entries = [];
-var off = 8;
-var sawIEND = false;
-
-while (off < len) {
-if (off + 8 > len) { throw new Error("truncated PNG: incomplete chunk header at offset " + off);}
-var dataLen = u32be(bytes, off);
-var typeStart = off + 4;
-var dataStart = off + 8;
-var dataEnd = dataStart + dataLen;
-var crcEnd = dataEnd + 4;
-if (crcEnd > len) { throw new Error("truncated PNG: chunk data/CRC runs past end at offset " + off);}
-
-var type = latin1(bytes, typeStart, typeStart + 4);
-var storedCrc = u32be(bytes, dataEnd);
-var actualCrc = crc32(bytes, typeStart, dataEnd);
-if (storedCrc!== actualCrc) {
-throw new Error("CRC mismatch in " + type + " chunk at offset " + off +
-": stored 0x" + storedCrc.toString(16) + "!= computed 0x" + actualCrc.toString(16));
+// ---- scale (shared value-domain across all cells; shape from svg-sink/sparkline) --
+function domain(values, min, max) {
+var lo = (min!= null)? Number(min): Infinity;
+var hi = (max!= null)? Number(max): -Infinity;
+if (min == null || max == null) {
+for (var i = 0; i < values.length; i++) {
+var v = values[i];
+if (min == null && v < lo) lo = v;
+if (max == null && v > hi) hi = v;
+}
+}
+if (!isFinite(lo)) lo = 0;
+if (!isFinite(hi)) hi = 0;
+if (lo === hi) { lo -= 1; hi += 1;} // flat field -> unit window, painted mid-scale
+return { lo: lo, hi: hi};
+}
+function level(v, lo, hi) {
+var k = Math.floor(((v - lo) / (hi - lo)) * N_BUCKETS);
+if (k < 0) k = 0;
+if (k >= N_BUCKETS) k = N_BUCKETS - 1; // v == hi -> N clamps to N-1
+return k;
 }
 
-var data = bytes.subarray? bytes.subarray(dataStart, dataEnd): bytes.slice(dataStart, dataEnd);
-if (type === "tEXt") { entries.push(decodeTEXt(data));}
-else if (type === "zTXt") { entries.push(decodeZTXt(data, inflate));}
-else if (type === "iTXt") { entries.push(decodeITXt(data, inflate));}
-else if (type === "IEND") { sawIEND = true; off = crcEnd; break;}
+// ---- input normalization -------------------------------------------------------
+// Accept: [[x,y,v],...] | [{x,y,v},...] | {cells,...}. Return a validated spec.
+function normalize(input, flags) {
+var spec = {};
+var cellsRaw;
+if (input &&!Array.isArray(input) && typeof input === 'object') {
+cellsRaw = input.cells;
+if (input.min!= null) spec.min = input.min;
+if (input.max!= null) spec.max = input.max;
+if (input.palette!= null) spec.palette = input.palette;
+if (input.cell!= null) spec.cell = input.cell;
+if (input.cols!= null) spec.cols = input.cols;
+if (input.rows!= null) spec.rows = input.rows;
+if (input.empty!= null) spec.empty = input.empty;
+} else {
+cellsRaw = input;
+}
+flags = flags || {};
+for (var k in flags) if (flags[k]!= null) spec[k] = flags[k];
 
-off = crcEnd;
+if (cellsRaw == null) cellsRaw = [];
+if (!Array.isArray(cellsRaw)) throw new Error('input has no cells (expected [[x,y,v],...] or a {cells:...} object)');
+
+var cells = cellsRaw.map(asCell);
+
+spec.palette = (spec.palette!= null)? String(spec.palette): DEFAULTS.palette;
+spec.empty = (spec.empty!= null)? String(spec.empty): DEFAULTS.empty;
+spec.cell = posInt(spec.cell, DEFAULTS.cell, 'cell');
+spec.pinCols = nonNegIntOrNull(spec.cols, 'cols');
+spec.pinRows = nonNegIntOrNull(spec.rows, 'rows');
+if (spec.min!= null) spec.min = numOrThrow(spec.min, 'min');
+if (spec.max!= null) spec.max = numOrThrow(spec.max, 'max');
+if (spec.min!= null && spec.max!= null && spec.min >= spec.max) {
+throw new Error('min must be < max (got min=' + spec.min + ', max=' + spec.max + ')');
+}
+if (!SCALES[spec.palette]) throw new Error('unknown palette "' + spec.palette + '" (expected ' + Object.keys(SCALES).join(' | ') + ')');
+if (!(spec.empty in EMPTY_FILLS)) throw new Error('unknown empty "' + spec.empty + '" (expected ' + Object.keys(EMPTY_FILLS).join(' | ') + ')');
+
+// build the cell map; a duplicate (x,y) is a HARD error (ambiguous cell, no silent last-wins)
+var mapKey = {}, maxX = -1, maxY = -1;
+for (var i = 0; i < cells.length; i++) {
+var c = cells[i], key = c.x + ',' + c.y;
+if (Object.prototype.hasOwnProperty.call(mapKey, key)) {
+throw new Error('duplicate cell at (' + c.x + ',' + c.y + ') — each grid position may appear at most once');
+}
+mapKey[key] = c.v;
+if (c.x > maxX) maxX = c.x;
+if (c.y > maxY) maxY = c.y;
+}
+var cols = (spec.pinCols!= null)? spec.pinCols: maxX + 1;
+var rows = (spec.pinRows!= null)? spec.pinRows: maxY + 1;
+if (spec.pinCols!= null && maxX >= spec.pinCols) throw new Error('cell x=' + maxX + ' is outside the pinned grid cols=' + spec.pinCols);
+if (spec.pinRows!= null && maxY >= spec.pinRows) throw new Error('cell y=' + maxY + ' is outside the pinned grid rows=' + spec.pinRows);
+if (cols < 0) cols = 0;
+if (rows < 0) rows = 0;
+
+spec.cellMap = mapKey;
+spec.cols = cols;
+spec.rows = rows;
+spec.values = cells.map(function (c) { return c.v;});
+return spec;
+}
+function numOrThrow(v, name) {
+var n = Number(v);
+if (typeof n!== 'number' ||!isFinite(n)) throw new Error(name + ' must be a finite number, got ' + JSON.stringify(v));
+return n;
 }
 
-if (!sawIEND) { throw new Error("truncated PNG: stream ended before the IEND chunk");}
-return entries;
+// ---- core: renderHeatmap(spec) -> string (pure, the whole gift) ----------------
+function heatmap(input, flags) {
+var spec = normalize(input, flags);
+var cell = spec.cell, cols = spec.cols, rows = spec.rows;
+var W = cols * cell, H = rows * cell;
+var scale = SCALES[spec.palette];
+var emptyFill = EMPTY_FILLS[spec.empty]; // may be null (omit empty rects)
+var dom = domain(spec.values, spec.min, spec.max);
+
+var body = [];
+// row-major order — INPUT-ORDER-INDEPENDENT and deterministic.
+for (var y = 0; y < rows; y++) {
+for (var x = 0; x < cols; x++) {
+var key = x + ',' + y;
+var fill;
+if (Object.prototype.hasOwnProperty.call(spec.cellMap, key)) {
+fill = scale[level(spec.cellMap[key], dom.lo, dom.hi)];
+} else if (emptyFill == null) {
+continue; // 'none' -> omit the rect entirely
+} else {
+fill = emptyFill;
+}
+body.push('<rect x="' + num(x * cell) + '" y="' + num(y * cell) +
+'" width="' + num(cell) + '" height="' + num(cell) + '" fill="' + fill + '" />');
+}
 }
 
-// ---- Dual-runtime export: browser namespace + Node module ------------------
-if (typeof window!== "undefined") {
+// Fixed attribute order; xmlns first so the fragment is a valid standalone document.
+var open = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '">';
+return open + '\n' + (body.length? body.join('\n') + '\n': '') + '</svg>\n';
+}
+
+// ---- exports (browser attach · require · direct run) ---------------------------
+if (typeof window!== 'undefined') {
 window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.parsePngText = parsePngText;
+window.LoopGifts['heatmap-sink'] = { heatmap: heatmap, SCALES: SCALES, EMPTY_FILLS: EMPTY_FILLS};
 }
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { parsePngText: parsePngText};
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { heatmap: heatmap, num: num, normalize: normalize, domain: domain, SCALES: SCALES, EMPTY_FILLS: EMPTY_FILLS, N_BUCKETS: N_BUCKETS};
 }
 
-// ---- CLI: print "keyword\ttext" per text entry; Node supplies the inflater ---
-if (typeof require!== "undefined" && require.main === module) {
-var args = process.argv.slice(2);
-if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
-process.stdout.write(
-"ratchet-png-text — extract tEXt/zTXt/iTXt metadata from a PNG (strict)\n\n" +
-" node ratchet-png-text.js cover.png one line per text entry: keyword<TAB>text\n\n" +
-"Validates the PNG signature and every chunk's CRC-32; refuses malformed input.\n" +
-"Decodes tEXt and uncompressed iTXt directly; zTXt and compressed iTXt are\n" +
-"inflated here with Node's zlib (the shipped core is dependency-free).\n");
-process.exit(args.length === 0? 1: 0);
+// ---- cli -----------------------------------------------------------------------
+var HELP =
+'heatmap-sink — (x,y,v) cells -> a standalone, deterministic heatmap SVG, zero deps.\n\n' +
+" printf '[0,0,0]\\n[1,0,1]\\n[0,1,2]\\n[1,1,3]\\n' | node heatmap-sink.js\n" +
+" printf '{\"x\":0,\"y\":0,\"v\":9}\\n' | node heatmap-sink.js\n" +
+" printf '[0,0,5]\\n[1,0,5]\\n' | node heatmap-sink.js --palette cool --min 0 --max 10\n" +
+" echo '{\"cells\":[[0,0,1],[1,1,9]]}' | node heatmap-sink.js --cell 24\n\n" +
+'INPUT (stdin): JSONL of [x,y,v] or {x,y,v} cells (one per line), OR a {cells,...} spec object.\n' +
+'Flags (override object fields): --palette heat|cool|mono|viridis --cell N --min N --max N\n' +
+' --cols N --rows N --empty light|dark|none\n\n' +
+'Geometry only: one <rect> per cell, no axes/labels/legend/fonts/CSS/script. Numbers in, a\n' +
+'grid out. Colors come from a fixed named 5-bucket scale (not caller input). A non-finite v,\n' +
+'a bad coordinate, or a duplicate (x,y) -> error.\n';
+
+function parseFlags(argv) {
+var f = {};
+for (var i = 0; i < argv.length; i++) {
+var a = argv[i];
+if (a === '--palette') f.palette = argv[++i];
+else if (a === '--cell') f.cell = Number(argv[++i]);
+else if (a === '--min') f.min = Number(argv[++i]);
+else if (a === '--max') f.max = Number(argv[++i]);
+else if (a === '--cols') f.cols = Number(argv[++i]);
+else if (a === '--rows') f.rows = Number(argv[++i]);
+else if (a === '--empty') f.empty = argv[++i];
 }
-var fs = require("fs");
-var zlib = require("zlib");
-var inflate = function (b) { return zlib.inflateSync(Buffer.from(b));};
-var exitCode = 0;
-for (var a = 0; a < args.length; a++) {
+return f;
+}
+
+// Parse stdin: a single JSON spec object {cells:...} passes through; otherwise treat the
+// input as JSONL — one cell per non-empty line. Blank lines are skipped.
+function parseStdin(raw) {
+var trimmed = raw.trim();
+if (trimmed === '') return { cells: []};
+// single-object spec form?
+if (trimmed.charAt(0) === '{') {
 try {
-var buf = fs.readFileSync(args[a]);
-var list = parsePngText(buf, { inflate: inflate});
-if (args.length > 1) { process.stdout.write("== " + args[a] + " ==\n");}
-for (var e = 0; e < list.length; e++) {
-var en = list[e];
-var t = (en.text === null)? "[" + en.kind + ", compressed, no inflater]": en.text;
-process.stdout.write(en.keyword + "\t" + t + "\n");
+var obj = JSON.parse(trimmed);
+if (obj &&!Array.isArray(obj) && typeof obj === 'object' && 'cells' in obj) return obj;
+} catch (e) { /* fall through to JSONL (multi-line objects) */}
 }
-if (list.length === 0) { process.stdout.write("(no text chunks)\n");}
-} catch (err) {
-process.stderr.write("ratchet-png-text: " + args[a] + ": " + err.message + "\n");
-exitCode = 1;
+var cells = [];
+var lines = trimmed.split('\n');
+for (var i = 0; i < lines.length; i++) {
+var ln = lines[i].trim();
+if (ln === '') continue;
+var cell;
+try { cell = JSON.parse(ln);}
+catch (e) { throw new Error('line ' + (i + 1) + ' is not valid JSON: ' + e.message);}
+cells.push(cell);
 }
-}
-process.exit(exitCode);
+return { cells: cells};
 }
 
-test_ratchet-png-text.js 227 lines on GitHub →
+function main() {
+var argv = process.argv.slice(2);
+if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) { process.stdout.write(HELP); return;}
+var flags = parseFlags(argv);
+var chunks = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (d) { chunks += d;});
+process.stdin.on('end', function () {
+var input;
+try { input = parseStdin(chunks);}
+catch (e) { process.stderr.write('heatmap-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+var svg;
+try { svg = heatmap(input, flags);}
+catch (e) { process.stderr.write('heatmap-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+process.stdout.write(svg);
+});
+}
+if (typeof require!== 'undefined' && require.main === module) { main();}
+
+test_heatmap-sink.js 168 lines on GitHub →
 #!/usr/bin/env node
-/* test_ratchet-png-text.js — proves the strict PNG text extractor implements its
-stated contract correctly.
+/*
+* test_heatmap-sink.js — drift-check battery for the heatmap-sink gift.
+*
+* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The expected SVG documents below are
+* hand-computed from the documented math — level(v) = clamp(floor((v-lo)/(hi-lo)*5), 0, 4),
+* lo/hi the auto-fit or pinned domain (flat field -> unit window), cells drawn row-major at
+* (x*cell, y*cell) — written independently of the emitter, not captured from its output. A
+* build cannot certify itself, so the expected strings are the author's fact. The remaining
+* checks are contract properties (determinism, order-independence, closed palette, honest errors).
+*
+* Run: node test_heatmap-sink.js (exit 0 = all pass; nonzero = a named failure)
+*/
+'use strict';
+const assert = require('assert');
+const { heatmap, SCALES, EMPTY_FILLS} = require('./heatmap-sink.js');
 
-THE ORACLE. There is no PNG-text parser in the Node stdlib to diff against, so
-the oracle is the PNG spec expressed as CURATED, REAL PNG BYTE FIXTURES built
-in-test: each fixture is an actual PNG byte stream (8-byte signature + chunks
-with correct CRC-32 + IEND), so a "valid" vector is a genuine file the parser
-must read to a KNOWN set of entries, and an "invalid" vector is a genuine
-malformation the parser must THROW on. Every branch is exercised: tEXt,
-uncompressed iTXt (UTF-8, language tag, translated keyword), zTXt and compressed
-iTXt, the no-text case, and the malformations (bad signature, CRC mismatch,
-truncation, missing IEND, missing separators, bad length, non-buffer input).
-
-THE LIVE-REFERENCE BACKSTOP. The compressed path (zTXt / compressed iTXt) is
-built with Node's own zlib.deflateSync and decoded through the parser with
-zlib.inflateSync passed as the `inflate` option — so the zero-dependency core is
-cross-checked against a live reference implementation, sha256-style.
-
-Plus determinism (same bytes -> same entries, twice) and a mutation-bite (a
-text-carrying PNG and a no-text PNG must not share a result, so a degenerate
-core that returns a constant can't pass green). Exit 0 = all pass; exit 1 =
-a failure (loud). stdlib only. */
-"use strict";
-var assert = require("assert");
-var zlib = require("zlib");
-var parsePngText = require("./ratchet-png-text.js").parsePngText;
-
-var pass = 0, fail = 0;
-function ok(label, fn) {
-try { fn(); pass++;}
-catch (e) { fail++; console.error("FAIL " + label + "\n " + (e && e.message? e.message: e));}
+let n = 0, passed = 0;
+function check(name, fn) {
+n++;
+try { fn(); passed++; console.log(' ok ' + name);}
+catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
 }
 
-// ---- PNG fixture builder (a tiny, correct reference encoder) ----------------
-var SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// ---- hand-computed expected SVGs (heat palette, cell=16, empty=light) ------------
+// heat = #ffffcc #fed976 #fd8d3c #e31a1c #800026; empty light = #eeeeee
+const RAMP_2x2 =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fed976" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#e31a1c" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
 
-var CRC_TABLE = (function () {
-var t = new Array(256);
-for (var n = 0; n < 256; n++) {
-var c = n;
-for (var k = 0; k < 8; k++) { c = (c & 1)? (0xedb88320 ^ (c >>> 1)): (c >>> 1);}
-t[n] = c >>> 0;
-}
-return t;
-})();
-function crc32(buf) {
-var c = 0xffffffff;
-for (var i = 0; i < buf.length; i++) { c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);}
-return (c ^ 0xffffffff) >>> 0;
-}
-function u32(n) { var b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0, 0); return b;}
-
-// One PNG chunk: length + type + data + CRC(type+data).
-function chunk(type, data) {
-data = data || Buffer.alloc(0);
-var typeBuf = Buffer.from(type, "latin1");
-var body = Buffer.concat([typeBuf, data]);
-return Buffer.concat([u32(data.length), body, u32(crc32(body))]);
-}
-// A minimal, real IHDR (1x1, 8-bit grayscale) — for fixture realism.
-var IHDR = chunk("IHDR", Buffer.concat([u32(1), u32(1), Buffer.from([8, 0, 0, 0, 0])]));
-var IEND = chunk("IEND");
-
-function png(chunks) { return Buffer.concat([SIG].concat(chunks).concat([IEND]));}
-
-// tEXt data = keyword + \0 + text (Latin-1)
-function tEXt(keyword, text) {
-return chunk("tEXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0]), Buffer.from(text, "latin1")]));
-}
-// zTXt data = keyword + \0 + method(0) + zlib(text)
-function zTXt(keyword, text) {
-return chunk("zTXt", Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0, 0]), zlib.deflateSync(Buffer.from(text, "latin1"))]));
-}
-// iTXt data = keyword + \0 + cflag + cmethod + lang + \0 + transKeyword + \0 + text(UTF-8, maybe deflated)
-function iTXt(keyword, lang, trans, text, compressed) {
-var body = compressed? zlib.deflateSync(Buffer.from(text, "utf8")): Buffer.from(text, "utf8");
-return chunk("iTXt", Buffer.concat([
-Buffer.from(keyword, "utf8"), Buffer.from([0]),
-Buffer.from([compressed? 1: 0, 0]),
-Buffer.from(lang, "latin1"), Buffer.from([0]),
-Buffer.from(trans, "utf8"), Buffer.from([0]),
-body
-]));
-}
-
-var INFLATE = { inflate: function (b) { return zlib.inflateSync(Buffer.from(b));}};
-
-// ===========================================================================
-// VALID vectors — each must parse to a KNOWN result.
-// ===========================================================================
-ok("single tEXt decodes keyword+text", function () {
-var out = parsePngText(png([IHDR, tEXt("Title", "A Quiet Loop")]));
-assert.strictEqual(out.length, 1);
-assert.deepStrictEqual(out[0], { kind: "tEXt", keyword: "Title", text: "A Quiet Loop", compressed: false});
+// 1 — full 2x2 grid, values 0..3 auto-domain [0,3] -> one bucket per corner, in order.
+// level(0)=0 level(1)=floor(1/3*5)=1 level(2)=floor(2/3*5)=3 level(3)=clamp(5)=4
+check('ramp 2x2: [0,1,2,3] -> #ffffcc #fed976 #e31a1c #800026', () => {
+assert.strictEqual(heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]}), RAMP_2x2);
 });
 
-ok("multiple tEXt chunks preserved in file order", function () {
-var out = parsePngText(png([IHDR, tEXt("Author", "Shea"), tEXt("Software", "Loop MMT")]));
-assert.strictEqual(out.length, 2);
-assert.strictEqual(out[0].keyword, "Author");
-assert.strictEqual(out[0].text, "Shea");
-assert.strictEqual(out[1].keyword, "Software");
-assert.strictEqual(out[1].text, "Loop MMT");
+// 2 — flat field: all equal -> unit window -> every cell mid-scale (bucket 2 = #fd8d3c).
+check('flat field: [5,5,5,5] -> all #fd8d3c (mid-scale, no divide-by-0)', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,5],[1,0,5],[0,1,5],[1,1,5]]}), exp);
 });
 
-ok("tEXt with empty text is valid (keyword, empty value)", function () {
-var out = parsePngText(png([IHDR, tEXt("Comment", "")]));
-assert.strictEqual(out[0].text, "");
+// 3 — single cell -> flat window -> one mid-scale rect, 16x16 frame.
+check('single cell: [0,0,7] -> one #fd8d3c rect', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,7]]}), exp);
 });
 
-ok("no text chunks -> empty array (not an error)", function () {
-var out = parsePngText(png([IHDR]));
-assert.deepStrictEqual(out, []);
+// 4 — sparse input: two corners set, 3x3 grid, the 7 missing cells take the empty fill.
+check('sparse: [(0,0)=0,(2,2)=10] -> corners painted, 7 empty #eeeeee', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="0" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="0" y="32" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="16" y="32" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="32" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,0],[2,2,10]]}), exp);
 });
 
-ok("uncompressed iTXt decodes UTF-8 text, lang, translated keyword", function () {
-var out = parsePngText(png([IHDR, iTXt("Description", "en", "Descripción", "a café at dawn — \u2728", false)]));
-assert.strictEqual(out.length, 1);
-var e = out[0];
-assert.strictEqual(e.kind, "iTXt");
-assert.strictEqual(e.keyword, "Description");
-assert.strictEqual(e.compressed, false);
-assert.strictEqual(e.languageTag, "en");
-assert.strictEqual(e.translatedKeyword, "Descripción");
-assert.strictEqual(e.text, "a café at dawn — \u2728");
+// 5 — pinned domain overrides the flat-window auto-fit: [5,5] on [0,10] -> bucket 2.
+check('pinned: {cells:[5,5],min:0,max:10} -> both #fd8d3c', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 16" width="32" height="16">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,5],[1,0,5]], min: 0, max: 10}), exp);
 });
 
-ok("zTXt: without inflater -> compressed entry, raw bytes, text null", function () {
-var out = parsePngText(png([IHDR, zTXt("XML:com.adobe.xmp", "the quick brown fox")]));
-var e = out[0];
-assert.strictEqual(e.kind, "zTXt");
-assert.strictEqual(e.keyword, "XML:com.adobe.xmp");
-assert.strictEqual(e.compressed, true);
-assert.strictEqual(e.text, null);
-assert.ok(e.compressedText && e.compressedText.length > 0, "compressedText surfaced");
+// 6 — empty input -> a valid, empty 0x0 frame, never a crash.
+check('empty: {cells:[]} -> empty <svg> frame', () => {
+assert.strictEqual(heatmap({ cells: []}),
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 0 0" width="0" height="0">\n</svg>\n');
 });
 
-ok("zTXt: WITH live zlib inflater -> text decoded (live-reference backstop)", function () {
-var out = parsePngText(png([IHDR, zTXt("Copyright", "© 2026 Shea Gunther")]), INFLATE);
-assert.strictEqual(out[0].text, "© 2026 Shea Gunther");
+// 7 — 'none' empty omits missing rects entirely.
+check("empty:none -> missing cells produce no rect", () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,0],[1,1,10]], empty: 'none'}), exp);
 });
 
-ok("compressed iTXt: WITH inflater -> UTF-8 text decoded", function () {
-var out = parsePngText(png([IHDR, iTXt("Story", "en", "", "compressed unicode: ✓ café", true)]), INFLATE);
-var e = out[0];
-assert.strictEqual(e.compressed, true);
-assert.strictEqual(e.text, "compressed unicode: ✓ café");
+// 8 — object-form cells {x,y,v} render identically to array-form.
+check('object cells {x,y,v} == array cells [x,y,v]', () => {
+const a = heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]});
+const o = heatmap({ cells: [{x:0,y:0,v:0},{x:1,y:0,v:1},{x:0,y:1,v:2},{x:1,y:1,v:3}]});
+assert.strictEqual(o, a);
+assert.strictEqual(o, RAMP_2x2);
 });
 
-ok("mixed chunk types collected in order", function () {
-var out = parsePngText(png([IHDR, tEXt("A", "1"), iTXt("B", "en", "", "2", false), zTXt("C", "3")]), INFLATE);
-assert.deepStrictEqual(out.map(function (e) { return e.keyword;}), ["A", "B", "C"]);
-assert.strictEqual(out[2].text, "3");
+// 9 — INPUT-ORDER-INDEPENDENCE: scrambled cell order -> byte-identical SVG (a heatmap is a SET).
+check('order-independent: scrambled cells -> identical bytes', () => {
+const scrambled = heatmap({ cells: [[1,1,3],[0,0,0],[1,0,1],[0,1,2]]});
+assert.strictEqual(scrambled, RAMP_2x2);
 });
 
-ok("accepts an ArrayBuffer as well as a Buffer", function () {
-var buf = png([IHDR, tEXt("Title", "AB")]);
-var ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-assert.strictEqual(parsePngText(ab)[0].text, "AB");
+// 10 — determinism: same cells -> byte-identical output, twice.
+check('determinism: repeated render is byte-identical', () => {
+const c = { cells: [[0,0,3],[1,0,1],[2,0,4],[0,1,1],[1,1,5],[2,1,9]]};
+assert.strictEqual(heatmap(c), heatmap(c));
 });
 
-// ===========================================================================
-// INVALID vectors — each must THROW (the ratchet refuses to advance).
-// ===========================================================================
-function throws(label, buildBadBytes) {
-ok(label, function () { assert.throws(function () { parsePngText(buildBadBytes());});});
-}
-
-throws("bad PNG signature", function () {
-var b = png([IHDR, tEXt("Title", "x")]); b[0] = 0x00; return b;
-});
-throws("CRC mismatch (a data byte flipped after CRC was written)", function () {
-var b = png([IHDR, tEXt("Title", "hello")]);
-// flip the last byte of the tEXt text; its stored CRC no longer matches
-b[b.length - 5] ^= 0xff; return b;
-});
-throws("truncated mid-chunk", function () {
-var b = png([IHDR, tEXt("Title", "hello")]); return b.subarray(0, b.length - 10);
-});
-throws("stream ends before IEND", function () {
-// signature + IHDR + a tEXt, but no IEND appended
-return Buffer.concat([SIG, IHDR, tEXt("Title", "x")]);
-});
-throws("tEXt missing its null separator", function () {
-var bad = chunk("tEXt", Buffer.from("NoNullHere", "latin1")); // no \0 in the data
-return Buffer.concat([SIG, IHDR, bad, IEND]);
-});
-throws("chunk length runs past end of buffer", function () {
-var b = png([IHDR, tEXt("Title", "x")]);
-// corrupt the tEXt length field to claim a huge data size
-var off = SIG.length + IHDR.length;
-b.writeUInt32BE(0x7fffffff, off); return b;
-});
-throws("zTXt with unknown compression method", function () {
-var data = Buffer.concat([Buffer.from("K", "latin1"), Buffer.from([0, 9]), zlib.deflateSync(Buffer.from("x"))]);
-return Buffer.concat([SIG, IHDR, chunk("zTXt", data), IEND]);
-});
-throws("shorter than the 8-byte signature", function () { return Buffer.from([0x89, 0x50, 0x4e]);});
-
-// non-buffer inputs throw a TypeError
-ok("non-buffer inputs are rejected", function () {
-["a string", 42, null, undefined, {}].forEach(function (bad) {
-assert.throws(function () { parsePngText(bad);});
-});
+// 11 — closed palette + no text: every fill is in the named scale (∪ empty); no <text|script|style.
+check('closed palette: only scale colors + empty, no text/script/style', () => {
+const out = heatmap({ cells: [[0,0,0],[1,0,50],[0,1,100],[1,1,25]], palette: 'cool', min: 0, max: 100});
+const allowed = new Set(SCALES.cool.concat([EMPTY_FILLS.light]));
+const fills = out.match(/fill="([^"]*)"/g).map(s => s.slice(6, -1));
+for (const f of fills) assert.ok(allowed.has(f), 'unexpected fill ' + f);
+assert.ok(!/<text|<script|<style|font/.test(out), 'output must contain no text/script/style/font');
+assert.ok(out.startsWith('<svg ') && out.endsWith('</svg>\n'), 'well-formed svg frame');
 });
 
-// ===========================================================================
-// Determinism + mutation-bite
-// ===========================================================================
-ok("determinism: same bytes -> identical entries, twice", function () {
-var b = png([IHDR, tEXt("Title", "same"), zTXt("Z", "twice")]);
-assert.deepStrictEqual(parsePngText(b, INFLATE), parsePngText(b, INFLATE));
+// 12 — non-finite value is a hard, named error (never a guessed color).
+check('non-finite value throws, naming the cell', () => {
+assert.throws(() => heatmap({ cells: [[0,0,0],[1,0,NaN]]}), /cell \(1,0\) value is not a finite number/);
+assert.throws(() => heatmap({ cells: [[0,0,Infinity]]}), /is not a finite number/);
 });
 
-ok("mutation-bite: a text PNG and a no-text PNG do not share a result", function () {
-var withText = parsePngText(png([IHDR, tEXt("Title", "real")]));
-var without = parsePngText(png([IHDR]));
-// a constant-returning core would make these equal; they must not be.
-assert.notDeepStrictEqual(withText, without);
-assert.strictEqual(withText[0].text, "real"); // and the value is the input's, not a constant
+// 13 — bad coordinates throw: negative and non-integer are both refused.
+check('negative / non-integer coordinate throws', () => {
+assert.throws(() => heatmap({ cells: [[-1,0,5]]}), /coordinate must be a non-negative integer/);
+assert.throws(() => heatmap({ cells: [[0.5,0,5]]}), /coordinate must be a non-negative integer/);
 });
 
-console.log("\nratchet-png-text: " + pass + " passed, " + fail + " failed" +
-" (real-PNG-byte vectors: tEXt/iTXt/zTXt/compressed-iTXt/no-text, malformed-rejection set, " +
-"live-zlib backstop, coercion, determinism, mutation-bite)");
-process.exit(fail === 0? 0: 1);
+// 14 — a duplicate (x,y) is a hard error (no silent last-wins).
+check('duplicate cell throws', () => {
+assert.throws(() => heatmap({ cells: [[0,0,1],[0,0,2]]}), /duplicate cell at \(0,0\)/);
+});
+
+// 15 — a cell outside a pinned grid throws (no silent clipping); unknown palette throws.
+check('out-of-grid cell and unknown palette throw', () => {
+assert.throws(() => heatmap({ cells: [[3,0,1]], cols: 2}), /outside the pinned grid/);
+assert.throws(() => heatmap({ cells: [[0,0,1]], palette: 'nope'}), /unknown palette/);
+});
+
+// 16 — mutation bite (non-vacuity): a deliberately-wrong SVG (last fill bumped one bucket down)
+// MUST NOT equal the real render.
+check('mutation bite: a wrong-color SVG is rejected', () => {
+const wrong = RAMP_2x2.replace('fill="#800026"', 'fill="#e31a1c"');
+const got = heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]});
+assert.strictEqual(got, RAMP_2x2);
+assert.notStrictEqual(got, wrong);
+});
+
+console.log('\n' + passed + '/' + n + ' passed');
+if (passed!== n) process.exit(1);
 
 Take the whole folder →
 MIT
 Node / browser, no dependencies
+
+---
+
+# Histogram-fold — a Loop MMT gift
+https://loopmmt.com/gifts/histogram-fold/
+[coverage: optional · branch: gifts]
+
+One Bucketed Histogram Over a Numeric Stream fold ← all gifts
+
+Histogram-fold
+
+histogram-fold reads a stream of numbers — one JSON number per line (JSON Lines) — and folds them in ONE PASS into a single aggregate record: a contiguous list of fixed-width buckets with a count in each, plus the total count and the observed min and max, with zero dependencies. Buckets are fixed-width by a fixed origin (--width, --origin), so a value's bucket (floor((x-origin)/width), range [lo,hi) lower-closed) never depends on the rest of the stream — that is what makes it one pass. The same numbers in any order fold to a byte-identical record (a histogram is a multiset fold). Non-finite or non-number input is a hard error, never a silent skip, and the IEEE-754 bucket boundary is a documented, pinned rule. Same stream in → byte-identical record out, in Node or a browser.
+
+The honest edge
+
+histogram-fold COUNTS values into fixed-width buckets — it is NOT density estimation (no smoothing or KDE), NOT a quantile/percentile summary (it keeps no per-value order statistics beyond min and max), and it does NOT choose data-driven ‘nice’ bin edges (that would make a value's bin depend on the whole stream and cost the one-pass property). The output is a JSON aggregate, not a chart: hand it to a plotter, a test, or a diff.
+
+Run it
+
+printf '%s\n' 1 2 2 5 | node histogram-fold.js # {bins:[{lo,hi,count}..],width,origin,count,min,max}; --width W --origin O; exit 0 ok | 2 input error
+test_histogram-fold.js (27/27: frozen hand goldens cross-checked by an independent range-membership oracle, order-independence (shuffled==base), the pinned IEEE-754 float boundary (0.3@width0.1->bin 2), numeric-honesty hard errors (Infinity/string/bad-JSON/bad-width), contiguity + exact shared edges, blank-skip + CRLF, mutation bite lower-closed vs upper-closed)
+Zero dependencies, Node or browser, deterministic
+
+The code — every file that ships
+
+histogram-fold.js 237 lines on GitHub →
+#!/usr/bin/env node
+/* histogram-fold.js — fold a JSONL numeric stream into ONE bucketed histogram.
+Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
+
+WHAT IT IS. Give it a stream of numbers — one JSON number per line (JSONL) —
+and it folds them into a single aggregate record: a contiguous list of
+fixed-width buckets with a count in each, plus the total count and the observed
+min and max. Same stream in, byte-identical record out, on every machine and
+every run. It is a FOLD, not a chart: the output is a JSON aggregate, not a
+picture — hand it to a plotter, a test, or a diff.
+
+HOW THE BUCKETS ARE DEFINED (the whole determinism story). Buckets are
+FIXED-WIDTH with a fixed origin, so a value's bucket never depends on the rest
+of the stream — which is exactly what makes the fold ONE PASS (no need to see
+every value first to learn a min/max range). For a value x:
+
+bucket index i = floor((x - origin) / width)
+bucket range [ origin + i*width, origin + (i+1)*width) (lower-closed,
+upper-open)
+
+The default origin is 0 and the default width is 1, so a bare stream of numbers
+buckets into unit integer bins. Override with --width and --origin.
+
+The output bins are CONTIGUOUS from the lowest occupied bucket to the highest,
+with any empty interior bucket carried as a count of 0 — a histogram has no
+holes. Each bin's `hi` equals the next bin's `lo` exactly, because both edges
+are computed as origin + k*width for an integer k (never lo + width, which could
+round differently). An empty stream folds to `{bins:[], count:0, min:null,
+max:null}`.
+
+NUMERIC HONESTY (the character of this gift). A fold over numbers is only
+trustworthy if it refuses to quietly mishandle a number:
+- Every line must be a FINITE JSON number. A line that is not valid JSON, is
+not a number (a string, object, bool, null), or is a number that overflows
+to +/-Infinity (e.g. 1e999, which `JSON.parse` yields as Infinity) or is NaN
+is a HARD ERROR (exit 2) naming the line — never a silent skip.
+- Counts are integers and stay integers.
+- The bucket index is `Math.floor((x - origin) / width)` in IEEE-754 double.
+This is a DELIBERATE, PINNED specification, not an accident: on a float
+boundary the double arithmetic decides the bin, so with width 0.1 the value
+0.3 lands in bin 2 ([0.2,0.3)), because (0.3 - 0) / 0.1 === 2.9999999999996
+in IEEE-754, not 3. The gift does not paper this over with an epsilon (which
+would trade one surprise for a subtler one) — it states the rule, and the
+battery pins the 0.3-with-width-0.1 case so the behavior is a documented
+invariant. For clean boundaries, use an integer or exactly-representable
+width (1, 2, 5, 10, 0.5, 0.25).
+
+USAGE
+printf '%s\n' 1 2 2 5 | node histogram-fold.js # unit integer bins
+node histogram-fold.js --width 10 nums.jsonl # width-10 buckets
+node histogram-fold.js --width 10 --origin 5 < nums.jsonl # origin at 5
+node histogram-fold.js --help
+
+Each non-blank line is one number. Blank lines are skipped. A trailing \r
+(CRLF files) is trimmed. Output is one line of compact JSON (the aggregate
+record) followed by a newline.
+
+Exit codes: 0 success · 2 input error (missing file, a directory, a bad
+--width/--origin, a line that is not a finite JSON number, or a bucket range so
+large it would exhaust memory). Always a clean one-line message on stderr,
+never a stack trace.
+
+Released under MIT. Its edge is printed in the README: this COUNTS values into
+fixed-width buckets. It is NOT a density estimate (no smoothing, no KDE), NOT a
+quantile/percentile summary (it keeps no per-value order statistics beyond min
+and max), and the buckets are fixed-width by a fixed origin — it does NOT choose
+"nice" bin edges from the data (that would make a value's bin depend on the
+whole stream and cost the one-pass property).
+*/
+"use strict";
+
+var MAX_BINS = 10000000; // guard: a range/width so large it would exhaust memory
+
+// Parse one input line into a finite number, or throw a clean, line-named Error.
+// (JSON.parse("1e999") === Infinity, so the finite check is load-bearing, not
+// redundant with the parse.)
+function parseNumber(line, lineNo) {
+var v;
+try { v = JSON.parse(line);}
+catch (e) {
+throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
+}
+if (typeof v!== "number") {
+throw new Error("line " + lineNo + " is not a number (got " +
+(v === null? "null": Array.isArray(v)? "array": typeof v) + "): " +
+JSON.stringify(line.slice(0, 40)));
+}
+if (!isFinite(v)) {
+throw new Error("line " + lineNo + " is not a finite number (" + String(v) + ")");
+}
+return v;
+}
+
+// The public fold: JSONL text + {width, origin} -> the aggregate record.
+// { bins: [ {lo, hi, count},...], // contiguous, lowest..highest occupied
+// width, origin,
+// count, // total values folded
+// min, max} // observed value extremes, null if empty
+function fold(text, opts) {
+opts = opts || {};
+var width = opts.width === undefined? 1: opts.width;
+var origin = opts.origin === undefined? 0: opts.origin;
+if (typeof width!== "number" ||!isFinite(width) || width <= 0) {
+throw new Error("width must be a finite number greater than 0 (got " + String(width) + ")");
+}
+if (typeof origin!== "number" ||!isFinite(origin)) {
+throw new Error("origin must be a finite number (got " + String(origin) + ")");
+}
+
+var lines = String(text).split("\n");
+var counts = Object.create(null); // bucket index -> count
+var total = 0, min = null, max = null, minIdx = null, maxIdx = null;
+var i, line, x, idx;
+
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line is not a value
+
+x = parseNumber(line, i + 1);
+idx = Math.floor((x - origin) / width); // IEEE-754; boundary behavior is pinned
+
+counts[idx] = (counts[idx] || 0) + 1;
+total += 1;
+if (min === null || x < min) min = x;
+if (max === null || x > max) max = x;
+if (minIdx === null || idx < minIdx) minIdx = idx;
+if (maxIdx === null || idx > maxIdx) maxIdx = idx;
+}
+
+var bins = [];
+if (total > 0) {
+var span = maxIdx - minIdx + 1;
+if (span > MAX_BINS) {
+throw new Error("bucket range too large (" + span + " bins > " + MAX_BINS +
+"): widen --width or narrow the input range");
+}
+for (idx = minIdx; idx <= maxIdx; idx++) {
+bins.push({
+lo: origin + idx * width,
+hi: origin + (idx + 1) * width,
+count: counts[idx] || 0
+});
+}
+}
+
+return { bins: bins, width: width, origin: origin, count: total, min: min, max: max};
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.histogramFold = fold;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { fold: fold, MAX_BINS: MAX_BINS};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+function run(text, opts) {
+return JSON.stringify(fold(text, opts)) + "\n";
+}
+
+// Parse a numeric CLI option value; throw a clean Error on a bad value.
+function numOpt(name, raw) {
+var v = Number(raw);
+if (raw === undefined || raw === "" ||!isFinite(v)) {
+throw new Error(name + " requires a finite number (got " + JSON.stringify(raw) + ")");
+}
+return v;
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"histogram-fold.js — fold a JSONL numeric stream into one bucketed histogram.\n\n" +
+" printf '%s\\n' 1 2 2 5 | node histogram-fold.js unit integer bins\n" +
+" node histogram-fold.js --width 10 nums.jsonl width-10 buckets\n" +
+" node histogram-fold.js --width 10 --origin 5 < in origin at 5\n" +
+" node histogram-fold.js --help\n\n" +
+"Each non-blank line is one FINITE JSON number. A value x lands in bucket\n" +
+"floor((x - origin) / width); buckets are [lo, hi) (lower-closed). Output is\n" +
+"one line of JSON: {bins:[{lo,hi,count}..], width, origin, count, min, max},\n" +
+"bins contiguous from the lowest to the highest occupied bucket.\n\n" +
+"Edge: this COUNTS into fixed-width buckets. It is NOT density estimation,\n" +
+"NOT a quantile summary, and it does NOT pick 'nice' data-driven bin edges\n" +
+"(that would cost the one-pass property). Non-finite or non-number input is\n" +
+"a hard error, never a silent skip.\n"
+);
+return 0;
+}
+
+var opts = {};
+var files = [];
+var i;
+try {
+for (i = 0; i < args.length; i++) {
+if (args[i] === "--width") { opts.width = numOpt("--width", args[++i]);}
+else if (args[i] === "--origin") { opts.origin = numOpt("--origin", args[++i]);}
+else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
+else { files.push(args[i]);}
+}
+} catch (e) {
+process.stderr.write("histogram-fold: " + e.message + "\n");
+return 2;
+}
+
+function emit(text) {
+try { process.stdout.write(run(text, opts)); return 0;}
+catch (e) { process.stderr.write("histogram-fold: " + e.message + "\n"); return 2;}
+}
+
+if (files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(files[0], "utf8");}
+catch (e) {
+process.stderr.write("histogram-fold: cannot read " + files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
+}
+
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_histogram-fold.js 196 lines on GitHub →
+#!/usr/bin/env node
+/* test_histogram-fold.js — golden battery for the histogram-fold gift.
+
+Out-of-band and self-verifying. The oracle is TWO independent things, neither a
+copy of the gift's streaming floor-and-tally loop:
+
+(1) RANGE-MEMBERSHIP counting — for a bin [lo, hi), the count is
+values.filter(x => x >= lo && x < hi).length. This is a genuinely
+different algorithm (predicate over the whole set per bin, O(bins*n))
+than the gift's one-pass Map tally, and it uses NO floor-index math. It
+is valid where the bin edges are exact (integer widths), where
+floor-index and range-membership provably agree.
+
+(2) FROZEN hand-computed golden records, pinned by hand from the spec —
+including the deliberate IEEE-754 float-boundary case, where floor-index
+and range-membership DIVERGE (see §7). That divergence is the documented
+numeric-honesty invariant, not a bug, so the pin is checked against the
+hand golden, never against the range oracle.
+
+A planted mutation (the bite, §9) MUST be caught — if the suite passes with the
+mutation live, the suite proves nothing.
+
+Run: node test_histogram-fold.js -> exit 0 GREEN / non-zero RED
+*/
+"use strict";
+var hf = require("./histogram-fold.js");
+
+var pass = 0, fail = 0;
+function ok(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.log(" FAIL " + name);}
+}
+function foldRec(nums, opts) { return hf.fold(nums.join("\n"), opts);}
+function J(v) { return JSON.stringify(v);}
+
+/* ---- independent range-membership oracle (no floor-index math) ------------ */
+function rangeCount(values, lo, hi) {
+var n = 0, i;
+for (i = 0; i < values.length; i++) if (values[i] >= lo && values[i] < hi) n++;
+return n;
+}
+
+/* ---- 1. Frozen hand golden: unit bins, cross-checked by range membership -- *
+values [1,2,2,5], width 1, origin 0.
+floor: 1->1, 2->2, 2->2, 5->5; occupied 1..5; contiguous with empty 3,4. */
+(function () {
+var vals = [1, 2, 2, 5];
+var rec = foldRec(vals);
+var goldenBins = [
+{ lo: 1, hi: 2, count: 1},
+{ lo: 2, hi: 3, count: 2},
+{ lo: 3, hi: 4, count: 0},
+{ lo: 4, hi: 5, count: 0},
+{ lo: 5, hi: 6, count: 1}
+];
+ok("unit bins == frozen hand golden", J(rec.bins) === J(goldenBins));
+ok("unit bins: count/min/max", rec.count === 4 && rec.min === 1 && rec.max === 5);
+// independent cross-check: every golden bin count == range membership count
+var allMatch = goldenBins.every(function (b) { return b.count === rangeCount(vals, b.lo, b.hi);});
+ok("unit bins == independent range-membership oracle", allMatch);
+})();
+
+/* ---- 2. width/origin override, cross-checked by range membership ---------- *
+values [5,12,13,27], width 10, origin 0 -> floor 0,1,1,2; occupied 0..2. */
+(function () {
+var vals = [5, 12, 13, 27], opts = { width: 10, origin: 0};
+var rec = foldRec(vals, opts);
+var golden = [
+{ lo: 0, hi: 10, count: 1},
+{ lo: 10, hi: 20, count: 2},
+{ lo: 20, hi: 30, count: 1}
+];
+ok("width-10 bins == frozen hand golden", J(rec.bins) === J(golden));
+ok("width-10 == range-membership oracle",
+golden.every(function (b) { return b.count === rangeCount(vals, b.lo, b.hi);}));
+// origin shift: same values, origin 5, width 10 -> floor((x-5)/10): 0,0,0,2
+var rec2 = foldRec(vals, { width: 10, origin: 5});
+ok("origin shift changes bucketing",
+J(rec2.bins) === J([
+{ lo: 5, hi: 15, count: 3},
+{ lo: 15, hi: 25, count: 0},
+{ lo: 25, hi: 35, count: 1}
+]));
+})();
+
+/* ---- 3. Empty stream folds to the empty record --------------------------- */
+(function () {
+var rec = foldRec([]);
+ok("empty stream -> empty record",
+J(rec) === J({ bins: [], width: 1, origin: 0, count: 0, min: null, max: null}));
+})();
+
+/* ---- 4. Order-independence: a histogram is a MULTISET fold --------------- *
+This is THE fold-lane invariant that separates histogram from an ordered fold
+(merkle): shuffle the stream and the record is byte-identical. */
+(function () {
+var base = [5, 1, 9, 2, 5, 5, 1, 8, 3, 2, 9, 1];
+var shuffled = [9, 1, 2, 5, 8, 1, 5, 3, 2, 9, 5, 1];
+var reversed = base.slice().reverse();
+ok("order-independent: shuffled == base", J(foldRec(shuffled)) === J(foldRec(base)));
+ok("order-independent: reversed == base", J(foldRec(reversed)) === J(foldRec(base)));
+})();
+
+/* ---- 5. Determinism: folds twice byte-identical -------------------------- */
+(function () {
+var vals = [1, 2, 3, 4, 5, 6, 7];
+ok("folds-twice-identical", J(foldRec(vals)) === J(foldRec(vals)));
+})();
+
+/* ---- 6. Contiguity + exact shared edges ---------------------------------- *
+No holes: empty interior buckets are carried as count 0, and bin[i].hi is
+byte-exactly bin[i+1].lo (both edges are origin + k*width, never lo+width). */
+(function () {
+var rec = foldRec([0, 30], { width: 10, origin: 0}); // occupied 0 and 3; 1,2 empty
+ok("contiguous incl. empty interior bins (count 0)",
+rec.bins.length === 4 && rec.bins[1].count === 0 && rec.bins[2].count === 0);
+var sharedEdges = true, i;
+for (i = 0; i + 1 < rec.bins.length; i++) if (rec.bins[i].hi!== rec.bins[i + 1].lo) sharedEdges = false;
+ok("adjacent bins share an exact edge (hi[i] === lo[i+1])", sharedEdges);
+})();
+
+/* ---- 7. The pinned IEEE-754 float boundary (numeric-honesty invariant) ---- *
+With width 0.1, origin 0, the value 0.3 lands in bin index 2 ([0.2,0.3)),
+because (0.3 - 0) / 0.1 === 2.9999999999999996 and floor of that is 2, NOT 3.
+This is the DOCUMENTED behavior, not a bug: the gift does not epsilon-fudge it.
+Checked against the hand golden (index 2), NOT the range oracle — range
+membership would put 0.3 in bin 3, and that divergence IS the trap being
+pinned. A single value -> a single-bin record whose lone bin is index 2. */
+(function () {
+var rec = foldRec([0.3], { width: 0.1, origin: 0});
+ok("float-boundary pin: 0.3 @ width 0.1 -> bin index 2 (lo≈0.2)",
+rec.bins.length === 1 && Math.abs(rec.bins[0].lo - 0.2) < 1e-12);
+// sanity: the arithmetic really does floor to 2 here (documents the trap)
+ok("float-boundary: floor((0.3-0)/0.1) === 2 (the IEEE-754 fact)",
+Math.floor((0.3 - 0) / 0.1) === 2);
+})();
+
+/* ---- 8. Numeric honesty: non-finite / non-number / bad JSON are hard errors */
+(function () {
+function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
+ok("1e999 (overflows to Infinity) is a hard error",
+throws(function () { hf.fold("1e999");}));
+ok("a string line is a hard error", throws(function () { hf.fold("\"12\"");}));
+ok("a null line is a hard error", throws(function () { hf.fold("null");}));
+ok("a bool line is a hard error", throws(function () { hf.fold("true");}));
+ok("an object line is a hard error", throws(function () { hf.fold("{\"v\":1}");}));
+ok("invalid JSON line is a hard error", throws(function () { hf.fold("not-a-number");}));
+ok("width <= 0 is a hard error", throws(function () { hf.fold("1\n2", { width: 0});}));
+ok("non-finite width is a hard error", throws(function () { hf.fold("1\n2", { width: Infinity});}));
+ok("non-finite origin is a hard error", throws(function () { hf.fold("1", { origin: NaN});}));
+})();
+
+/* ---- 9. Blank lines skipped, CRLF trimmed -------------------------------- */
+(function () {
+ok("blank lines skipped (not a value)", J(hf.fold("1\n\n2\n")) === J(hf.fold("1\n2")));
+ok("CRLF trimmed: \\r\\n folds like \\n", J(hf.fold("1\r\n2\r\n")) === J(hf.fold("1\n2")));
+ok("integer counts stay integers",
+hf.fold("1\n1\n1").bins[0].count === 3 && Number.isInteger(hf.fold("1\n1\n1").bins[0].count));
+})();
+
+/* ---- 10. THE MUTATION BITE (non-vacuity) --------------------------------- *
+A WRONG construction: upper-closed bins (lo, hi] via ceil-1 instead of the
+spec's lower-closed [lo, hi) via floor. On a value exactly on an integer edge
+(10, width 10, origin 0) the two disagree: floor-spec -> bin index 1 ([10,20));
+the wrong upper-closed construction -> bin index 0 ((0,10]). The gift's record
+MUST NOT match the wrong one, proving the suite would catch that regression. */
+(function () {
+function wrongFold(vals, width, origin) {
+// upper-closed (lo, hi]: index = ceil((x-origin)/width) - 1
+var counts = {}, minI = null, maxI = null;
+vals.forEach(function (x) {
+var idx = Math.ceil((x - origin) / width) - 1;
+counts[idx] = (counts[idx] || 0) + 1;
+if (minI === null || idx < minI) minI = idx;
+if (maxI === null || idx > maxI) maxI = idx;
+});
+var bins = [];
+for (var i = minI; i <= maxI; i++) bins.push({ lo: origin + i * width, hi: origin + (i + 1) * width, count: counts[i] || 0});
+return bins;
+}
+var vals = [10, 10, 5];
+var gift = foldRec(vals, { width: 10, origin: 0}).bins;
+var wrong = wrongFold(vals, 10, 0);
+ok("mutation bite: lower-closed [lo,hi)!= upper-closed (lo,hi] on an edge value",
+J(gift)!== J(wrong));
+})();
+
+/* ---- report -------------------------------------------------------------- */
+console.log("");
+if (fail === 0) {
+console.log("GREEN: " + pass + " assertions passed, 0 failed [test_histogram-fold]");
+process.exit(0);
+} else {
+console.log("RED: " + pass + " passed, " + fail + " FAILED [test_histogram-fold]");
+process.exit(1);
+}
+
+Take the whole folder →
+MIT
+Zero dependencies, Node or browser, deterministic
 
 ---
