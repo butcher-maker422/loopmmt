@@ -35,6 +35,23 @@
     return (f && Array.isArray(f.order)) ? f.order.slice() : [];
   }
 
+  /* isGift(node) -> true iff the node is a GIFT page, not the gifts hub or a reserved
+     gifts-branch feature page. A gift's served url is /gifts/<slug>/ (two path segments:
+     "gifts" + slug); the hub is /gifts/ (one segment); and RESERVED_GIFT_SLUGS names
+     depth-2 pages under /gifts/ that are features, not gifts (the search page itself lives
+     at /gifts/search/). This mirrors the builder's _gift_slug + RESERVED_GIFT_SLUGS
+     (build_gifts_search_index.py) EXACTLY — the two layers share one rule so a gift count
+     computed at either layer equals the manifest N. Pure, total: a function of the url alone.
+     Without this, `_all` counted the hub (was 96) and would count the search page too. */
+  var RESERVED_GIFT_SLUGS = { search: true };
+  function isGift(node) {
+    var url = node && node.url;
+    if (typeof url !== "string") { return false; }
+    var tail = url.replace(/^https?:\/\/[^/]+\//, "").replace(/\/+$/, "").split("/");
+    if (tail.length !== 2 || tail[0] !== "gifts" || tail[1] === "") { return false; }
+    return !Object.prototype.hasOwnProperty.call(RESERVED_GIFT_SLUGS, tail[1]);
+  }
+
   /* filterByPortVerb(index, verb) -> a new index object with `nodes` narrowed to the active
      facet. verb === ALL (null) or "" returns the index UNCHANGED-BY-VALUE (all nodes, incl.
      the 65 null-facet gifts and the hub). A specific verb returns ONLY nodes whose port_verb
@@ -56,13 +73,22 @@
   function facetCounts(index) {
     var order = facetOrder(index);
     var nodes = (index && Array.isArray(index.nodes)) ? index.nodes : [];
-    var out = { _all: nodes.length, _unclassified: 0 };
+    // `_all` counts GIFTS, not nodes: the hub (/gifts/) rides in the node set to stay
+    // text-searchable but is not a gift, so it must not inflate the "All gifts" tally.
+    // isGift is the same leaf-vs-hub test the builder applies (counts.gift_pages).
+    var out = { _all: 0, _unclassified: 0 };
     order.forEach(function (v) { out[v] = 0; });
     nodes.forEach(function (n) {
+      if (isGift(n)) { out._all += 1; }
       var v = n && n.port_verb;
-      if (v == null) { out._unclassified += 1; return; }
+      if (v == null) { return; }
       if (Object.prototype.hasOwnProperty.call(out, v)) { out[v] += 1; }
     });
+    // _unclassified: gifts with no port-verb (the hub is excluded — it is not an
+    // unclassified gift, it is not a gift). Kept consistent with _all's gift-only basis.
+    out._unclassified = nodes.reduce(function (acc, n) {
+      return acc + ((isGift(n) && (n.port_verb == null)) ? 1 : 0);
+    }, 0);
     return out;
   }
 
@@ -80,6 +106,7 @@
     facetOrder: facetOrder,
     filterByPortVerb: filterByPortVerb,
     facetCounts: facetCounts,
+    isGift: isGift,
     _version: "1.0"
   };
 
