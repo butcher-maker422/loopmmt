@@ -88,10 +88,13 @@ _BASELINE = [
 # design (§5.3): the session can never widen it — it is owned HERE, and it is
 # pinned THREE ways so a real leak can never ride the waiver:
 #
-#   1. PATH-scoped   — only files under `gifts/scrub/` are eligible.
+#   1. PATH-scoped   — only files under a DECLARED secret-detector gift dir are
+#      eligible (currently `gifts/scrub/` and `gifts/seance/`; both are
+#      secret-detector gifts whose PUBLIC PURPOSE is to display credential
+#      SHAPES). Adding a gift dir here is an operator-reviewed public-repo commit.
 #   2. CLASS-scoped  — only the credential-demo classes are waivable; a
-#      path/infra/session-id/private-repo/cairn hit inside gifts/scrub/ still
-#      REFUSES (a scrubber gift may demo a fake cred, never leak real infra).
+#      path/infra/session-id/private-repo/cairn hit inside a detector gift dir
+#      still REFUSES (a detector gift may demo a fake cred, never leak real infra).
 #   3. STRING-pinned — the waived hit's exact text must be one of the KNOWN fake
 #      fixtures. An UNKNOWN credential shape in a scrub file (a real key smuggled
 #      in) matches no pin and still REFUSES. This is stronger than a bare
@@ -99,23 +102,31 @@ _BASELINE = [
 #
 # All three must hold for a hit to be dropped. Changed only by an operator-
 # reviewed public-repo commit (like the baseline above).
-_SCRUB_SANCTION_PATH_PREFIX = "gifts/scrub/"
+# DECLARED secret-detector gift dirs. Each is a gift whose fixtures are example
+# credential SHAPES by design (operator ruling S09.2057 option B, extended to
+# `seance` S14.1049). A hit is path-eligible iff it sits under one of these.
+_DETECTOR_SANCTION_PATH_PREFIXES = (
+    "gifts/scrub/",
+    "gifts/seance/",
+)
 # The scrub gift's fixtures are also folded into the machine corpus by the
-# aggregation builders (build_corpus_shards.py, build_search_index.py). Those two
-# DECLARED aggregation faces therefore legitimately carry the SAME known fixtures.
-# redact.py sanctions them the same way on the session side (the declared-
-# aggregation sanction). A shard file is `corpus-shard-<N>.txt`; the search index
-# is `search-index.json`. Both sit at the flattened staging ROOT.
-_SCRUB_SANCTION_AGG_RE = re.compile(r"^(?:corpus-shard-\d+\.txt|search-index\.json)$")
-_SCRUB_SANCTION_CLASSES = frozenset({
+# aggregation builders. Those DECLARED aggregation faces therefore legitimately
+# carry the SAME known fixtures. redact.py sanctions them the same way on the
+# session side (the declared-aggregation sanction). A shard file is
+# `corpus-shard-<N>.txt`; the search indices are `search-index.json` and
+# `gifts-search-index.json`. All sit at the flattened staging ROOT.
+_DETECTOR_SANCTION_AGG_RE = re.compile(
+    r"^(?:corpus-shard-\d+\.txt|search-index\.json|gifts-search-index\.json)$"
+)
+_DETECTOR_SANCTION_CLASSES = frozenset({
     "credential-aws",
     "credential-slack",
     "credential-private-key",
     "hex40-assignment",
 })
-# The exact fake fixtures scrub ships (assembled from fragments so THIS gate file
+# The exact fake fixtures the detector gifts ship (assembled from fragments so THIS gate file
 # carries no literal credential-shape that would self-flag a whole-repo scan).
-_SCRUB_SANCTION_STRINGS = frozenset({
+_DETECTOR_SANCTION_STRINGS = frozenset({
     "AKIA" + "IOSFODNN7" + "EXAMPLE",                       # AWS doc example key
     "xoxb-" + "2411-" + "abcdefghijklmnop",                 # fake slack bot token
     "-----BEGIN RSA PRIVATE KEY-----",                      # fixture PEM header
@@ -123,12 +134,12 @@ _SCRUB_SANCTION_STRINGS = frozenset({
 })
 
 
-def _is_scrub_sanctioned(rel, cls, snip):
-    """True iff this hit is a KNOWN scrub demo fixture that may ship.
+def _is_detector_sanctioned(rel, cls, snip):
+    """True iff this hit is a KNOWN detector-gift demo fixture that may ship.
 
-    Path rail: the file is EITHER under gifts/scrub/ (the gift's own served
-    files) OR one of the two declared aggregation faces (a corpus shard or the
-    search index) that legitimately fold the gift's fixtures. Class rail: a
+    Path rail: the file is EITHER under a DECLARED detector-gift dir (the gift's
+    own served files) OR one of the declared aggregation faces (a corpus shard or
+    a search index) that legitimately fold the gift's fixtures. Class rail: a
     credential-demo class. String rail: an exact known fixture. All three must
     hold; any one failing → not sanctioned → the hit stands and the run REFUSES.
     An UNKNOWN cred shape, or ANY non-cred class, in ANY of these files still
@@ -136,14 +147,14 @@ def _is_scrub_sanctioned(rel, cls, snip):
     """
     rel_norm = rel.replace(os.sep, "/")
     path_ok = (
-        rel_norm.startswith(_SCRUB_SANCTION_PATH_PREFIX)
-        or _SCRUB_SANCTION_AGG_RE.match(rel_norm) is not None
+        any(rel_norm.startswith(pfx) for pfx in _DETECTOR_SANCTION_PATH_PREFIXES)
+        or _DETECTOR_SANCTION_AGG_RE.match(rel_norm) is not None
     )
     if not path_ok:
         return False
-    if cls not in _SCRUB_SANCTION_CLASSES:
+    if cls not in _DETECTOR_SANCTION_CLASSES:
         return False
-    return snip in _SCRUB_SANCTION_STRINGS
+    return snip in _DETECTOR_SANCTION_STRINGS
 
 
 _EXTRAS_FILE = ".ci-extra-signatures.txt"
@@ -207,7 +218,7 @@ def scan_tree(root):
             for cls, rx in _BASELINE:
                 for m in rx.finditer(line):
                     snip = m.group(0).strip()
-                    if snip and not _is_scrub_sanctioned(rel, cls, snip):
+                    if snip and not _is_detector_sanctioned(rel, cls, snip):
                         hits.append((rel, i, cls, snip))
             # Session-exported extras are NEVER sanctioned — the sanction is a
             # public-owned baseline concept only; a session cannot both add a
