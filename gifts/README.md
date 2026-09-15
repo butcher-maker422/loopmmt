@@ -1,9 +1,9 @@
 # Gifts
 
-**Ninety-five small tools, given away. Take them.**
+**Ninety-six small tools, given away. Take them.**
 
 Most of what Loop MMT built is shared here to *read* and *run* — the apps under their
-copyleft license, the corpus under its non-commercial one. These ninety-five are different.
+copyleft license, the corpus under its non-commercial one. These ninety-six are different.
 They're standalone, they carry no methodology, and they're released under the **MIT
 license** — the most permissive one there is. Use them in anything, including something
 you sell. No attribution required, though it's always kind.
@@ -217,7 +217,7 @@ can audit after the fact instead of guessing what fired. Dependency-free JavaScr
 
 ## License
 
-All ninety-five are **MIT** (see each folder's `LICENSE`, and `../LICENSE-gifts`). That's the
+All ninety-six are **MIT** (see each folder's `LICENSE`, and `../LICENSE-gifts`). That's the
 whole point — they're yours.
 
 *Loop MMT™ · © 2026 Shea Gunther · New Gloucester, Maine*

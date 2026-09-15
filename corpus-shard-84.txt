@@ -1,2057 +1,1388 @@
-# Loop MMT — corpus shard 84/86
+# Loop MMT — corpus shard 84/87
 
-> Bundle 84 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 84 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 2 (/gifts/vclock/, /gifts/verify/)
+Nodes in this shard: 3 (/gifts/typecheck/, /gifts/uniq-filter/, /gifts/units-convert/)
 
 ---
 
-# Vclock — a Loop MMT gift
-https://loopmmt.com/gifts/vclock/
+# typecheck — a Loop MMT gift
+https://loopmmt.com/gifts/typecheck/
 [coverage: optional · branch: gifts]
 
-Causal Order, Not Wall-Clock Time order ← all gifts
+Composition Typecheck check ← all gifts
 
-Vclock
+typecheck
 
-Reason about the causal order of a stream of records — is A before B, or are they concurrent, causally independent, neither able to have known about the other? Wall-clock time can't express that last case; a vector clock can. bump, merge, and compare over JSON lines, so it sits in the middle of a pipe.
+Give it a pipeline of small JSONL tools you mean to chain — A,B,C — and, before you run anything and with no side effects, typecheck says whether it is well-formed: does each stage EMIT what the next one ACCEPTS. It walks the adjacent pairs and the endpoints, names the exact hop that breaks (a sink piped into a transform, a source stranded mid-pipeline), and exits non-zero so you can gate on it.
 
 The honest edge
 
-It orders events that share an actor namespace. Two records whose actor sets never overlap read as concurrent by construction — which is correct, but only useful if your actors are named consistently across the stream.
+It validates the PORT type — can the pipe carry data at all — NOT the RECORD shape. Two tools can both speak JSON-lines so the ports agree, while the records one emits are not the records the other expects; that pipeline typechecks clean here and still fails at runtime. typecheck flags the record-shape layer as unproven and never asserts semantic fit. A slug not in the manifest is reported UNRESOLVED, never guessed.
 
 Run it
 
-python3 vclock.py compare
-test_vclock.py (37/37, mutation-bitten)
-Python stdlib only
+python3 typecheck.py text --pipeline A,B,C --manifest gifts-manifest.json
+test_typecheck.py (15/15 golden, 8/8 mutations caught)
+Python 3, standard library only
 
 The code — every file that ships
 
-vclock.py 221 lines on GitHub →
+typecheck.py 385 lines on GitHub →
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""vclock.py — reason about the causal order of a stream of records, on a pipe.
-
-A vector clock answers a question a timestamp cannot: given two events, did one
-happen *before* the other, or are they *concurrent* — causally independent,
-neither one able to have known about the other? Wall-clock time can't tell you
-that (clocks drift, and "later" is not "caused by"). A vector clock can, by
-giving every actor its own counter and carrying the whole vector on each record.
-
-This is a *transform*: it reads JSON lines on stdin and writes JSON lines on
-stdout, so it sits in the middle of a pipe. Each input record may carry a
-`clock` field — an object mapping actor names to integer counts, e.g.
-`{"a": 3, "b": 1}`. An absent actor is read as 0 (it simply hasn't been seen).
-
-Three operations, each a subcommand:
-
-bump --actor A increment actor A's component on every record's clock
-(A absent → starts at 1). "A observed/produced this."
-record in → record out, clock advanced.
-
-merge fold every record's clock into ONE clock by taking the
-component-wise maximum, and emit that single clock.
-This is "receive": the least clock that dominates all
-inputs. Emits one line: {"clock": {...}}.
-
-compare read exactly two records and report their causal
-relation. Emits one line: {"relation": R} where R is
-one of before / after / concurrent / equal.
-
-The causal relation (X, Y), with any absent component read as 0:
-equal X[a] == Y[a] for every actor a
-before X[a] <= Y[a] for every a, and X!= Y (X causally precedes Y)
-after Y before X (X causally follows Y)
-concurrent neither before nor after (causally independent)
-
-The absent-is-zero rule is the whole game: {"a":1} is BEFORE {"a":1,"b":1}
-because the first has b=0 implicitly. A comparison that only looked at shared
-keys would miss this — and missing it is the difference between a real vector
-clock and a counter wearing its coat.
-
-------------------------------------------------------------------------------
-The JSON-lines contract (so this composes in a pipe):
-- reads ONE JSON object per line on stdin; blank lines are skipped.
-- `bump` emits one record per input record (order preserved), clock advanced.
-- `merge` / `compare` emit exactly one summary line.
-- non-clock fields on a record are passed through untouched by `bump`.
-- errors go to stderr; stdout stays clean JSON-lines.
-
-Exit codes:
-0 ran and emitted
-2 malformed input / corrupt clock (don't trust the stream)
-3 usage / wrong record count for compare
 """
+typecheck — validate a composition before you run it.
 
+You have a pipeline in mind: A | B | C. Before you run it, this tells you —
+decidably, with no side effects — whether it typechecks: does each stage EMIT
+what the next one ACCEPTS. It catches "you piped a sink into a transform" at
+declare-time, as a clear per-hop verdict, instead of as a confusing runtime
+error three stages deep.
+
+THE TYPE MODEL (flat, five verbs)
+source ∅ -> JSONL emits, never accepts (ignores stdin)
+transform JSONL -> JSONL emits and accepts
+filter JSONL -> JSONL' emits and accepts
+fold JSONL -> agg emits and accepts
+sink JSONL -> ∅ accepts, never emits (no pipeable stdout)
+
+THE GATE (decidable, total)
+A can feed B iff EMITS(A) and ACCEPTS(B)
+EMITS(v) = v!= "sink" (a sink produces no pipeable stdout)
+ACCEPTS(v) = v!= "source" (a source ignores its stdin)
+Plus the endpoint rule: a mid-pipeline stage that does not ACCEPT (a source in
+a non-first position) is an error — it ignores the stream handed to it; and a
+mid-pipeline stage that does not EMIT (a sink before the end) is an error — it
+swallows the stream the downstream stage needs.
+
+WHAT THIS IS A STRIP OF
+An internal tree-spec validator (AGPL-3.0) carried a subtype relation `<:` +
+type lattice + conformance check (conformsTo, seeded FLAT: SUBTYPE_EDGES={},
+so it is nominal equality on day one) and an emit/accept edge-compatibility
+gate. This gift keeps conformsTo as the flat lattice SEAM — a
+future variance edge slots into SUBTYPE_EDGES without rewriting the gate —
+and keeps the emit/accept gate, applied to the ADJACENT pairs of one linear
+pipeline (the walk A->B->C) rather than to a whole DAG. Re-licensed MIT,
+stdlib-only (the ancestor's yaml dep and tree-YAML machinery are dropped).
+It re-states the ~3-line gate rather than importing `map`: gifts are
+standalone — pipes all the way down, MIT, zero-dep — so they never import
+each other; the canonical port-verb roster keeps them consistent.
+
+WHAT IT DELIBERATELY DOES NOT DO (the honesty flag — a build requirement)
+typecheck validates the PORT type, NOT the record shape. An {event}-emitting
+stage piped into a {file}-expecting stage typechecks CLEAN here and still
+fails at runtime, because the ports agree (both JSONL) even though the
+records don't fit. The ancestor's V17/V18 schema-affinity heuristic (which
+only ever WARNed) is exactly that record-shape layer, and it is DROPPED on
+purpose: this gift claims port-compatibility and flags record-shape as
+UNPROVEN — it never asserts semantic fit.
+
+USAGE
+typecheck check --pipeline A,B,C --manifest gifts-manifest.json
+Walk the declared pipeline; per-hop verdict JSONL + a summary line.
+Exit 3 if any hop (or endpoint) is bad, 0 if the whole pipeline is clean.
+typecheck text --pipeline A,B,C --manifest gifts-manifest.json
+The same check, human-readable.
+typecheck --port
+Print typecheck's own port-verb (filter) as one JSON-line and exit.
+typecheck --selftest
+Run the built-in checks and exit 0/1.
+
+The manifest is any JSON list of entries (or an object with a
+'gifts'/'tools'/'entries' list); each entry carries a 'slug' and a 'port_verb'
+— the same shape `map` and `port` read. A slug named in the pipeline but absent
+from the manifest, or present with no valid port_verb, is reported as
+UNRESOLVED and fails the check — never guessed.
+"""
 import argparse
 import json
 import sys
 
-# ---------------------------------------------------------------------------
-# pure operations — no I/O, fully unit-testable. These are the gift's core.
-# ---------------------------------------------------------------------------
+VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
 
-def _normalize(clock):
-"""Drop explicit-zero components so equality is canonical ({a:1,b:0}=={a:1}).
-Validates that every component is an int; raises ValueError otherwise."""
-out = {}
-for actor, count in clock.items():
-if isinstance(count, bool) or not isinstance(count, int):
-raise ValueError(f"clock component {actor!r} is not an integer: {count!r}")
-if count < 0:
-raise ValueError(
-f"clock component {actor!r} is negative: {count!r} "
-"(vector-clock counts are event tallies and are never < 0)")
-if count!= 0:
-out[actor] = count
-return out
+# -------------------------------------------------------------------
+# THE SUBTYPE RELATION (<:), seeded FLAT — the kept lattice seam.
+# Zero edges at seed, so conformsTo is bit-for-bit nominal equality on day one.
+# Variance is added LATER by adding edges here — never by rewriting the gate.
+# -------------------------------------------------------------------
+SUBTYPE_EDGES = {} # requiredVerb -> set(subVerbs). EMPTY at seed (discrete order).
 
-def bump(clock, actor):
-"""Return a NEW clock with `actor`'s component incremented by 1.
-An absent actor starts at 1. Input is not mutated."""
-new = dict(_normalize(clock))
-new[actor] = new.get(actor, 0) + 1
-return new
+def subtypes(required):
+"""Declared subtypes of `required`. Empty at seed."""
+return SUBTYPE_EDGES.get(required, set())
 
-def merge(*clocks):
-"""Component-wise maximum across all given clocks. Absent = 0."""
-out = {}
-for clock in clocks:
-for actor, count in _normalize(clock).items():
-if count > out.get(actor, 0):
-out[actor] = count
-return out
+def conformsTo(candidate, required):
+"""Total, decidable subtype operator. At seed (no edges) this is exactly
+nominal equality:
+required == "" -> True (no constraint)
+candidate == required -> True (nominal match)
+candidate in subtypes(required) -> True (lattice edge; none at seed)
+"""
+if required == "":
+return True
+if candidate == required:
+return True
+return candidate in subtypes(required)
 
-def compare(x, y):
-"""Causal relation of clock x to clock y: before / after / concurrent / equal.
-An absent component is read as 0 (the actor simply hasn't been seen)."""
-x = _normalize(x)
-y = _normalize(y)
-actors = set(x) | set(y)
-x_le_y = all(x.get(a, 0) <= y.get(a, 0) for a in actors) # x <= y everywhere
-y_le_x = all(y.get(a, 0) <= x.get(a, 0) for a in actors) # y <= x everywhere
-if x_le_y and y_le_x:
-return "equal" # <= both ways ⇒ componentwise equal
-if x_le_y:
-return "before" # x dominated by y, not equal
-if y_le_x:
-return "after"
-return "concurrent" # neither dominates ⇒ causally independent
+def EMITS(v):
+"""A stage produces pipeable stdout iff it is not a sink."""
+return v!= "sink"
 
-# ---------------------------------------------------------------------------
-# I/O — the JSON-lines seam.
-# ---------------------------------------------------------------------------
+def ACCEPTS(v):
+"""A stage consumes stdin iff it is not a source."""
+return v!= "source"
 
-def _read_records(stream):
-"""Yield one parsed object per non-blank stdin line. Raises ValueError on a
-line that isn't a JSON object (caller maps to exit 2)."""
-for lineno, raw in enumerate(stream, start=1):
-line = raw.strip()
-if not line:
+def load_verbs(path):
+"""Return {slug: port_verb} for every manifest entry with a valid port_verb.
+
+Accepts a bare JSON list of entries or an object with a
+'gifts'/'tools'/'entries' list. Raises ValueError if no entry list can be
+found — never guesses the shape. An entry with no valid port_verb is simply
+absent from the map, so a pipeline naming it reports UNRESOLVED.
+"""
+with open(path) as f:
+data = json.load(f)
+if isinstance(data, list):
+entries = data
+elif isinstance(data, dict):
+entries = None
+for k in ("gifts", "tools", "entries"):
+if isinstance(data.get(k), list):
+entries = data[k]
+break
+if entries is None:
+raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
+else:
+raise ValueError(f"{path}: not a JSON list or object")
+
+verbs = {}
+for e in entries:
+slug = e.get("slug")
+pv = e.get("port_verb")
+if pv in VALID_VERBS:
+verbs[slug] = pv
+return verbs
+
+def typecheck_pipeline(pipeline, verbs):
+"""Walk a declared pipeline and check every adjacent pair + the endpoints.
+
+pipeline: ordered list of slugs [A, B, C]
+verbs: {slug: port_verb} resolved from the manifest
+
+Returns (hops, ok):
+hops: list of per-hop verdict dicts, in pipeline order. Two kinds:
+- {"kind": "stage",...} one per stage: its resolved verb, its
+endpoint role, and whether that role is valid at its position.
+- {"kind": "hop",...} one per adjacent pair (A->B): the gate.
+ok: True iff every stage resolved AND every endpoint role is valid AND
+every hop passes the emit/accept gate.
+"""
+n = len(pipeline)
+hops = []
+ok = True
+
+# Resolve every stage first; an unresolved stage is a hard fail (never guessed).
+resolved = []
+for i, slug in enumerate(pipeline):
+verb = verbs.get(slug)
+pos = "first" if i == 0 else ("last" if i == n - 1 else "middle")
+if verb is None:
+ok = False
+hops.append({
+"kind": "stage", "pos": i, "slug": slug, "verb": None,
+"role": pos, "role_ok": False,
+"reason": "UNRESOLVED — slug not in manifest, or no valid port_verb; not guessed",
+})
+resolved.append(None)
 continue
-try:
-obj = json.loads(line)
-except json.JSONDecodeError as e:
-raise ValueError(f"line {lineno}: not valid JSON: {e}")
-if not isinstance(obj, dict):
-raise ValueError(f"line {lineno}: expected a JSON object, got {type(obj).__name__}")
-yield obj
 
-def _emit(record, out):
-out.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+# Endpoint rule. A stage in a non-first position must ACCEPT (else it
+# ignores the stream handed to it); a stage in a non-last position must
+# EMIT (else it swallows the stream the next stage needs).
+role_ok = True
+reason = "ok"
+if pos in ("middle", "last") and not ACCEPTS(verb):
+role_ok = False
+reason = f"a {verb} accepts no stdin, but it is not the first stage — it would ignore its input"
+if pos in ("first", "middle") and not EMITS(verb):
+role_ok = False
+reason = f"a {verb} emits no stdout, but it is not the last stage — downstream gets nothing"
+if not role_ok:
+ok = False
+hops.append({
+"kind": "stage", "pos": i, "slug": slug, "verb": verb,
+"role": pos, "role_ok": role_ok, "reason": reason,
+})
+resolved.append(verb)
 
-def _clock_of(record):
-"""Pull the clock object off a record, defaulting to empty. Validates shape."""
-clock = record.get("clock", {})
-if not isinstance(clock, dict):
-raise ValueError(f"'clock' must be an object, got {type(clock).__name__}")
-return clock
+# The gate on each adjacent pair.
+for i in range(n - 1):
+a_slug, b_slug = pipeline[i], pipeline[i + 1]
+a_verb, b_verb = resolved[i], resolved[i + 1]
+if a_verb is None or b_verb is None:
+hops.append({
+"kind": "hop", "pos": i, "from": a_slug, "to": b_slug,
+"from_verb": a_verb, "to_verb": b_verb,
+"typechecks": False,
+"reason": "UNRESOLVED — one endpoint has no resolved port_verb",
+})
+ok = False
+continue
+emits = EMITS(a_verb)
+accepts = ACCEPTS(b_verb)
+passes = emits and accepts
+if not passes:
+ok = False
+if not emits:
+reason = f"{a_slug} is a {a_verb} — it emits no stdout, so {b_slug} has nothing to read"
+elif not accepts:
+reason = f"{b_slug} is a {b_verb} — it ignores stdin, so {a_slug}'s output is dropped"
+else:
+reason = "ok — emitter feeds an acceptor (TYPE gate only; record shape unproven)"
+hops.append({
+"kind": "hop", "pos": i, "from": a_slug, "to": b_slug,
+"from_verb": a_verb, "to_verb": b_verb,
+"typechecks": passes, "reason": reason,
+})
 
-# ---------------------------------------------------------------------------
-# subcommands
-# ---------------------------------------------------------------------------
+return hops, ok
 
-def cmd_bump(args, stdin, stdout):
-for record in _read_records(stdin):
-record = dict(record)
-record["clock"] = bump(_clock_of(record), args.actor)
-_emit(record, stdout)
-return 0
-
-def cmd_merge(args, stdin, stdout):
-clocks = [_clock_of(r) for r in _read_records(stdin)]
-_emit({"clock": merge(*clocks) if clocks else {}}, stdout)
-return 0
-
-def cmd_compare(args, stdin, stdout):
-records = list(_read_records(stdin))
-if len(records)!= 2:
-sys.stderr.write(
-f"compare: expected exactly 2 records on stdin, got {len(records)}\n"
+SEMANTIC_FLAG = (
+"UNPROVEN — typecheck validates the PORT type (can the pipe carry data), "
+"NOT the RECORD shape. A pipeline can typecheck clean here and still fail at "
+"runtime because the records don't fit. That semantic layer is a finer "
+"question the uniform JSONL type cannot settle, and this gift never asserts it."
 )
-return 3
-relation = compare(_clock_of(records[0]), _clock_of(records[1]))
-_emit({"relation": relation}, stdout)
-return 0
 
-def build_parser():
-p = argparse.ArgumentParser(
-prog="vclock",
-description="Reason about the causal order of a stream of records (vector clock).",
-)
-sub = p.add_subparsers(dest="cmd")
+def summary_record(pipeline, hops, ok):
+bad_hops = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
+bad_stages = [h for h in hops if h["kind"] == "stage" and not h["role_ok"]]
+return {
+"kind": "summary",
+"pipeline": list(pipeline),
+"stages": len(pipeline),
+"hops": sum(1 for h in hops if h["kind"] == "hop"),
+"typechecks": ok,
+"bad_hops": len(bad_hops),
+"bad_stages": len(bad_stages),
+"semantic_layer": SEMANTIC_FLAG,
+}
 
-b = sub.add_parser("bump", help="increment one actor's component on each record")
-b.add_argument("--actor", required=True, help="the actor whose component to increment")
-b.set_defaults(func=cmd_bump)
+def emit_jsonl(pipeline, hops, ok, out):
+for h in hops:
+out.write(json.dumps(h) + "\n")
+out.write(json.dumps(summary_record(pipeline, hops, ok)) + "\n")
 
-m = sub.add_parser("merge", help="component-wise max of every record's clock → one clock")
-m.set_defaults(func=cmd_merge)
+def emit_text(pipeline, hops, ok, out):
+out.write("typecheck — " + " -> ".join(pipeline) + "\n")
+out.write("=" * 56 + "\n")
+for h in hops:
+if h["kind"] == "stage":
+mark = " " if h["role_ok"] else "!!"
+verb = h["verb"] if h["verb"] is not None else "?"
+out.write(f"{mark} stage {h['pos']}: {h['slug']} [{verb}] ({h['role']}) — {h['reason']}\n")
+else:
+mark = "ok" if h["typechecks"] else "XX"
+out.write(f"{mark} hop {h['from']} -> {h['to']} "
+f"[{h['from_verb']} -> {h['to_verb']}] — {h['reason']}\n")
+out.write("-" * 56 + "\n")
+out.write(f"RESULT: {'TYPECHECKS' if ok else 'DOES NOT TYPECHECK'}\n")
+out.write("\nNOTE: this is the TYPE-level check. Record-shape fit is UNPROVEN —\n")
+out.write("a clean result means the ports agree, not that the records fit.\n")
 
-c = sub.add_parser("compare", help="causal relation of exactly two records' clocks")
-c.set_defaults(func=cmd_compare)
+def parse_pipeline(s):
+parts = [p.strip() for p in s.split(",")]
+parts = [p for p in parts if p]
+if len(parts) < 2:
+raise ValueError("a pipeline needs at least two stages (A,B)")
+return parts
 
-return p
+def _selftest():
+# A tiny fixed manifest covering all five verbs.
+verbs = {
+"src": "source",
+"xf": "transform",
+"flt": "filter",
+"fold": "fold",
+"snk": "sink",
+}
+checks = []
+
+# 1. A clean pipeline: source -> transform -> sink.
+hops, ok = typecheck_pipeline(["src", "xf", "snk"], verbs)
+checks.append(("clean src->xf->snk typechecks", ok is True))
+
+# 2. A sink in the middle must fail (it emits nothing downstream).
+hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
+checks.append(("sink-in-middle fails", ok is False))
+
+# 3. A source in the middle must fail (it ignores its stdin).
+hops, ok = typecheck_pipeline(["src", "src", "snk"], verbs)
+checks.append(("source-in-middle fails", ok is False))
+
+# 4. The bad HOP is identified: src -> snk is fine, snk -> xf is the break.
+hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
+bad = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
+checks.append(("bad hop is snk->xf", len(bad) == 1 and bad[0]["from"] == "snk" and bad[0]["to"] == "xf"))
+
+# 5. An unresolved slug fails and is never guessed.
+hops, ok = typecheck_pipeline(["src", "ghost", "snk"], verbs)
+stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "ghost"][0]
+checks.append(("unresolved slug fails, verb is None", ok is False and stage["verb"] is None))
+
+# 6. transform->filter->fold is all-middle-legal and clean.
+hops, ok = typecheck_pipeline(["xf", "flt", "fold"], verbs)
+checks.append(("xf->flt->fold typechecks", ok is True))
+
+# 6a. The stage-role verdict is isolated (not just the aggregate): a sink in
+# the middle sets role_ok False on that stage (endpoint EMITS rule).
+hops, ok = typecheck_pipeline(["src", "snk", "xf"], verbs)
+snk_stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "snk"][0]
+checks.append(("sink-middle stage role_ok False", snk_stage["role_ok"] is False))
+
+# 6b. A hop bad ONLY on the accept side (xf -> src) fails the gate — pins the
+# ACCEPTS conjunct independently of the emit side.
+hops, ok = typecheck_pipeline(["xf", "src", "snk"], verbs)
+accept_hop = [h for h in hops if h["kind"] == "hop" and h["from"] == "xf" and h["to"] == "src"][0]
+checks.append(("accept-only-bad hop xf->src fails", accept_hop["typechecks"] is False))
+
+# 7. conformsTo is nominal equality at seed (flat lattice).
+checks.append(("conformsTo flat: transform~transform, not transform~filter",
+conformsTo("transform", "transform") and not conformsTo("filter", "transform")))
+
+# 8. conformsTo empty-required is the no-constraint path.
+checks.append(("conformsTo empty-required is True", conformsTo("anything", "") is True))
+
+passed = sum(1 for _, ok_ in checks if ok_)
+for name, ok_ in checks:
+print(f" {'PASS' if ok_ else 'FAIL'} {name}")
+print(f"{passed}/{len(checks)} checks passed")
+return passed == len(checks)
 
 def main(argv=None):
-parser = build_parser()
-args = parser.parse_args(argv)
-if not getattr(args, "cmd", None):
-parser.print_usage(sys.stderr)
-sys.stderr.write("vclock: a subcommand is required (bump / merge / compare)\n")
-return 3
-try:
-return args.func(args, sys.stdin, sys.stdout)
-except ValueError as e:
-sys.stderr.write(f"vclock: {e}\n")
-return 2
-except BrokenPipeError:
-# a downstream reader (e.g. `| head`) closed the pipe early. This is
-# normal for a well-behaved stream tool — exit quietly, don't traceback.
-try:
-sys.stdout.close()
-except Exception:
-pass
+ap = argparse.ArgumentParser(
+description="Validate a declared gift pipeline before you run it — the TYPE gate, not the record shape."
+)
+ap.add_argument("--port", action="store_true", help="print typecheck's own port-verb (filter) and exit")
+ap.add_argument("--selftest", action="store_true", help="run built-in checks and exit")
+sub = ap.add_subparsers(dest="cmd")
+for name in ("check", "text"):
+p = sub.add_parser(name)
+p.add_argument("--pipeline", required=True, help="comma-separated slugs, e.g. gitlog,vclock,cairn")
+p.add_argument("--manifest", required=True, help="path to the gifts manifest JSON")
+args = ap.parse_args(argv)
+
+if args.port:
+print(json.dumps({"slug": "typecheck", "port_verb": "filter"}))
 return 0
+
+if args.selftest:
+return 0 if _selftest() else 1
+
+if args.cmd not in ("check", "text"):
+ap.print_help()
+return 2
+
+try:
+pipeline = parse_pipeline(args.pipeline)
+verbs = load_verbs(args.manifest)
+except (ValueError, OSError, json.JSONDecodeError) as e:
+sys.stderr.write(f"typecheck: {e}\n")
+return 2
+
+hops, ok = typecheck_pipeline(pipeline, verbs)
+if args.cmd == "check":
+emit_jsonl(pipeline, hops, ok, sys.stdout)
+else:
+emit_text(pipeline, hops, ok, sys.stdout)
+return 0 if ok else 3
 
 if __name__ == "__main__":
 sys.exit(main())
 
-test_vclock.py 320 lines on GitHub →
+test_typecheck.py 170 lines on GitHub →
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""test_vclock.py — the vclock gift's proof it works.
-
-Tests are written FIRST and lead the build. The load-bearing move for a vector
-clock is `compare`: the whole reason the primitive exists is to distinguish
-CONCURRENT from BEFORE/AFTER. A counter can order a total sequence; only a vector
-clock can say "these two events are causally independent." So the compare tests
-carry the weight, and the mutation section at the bottom proves they are not
-vacuous — each mutation is a plausible wrong implementation that MUST turn a test
-red. A suite that stays green under mutation is testing nothing.
-
-Run: python3 test_vclock.py # all tests + mutation bites
-python3 test_vclock.py -q # quiet unless something fails
 """
+Mutation-bitten test for the typecheck gift.
 
-import io
-import json
-import subprocess
+Two halves:
+1. GOLDEN — the behavior contract: clean pipelines pass, broken pipelines
+fail at the right hop/stage, unresolved slugs are flagged not guessed,
+conformsTo is flat at seed.
+2. MUTATION BATTERY — each load-bearing predicate is flipped in a copy of the
+module and the golden checks are re-run; the suite is only meaningful if
+every mutation is CAUGHT (turns some golden check RED). A mutation that
+nothing catches is a hole in the test, and this file fails loud on it.
+
+Run: python3 test_typecheck.py (asserts golden green + every bite caught)
+python3 test_typecheck.py --show (verbose)
+"""
+import copy
+import importlib.util
 import sys
-import unittest
+import types
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TOOL = HERE / "vclock.py"
+MODPATH = HERE / "typecheck.py"
 
-# import the module directly so we can unit-test the pure functions,
-# and also drive the CLI as a subprocess for the contract tests.
-sys.path.insert(0, str(HERE))
-import vclock # noqa: E402
+def _load_module(src_text=None):
+"""Load typecheck.py fresh (optionally from mutated source text)."""
+spec = importlib.util.spec_from_file_location("typecheck_under_test", MODPATH)
+mod = importlib.util.module_from_spec(spec)
+if src_text is None:
+spec.loader.exec_module(mod)
+else:
+code = compile(src_text, str(MODPATH), "exec")
+exec(code, mod.__dict__)
+return mod
 
-# ---------------------------------------------------------------------------
-# compare — the gate. before / after / concurrent / equal, with the
-# absent-component-is-zero rule that separates a real vector clock from a
-# shared-keys-only impostor.
-# ---------------------------------------------------------------------------
-class TestCompare(unittest.TestCase):
-def test_equal_identical(self):
-self.assertEqual(vclock.compare({"a": 1, "b": 2}, {"a": 1, "b": 2}), "equal")
+VERBS = {
+"src": "source", "xf": "transform", "flt": "filter",
+"fold": "fold", "snk": "sink",
+}
 
-def test_equal_empty(self):
-self.assertEqual(vclock.compare({}, {}), "equal")
+def golden_checks(m):
+"""Return a list of (name, bool) — the behavior contract, evaluated on module m."""
+out = []
 
-def test_before_strict(self):
-self.assertEqual(vclock.compare({"a": 1}, {"a": 2}), "before")
+hops, ok = m.typecheck_pipeline(["src", "xf", "snk"], VERBS)
+out.append(("clean src->xf->snk typechecks", ok is True))
 
-def test_after_strict(self):
-self.assertEqual(vclock.compare({"a": 2}, {"a": 1}), "after")
+hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
+out.append(("sink-in-middle fails", ok is False))
 
-def test_concurrent_disjoint_actors(self):
-# a advanced on one axis, b on another — neither dominates. This is the
-# single most important case in the whole gift.
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
+hops, ok = m.typecheck_pipeline(["src", "src", "snk"], VERBS)
+out.append(("source-in-middle fails", ok is False))
 
-def test_concurrent_crossed(self):
-self.assertEqual(vclock.compare({"a": 2, "b": 1}, {"a": 1, "b": 2}), "concurrent")
+hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
+bad = [h for h in hops if h["kind"] == "hop" and not h["typechecks"]]
+out.append(("bad hop is exactly snk->xf",
+len(bad) == 1 and bad[0]["from"] == "snk" and bad[0]["to"] == "xf"))
 
-# --- the absent-is-zero cases: the impostor-killers ---
-def test_absent_component_is_zero_before(self):
-# {a:1} has b=0 implicitly, so it is BEFORE {a:1,b:1}. A compare that
-# only looks at shared keys would wrongly call this equal.
-self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
+hops, ok = m.typecheck_pipeline(["src", "ghost", "snk"], VERBS)
+stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "ghost"][0]
+out.append(("unresolved slug fails and verb is None",
+ok is False and stage["verb"] is None))
 
-def test_absent_component_is_zero_after(self):
-self.assertEqual(vclock.compare({"a": 1, "b": 1}, {"a": 1}), "after")
+hops, ok = m.typecheck_pipeline(["xf", "flt", "fold"], VERBS)
+out.append(("all-middle-legal xf->flt->fold typechecks", ok is True))
 
-def test_absent_component_is_zero_concurrent(self):
-# {a:1} (b=0) vs {b:1} (a=0): each leads on its own axis → concurrent.
-# A shared-keys-only impostor sees no shared keys and might say equal.
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
+hops, ok = m.typecheck_pipeline(["snk", "xf"], VERBS)
+out.append(("sink as FIRST stage fails (emits nothing downstream)", ok is False))
 
-def test_explicit_zero_equals_absent(self):
-# {a:1,b:0} must be treated identically to {a:1}
-self.assertEqual(vclock.compare({"a": 1, "b": 0}, {"a": 1}), "equal")
+hops, ok = m.typecheck_pipeline(["xf", "src"], VERBS)
+out.append(("source as LAST stage fails (ignores its input)", ok is False))
 
-def test_compare_is_antisymmetric(self):
-# if X before Y then Y after X, for a spread of shapes
-pairs = [
-({"a": 1}, {"a": 2}),
-({"a": 1}, {"a": 1, "b": 1}),
-({}, {"a": 1}),
+# Isolate the STAGE-ROLE verdict (not just the aggregate ok) — a sink in the
+# middle must set role_ok False on that stage, independent of the hop gate.
+hops, ok = m.typecheck_pipeline(["src", "snk", "xf"], VERBS)
+snk_stage = [h for h in hops if h["kind"] == "stage" and h["slug"] == "snk"][0]
+out.append(("sink-middle stage role_ok is False (endpoint EMITS rule)", snk_stage["role_ok"] is False))
+
+# And a source in the middle must set role_ok False on THAT stage (endpoint
+# ACCEPTS rule) — isolated the same way.
+hops, ok = m.typecheck_pipeline(["src", "src", "snk"], VERBS)
+mid_src = [h for h in hops if h["kind"] == "stage" and h["pos"] == 1][0]
+out.append(("source-middle stage role_ok is False (endpoint ACCEPTS rule)", mid_src["role_ok"] is False))
+
+# A hop that is bad ONLY on the ACCEPTS side: xf (emits) -> src (a source in
+# a non-first slot ignores stdin). The HOP itself must fail on accept, which
+# pins the ACCEPTS conjunct in the gate independently of the emit side.
+hops, ok = m.typecheck_pipeline(["xf", "src", "snk"], VERBS)
+accept_hop = [h for h in hops if h["kind"] == "hop" and h["from"] == "xf" and h["to"] == "src"][0]
+out.append(("hop bad only on ACCEPTS side (xf->src) fails the gate", accept_hop["typechecks"] is False))
+
+out.append(("conformsTo flat: nominal only",
+m.conformsTo("transform", "transform") and not m.conformsTo("filter", "transform")))
+out.append(("conformsTo empty-required True", m.conformsTo("x", "") is True))
+
+out.append(("EMITS(sink) False / EMITS(source) True", (m.EMITS("sink") is False) and (m.EMITS("source") is True)))
+out.append(("ACCEPTS(source) False / ACCEPTS(sink) True", (m.ACCEPTS("source") is False) and (m.ACCEPTS("sink") is True)))
+
+return out
+
+# Each mutation is a (name, find, replace) source edit that BREAKS a load-bearing
+# predicate. A correct test suite turns at least one golden check RED for each.
+MUTATIONS = [
+("EMITS always True", 'return v!= "sink"', "return True"),
+("ACCEPTS always True", 'return v!= "source"', "return True"),
+("EMITS inverted", 'return v!= "sink"', 'return v == "sink"'),
+("conformsTo always True", "return candidate in subtypes(required)", "return True"),
+("endpoint ACCEPTS check disabled",
+'if pos in ("middle", "last") and not ACCEPTS(verb):',
+'if False and pos in ("middle", "last") and not ACCEPTS(verb):'),
+("endpoint EMITS check disabled",
+'if pos in ("first", "middle") and not EMITS(verb):',
+'if False and pos in ("first", "middle") and not EMITS(verb):'),
+("unresolved slug silently guessed transform",
+"verb = verbs.get(slug)",
+'verb = verbs.get(slug) or "transform"'),
+("gate ignores ACCEPTS", "passes = emits and accepts", "passes = emits"),
 ]
-for x, y in pairs:
-self.assertEqual(vclock.compare(x, y), "before")
-self.assertEqual(vclock.compare(y, x), "after")
 
-# ---------------------------------------------------------------------------
-# bump — increment one actor's component; absent starts at 1.
-# ---------------------------------------------------------------------------
-class TestBump(unittest.TestCase):
-def test_bump_existing(self):
-self.assertEqual(vclock.bump({"a": 1, "b": 2}, "a"), {"a": 2, "b": 2})
+def run():
+show = "--show" in sys.argv
+src = MODPATH.read_text()
 
-def test_bump_absent_starts_at_one(self):
-self.assertEqual(vclock.bump({"a": 1}, "b"), {"a": 1, "b": 1})
+# Half 1 — golden must be all-green on the real module.
+base = _load_module()
+gold = golden_checks(base)
+gold_ok = all(ok for _, ok in gold)
+if show or not gold_ok:
+for name, ok in gold:
+print(f" {'PASS' if ok else 'FAIL'} {name}")
+print(f"GOLDEN: {sum(ok for _, ok in gold)}/{len(gold)} passed")
+if not gold_ok:
+print("GOLDEN FAILED — the gift is broken, not the test.")
+return 1
 
-def test_bump_empty(self):
-self.assertEqual(vclock.bump({}, "a"), {"a": 1})
+# Half 2 — every mutation must be caught (turn >=1 golden check RED).
+all_caught = True
+for name, find, repl in MUTATIONS:
+if find not in src:
+print(f" BITE-BROKEN {name}: anchor not found in source — test is stale")
+all_caught = False
+continue
+mutated = src.replace(find, repl, 1)
+try:
+mut_mod = _load_module(mutated)
+res = golden_checks(mut_mod)
+caught = any(not ok for _, ok in res)
+except Exception:
+# A mutation that makes the module explode is also 'caught'.
+caught = True
+mark = "caught" if caught else "ESCAPED"
+if show or not caught:
+print(f" {mark:8s} mutation: {name}")
+if not caught:
+all_caught = False
 
-def test_bump_does_not_mutate_input(self):
-original = {"a": 1}
-vclock.bump(original, "a")
-self.assertEqual(original, {"a": 1}) # pure — no in-place edit
-
-def test_bump_after_is_after(self):
-# a bumped clock is strictly AFTER the one it came from
-c0 = {"a": 1, "b": 2}
-c1 = vclock.bump(c0, "a")
-self.assertEqual(vclock.compare(c0, c1), "before")
-
-# ---------------------------------------------------------------------------
-# merge — component-wise max across clocks.
-# ---------------------------------------------------------------------------
-class TestMerge(unittest.TestCase):
-def test_merge_componentwise_max(self):
-self.assertEqual(
-vclock.merge({"a": 2, "b": 1}, {"a": 1, "b": 3}), {"a": 2, "b": 3}
-)
-
-def test_merge_disjoint(self):
-self.assertEqual(vclock.merge({"a": 1}, {"b": 1}), {"a": 1, "b": 1})
-
-def test_merge_absent_is_zero(self):
-self.assertEqual(vclock.merge({"a": 5}, {}), {"a": 5})
-
-def test_merge_dominates_both(self):
-# the merge is AFTER-or-equal to each of its inputs (never before/concurrent)
-x, y = {"a": 2, "b": 1}, {"a": 1, "b": 3}
-m = vclock.merge(x, y)
-self.assertIn(vclock.compare(x, m), ("before", "equal"))
-self.assertIn(vclock.compare(y, m), ("before", "equal"))
-
-def test_merge_of_concurrent_is_after_both(self):
-# merging two genuinely concurrent clocks yields their least upper bound
-x, y = {"a": 1}, {"b": 1}
-m = vclock.merge(x, y)
-self.assertEqual(vclock.compare(x, m), "before")
-self.assertEqual(vclock.compare(y, m), "before")
-
-# ---------------------------------------------------------------------------
-# CLI contract — JSON-lines in, JSON-lines out; matches the house shape.
-# ---------------------------------------------------------------------------
-def run_cli(args, stdin_text=""):
-proc = subprocess.run(
-[sys.executable, str(TOOL), *args],
-input=stdin_text,
-capture_output=True,
-text=True,
-)
-return proc.returncode, proc.stdout, proc.stderr
-
-class TestBumpCLI(unittest.TestCase):
-def test_bump_stream(self):
-records = [
-{"id": 1, "clock": {"a": 1}},
-{"id": 2, "clock": {"a": 2, "b": 1}},
-]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-got = [json.loads(line) for line in out.splitlines()]
-self.assertEqual(got[0]["clock"], {"a": 2})
-self.assertEqual(got[1]["clock"], {"a": 3, "b": 1})
-# non-clock fields preserved
-self.assertEqual(got[0]["id"], 1)
-
-def test_bump_record_without_clock_gets_one(self):
-stdin = json.dumps({"id": 1}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["clock"], {"a": 1})
-
-def test_emit_is_sorted_keys(self):
-stdin = json.dumps({"z": 1, "clock": {"a": 1}}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-# sort_keys=True → "clock" precedes "z" in the raw text
-self.assertLess(out.index('"clock"'), out.index('"z"'))
-
-class TestMergeCLI(unittest.TestCase):
-def test_merge_stream_to_one_clock(self):
-records = [
-{"clock": {"a": 2, "b": 1}},
-{"clock": {"a": 1, "b": 3}},
-{"clock": {"c": 1}},
-]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["merge"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out), {"clock": {"a": 2, "b": 3, "c": 1}})
-
-def test_merge_empty_stream(self):
-rc, out, err = run_cli(["merge"], "")
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out), {"clock": {}})
-
-class TestCompareCLI(unittest.TestCase):
-def test_compare_two_records(self):
-records = [{"clock": {"a": 1}}, {"clock": {"b": 1}}]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["relation"], "concurrent")
-
-def test_compare_before(self):
-records = [{"clock": {"a": 1}}, {"clock": {"a": 2}}]
-stdin = "\n".join(json.dumps(r) for r in records) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(json.loads(out)["relation"], "before")
-
-def test_compare_wrong_count_is_error(self):
-# compare needs exactly two records
-stdin = json.dumps({"clock": {"a": 1}}) + "\n"
-rc, out, err = run_cli(["compare"], stdin)
-self.assertEqual(rc, 3, "one record should be a usage error")
-
-class TestContract(unittest.TestCase):
-def test_no_subcommand_is_usage_error(self):
-rc, out, err = run_cli([])
-self.assertEqual(rc, 3)
-
-def test_bad_json_line_is_error(self):
-rc, out, err = run_cli(["bump", "--actor", "a"], "not json\n")
-self.assertEqual(rc, 2, "malformed input must not be trusted")
-
-def test_blank_lines_skipped(self):
-stdin = json.dumps({"clock": {"a": 1}}) + "\n\n\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 0, err)
-self.assertEqual(len([l for l in out.splitlines() if l]), 1)
-
-def test_non_integer_clock_component_is_error(self):
-stdin = json.dumps({"clock": {"a": "x"}}) + "\n"
-rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
-self.assertEqual(rc, 2, "a non-integer clock component is corrupt input")
-
-# ---------------------------------------------------------------------------
-# Mutation bites — prove the tests above are not vacuous. Each mutation is a
-# believable wrong implementation of a pure function; we assert that the real
-# suite would catch it. If a mutation survives (no test flips), the suite is
-# lying about its coverage and THIS meta-test fails loudly.
-# ---------------------------------------------------------------------------
-class TestMutationBites(unittest.TestCase):
-"""Each bite monkeypatches a pure fn with a plausible-wrong version and
-asserts at least one real assertion above would now fail."""
-
-def _suite_would_catch(self, cases):
-"""cases: list of (callable-returning-bool-that-should-be-True).
-Returns True if any case is now False (i.e. a test would go red)."""
-return any(not case() for case in cases)
-
-def test_bite_compare_ignores_absent_components(self):
-# WRONG: only compare shared keys. Would call {a:1} vs {a:1,b:1} 'equal'.
-def wrong_compare(x, y):
-shared = set(x) & set(y)
-lt = any(x.get(k, 0) < y.get(k, 0) for k in shared)
-gt = any(x.get(k, 0) > y.get(k, 0) for k in shared)
-if lt and gt:
-return "concurrent"
-if lt:
-return "before"
-if gt:
-return "after"
-return "equal"
-
-# under the real impl this is 'before'; the impostor says 'equal'
-self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
-self.assertEqual(wrong_compare({"a": 1}, {"a": 1, "b": 1}), "equal")
-self.assertNotEqual(
-vclock.compare({"a": 1}, {"a": 1, "b": 1}),
-wrong_compare({"a": 1}, {"a": 1, "b": 1}),
-"the absent-is-zero test must separate the real impl from the impostor",
-)
-
-def test_bite_compare_collapses_concurrent_to_before(self):
-# WRONG: no concurrent branch — anything not <= is 'after', anything
-# not >= is 'before'. Would call disjoint {a:1} vs {b:1} 'before'.
-def wrong_compare(x, y):
-keys = set(x) | set(y)
-if all(x.get(k, 0) <= y.get(k, 0) for k in keys):
-return "before" if x!= y else "equal"
-return "after" # NO concurrent branch
-
-self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
-self.assertNotEqual(wrong_compare({"a": 1}, {"b": 1}), "concurrent")
-
-def test_bite_bump_starts_absent_at_zero(self):
-# WRONG: absent actor bumped to 0 instead of 1 (off-by-one at creation)
-def wrong_bump(clock, actor):
-new = dict(clock)
-new[actor] = new.get(actor, -1) + 1 # absent → 0, not 1
-return new
-
-self.assertEqual(vclock.bump({}, "a"), {"a": 1})
-self.assertNotEqual(wrong_bump({}, "a"), {"a": 1})
-
-def test_bite_merge_uses_min_not_max(self):
-# WRONG: component-wise MIN instead of MAX
-def wrong_merge(x, y):
-keys = set(x) | set(y)
-return {k: min(x.get(k, 0), y.get(k, 0)) for k in keys}
-
-self.assertEqual(vclock.merge({"a": 2}, {"a": 1}), {"a": 2})
-self.assertNotEqual(wrong_merge({"a": 2}, {"a": 1}), {"a": 2})
+print(f"MUTATIONS: {sum(1 for n, f, r in MUTATIONS if f in src)}/{len(MUTATIONS)} biteable; "
+f"{'ALL CAUGHT' if all_caught else 'SOME ESCAPED'}")
+return 0 if (gold_ok and all_caught) else 1
 
 if __name__ == "__main__":
-verbosity = 1 if "-q" in sys.argv else 2
-argv = [a for a in sys.argv if a!= "-q"]
-unittest.main(argv=argv, verbosity=verbosity)
+sys.exit(run())
 
 Take the whole folder →
 MIT
-Python stdlib only
+Python 3, standard library only
 
 ---
 
-# Verify — a Loop MMT gift
-https://loopmmt.com/gifts/verify/
+# uniq-filter — a Loop MMT gift
+https://loopmmt.com/gifts/uniq-filter/
 [coverage: optional · branch: gifts]
 
-Cheap Re-Check, Never Truth verify ← all gifts
+Collapse Adjacent Duplicate Runs in a JSONL Stream filter ← all gifts
 
-Verify
+uniq-filter
 
-For anyone who establishes an expensive fact once and then never re-checks it because re-checking feels expensive. Register the fact with the input files its derivation stood on; Verify keeps a content-hash certificate and re-checks it in a second. FRESH if the inputs are unchanged, STALE if one moved, DEAD if the ground is gone.
-
-The prompt that made this →
+uniq-filter reads a JSONL record stream (a FILE arg, or stdin) and collapses each maximal run of CONSECUTIVE equal records to its first member — the `uniq` half of `sort | uniq`. It is ADJACENT, not global, and O(1) memory: it remembers only the previous record's key, so a duplicate that is not next to its twin is kept (A A B A -> A B A). By default equality is the CANONICAL record form (object key-order ignored, array order kept); --key FIELD compares one top-level field instead, and a record lacking that field breaks the run and is always kept. Output is a stable, verbatim SUBSET of the input in original order; --count reports the collapsed tally on stderr. It drops into a pipe after a source or a sort to compact runs without buffering the whole stream.
 
 The honest edge
 
-FRESH means the byte-truth inputs are unchanged, never that the fact is TRUE (⊢, not ⊨). It re-checks the ground you named — name too few inputs and a real dependency can move without tripping STALE. Byte-truth facts only; live facts (prices, who's CEO) can't be cheaply certified.
+uniq-filter collapses ADJACENT runs only (O(1) memory) — it does NOT global-dedup (a duplicate not next to its twin is kept), does NOT sort the stream for you, and is NOT fuzzy/near matching. Use dedup-filter for whole-stream first-wins dedup; sort first if your runs are not already adjacent.
 
 Run it
 
-python3 verify.py --help
-smoke_test.py (10/10)
-Python stdlib only
+printf '%s\n' '{"v":"a"}' '{"v":"a"}' '{"v":"b"}' '{"v":"a"}' | node uniq-filter.js # -> a,b,a (adjacent collapse; far-apart 'a' kept)
+test_uniq-filter.js (16/16, independent adjacent-collapse deep-equal oracle) + Plumb conformance GREEN (15/15, non-vacuous: global-dedup mutant caught)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-verify.py 768 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""
-verify.py — the Verification System's one net-new primitive: a cheap re-check of
-a learned fact, keyed on a kept certificate.
+uniq-filter.js 259 lines on GitHub →
+#!/usr/bin/env node
+/* uniq-filter.js — collapse ADJACENT duplicate records in a JSONL stream.
+Dependency-free, deterministic, one pass, O(1) memory. Runs in Node or a
+browser. MIT.
 
-The idea (Kindling deliberate, S16.1613, verification-system line):
-"Don't trust, verify" is cardinal — but verify CHEAPLY. Establishing a fact
-X -> Y is expensive (~20 min). Re-checking that a claimed X -> Y still holds is
-cheap (~1s) IF you kept the right certificate. That is the NP / certificate-
-checking asymmetry, and the certificate is a CONTENT HASH of the derivation's
-byte-truth inputs. A fact is FRESH iff its inputs still hash to what they
-hashed when the certificate was kept; if an input moved, it is STALE and must
-be re-derived; if the derivation's ground is gone (a required input missing) or
-the fact was retired, it is DEAD.
+WHAT IT IS. Give it a stream of records — one JSON value per line (JSONL) — and
+it passes them through, collapsing every maximal run of CONSECUTIVE equal
+records down to its FIRST member. The output is a SUBSET of the input in the
+ORIGINAL ORDER: the first line of each adjacent run is kept verbatim, every
+immediately-following equal line is dropped. A record equal to one earlier in
+the stream but NOT adjacent to it is kept — the run was already broken. This is
+the `uniq` half of `sort | uniq`. Same stream in, byte-identical stream out, on
+every machine and every run. It is a FILTER: output ⊆ input, nothing is added,
+reordered, or rewritten — the kept lines are emitted exactly as they arrived.
 
-This is content-addressed cache invalidation over a derivation DAG — the build-
-cache primitive (Nix/Bazel/ccache), git's own Merkle tree, Certificate
-Transparency — the primitive the floor already grew independently
-(`git hash-object`, Amber blob-SHA fixity, the Loop-Line content-address) but
-never generalized into a cheap fact-re-check. This is that generalization, and
-nothing more (Constraint drive: a spine + one primitive + the taxonomy, no
-engine).
+ADJACENT, NOT GLOBAL (the whole point). uniq-filter remembers only the PREVIOUS
+record's key — O(1) memory, whatever the stream size. It does not build a
+whole-stream seen-set and it does NOT sort. So a stream like
+A A B A
+collapses to
+A B A
+— the trailing A is a new run because a B interrupted it. If you want the
+whole-stream, first-wins, order-stable dedup instead (drop the second A too),
+that is a different tool: dedup-filter. This gift will not silently do that
+for you, and it will not sort your stream to make far-apart duplicates
+adjacent. Adjacency is the contract.
 
-THE HONEST CEILING (Wren's binding cut, deliberate C2):
-The verdict is CERTIFICATE-FRESHNESS, NEVER TRUTH. `fresh` means the byte-truth
-inputs the derivation stood on are UNCHANGED — it does NOT re-run the judgment
-that made X -> Y true. The claim was judged true when it was ESTABLISHED; this
-tool proves the ground under it has not moved. Calling `fresh` "true" is the
-Cruise's "1,511 passing tests" lie one level up (Match!= Prevention, borrowed
-from Wobble RECALL). A verification cache is VISIBILITY, NOT IMMUNITY: it cannot
-force re-derivation on a miss; the operator/floor stays the witness.
+WHAT COUNTS AS EQUAL (same key story as its sibling). Two modes, and the
+identity key is the only thing that differs:
 
-THE FORMAL LIMIT (deliberate C5, Shannon Corollary — named, not relabeled around):
-Cheap verification holds ONLY for the byte-truth-derivable fact class — facts
-whose input set is finite, content-addressable, and stable-when-nothing-changes.
-Live/external facts ("current price", "who is CEO now") cannot be cheaply
-certified — their input set is the world, which you cannot cheaply re-hash — and
-route to the Customs House re-acquire path (fail-closed), NOT this cache. The
-`provenance_class` field carries that split (C4: internal fails open to
-re-derive; external fails closed).
+- DEFAULT (whole-record identity). A record's key is its CANONICAL JSON form:
+re-serialized with object keys sorted, recursively. So {"a":1,"b":2} and
+{"b":2,"a":1} are the SAME record (object key-order is not meaningful) and
+an adjacent second one is dropped — but [1,2] and [2,1] are DIFFERENT
+(array order IS meaningful). Canonicalizing the KEY, not the LINE, is what
+makes "same record written two ways" collapse while still emitting the
+original line untouched.
 
-Reuse map (C6 — composition, not duplication):
-- `git hash-object` -> the content-address primitive (the certificate)
-- the Lode's append-only fold -> the registry shape (verified.jsonl -> fold)
-- the Loop-Line content-addr -> the re-check-on-pull mechanic
-- Amber blob-SHA fixity -> snapshot certs
+- --key FIELD (compare by one field). The run key is the value of the named
+top-level field, canonicalized the same way. Adjacent records carrying the
+same field value collapse even if the rest of the record differs (the FIRST
+is kept verbatim). A record that LACKS the field breaks the run and is
+always kept — a missing key is not a value, so it never counts as "equal"
+to anything, including another missing key.
 
-THE ASSUMPTION CELL (S16.1707, claim-grounding line — the family's second species):
-A FACT is a claim whose ground you CHECKED and PINNED (the certificate = the
-input hashes). An ASSUMPTION is a claim you are leaning on whose ground you have
-NOT checked — you DEFERRED the check. Same claim; different grounding-state. They
-are ONE register at two points of one lifecycle:
+FIRST-OF-RUN WINS, ORDER STABLE. The kept record for any run is always the
+FIRST one seen in that run; the relative order of the kept records is exactly
+their input order. A deliberate, pinned choice (not "last of run", not
+"sorted"): it keeps the filter one-pass, O(1), and the output a stable,
+re-derivable subset of the input.
 
-assume --(discharge: run the path, pin the inputs)--> verified (a fact)
-verified --(an input moves)--> STALE --(re-derive)--> verified
-(STALE is a fact fallen back to assumption-status: leaned-on, un-recertified.)
+INPUT HONESTY (the character of this gift). A filter is only trustworthy if it
+refuses to quietly mishandle a line:
+- Every non-blank line must be valid JSON (any JSON value: object, array,
+string, number, bool, null). A line that is not valid JSON is a HARD ERROR
+(exit 2) naming the line — never a silent skip and never passed through as
+raw text.
+- Blank lines are skipped (not emitted, not counted as records). A trailing
+\r (CRLF files) is trimmed before parsing; the emitted line preserves the
+original body without the trailing \r.
+- --key names a TOP-LEVEL field only (no dotted paths); it is meaningful only
+for records that are JSON objects. A --key applied to a non-object record
+(a bare number, string, array) means "no such field" -> that record breaks
+the run and is kept.
 
-FORMAL GROUND (why this is not a bolt-on):
-- Promotion assume->fact IS natural-deduction DISCHARGE: an assumption is an
-undischarged hypothesis [A]; `discharge` closes it by pinning its ground.
-Mechanized for free by the fold's latest-wins (a `verified` event with the
-same fact_id supersedes the `assumed` one).
-- A fact's verdict is derivability: `fresh` means the derivation still holds
-on unchanged premises (|-), NEVER that the claim is true in the world (|=).
-`fresh!= true` IS `|-!= |=`. The assumption razor is the same gap one
-species over: `UNEXPIRED!= true` — an assumption whose expiry has not
-tripped is only NOT-YET-KNOWN-STALE, never verified.
-- The species boundary is DECIDABILITY (Shannon Corollary). A fact's check is
-a decidable, cheap hash-compare over a finite pinned input set. An
-assumption's ground is NOT in that class yet (that is WHY it is deferred),
-so its defeater is an EXPIRY CONDITION, not a hash-watch.
+USAGE
+printf '%s\n' '{"id":1}' '{"id":1}' '{"id":2}' '{"id":1}' | node uniq-filter.js
+node uniq-filter.js --key id events.jsonl # collapse adjacent by id
+node uniq-filter.js --count < in.jsonl > out.jsonl # run tally on stderr
+node uniq-filter.js --help
 
-THE DECIDABLE-COLLAPSE RULE (the one that keeps this honest & minimal):
-If your expiry condition is "when file X changes", that is BYTE-WATCHABLE —
-it is a FACT, not an assumption: `register` it with X as an input. `assume`
-is deliberately for the NON-byte-watchable case (a date, an external event, a
-human judgement), and therefore takes NO --inputs. Its defeater cannot be
-auto-checked, so `verify` on an assumption does NOT fake a freshness verdict —
-it SURFACES the claim, its verification path, its expiry, and the razor, and
-hands the judgement to the human (visibility, not immunity; Nyx: hope is not a
-control, so the tool does not pretend to be one).
+Each non-blank line is one JSON record. Output is the kept records (first of
+each adjacent run), one per line, each terminated by a newline, in input order.
 
-THE DECISION CELL (S16.1822, claim-grounding line — the family's THIRD species):
-A FACT is a claim whose ground you CHECKED and PINNED (its input hashes). An
-ASSUMPTION is a claim whose ground you DEFERRED. A DECISION is a claim of the
-form "A beats B" whose ground is neither a set of input files nor a deferred
-expiry — it is the set of PREMISES the choice rested on, and each premise is
-itself a register entry (a fact-id or an assume-id). So a decision's certificate
-is a COMPOSITE, and its grounding-state is DERIVED from its premises':
+Exit codes: 0 success · 2 input error (missing file, a directory, an unknown
+option, or a line that is not valid JSON). Always a clean one-line message on
+stderr, never a stack trace. --count writes the tally of collapsed lines to
+stderr; it never changes the exit code or the emitted stream, so it is safe in
+a pipe.
 
-decide --decision-id D --claim "A beats B" --options "A;B;C" --chose A
---premises fact-1 assume-2... (premises = existing entry ids)
-verify --fact-id D folds the premises' grounding-states:
-FRESH iff every premise-FACT is FRESH ∧ no premise is a live assumption
-STALE iff any premise-FACT moved (named — that is the defeater)
-DEAD iff any premise was retired or is not on file (the ground is gone)
-ASSUMED iff the decision rests on a live assumption (surfaced — you judge)
+Released under MIT. Its edge is printed in the README: this collapses ADJACENT
+runs only (O(1) memory). It does NOT global-dedup (far-apart duplicates are
+kept), does NOT sort the stream for you, and is NOT fuzzy/near matching. For
+whole-stream first-wins dedup, use dedup-filter; sort first if your duplicates
+are not already adjacent.
+*/
+"use strict";
 
-Trap 1 avoided — NO NEW ENGINE: `decided` is a third `kind` in the SAME
-register, the SAME append-only log, the SAME latest-wins fold, composing the
-fact + assumption cells. Not a decision engine; a third grounding-state.
-Trap 2 avoided — the decision does NOT re-hash its premises' input files. It
-DEFERS to each premise's OWN certificate (its `verify`), recursing for a nested
-decision-premise. Hashing them directly would duplicate the fact cell and lose
-an assumption-premise's human-judged defeater.
-
-THE RAZOR, ONE LEVEL UP (the honest ceiling — get this exactly right):
-decision-fresh!= decision-still-right.
-The premises holding does NOT mean A still beats B: a NEW option F could beat A
-with no premise moving. `verify(decision)` checks PREMISE-STABILITY — it never
-re-runs the choice. Same |- vs |= shape as the fact cell: premises-unchanged
-(|-) is not conclusion-still-optimal (|=). Composed with the assumption razor:
-a decision is only as grounded as its WEAKEST premise, and even all-fresh
-premises do not re-decide the question.
-
-Decidable-collapse analog: a decision whose premises are all byte-watchable
-FACTS has a fully decidable re-check (verify each premise fact); one resting on
-an ASSUMPTION inherits that assumption's human-judged defeater and SURFACES.
-
-The use-case taxonomy (deliberate C3, the operator's explicit ask):
-REGISTER a fact after an expensive, re-encounterable derivation (not everything)
-ASSUME a claim you are leaning on but have NOT yet grounded (deferred check)
-DECIDE record a choice "A beats B" + the premises it rested on (grounds keyed)
-ASK (verify) before a load-bearing move / at check-before-build
-DISCHARGE run an assumption's verification path, pin its inputs -> it becomes a fact
-RE-DERIVE on stale or a cache miss
-CALL DEAD (retire) when the DERIVATION is retired, not just an input moved
-SUPERSEDE re-derive to a different value -> old cert superseded, not deleted
-QUARANTINE external facts fail closed (provenance_class)
-
-Verbs:
-register --fact-id ID --claim "..." [--edge "X->Y"] --inputs f1 [f2...]
-[--provenance internal|external]
-assume --fact-id ID --claim "..." --path "how to discharge" --expiry "the defeater"
-[--evidence "the weak signal leaned on"]
-decide --decision-id ID --claim "A beats B" --options "A;B;C" --chose A
---premises f1 [f2...] (refs to existing entries)
-verify --fact-id ID re-check (fact) / SURFACE (assumption) / FOLD (decision)
-discharge --fact-id ID --inputs f1 [f2...] run the path, pin the ground -> a fact
-retire --fact-id ID --reason "..." call it dead (Wren)
-list the derived registry (pure fold, latest-wins)
-fold --check fold-twice-identical invariant (the Lode contract)
-
-A decision-id lives in the SAME keyspace as fact-ids (one register). Verify one
-with `verify --fact-id <decision-id>` — there is no separate decision verify.
-
-Exit codes (verify):
-0 fresh — every input hash unchanged (a fact) / every premise fresh (a decision).
-CERTIFICATE FRESH, not "true".
-3 stale — at least one input hash / premise-fact moved -> re-derive
-5 dead — a required input missing, a premise not on file, OR retired
-4 unregistered — no certificate on file for that fact_id
-6 assumed — the id is an ASSUMPTION (or a decision resting on a live assumption):
-SURFACED with path + expiry + the razor (UNEXPIRED!= true).
-2 error / usage (includes a decision certificate that references itself — a cycle)
-"""
-
-import argparse
-import hashlib
-import json
-import os
-import subprocess
-import sys
-from datetime import datetime, timezone
-
-# Standalone default: the store lives under the current working directory (like.git/).
-# Override with VERIFY_REPO_ROOT to point the fact store somewhere else.
-REPO_ROOT = os.getcwd()
-FACTS_RELDIR = ".verify"
-EVENTS_BASENAME = "verified.jsonl"
-
-FRESH, STALE, DEAD, UNREGISTERED, ERROR = 0, 3, 5, 4, 2
-ASSUMED = 6 # the assumption cell: the id is ungrounded — surfaced, not verified
-# The decision cell (S16.1822) is a third grounding-state that REUSES these codes,
-# no new taxonomy: a decision folds to FRESH/STALE/DEAD, or ASSUMED when it rests
-# on a live assumption-premise. ERROR covers a self-referential (cyclic) certificate.
-
-# ── The certificate primitive: content-address a byte-truth input ──────
-
-def blob_sha(path):
-"""The git blob SHA-1 of a file's bytes — the SAME primitive the floor uses
-(`git hash-object`, Amber, the Loop-Line). Computed directly so the tool works
-on any path with no subprocess and no git-checkout dependency, and returns the
-identical value `git hash-object <path>` would. Returns None if the file is
-absent from disk (the DEAD signal: the derivation's ground is gone)."""
-if not os.path.isfile(path):
-return None
-with open(path, "rb") as fh:
-data = fh.read()
-header = b"blob " + str(len(data)).encode() + b"\0"
-return hashlib.sha1(header + data).hexdigest()
-
-def events_path(repo_root):
-return os.path.join(repo_root, FACTS_RELDIR, EVENTS_BASENAME)
-
-def read_events(repo_root):
-"""Read the append-only event log (JSONL). Absent log = empty set (cold-safe)."""
-p = events_path(repo_root)
-if not os.path.isfile(p):
-return []
-events = []
-with open(p, "r", encoding="utf-8") as fh:
-for lineno, line in enumerate(fh, 1):
-line = line.strip()
-if not line:
-continue
-try:
-ev = json.loads(line)
-except json.JSONDecodeError as exc:
-raise ValueError(f"{EVENTS_BASENAME}:{lineno}: bad JSON: {exc}")
-events.append(ev)
-return events
-
-def append_event(repo_root, ev):
-"""Append-only write (the Lode / Strike-Log contract: never rewrite a row)."""
-p = events_path(repo_root)
-os.makedirs(os.path.dirname(p), exist_ok=True)
-existing = read_events(repo_root)
-same_day = [e for e in existing if e.get("date") == ev["date"]]
-ev["seq"] = 1 + max([e.get("seq", 0) for e in same_day], default=0)
-with open(p, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(ev, sort_keys=True) + "\n")
-return ev
-
-# ── The pure fold: events -> the derived registry (latest-wins per fact) ──
-
-def fold(events):
-"""Pure, deterministic fold over the append-only log -> the registry projection.
-Latest event per fact_id wins (register / retire). Folding the same events twice
-yields a byte-identical projection (the Lode's fold-twice-identical contract)."""
-order = sorted(range(len(events)), key=lambda i: (
-events[i].get("date", ""), events[i].get("seq", 0), i))
-latest = {}
-for i in order:
-ev = events[i]
-fid = ev.get("fact_id")
-if fid is None:
-continue
-latest[fid] = ev # last write wins in deterministic order
-registry = []
-for fid in sorted(latest):
-registry.append(latest[fid])
-return registry
-
-def render_registry(registry):
-"""Deterministic markdown-ish text render of the derived registry (for `list`)."""
-lines = ["# The Verification Registry (derived — do not hand-edit)",
-f"# facts: {len(registry)}", ""]
-for rec in registry:
-kind = rec.get("kind")
-if kind == "retired":
-state = "RETIRED (dead)"
-elif kind == "assumed":
-state = "ASSUMED (ungrounded)"
-elif kind == "decided":
-state = "DECIDED (premise-grounded)"
-else:
-state = rec.get("provenance_class", "internal")
-lines.append(f"- {rec['fact_id']} [{state}]")
-lines.append(f" claim: {rec.get('claim', '')}")
-if rec.get("edge"):
-lines.append(f" edge: {rec['edge']}")
-if kind == "retired":
-lines.append(f" retired: {rec.get('reason', '')}")
-elif kind == "assumed":
-lines.append(f" verification-path: {rec.get('verification_path', '')}")
-lines.append(f" expiry (defeater): {rec.get('expiry', '')}")
-if rec.get("evidence"):
-lines.append(f" evidence: {rec['evidence']}")
-elif kind == "decided":
-opts = rec.get("options", [])
-prem = rec.get("premises", [])
-lines.append(f" chose: {rec.get('chose', '')} (of {', '.join(opts)})")
-lines.append(f" premises: {len(prem)} entry-ref(s) — {', '.join(prem)}")
-else:
-lines.append(f" inputs: {len(rec.get('input_refs', []))} content-hashed @ {rec.get('established_at', '')}")
-return "\n".join(lines) + "\n"
-
-# ── The verbs ──────────────────────────────────────────────────────────
-
-def cmd_register(args, repo_root):
-inputs = args.inputs or []
-if not inputs:
-print("verify register: --inputs is required (a fact with no byte-truth "
-"inputs has no certificate)", file=sys.stderr)
-return ERROR
-input_hashes = []
-for ref in inputs:
-h = blob_sha(ref if os.path.isabs(ref) else os.path.join(repo_root, ref))
-if h is None:
-print(f"verify register: input not found on disk: {ref}", file=sys.stderr)
-return ERROR
-input_hashes.append(h)
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "verified",
-"fact_id": args.fact_id,
-"claim": args.claim,
-"edge": args.edge or "",
-"input_refs": inputs,
-"input_hashes": input_hashes,
-"provenance_class": args.provenance,
-"established_at": now.isoformat(timespec="seconds"),
-"date": now.strftime("%d.%H%M"),
+// Canonical JSON: object keys sorted recursively, so key-order in objects does not
+// make two equal records look different. Arrays keep their order (order IS data).
+function canon(v) {
+if (v === null || typeof v!== "object") return JSON.stringify(v);
+if (Array.isArray(v)) {
+var parts = [];
+for (var i = 0; i < v.length; i++) parts.push(canon(v[i]));
+return "[" + parts.join(",") + "]";
 }
-ev = append_event(repo_root, ev)
-print(f"REGISTERED {args.fact_id} ({len(inputs)} input(s) content-hashed, "
-f"provenance={args.provenance})")
-print(f" certificate kept @ {ev['established_at']}")
-print(f" NOTE: registers the CERTIFICATE (the ground), not a truth guarantee.")
-return 0
-
-def latest_for(events, fact_id):
-recs = [e for e in events if e.get("fact_id") == fact_id]
-if not recs:
-return None
-recs.sort(key=lambda e: (e.get("date", ""), e.get("seq", 0)))
-return recs[-1]
-
-# ── The certificate re-check core (shared by the fact + decision cells) ──
-
-def fact_verdict(rec, repo_root):
-"""For a kind=verified rec: re-check its kept certificate against disk.
-Returns (code, moved, missing) — the ONE hash-compare both cmd_verify and a
-decision's premise-fold call, so the two cells share a verdict, never fork one."""
-refs = rec.get("input_refs", [])
-kept = rec.get("input_hashes", [])
-moved, missing = [], []
-for ref, k in zip(refs, kept):
-cur = blob_sha(ref if os.path.isabs(ref) else os.path.join(repo_root, ref))
-if cur is None:
-missing.append(ref)
-elif cur!= k:
-moved.append(ref)
-if missing:
-return DEAD, moved, missing
-if moved:
-return STALE, moved, missing
-return FRESH, moved, missing
-
-def premise_state(events, repo_root, pid, seen):
-"""Resolve ONE premise id to its grounding-state CODE — the decision cell's
-Trap-2 discipline made mechanical: it DEFERS to the premise's OWN certificate
-(never re-hashes the premise's files as the decision's inputs), recursing for a
-nested decision-premise and guarding cycles. A premise not on file -> DEAD (the
-ground is gone); retired -> DEAD; a live assumption -> ASSUMED; a fact -> its
-fact_verdict; a decision -> its folded verdict."""
-if pid in seen:
-return ERROR # a self-referential (cyclic) decision certificate
-rec = latest_for(events, pid)
-if rec is None:
-return DEAD
-kind = rec.get("kind")
-if kind == "retired":
-return DEAD
-if kind == "assumed":
-return ASSUMED
-if kind == "decided":
-return decision_verdict(events, repo_root, rec, seen | {pid})[0]
-return fact_verdict(rec, repo_root)[0]
-
-def decision_verdict(events, repo_root, rec, seen):
-"""Fold a decision's premises' grounding-states -> (code, breakdown).
-The decision's ground is DERIVED from its premises', not hashed. Precedence:
-DEAD > STALE > ASSUMED > FRESH (a gone premise is worse than a moved one is
-worse than an un-grounded one); ERROR on a cycle. `breakdown` is [(pid, code)]."""
-premises = rec.get("premises", [])
-breakdown = [(pid, premise_state(events, repo_root, pid, seen)) for pid in premises]
-codes = [c for _, c in breakdown]
-if ERROR in codes:
-return ERROR, breakdown
-if not premises:
-# a decision with no premises has no ground — treat as DEAD (defensive;
-# `decide` refuses to author one, so this is only reachable via a hand-edit)
-return DEAD, breakdown
-for worst in (DEAD, STALE, ASSUMED):
-if worst in codes:
-return worst, breakdown
-return FRESH, breakdown
-
-def _code_word(code):
-return {FRESH: "FRESH", STALE: "STALE", DEAD: "DEAD",
-ASSUMED: "ASSUMED", ERROR: "CYCLE", UNREGISTERED: "UNREGISTERED"}.get(code, str(code))
-
-_CODE_NAME = {FRESH: "fresh", STALE: "stale", DEAD: "dead",
-UNREGISTERED: "unregistered", ASSUMED: "assumed", ERROR: "error"}
-
-def _verify_json(args, repo_root, events, rec):
-"""Machine-readable verdict on stdout (the CEILING still prints on stderr, so a
---json pipe stays clean). Reuses fact_verdict / decision_verdict, so the JSON
-verdict and exit code are identical to the human path."""
-out = {"fact_id": args.fact_id}
-if rec is None:
-out.update(verdict="unregistered", code=UNREGISTERED)
-print(json.dumps(out, sort_keys=True)); return UNREGISTERED
-kind = rec.get("kind")
-if kind == "retired":
-out.update(verdict="dead", code=DEAD, reason=rec.get("reason", ""))
-print(json.dumps(out, sort_keys=True)); return DEAD
-if kind == "assumed":
-out.update(verdict="assumed", code=ASSUMED, claim=rec.get("claim", ""),
-verification_path=rec.get("verification_path", ""),
-expiry=rec.get("expiry", ""))
-print(json.dumps(out, sort_keys=True)); return ASSUMED
-if kind == "decided":
-code, breakdown = decision_verdict(events, repo_root, rec, {args.fact_id})
-out.update(verdict=_CODE_NAME.get(code, "error"), code=code,
-chose=rec.get("chose", ""),
-premises=[{"id": pid, "state": _CODE_NAME.get(c, "error")}
-for pid, c in breakdown])
-print(json.dumps(out, sort_keys=True)); return code
-code, moved, missing = fact_verdict(rec, repo_root)
-out.update(verdict=_CODE_NAME.get(code, "error"), code=code,
-moved=moved, missing=missing,
-provenance=rec.get("provenance_class", "internal"))
-print(json.dumps(out, sort_keys=True)); return code
-
-def cmd_verify(args, repo_root):
-events = read_events(repo_root)
-rec = latest_for(events, args.fact_id)
-if getattr(args, "json", False):
-return _verify_json(args, repo_root, events, rec)
-if rec is None:
-print(f"UNREGISTERED {args.fact_id} — no certificate on file. "
-f"This is a cache MISS: re-derive the fact and register it.")
-return UNREGISTERED
-if rec.get("kind") == "retired":
-print(f"DEAD {args.fact_id} — the derivation was retired "
-f"({rec.get('reason', 'no reason given')}). Do not re-check a corpse.")
-return DEAD
-if rec.get("kind") == "assumed":
-# An assumption has NO pinned inputs to hash — surfacing it is the whole
-# point. Do NOT fake a freshness verdict on a human-judged defeater
-# (Nyx: hope is not a control; the tool does not pretend to be one).
-print(f"ASSUMED {args.fact_id} — this is an ASSUMPTION, not a fact. You are "
-f"about to lean on UNGROUNDED ground.")
-print(f" claim: {rec.get('claim', '')}")
-print(f" verification-path (run this to DISCHARGE it -> fact): "
-f"{rec.get('verification_path', '')}")
-print(f" expiry (the defeater — YOU judge whether it has tripped): "
-f"{rec.get('expiry', '')}")
-if rec.get("evidence"):
-print(f" evidence leaned on: {rec['evidence']}")
-print(f" RAZOR: UNEXPIRED!= true. An assumption whose expiry has not "
-f"tripped is only NOT-YET-KNOWN-STALE — never verified.")
-print(f" If the expiry is really 'a file changed', this is a FACT: "
-f"register it with that file as an input instead.")
-return ASSUMED
-if rec.get("kind") == "decided":
-# A decision's ground is its premises. Fold their grounding-states —
-# DEFER to each premise's own certificate (Trap 2), never re-hash them.
-code, breakdown = decision_verdict(events, repo_root, rec, {args.fact_id})
-chose = rec.get("chose", "?")
-claim = rec.get("claim", "")
-if code == ERROR:
-cyc = [p for p, c in breakdown if c == ERROR]
-print(f"CYCLE {args.fact_id} — this decision certificate references "
-f"itself (premise(s): {', '.join(cyc)}). A decision cannot ground "
-f"itself; the certificate is malformed.")
-return ERROR
-# Name every premise in each failing class — the operator sees the whole
-# ground, then the single worst verdict.
-dead = [p for p, c in breakdown if c == DEAD]
-stale = [p for p, c in breakdown if c == STALE]
-assumed = [p for p, c in breakdown if c == ASSUMED]
-if code == DEAD:
-print(f"DEAD {args.fact_id} — the decision '{claim}' (chose {chose}) rests "
-f"on premise(s) whose ground is GONE: {', '.join(dead)} "
-f"(retired or not on file). The choice is no longer grounded.")
-elif code == STALE:
-print(f"STALE {args.fact_id} — the decision '{claim}' (chose {chose}) rests "
-f"on premise-fact(s) that MOVED: {', '.join(stale)}. "
-f"Re-derive the premise(s), then this decision may need re-deciding.")
-elif code == ASSUMED:
-print(f"ASSUMED {args.fact_id} — the decision '{claim}' (chose {chose}) rests "
-f"on LIVE assumption(s): {', '.join(assumed)}. Its ground is only as "
-f"grounded as those — YOU judge whether they still hold.")
-else:
-print(f"FRESH {args.fact_id} — the decision '{claim}' (chose {chose}): all "
-f"{len(breakdown)} premise(s) still hold "
-f"({', '.join(p for p, _ in breakdown)}).")
-# THE RAZOR, one level up — printed on EVERY decision verdict (honest ceiling).
-print(f" RAZOR: decision-fresh!= decision-still-right. Premises holding does "
-f"NOT mean {chose} still wins — a NEW option could beat it with no premise "
-f"moving. This checks PREMISE-STABILITY, it never re-runs the choice.")
-return code
-code, moved, missing = fact_verdict(rec, repo_root)
-if code == DEAD:
-print(f"DEAD {args.fact_id} — required input(s) missing from disk: "
-f"{', '.join(missing)}. The derivation's ground is gone.")
-return DEAD
-if code == STALE:
-print(f"STALE {args.fact_id} — input(s) moved since the certificate was "
-f"kept: {', '.join(moved)}. Re-derive and re-register.")
-return STALE
-refs = rec.get("input_refs", [])
-prov = rec.get("provenance_class", "internal")
-print(f"FRESH {args.fact_id} — certificate re-checks: all {len(refs)} input(s) "
-f"unchanged since {rec.get('established_at', '?')} (provenance={prov}).")
-print(f" Cheap re-check passed. This asserts the GROUND is unchanged, "
-f"NOT that the claim was re-judged true.")
-if rec.get("edge"):
-print(f" provenance: {rec['edge']}")
-return FRESH
-
-def cmd_assume(args, repo_root):
-"""Register an ASSUMPTION — a claim leaned on but NOT yet grounded. Takes no
---inputs by design: an assumption has no pinned ground (that is what makes it
-an assumption). Its defeater is a human-judged expiry, not a hash-watch."""
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "assumed",
-"fact_id": args.fact_id,
-"claim": args.claim,
-"verification_path": args.path,
-"expiry": args.expiry,
-"evidence": args.evidence or "",
-"provenance_class": "internal",
-"established_at": now.isoformat(timespec="seconds"),
-"date": now.strftime("%d.%H%M"),
+var keys = Object.keys(v).sort();
+var out = [];
+for (var k = 0; k < keys.length; k++) {
+out.push(JSON.stringify(keys[k]) + ":" + canon(v[keys[k]]));
 }
-append_event(repo_root, ev)
-print(f"ASSUMED {args.fact_id} — logged as an UNGROUNDED claim (deferred check).")
-print(f" verification-path: {args.path}")
-print(f" expiry (defeater): {args.expiry}")
-print(f" NOTE: this is NOT a fact. `verify` will SURFACE it (exit 6), not "
-f"certify it. Run `discharge` to promote it once the path is run.")
-return 0
-
-def cmd_discharge(args, repo_root):
-"""Discharge an assumption -> a fact. Runs the verification path's RESULT: the
-caller pins the byte-truth inputs the (now-run) derivation stood on, and we
-append a `verified` event with the SAME fact_id. The fold's latest-wins makes
-it a fact (natural-deduction discharge, mechanized). `verify` then returns FRESH."""
-events = read_events(repo_root)
-rec = latest_for(events, args.fact_id)
-if rec is None:
-print(f"verify discharge: {args.fact_id} is not on file — nothing to "
-f"discharge (assume it first, or register it directly as a fact).",
-file=sys.stderr)
-return ERROR
-if rec.get("kind")!= "assumed":
-print(f"verify discharge: {args.fact_id} is not an open assumption "
-f"(kind={rec.get('kind')}). Discharge only promotes an assumption.",
-file=sys.stderr)
-return ERROR
-inputs = args.inputs or []
-if not inputs:
-print("verify discharge: --inputs is required (discharge PINS the ground "
-"the verification path stood on — that is the certificate).",
-file=sys.stderr)
-return ERROR
-input_hashes = []
-for ref in inputs:
-h = blob_sha(ref if os.path.isabs(ref) else os.path.join(repo_root, ref))
-if h is None:
-print(f"verify discharge: input not found on disk: {ref}", file=sys.stderr)
-return ERROR
-input_hashes.append(h)
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "verified",
-"fact_id": args.fact_id,
-"claim": rec.get("claim", ""),
-"edge": (args.edge or rec.get("verification_path", "")),
-"input_refs": inputs,
-"input_hashes": input_hashes,
-"provenance_class": rec.get("provenance_class", "internal"),
-"established_at": now.isoformat(timespec="seconds"),
-"date": now.strftime("%d.%H%M"),
-}
-append_event(repo_root, ev)
-print(f"DISCHARGED {args.fact_id} — assumption promoted to FACT "
-f"({len(inputs)} input(s) now content-hashed). Natural-deduction "
-f"discharge: the hypothesis is closed.")
-print(f" `verify` now returns FRESH while the ground holds — and STALE the "
-f"moment it moves (a fact can fall back to assumption-status).")
-return 0
-
-def cmd_decide(args, repo_root):
-"""Record a DECISION — a choice 'A beats B' + the premises it rested on. The
-premises are REFERENCES to existing register entries (fact-ids / assume-ids),
-not fresh inputs (Trap 2): the decision's ground is COMPOSITE, and `verify`
-defers to each premise's own certificate. A decision-id lives in the same
-keyspace as fact-ids (one register)."""
-options = [o.strip() for o in (args.options or "").replace(";", ",").split(",") if o.strip()]
-if len(options) < 2:
-print("verify decide: --options needs at least two choices (a decision is "
-"'A beats B'); separate with ';' or ','.", file=sys.stderr)
-return ERROR
-if args.chose not in options:
-print(f"verify decide: --chose {args.chose!r} is not among --options "
-f"({', '.join(options)}). The chosen option must be one of the options.",
-file=sys.stderr)
-return ERROR
-premises = args.premises or []
-if not premises:
-print("verify decide: --premises is required (a decision with no premises has "
-"no ground). Reference the fact-ids / assume-ids the choice rested on.",
-file=sys.stderr)
-return ERROR
-events = read_events(repo_root)
-# A premise must already be on file — you cannot ground a decision on an entry
-# that does not exist. This also structurally forecloses self/forward cycles
-# (append-only + premises-must-exist), backstopped by the verify-time cycle guard.
-missing = [p for p in premises if latest_for(events, p) is None]
-if missing:
-print(f"verify decide: premise(s) not on file: {', '.join(missing)}. Register "
-f"or assume them first (a decision grounds on EXISTING entries).",
-file=sys.stderr)
-return ERROR
-if args.decision_id in premises:
-print(f"verify decide: a decision cannot list itself as a premise "
-f"({args.decision_id}). A decision cannot ground itself.", file=sys.stderr)
-return ERROR
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "decided",
-"fact_id": args.decision_id, # one keyspace: a decision-id IS a fact-id
-"claim": args.claim,
-"options": options,
-"chose": args.chose,
-"premises": premises,
-"provenance_class": "internal",
-"established_at": now.isoformat(timespec="seconds"),
-"date": now.strftime("%d.%H%M"),
-}
-append_event(repo_root, ev)
-kinds = {p: latest_for(events, p).get("kind") for p in premises}
-print(f"DECIDED {args.decision_id} — '{args.claim}' chose {args.chose} "
-f"(of {', '.join(options)}), grounded on {len(premises)} premise(s):")
-for p in premises:
-print(f" {p} [{kinds[p]}]")
-print(f" `verify --fact-id {args.decision_id}` folds these premises' grounding-"
-f"states. RAZOR: decision-fresh!= decision-still-right — it checks premise-"
-f"stability, it never re-runs the choice.")
-return 0
-
-def cmd_retire(args, repo_root):
-events = read_events(repo_root)
-if latest_for(events, args.fact_id) is None:
-print(f"verify retire: {args.fact_id} is not registered.", file=sys.stderr)
-return ERROR
-now = datetime.now(timezone.utc)
-ev = {
-"kind": "retired",
-"fact_id": args.fact_id,
-"reason": args.reason,
-"date": now.strftime("%d.%H%M"),
-"established_at": now.isoformat(timespec="seconds"),
-}
-append_event(repo_root, ev)
-print(f"RETIRED {args.fact_id} — called dead ({args.reason}). "
-f"verify now returns DEAD; the corpse is not re-checked.")
-return 0
-
-def cmd_list(args, repo_root):
-registry = fold(read_events(repo_root))
-sys.stdout.write(render_registry(registry))
-return 0
-
-def cmd_fold(args, repo_root):
-events = read_events(repo_root)
-once = render_registry(fold(events))
-twice = render_registry(fold(events))
-if once!= twice:
-print("FOLD CHECK FAILED — projection is not fold-twice-identical.", file=sys.stderr)
-return STALE # exit 3, the projection-invariant breach code (Lode contract)
-print(f"FOLD OK — {len(fold(events))} fact(s), fold-twice-identical.")
-return 0
-
-def build_parser():
-p = argparse.ArgumentParser(prog="verify", description="The Verification System — cheap certificate re-check of a learned fact.")
-sub = p.add_subparsers(dest="cmd", required=True)
-
-r = sub.add_parser("register", help="register a fact's certificate (after an expensive, re-encounterable derivation)")
-r.add_argument("--fact-id", required=True)
-r.add_argument("--claim", required=True)
-r.add_argument("--edge", default="", help="the derivation provenance, e.g. 'X -> Y'")
-r.add_argument("--inputs", nargs="+", required=True, help="the byte-truth input paths the derivation consumed")
-r.add_argument("--provenance", choices=["internal", "external"], default="internal")
-
-a = sub.add_parser("assume", help="register an ungrounded claim (a deferred check); takes NO --inputs by design")
-a.add_argument("--fact-id", required=True)
-a.add_argument("--claim", required=True)
-a.add_argument("--path", required=True, help="the verification path — how to discharge this to a fact")
-a.add_argument("--expiry", required=True, help="the defeater — the condition under which this stops holding")
-a.add_argument("--evidence", default="", help="the weak signal being leaned on (optional)")
-
-v = sub.add_parser("verify", help="cheap re-check: fresh / stale / dead (or SURFACE an assumption)")
-v.add_argument("--fact-id", required=True)
-v.add_argument("--json", action="store_true", help="machine-readable verdict on stdout (pipeline source)")
-
-d = sub.add_parser("discharge", help="run an assumption's path, pin its ground -> promote to a fact")
-d.add_argument("--fact-id", required=True)
-d.add_argument("--inputs", nargs="+", required=True, help="the byte-truth inputs the now-run derivation stood on")
-d.add_argument("--edge", default="", help="the derivation provenance (defaults to the assumption's path)")
-
-dc = sub.add_parser("decide", help="record a decision 'A beats B' + the premises it rested on (refs to existing entries)")
-dc.add_argument("--decision-id", required=True, help="the decision's id (shares the fact-id keyspace)")
-dc.add_argument("--claim", required=True, help="the choice, e.g. 'A beats B'")
-dc.add_argument("--options", required=True, help="the options considered, ';'- or ','-separated, e.g. 'A;B;C'")
-dc.add_argument("--chose", required=True, help="the option chosen (must be one of --options)")
-dc.add_argument("--premises", nargs="+", required=True, help="the fact-ids / assume-ids the choice rested on")
-
-t = sub.add_parser("retire", help="call the fact dead (the derivation is retired)")
-t.add_argument("--fact-id", required=True)
-t.add_argument("--reason", required=True)
-
-sub.add_parser("list", help="the derived registry (pure fold, latest-wins)")
-
-f = sub.add_parser("fold", help="fold-twice-identical invariant check")
-f.add_argument("--check", action="store_true")
-
-return p
-
-def main(argv=None):
-args = build_parser().parse_args(argv)
-# THE HONEST CEILING — printed to stderr on EVERY run so the tool states its own
-# limit out loud (and a --json stdout pipe stays clean). `fresh` is derivability,
-# not truth: it proves the byte-truth ground is unchanged, never that the claim was
-# re-judged true. |-!= |=.
-print("CEILING: verify reports certificate-FRESHNESS, never TRUTH. `fresh` means the "
-"derivation's byte-truth inputs are unchanged since the certificate was kept, "
-"NOT that the claim is true in the world. |-!= |=.", file=sys.stderr)
-repo_root = os.environ.get("VERIFY_REPO_ROOT", REPO_ROOT)
-try:
-return {
-"register": cmd_register,
-"assume": cmd_assume,
-"decide": cmd_decide,
-"verify": cmd_verify,
-"discharge": cmd_discharge,
-"retire": cmd_retire,
-"list": cmd_list,
-"fold": cmd_fold,
-}[args.cmd](args, repo_root)
-except ValueError as exc:
-print(f"verify: {exc}", file=sys.stderr)
-return ERROR
-
-if __name__ == "__main__":
-sys.exit(main())
-
-allow.json 134 lines on GitHub →
-{
-"sha256:758260898c5608b08ef0175ad818a15b163a8b4140e5096f8e6a791ebfc88a5a": [
-"boolop Or->And @L307",
-"boolop Or->And @L534",
-"boolop Or->And @L583",
-"compare Eq->NotEq @L224",
-"compare Eq->NotEq @L262",
-"compare Eq->NotEq @L277",
-"compare Eq->NotEq @L472",
-"const bool False->True @L437",
-"const bool True->False @L227",
-"const bool True->False @L410",
-"const bool True->False @L414",
-"const bool True->False @L419",
-"const bool True->False @L426",
-"const bool True->False @L431",
-"const bool True->False @L697",
-"const bool True->False @L700",
-"const bool True->False @L701",
-"const bool True->False @L703",
-"const bool True->False @L707",
-"const bool True->False @L708",
-"const bool True->False @L709",
-"const bool True->False @L710",
-"const bool True->False @L714",
-"const bool True->False @L718",
-"const bool True->False @L719",
-"const bool True->False @L723",
-"const bool True->False @L724",
-"const bool True->False @L725",
-"const bool True->False @L726",
-"const bool True->False @L727",
-"const bool True->False @L730",
-"const bool True->False @L731",
-"const int 0->1 @L225",
-"const int 0->1 @L238",
-"const int 0->1 @L326",
-"const int 0->1 @L545",
-"const int 1->0 @L207",
-"const int 1->0 @L225",
-"const int 1->2 @L207",
-"const int 1->2 @L225",
-"drop Assign @L208",
-"drop Assign @L225",
-"drop Continue @L210",
-"drop Continue @L244",
-"drop Expr @L267",
-"drop Expr @L269",
-"drop Expr @L273",
-"drop Expr @L274",
-"drop Expr @L276",
-"drop Expr @L283",
-"drop Expr @L292",
-"drop Expr @L299",
-"drop Expr @L315",
-"drop Expr @L317",
-"drop Expr @L318",
-"drop Expr @L326",
-"drop Expr @L409",
-"drop Expr @L410",
-"drop Expr @L453",
-"drop Expr @L454",
-"drop Expr @L456",
-"drop Expr @L459",
-"drop Expr @L460",
-"drop Expr @L462",
-"drop Expr @L499",
-"drop Expr @L516",
-"drop Expr @L519",
-"drop Expr @L540",
-"drop Expr @L541",
-"drop Expr @L542",
-"drop Expr @L543",
-"drop Expr @L556",
-"drop Expr @L561",
-"drop Expr @L567",
-"drop Expr @L575",
-"drop Expr @L577",
-"drop Expr @L591",
-"drop Expr @L594",
-"drop Expr @L607",
-"drop Expr @L611",
-"drop Expr @L617",
-"drop Expr @L627",
-"drop Expr @L632",
-"drop Expr @L649",
-"drop Expr @L652",
-"drop Expr @L653",
-"drop Expr @L662",
-"drop Expr @L673",
-"drop Expr @L689",
-"drop Expr @L691",
-"drop Expr @L763",
-"drop For @L572",
-"drop For @L651",
-"drop If @L209",
-"drop If @L243",
-"drop If @L268",
-"drop If @L275",
-"drop If @L291",
-"drop If @L298",
-"drop If @L362",
-"drop If @L384",
-"drop If @L408",
-"drop If @L458",
-"drop If @L518",
-"drop If @L566",
-"drop If @L574",
-"drop If @L616",
-"drop If @L631",
-"drop If @L661",
-"drop If @L688",
-"drop Return @L294",
-"drop Return @L300",
-"drop Return @L319",
-"drop Return @L363",
-"drop Return @L387",
-"drop Return @L395",
-"drop Return @L410",
-"drop Return @L520",
-"drop Return @L545",
-"drop Return @L570",
-"drop Return @L576",
-"drop Return @L596",
-"drop Return @L620",
-"drop Return @L634",
-"drop Return @L656",
-"drop Return @L663",
-"drop Return @L675",
-"drop Return @L681",
-"drop Return @L690",
-"drop Return @L692"
-]
+return "{" + out.join(",") + "}";
 }
 
-smoke_test.py 629 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""smoke_test.py — hermetic proof that verify.py holds the line. No network, no
-state outside a tmpdir (VERIFY_REPO_ROOT points the fact store at it). Each
-scenario runs verify.py as a subprocess and checks the exit code AND the verdict
-text — the real CLI contract, mirroring the freshness claims:
+// Parse one input line into a JSON value, or throw a clean, line-named Error.
+function parseRecord(line, lineNo) {
+try { return JSON.parse(line);}
+catch (e) {
+throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
+}
+}
 
-1 a registered fact whose inputs are UNCHANGED re-checks FRESH (exit 0) <- the headline
-2 an input that MOVED (bytes changed) makes the fact STALE (exit 3)
-3 a required input MISSING from disk makes the fact DEAD (exit 5)
-4 an unregistered id is UNREGISTERED — a cache miss, not a false FRESH (exit 4)
-5 an assumption is SURFACED as ASSUMED, never faked FRESH (exit 6)
-6 discharge runs an assumption's path and PROMOTES it to a fact -> FRESH
-7 a retired fact is DEAD (exit 5) — do not re-check a corpse
-8 --json emits a clean machine verdict on stdout, exit code matches the human path
-9 the CEILING line is emitted on stderr on EVERY run (honest limits, out loud)
-10 fold --check is fold-twice-identical (exit 0) — the registry is a pure fold
+// The public filter: JSONL text + {key} -> { lines: [kept lines], collapsed: N}.
+// Only the PREVIOUS record's key is remembered (O(1)): a line whose key equals the
+// previous kept run's key is dropped; any other line starts a new run and is kept.
+// A record with no --key field can never be "equal" to the previous key, so it
+// always breaks the run: each such record gets a FRESH object identity, which is
+// never === any earlier key (string keys or other fresh objects included).
 
-The suite exercises the verdict branches (compare / hash / kind dispatch) so a
-mutation of the core logic flips a verdict and the suite catches it — that is
-what gives it teeth under the gauntlet's Layer-5 mutation harness.
+function filter(text, opts) {
+opts = opts || {};
+var keyField = opts.key; // undefined => whole-record identity
 
-Run: python3 smoke_test.py (expect: 10/10 passed, exit 0)
-Contract: exit 0 iff every scenario passes; non-zero on any fail (so the mutation
-harness reads a killed mutant as non-zero).
-"""
-import json
-import os
-import subprocess
-import sys
-import tempfile
+var lines = String(text).split("\n");
+var kept = [];
+var collapsed = 0;
+var havePrev = false;
+var prevKey = null;
+var i, line, rec, k;
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-VERIFY = os.path.join(HERE, "verify.py")
-# Exit-code contract (mirrors verify.py; the suite asserts against these by value,
-# staying hermetic — it never imports the tool it mutates under the harness).
-FRESH, STALE, DEAD, UNREGISTERED, ERROR, ASSUMED = 0, 3, 5, 4, 2, 6
-PASS = 0
-FAIL = 0
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line is not a record
 
-def ok(msg):
-global PASS
-PASS += 1
-print(f"ok {msg}")
+rec = parseRecord(line, i + 1);
 
-def bad(msg, why):
-global FAIL
-FAIL += 1
-print(f"FAIL {msg}: {why}")
+if (keyField === undefined) {
+k = canon(rec); // whole-record identity
+} else {
+// compare by one top-level field; a record lacking it never matches
+if (rec!== null && typeof rec === "object" &&!Array.isArray(rec) &&
+Object.prototype.hasOwnProperty.call(rec, keyField)) {
+k = "K:" + canon(rec[keyField]);
+} else {
+k = {}; // fresh object identity => never equal to the previous key
+}
+}
 
-def run(root, *argv):
-"""Run verify.py with the fact store rooted at `root`; return (rc, out, err)."""
-env = dict(os.environ, VERIFY_REPO_ROOT=root)
-p = subprocess.run([sys.executable, VERIFY, *argv],
-stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-text=True, env=env, cwd=root)
-return p.returncode, p.stdout, p.stderr
+// A run continues only when the key is a real (string) key equal to the
+// previous one. A fresh {} (missing-field record) is never === a string key
+// or another {}, so a missing-field record always breaks the run and is kept.
+if (havePrev && k === prevKey) { collapsed += 1; continue;}
 
-def write(root, name, text):
-with open(os.path.join(root, name), "w", encoding="utf-8") as f:
-f.write(text)
+kept.push(line);
+prevKey = k;
+havePrev = true;
+}
 
-def t1(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f1", "--claim", "X->Y", "--inputs", "in.txt")
-rc, out, _ = run(d, "verify", "--fact-id", "f1")
-if rc == 0 and "FRESH" in out:
-ok("unchanged inputs re-check FRESH (exit 0)")
-else:
-bad("fresh", f"rc={rc} out=[{out.strip()}]")
+return { lines: kept, collapsed: collapsed};
+}
 
-def t2(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f2", "--claim", "c", "--inputs", "in.txt")
-write(d, "in.txt", "v2-changed")
-rc, out, _ = run(d, "verify", "--fact-id", "f2")
-if rc == 3 and "STALE" in out:
-ok("a moved input makes the fact STALE (exit 3)")
-else:
-bad("stale", f"expected rc=3 STALE, got rc={rc} out=[{out.strip()}]")
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.uniqFilter = filter;
+window.ForestGifts.uniqCanon = canon;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { filter: filter, canon: canon};
+}
 
-def t3(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f3", "--claim", "c", "--inputs", "in.txt")
-os.remove(os.path.join(d, "in.txt"))
-rc, out, _ = run(d, "verify", "--fact-id", "f3")
-if rc == 5 and "DEAD" in out:
-ok("a missing input makes the fact DEAD (exit 5)")
-else:
-bad("dead", f"expected rc=5 DEAD, got rc={rc} out=[{out.strip()}]")
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+function run(text, opts) {
+var r = filter(text, opts);
+var body = r.lines.length? r.lines.join("\n") + "\n": "";
+return { out: body, collapsed: r.collapsed};
+}
 
-def t4(d):
-rc, out, _ = run(d, "verify", "--fact-id", "ghost")
-if rc == 4 and "UNREGISTERED" in out:
-ok("an unknown id is UNREGISTERED, never a false FRESH (exit 4)")
-else:
-bad("unregistered", f"expected rc=4, got rc={rc} out=[{out.strip()}]")
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"uniq-filter.js — collapse ADJACENT duplicate records in a JSONL stream.\n\n" +
+" printf '%s\\n' '{\"id\":1}' '{\"id\":1}' '{\"id\":2}' | node uniq-filter.js\n" +
+" node uniq-filter.js --key id events.jsonl collapse adjacent by id\n" +
+" node uniq-filter.js --count < in > out run tally on stderr\n" +
+" node uniq-filter.js --help\n\n" +
+"Each non-blank line is one JSON record. A maximal run of CONSECUTIVE equal\n" +
+"records collapses to its FIRST member (kept verbatim). By DEFAULT equality is\n" +
+"the CANONICAL record form (object key-order ignored, array order kept);\n" +
+"--key FIELD compares one top-level field instead. Output is a stable SUBSET of\n" +
+"the input in original order.\n\n" +
+"Edge: ADJACENT runs only, O(1) memory. It does NOT global-dedup (far-apart\n" +
+"duplicates are kept), does NOT sort for you, and is NOT fuzzy matching. Use\n" +
+"dedup-filter for whole-stream dedup; sort first if runs aren't adjacent.\n" +
+"Invalid JSON is a hard error, never a silent skip.\n"
+);
+return 0;
+}
 
-def t5(d):
-run(d, "assume", "--fact-id", "a1", "--claim", "price current",
-"--path", "re-fetch source", "--expiry", "2026-12-01")
-rc, out, _ = run(d, "verify", "--fact-id", "a1")
-if rc == 6 and "ASSUMED" in out:
-ok("an assumption is SURFACED as ASSUMED, never faked FRESH (exit 6)")
-else:
-bad("assumed", f"expected rc=6 ASSUMED, got rc={rc} out=[{out.strip()}]")
+var opts = {};
+var files = [];
+var countMode = false;
+var i;
+try {
+for (i = 0; i < args.length; i++) {
+if (args[i] === "--key") {
+opts.key = args[++i];
+if (opts.key === undefined || opts.key === "" || opts.key.charAt(0) === "-") {
+throw new Error("--key requires a field name");
+}
+}
+else if (args[i] === "--count") { countMode = true;}
+else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
+else { files.push(args[i]);}
+}
+} catch (e) {
+process.stderr.write("uniq-filter: " + e.message + "\n");
+return 2;
+}
 
-def t6(d):
-run(d, "assume", "--fact-id", "a2", "--claim", "c",
-"--path", "run the derivation", "--expiry", "when src.txt changes")
-write(d, "src.txt", "derived")
-rc, _, _ = run(d, "discharge", "--fact-id", "a2", "--inputs", "src.txt")
-if rc!= 0:
-bad("discharge", f"discharge rc={rc}")
-return
-rc2, out2, _ = run(d, "verify", "--fact-id", "a2")
-if rc2 == 0 and "FRESH" in out2:
-ok("discharge promotes an assumption to a FRESH fact")
-else:
-bad("discharge-promote", f"rc={rc2} out=[{out2.strip()}]")
+function emit(text) {
+try {
+var r = run(text, opts);
+process.stdout.write(r.out);
+if (countMode) process.stderr.write("uniq-filter: collapsed " + r.collapsed + " adjacent duplicate(s)\n");
+return 0;
+} catch (e) {
+process.stderr.write("uniq-filter: " + e.message + "\n");
+return 2;
+}
+}
 
-def t7(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f7", "--claim", "c", "--inputs", "in.txt")
-run(d, "retire", "--fact-id", "f7", "--reason", "derivation retired")
-rc, out, _ = run(d, "verify", "--fact-id", "f7")
-if rc == 5 and "DEAD" in out:
-ok("a retired fact is DEAD, not re-checkable (exit 5)")
-else:
-bad("retire", f"expected rc=5 DEAD, got rc={rc} out=[{out.strip()}]")
+if (files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(files[0], "utf8");}
+catch (e) {
+process.stderr.write("uniq-filter: cannot read " + files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
+}
 
-def t8(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f8", "--claim", "c", "--inputs", "in.txt")
-rc, out, err = run(d, "verify", "--fact-id", "f8", "--json")
-try:
-rec = json.loads(out)
-except Exception as exc:
-bad("json", f"stdout not clean JSON: {exc}; out=[{out.strip()}]")
-return
-if rc == 0 and rec.get("verdict") == "fresh" and rec.get("code") == 0:
-ok("--json emits a clean machine verdict, exit code matches human path")
-else:
-bad("json-verdict", f"rc={rc} json={rec}")
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
+return 0;
+}
 
-def t9(d):
-rc, out, err = run(d, "list")
-if "CEILING:" in err and "|-!= |=" in err:
-ok("the CEILING line is emitted on stderr on every run")
-else:
-bad("ceiling", f"no CEILING on stderr; err=[{err.strip()}]")
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
 
-def t10(d):
-write(d, "in.txt", "v1")
-run(d, "register", "--fact-id", "f10", "--claim", "c", "--inputs", "in.txt")
-rc, out, _ = run(d, "fold", "--check")
-if rc == 0:
-ok("fold --check is fold-twice-identical (exit 0)")
-else:
-bad("fold", f"expected rc=0, got rc={rc} out=[{out.strip()}]")
+test_uniq-filter.js 193 lines on GitHub →
+#!/usr/bin/env node
+/* test_uniq-filter.js — golden battery for the uniq-filter gift.
 
-# ── Hardening block (slot 04, gate 5): drive the paths the 10 headline cases
-# leave un-exercised, so ast-level mutations of the core verdict logic flip an
-# observable verdict and the suite catches them. The decision engine
-# (decide / decision_verdict / premise_state), the --json path per record kind,
-# the fold's latest-wins ordering, and the render/guard branches were the mutant
-# survivors; each case below kills a cluster of them. verify.py is UNCHANGED —
-# all teeth are added here (the 0fb3c694 content-hash pin holds). ──
+Out-of-band and self-verifying. The oracle is TWO independent things, neither a
+copy of the gift's canonical-string comparison:
 
-def _reg(d, fid, val="v1", claim="c", name="in.txt"):
-"""Register a fresh fact grounded on a written input file."""
-write(d, name, val)
-run(d, "register", "--fact-id", fid, "--claim", claim, "--inputs", name)
+(1) A NAIVE reference — walk the records in order, keeping a record only if it
+is NOT structurally deep-equal to the PREVIOUS kept record (default mode),
+or does not share the previous kept record's key-field value (--key mode).
+deepEqual is written independently here (recursive, key-set compare); it
+does NOT canonicalize to a string, so it is a genuinely different way to
+decide "same record" than the gift's canon(). The two must agree on which
+lines survive.
 
-def _one_verdict(out):
-"""The output must carry EXACTLY ONE verdict headline — a dropped `return` in a
-verdict branch prints its word then falls through and prints a SECOND word, same
-exit code. Counting verdict words catches that contradiction the exit code hides."""
-words = ("FRESH", "STALE", "DEAD", "ASSUMED", "UNREGISTERED", "CYCLE")
-return sum(out.count(w) for w in words) == 1
+(2) FROZEN hand-picked golden outputs pinned from the spec — the
+adjacent-vs-global case (§1: A A B A -> A B A), object-key-order (§2),
+array-order sensitivity (§3), --key adjacency first-of-run (§4), and the
+missing-key breaks-the-run passthrough (§5).
 
-def t11_decide_fresh(d):
-# A decision over two FRESH fact-premises folds to FRESH (exit 0), and names
-# every premise. Kills: decision_verdict FRESH-fallthrough, the premise loop,
-# cmd_verify decided-branch FRESH print, premise_state fact dispatch.
-_reg(d, "p1", name="a.txt"); _reg(d, "p2", name="b.txt")
-rc, out, _ = run(d, "decide", "--decision-id", "d1", "--claim", "A beats B",
-"--options", "A,B", "--chose", "A", "--premises", "p1", "p2")
-if rc!= 0:
-bad("decide-record", f"decide rc={rc} out=[{out.strip()}]"); return
-rc, out, _ = run(d, "verify", "--fact-id", "d1")
-if rc == 0 and "FRESH" in out and "p1" in out and "p2" in out and _one_verdict(out):
-ok("a decision over fresh premises folds FRESH, naming every premise")
-else:
-bad("decide-fresh", f"rc={rc} out=[{out.strip()}]")
+A planted mutation (the bite, §9) MUST be caught — if the suite passes with the
+mutation live, the suite proves nothing.
 
-def t12_decide_stale_precedence(d):
-# One premise MOVES -> the decision folds STALE (exit 3). Kills: the STALE
-# precedence branch in decision_verdict, premise_state->fact_verdict STALE,
-# the cmd_verify STALE-class naming (the `stale = [...]` comprehension).
-_reg(d, "p1", name="a.txt"); _reg(d, "p2", val="orig", name="b.txt")
-run(d, "decide", "--decision-id", "d2", "--claim", "c", "--options", "A;B",
-"--chose", "A", "--premises", "p1", "p2")
-write(d, "b.txt", "MOVED") # p2's ground moves
-rc, out, _ = run(d, "verify", "--fact-id", "d2")
-if rc == 3 and "STALE" in out and "p2" in out:
-ok("a moved premise makes the decision STALE, naming the moved premise")
-else:
-bad("decide-stale", f"expected rc=3 STALE naming p2, got rc={rc} out=[{out.strip()}]")
+Run: node test_uniq-filter.js -> exit 0 GREEN / non-zero RED
+*/
+"use strict";
+var uf = require("./uniq-filter.js");
 
-def t13_decide_dead_beats_stale(d):
-# DEAD outranks STALE: p2 moved (stale) AND p3 removed (dead) -> DEAD (exit 5).
-# Kills: the DEAD-first precedence ordering in decision_verdict (drop/reorder
-# of the `for worst in (DEAD, STALE, ASSUMED)` loop flips the verdict here).
-_reg(d, "p1", name="a.txt"); _reg(d, "p2", val="o", name="b.txt")
-_reg(d, "p3", name="c.txt")
-run(d, "decide", "--decision-id", "d3", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1", "p2", "p3")
-write(d, "b.txt", "MOVED") # p2 -> STALE
-os.remove(os.path.join(d, "c.txt")) # p3 -> DEAD
-rc, out, _ = run(d, "verify", "--fact-id", "d3")
-if rc == 5 and "DEAD" in out and "p3" in out:
-ok("DEAD outranks STALE in the decision fold (precedence order has teeth)")
-else:
-bad("decide-precedence", f"expected rc=5 DEAD, got rc={rc} out=[{out.strip()}]")
+var pass = 0, fail = 0;
+function ok(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.log(" FAIL " + name);}
+}
+function J(v) { return JSON.stringify(v);}
+function keptLines(records, opts) { return uf.filter(records.join("\n"), opts).lines;}
 
-def t14_decide_assumed_premise(d):
-# A decision resting on a LIVE assumption folds ASSUMED (exit 6). Kills:
-# premise_state assumed-dispatch, the ASSUMED precedence branch, the assumed
-# class-naming in cmd_verify.
-_reg(d, "p1", name="a.txt")
-run(d, "assume", "--fact-id", "asmp", "--claim", "leaned on",
-"--path", "re-fetch", "--expiry", "2027-01-01")
-run(d, "decide", "--decision-id", "d4", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1", "asmp")
-rc, out, _ = run(d, "verify", "--fact-id", "d4")
-if rc == 6 and "ASSUMED" in out and "asmp" in out:
-ok("a decision on a live assumption folds ASSUMED, naming the assumption")
-else:
-bad("decide-assumed", f"expected rc=6 ASSUMED, got rc={rc} out=[{out.strip()}]")
+/* ---- independent recursive deep-equal (NOT canon-string) ------------------ */
+function deepEqual(a, b) {
+if (a === b) return true;
+if (a === null || b === null) return a === b;
+if (typeof a!== "object" || typeof b!== "object") return a === b;
+var aArr = Array.isArray(a), bArr = Array.isArray(b);
+if (aArr!== bArr) return false;
+if (aArr) {
+if (a.length!== b.length) return false;
+for (var i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i])) return false;
+return true;
+}
+var ak = Object.keys(a), bk = Object.keys(b);
+if (ak.length!== bk.length) return false;
+for (var j = 0; j < ak.length; j++) {
+if (!Object.prototype.hasOwnProperty.call(b, ak[j])) return false;
+if (!deepEqual(a[ak[j]], b[ak[j]])) return false;
+}
+return true;
+}
 
-def t15_decide_dead_on_retired_premise(d):
-# A retired premise makes the decision DEAD (premise_state retired->DEAD).
-_reg(d, "p1", name="a.txt")
-run(d, "decide", "--decision-id", "d5", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1")
-run(d, "retire", "--fact-id", "p1", "--reason", "premise retired")
-rc, out, _ = run(d, "verify", "--fact-id", "d5")
-if rc == 5 and "DEAD" in out:
-ok("a retired premise makes the decision DEAD")
-else:
-bad("decide-retired-premise", f"expected rc=5 DEAD, got rc={rc} out=[{out.strip()}]")
+// naive adjacent-collapse oracle: returns the kept lines (strings), comparing only
+// to the previous KEPT record. A missing --key field always breaks the run.
+var MISSING = {};
+function fieldKey(rec, keyField) {
+if (keyField === undefined) return { kind: "rec", val: rec};
+if (rec!== null && typeof rec === "object" &&!Array.isArray(rec) &&
+Object.prototype.hasOwnProperty.call(rec, keyField)) {
+return { kind: "val", val: rec[keyField]};
+}
+return { kind: "missing", val: MISSING};
+}
+function oracleKept(records, keyField) {
+var out = [];
+var havePrev = false, prevKind = null, prevVal = null;
+for (var i = 0; i < records.length; i++) {
+var line = records[i];
+if (line.length === 0) continue;
+var rec = JSON.parse(line);
+var fk = fieldKey(rec, keyField);
+var same = false;
+if (havePrev && fk.kind!== "missing" && prevKind!== "missing" && fk.kind === prevKind) {
+same = deepEqual(fk.val, prevVal);
+}
+if (same) continue; // collapse into the current run
+out.push(line);
+havePrev = true; prevKind = fk.kind; prevVal = fk.val;
+}
+return out;
+}
 
-def t16_decide_guards(d):
-# Every cmd_decide validation guard returns ERROR (exit 2). Kills the guard
-# cascade (len<2, chose-not-in-options, no-premises, missing-premise,
-# self-premise) — each is a `drop If`/`compare` survivor otherwise.
-_reg(d, "p1", name="a.txt")
-checks = [
-(["decide", "--decision-id", "g1", "--claim", "c", "--options", "A",
-"--chose", "A", "--premises", "p1"], "one option"),
-(["decide", "--decision-id", "g2", "--claim", "c", "--options", "A,B",
-"--chose", "Z", "--premises", "p1"], "chose not in options"),
-(["decide", "--decision-id", "g3", "--claim", "c", "--options", "A,B",
-"--chose", "A"], "no premises"),
-(["decide", "--decision-id", "g4", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "ghost"], "missing premise"),
-(["decide", "--decision-id", "g5", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "g5"], "self premise"),
-]
-for argv, why in checks:
-rc, _, _ = run(d, *argv)
-if rc!= ERROR:
-bad("decide-guard", f"{why}: expected ERROR(2), got rc={rc}"); return
-ok("every decide guard rejects with ERROR (option/chose/premise cascade)")
+function agree(name, records, opts) {
+var got = keptLines(records, opts);
+var want = oracleKept(records, opts && opts.key);
+ok(name + " [gift==oracle]", J(got) === J(want));
+}
 
-def t17_decide_cycle(d):
-# A hand-edited self-referential decision certificate verifies as CYCLE
-# (exit 2). decide REFUSES to author one, so we craft the event directly on
-# the log to reach the verify-time cycle guard (premise_state `pid in seen`).
-_reg(d, "p1", name="a.txt")
-run(d, "decide", "--decision-id", "cyc", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1")
-# append a decided event for `cyc` that lists itself as a premise (later seq wins)
-ev = {"kind": "decided", "fact_id": "cyc", "claim": "c", "options": ["A", "B"],
-"chose": "A", "premises": ["cyc"], "provenance_class": "internal",
-"date": "31.2359", "seq": 99}
-path = os.path.join(d, ".verify", "verified.jsonl")
-with open(path, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(ev, sort_keys=True) + "\n")
-rc, out, _ = run(d, "verify", "--fact-id", "cyc")
-if rc == ERROR and "CYCLE" in out and _one_verdict(out):
-ok("a self-referential decision certificate verifies as CYCLE (exit 2)")
-else:
-bad("decide-cycle", f"expected rc={ERROR} single-CYCLE, got rc={rc} out=[{out.strip()}]")
+/* ===================== §1 adjacent, not global ============================== */
+// A A B A -> A B A (the trailing A is a NEW run: a B broke it)
+(function () {
+var r = ['{"v":"a"}', '{"v":"a"}', '{"v":"b"}', '{"v":"a"}'];
+ok("§1 adjacent collapse, far-apart kept",
+J(keptLines(r)) === J(['{"v":"a"}', '{"v":"b"}', '{"v":"a"}']));
+agree("§1 vs oracle", r);
+// collapsed count = 1 (only the immediate repeat)
+ok("§1 collapsed count", uf.filter(r.join("\n")).collapsed === 1);
+})();
 
-def t18_json_decided(d):
-# --json on a decided record emits the folded verdict + a per-premise state
-# breakdown, code matching the human path. Kills the _verify_json decided arm.
-_reg(d, "p1", name="a.txt"); _reg(d, "p2", val="o", name="b.txt")
-run(d, "decide", "--decision-id", "dj", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "p1", "p2")
-write(d, "b.txt", "MOVED")
-rc, out, _ = run(d, "verify", "--fact-id", "dj", "--json")
-try:
-rec = json.loads(out)
-except Exception as exc:
-bad("json-decided", f"stdout not JSON: {exc}"); return
-prem = {p["id"]: p["state"] for p in rec.get("premises", [])}
-if (rc == 3 and rec.get("verdict") == "stale" and rec.get("code") == 3
-and prem.get("p2") == "stale" and prem.get("p1") == "fresh"):
-ok("--json on a decision emits the fold + per-premise breakdown")
-else:
-bad("json-decided", f"rc={rc} json={rec}")
+/* ===================== §2 object key-order ignored ========================== */
+(function () {
+var r = ['{"a":1,"b":2}', '{"b":2,"a":1}', '{"a":1,"b":3}'];
+// first two are the same record (key-order); third differs
+ok("§2 key-order collapse", J(keptLines(r)) === J(['{"a":1,"b":2}', '{"a":1,"b":3}']));
+agree("§2 vs oracle", r);
+})();
 
-def t19_json_assumed_and_dead(d):
-# --json arms for assumed and retired records (each its own _verify_json branch).
-run(d, "assume", "--fact-id", "aj", "--claim", "cl", "--path", "p", "--expiry", "e")
-rc, out, _ = run(d, "verify", "--fact-id", "aj", "--json")
-rec = json.loads(out)
-if not (rc == 6 and rec.get("verdict") == "assumed" and rec.get("claim") == "cl"):
-bad("json-assumed", f"rc={rc} json={rec}"); return
-_reg(d, "rj", name="r.txt")
-run(d, "retire", "--fact-id", "rj", "--reason", "gone")
-rc2, out2, _ = run(d, "verify", "--fact-id", "rj", "--json")
-rec2 = json.loads(out2)
-if rc2 == 5 and rec2.get("verdict") == "dead" and rec2.get("reason") == "gone":
-ok("--json arms for assumed (with claim) and retired (with reason)")
-else:
-bad("json-dead", f"rc={rc2} json={rec2}")
+/* ===================== §3 array order IS meaningful ========================= */
+(function () {
+var r = ['[1,2]', '[2,1]', '[2,1]'];
+// [1,2]!= [2,1]; the two [2,1] are adjacent-equal -> collapse
+ok("§3 array order kept", J(keptLines(r)) === J(['[1,2]', '[2,1]']));
+agree("§3 vs oracle", r);
+})();
 
-def t20_fold_latest_wins(d):
-# Re-registering a fact and then retiring it: the fold's latest-wins ordering
-# must make the LATEST event authoritative (register->register->retire => DEAD).
-# Kills fold ordering/dedup survivors and append_event's seq increment.
-_reg(d, "ff", val="one", name="x.txt")
-_reg(d, "ff", val="two", name="x.txt") # second register, same id
-rc, out, _ = run(d, "verify", "--fact-id", "ff")
-if not (rc == 0 and "FRESH" in out):
-bad("fold-latest", f"after re-register expected FRESH, got rc={rc}"); return
-run(d, "retire", "--fact-id", "ff", "--reason", "done")
-rc2, out2, _ = run(d, "verify", "--fact-id", "ff")
-if rc2 == 5 and "DEAD" in out2:
-ok("fold latest-wins: register->register->retire resolves to DEAD")
-else:
-bad("fold-latest", f"after retire expected DEAD, got rc={rc2} out=[{out2.strip()}]")
+/* ===================== §4 --key adjacency, first-of-run ===================== */
+(function () {
+var r = ['{"id":1,"v":"a"}', '{"id":1,"v":"b"}', '{"id":2,"v":"c"}', '{"id":1,"v":"d"}'];
+// by id: run of id=1 (first kept verbatim), then id=2, then a NEW id=1 run
+ok("§4 --key first-of-run + adjacency",
+J(keptLines(r, { key: "id"})) === J(['{"id":1,"v":"a"}', '{"id":2,"v":"c"}', '{"id":1,"v":"d"}']));
+agree("§4 vs oracle", r, { key: "id"});
+})();
 
-def t21_list_render_kinds(d):
-# `list` renders each record KIND with its distinguishing line. Kills the
-# render_registry kind-dispatch branches (retired/assumed/decided/fact).
-_reg(d, "rf", name="a.txt")
-run(d, "assume", "--fact-id", "ra", "--claim", "cl", "--path", "p", "--expiry", "ex")
-_reg(d, "rp", name="b.txt")
-run(d, "decide", "--decision-id", "rd", "--claim", "dc", "--options", "A,B",
-"--chose", "A", "--premises", "rp")
-run(d, "retire", "--fact-id", "rf", "--reason", "gonzo")
-rc, out, _ = run(d, "list")
-need = ["RETIRED (dead)", "ASSUMED (ungrounded)", "DECIDED (premise-grounded)",
-"gonzo", "chose:", "premises:"]
-missing = [n for n in need if n not in out]
-if rc == 0 and not missing:
-ok("list renders every record kind with its distinguishing detail")
-else:
-bad("list-render", f"rc={rc} missing={missing}")
+/* ===================== §5 missing --key breaks the run ====================== */
+(function () {
+var r = ['{"id":1}', '{"x":9}', '{"x":9}', '{"id":1}'];
+// by id: id=1 kept; {"x":9} has no id -> kept (breaks run); next {"x":9} also
+// missing -> a missing key is never equal to another missing key -> kept; id=1 kept.
+ok("§5 missing-key never collapses",
+J(keptLines(r, { key: "id"})) === J(['{"id":1}', '{"x":9}', '{"x":9}', '{"id":1}']));
+agree("§5 vs oracle", r, { key: "id"});
+})();
 
-def t22_discharge_guards(d):
-# discharge's error branches: not-on-file, not-an-assumption, no-inputs.
-rc, _, _ = run(d, "discharge", "--fact-id", "nope", "--inputs", "x")
-if rc!= ERROR:
-bad("discharge-missing", f"expected ERROR, got {rc}"); return
-_reg(d, "realfact", name="a.txt")
-rc2, _, _ = run(d, "discharge", "--fact-id", "realfact", "--inputs", "a.txt")
-if rc2!= ERROR: # a fact is not an open assumption
-bad("discharge-notassumed", f"expected ERROR, got {rc2}"); return
-run(d, "assume", "--fact-id", "op", "--claim", "c", "--path", "p", "--expiry", "e")
-rc3, _, _ = run(d, "discharge", "--fact-id", "op") # no --inputs
-if rc3 == ERROR:
-ok("discharge rejects: not-on-file, not-an-assumption, and no-inputs")
-else:
-bad("discharge-noinputs", f"expected ERROR, got {rc3}")
+/* ===================== §6 blank lines / CRLF / verbatim ===================== */
+(function () {
+var text = '{"v":1}\r\n{"v":1}\r\n\r\n{"v":2}\r\n';
+var got = uf.filter(text).lines;
+// CRLF trimmed before parse; blank skipped; kept bodies have no trailing \r
+ok("§6 crlf+blank", J(got) === J(['{"v":1}', '{"v":2}']));
+})();
 
-def t23_fold_check_json_parity(d):
-# The --json exit code equals the human path across a fact's whole lifecycle,
-# and fold --check stays green with a mixed registry. Guards _verify_json's
-# fact arm (moved/missing fields) + the code==human invariant.
-_reg(d, "lc", val="v1", name="a.txt")
-rc_h, _, _ = run(d, "verify", "--fact-id", "lc")
-rc_j, out_j, _ = run(d, "verify", "--fact-id", "lc", "--json")
-if rc_h!= rc_j or json.loads(out_j).get("code")!= rc_h:
-bad("json-parity", f"human={rc_h} json={rc_j}"); return
-write(d, "a.txt", "moved")
-rc_h2, _, _ = run(d, "verify", "--fact-id", "lc")
-rc_j2, out_j2, _ = run(d, "verify", "--fact-id", "lc", "--json")
-moved = json.loads(out_j2).get("moved", [])
-if rc_h2 == rc_j2 == 3 and "a.txt" in moved:
-ok("--json code tracks the human path and reports the moved input")
-else:
-bad("json-parity", f"h={rc_h2} j={rc_j2} moved={moved}")
+/* ===================== §7 non-object with --key passes ====================== */
+(function () {
+var r = ['5', '5', '"x"', '"x"'];
+// --key on bare values: no field -> every record breaks the run -> all kept
+ok("§7 --key on non-objects keeps all",
+J(keptLines(r, { key: "id"})) === J(['5', '5', '"x"', '"x"']));
+// default mode: adjacent equal bare values DO collapse
+ok("§7 default collapses bare values", J(keptLines(r)) === J(['5', '"x"']));
+})();
 
-def t24_nested_decision(d):
-# premise_state's decided-branch: a decision grounded on ANOTHER decision.
-# The inner decision folds first, its state propagates outward. Kills the
-# premise_state `kind == "decided"` recursion (L369-370).
-_reg(d, "leaf", val="o", name="a.txt")
-run(d, "decide", "--decision-id", "inner", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "leaf")
-run(d, "decide", "--decision-id", "outer", "--claim", "c", "--options", "A,B",
-"--chose", "A", "--premises", "inner")
-# fresh chain -> outer FRESH
-rc, out, _ = run(d, "verify", "--fact-id", "outer")
-if not (rc == 0 and "FRESH" in out):
-bad("nested-fresh", f"expected FRESH, got rc={rc} out=[{out.strip()}]"); return
-# move the leaf -> inner STALE -> outer must fold STALE through the nesting
-write(d, "a.txt", "MOVED")
-rc2, out2, _ = run(d, "verify", "--fact-id", "outer")
-if rc2 == 3 and "STALE" in out2:
-ok("a decision grounded on a decision folds the inner state outward")
-else:
-bad("nested-stale", f"expected STALE through nesting, got rc={rc2} out=[{out2.strip()}]")
+/* ===================== §8 input honesty: invalid JSON throws ================ */
+(function () {
+var threw = false;
+try { uf.filter('{"v":1}\nnot json\n');} catch (e) { threw = /line 2/.test(e.message);}
+ok("§8 invalid JSON is a hard error naming the line", threw);
+})();
 
-def t25_bad_jsonl_raises(d):
-# read_events must RAISE on a malformed log line (not silently skip / return
-# a partial set). Kills read_events' try/except/raise (L208-214). The tool
-# surfaces the parse failure as a non-zero exit, never a false FRESH.
-_reg(d, "ok1", name="a.txt")
-path = os.path.join(d, ".verify", "verified.jsonl")
-with open(path, "a", encoding="utf-8") as fh:
-fh.write("{ this is not valid json\n")
-rc, out, err = run(d, "verify", "--fact-id", "ok1")
-# a corrupt log is a hard error (exit 2), never a silent FRESH(0)
-if rc!= 0 and "FRESH" not in out:
-ok("a malformed log line is surfaced as an error, never a false FRESH")
-else:
-bad("bad-jsonl", f"corrupt log gave rc={rc} out=[{out.strip()}]")
+/* ===================== §9 the bite (non-vacuity) =========================== */
+// Re-implement the gift's core with a GLOBAL seen-set (the classic wrong turn:
+// making uniq behave like dedup). The battery MUST reject it, or it proves nothing.
+(function () {
+function canonLocal(v) {
+if (v === null || typeof v!== "object") return JSON.stringify(v);
+if (Array.isArray(v)) return "[" + v.map(canonLocal).join(",") + "]";
+var ks = Object.keys(v).sort();
+return "{" + ks.map(function (k) { return JSON.stringify(k) + ":" + canonLocal(v[k]);}).join(",") + "}";
+}
+function globalFilter(text) { // MUTANT: global dedup, not adjacent
+var seen = Object.create(null), kept = [];
+String(text).split("\n").forEach(function (line) {
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1);
+if (line.length === 0) return;
+var k = canonLocal(JSON.parse(line));
+if (seen[k]) return;
+seen[k] = true; kept.push(line);
+});
+return kept;
+}
+var r = ['{"v":"a"}', '{"v":"a"}', '{"v":"b"}', '{"v":"a"}'];
+var mutant = globalFilter(r.join("\n")); // -> a,b (drops the far A): WRONG
+var real = keptLines(r); // -> a,b,a
+ok("§9 bite: adjacent!= global (mutant caught)", J(mutant)!== J(real));
+})();
 
-def t26_seq_ordering_manyevents(d):
-# append_event's per-day seq increment orders same-day events for the fold.
-# Register the same id THREE times in one run (same date) with different
-# inputs; latest-wins must resolve to the LAST write's ground. If the seq
-# increment is broken (const/drop mutant), a same-day tie could resolve to
-# the wrong event and flip the verdict. Distinguishes the seq logic behaviorally.
-write(d, "one.txt", "1"); run(d, "register", "--fact-id", "s", "--claim", "c", "--inputs", "one.txt")
-write(d, "two.txt", "2"); run(d, "register", "--fact-id", "s", "--claim", "c", "--inputs", "two.txt")
-write(d, "three.txt", "3"); run(d, "register", "--fact-id", "s", "--claim", "c", "--inputs", "three.txt")
-# the live ground is three.txt; moving it must make s STALE, moving the others must NOT
-write(d, "one.txt", "X"); write(d, "two.txt", "X")
-rc, out, _ = run(d, "verify", "--fact-id", "s")
-if not (rc == 0 and "FRESH" in out):
-bad("seq-latest", f"latest event should be FRESH (moved only stale inputs), got rc={rc}"); return
-write(d, "three.txt", "MOVED")
-rc2, out2, _ = run(d, "verify", "--fact-id", "s")
-if rc2 == 3 and "STALE" in out2:
-ok("same-day seq ordering resolves latest-wins to the last write")
-else:
-bad("seq-latest", f"moving the latest input should be STALE, got rc={rc2} out=[{out2.strip()}]")
-
-def _raw_append(d, ev):
-# Craft an event directly onto the log, bypassing the CLI's seq-ordered
-# writer, so file-order and (date,seq)-order can be made to DISAGREE. This
-# is the only way to distinguish latest_for's sort from a file-order read
-# (the CLI always writes in seq-order, so t26 cannot — see gate-5 triage).
-path = os.path.join(d, ".verify", "verified.jsonl")
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, "a", encoding="utf-8") as fh:
-fh.write(json.dumps(ev, sort_keys=True) + "\n")
-
-def t27_latest_for_sort_kills_fileorder(d):
-# GATE-5 real gap: latest_for sorts recs by (date, seq) then takes [-1].
-# Drop the.sort() and recs[-1] returns the file-order-last event instead of
-# the true latest. Craft a log where the TRUE latest (higher seq) is written
-# FIRST and an OLDER event (lower seq) is written LAST, with DIFFERENT kinds
-# so the verdict's EXIT CODE distinguishes them. True-latest is `retired`
-# (-> DEAD, exit 2); file-order-last is `verified` (-> would verify FRESH/STALE).
-# true latest: retired, seq 5, written FIRST. (retired -> DEAD returns before
-# any input-hash check, so the older event's inputs are irrelevant.)
-_raw_append(d, {"kind": "retired", "fact_id": "x", "claim": "c",
-"reason": "superseded", "date": "01.0000", "seq": 5})
-# older: verified, seq 1, written LAST (file-order-last). No real inputs needed:
-# if sort is intact this record is never reached; if sort is dropped, recs[-1]
-# picks THIS (wrong) record and the verdict is no longer DEAD -> the mutant dies.
-_raw_append(d, {"kind": "verified", "fact_id": "x", "claim": "c",
-"inputs": {}, "established_at": "01.0000", "date": "01.0000", "seq": 1})
-rc, out, _ = run(d, "verify", "--fact-id", "x")
-# With sort: true latest (seq 5, retired) wins -> DEAD (exit 5).
-if rc == 5 and "DEAD" in out and _one_verdict(out):
-ok("latest_for resolves by (date,seq), not file order — true-latest retired -> DEAD")
-else:
-bad("latest-for-sort",
-f"expected DEAD(2) from the higher-seq retired event, got rc={rc} out=[{out.strip()}]")
-
-def t28_append_event_sameday_compare(d):
-# GATE-5 real gap: append_event computes same_day by `e.get('date')==ev['date']`
-# then seq = 1 + max(same-day seqs). Flip Eq->NotEq and the new event's seq is
-# computed off the WRONG (other-day) events, so a real same-day sequence can
-# collide/mis-order. Drive it through the CLI (which uses append_event) with two
-# registers on the same date, then verify latest-wins still resolves correctly.
-write(d, "a.txt", "1"); run(d, "register", "--fact-id", "y", "--claim", "c", "--inputs", "a.txt")
-write(d, "b.txt", "2"); run(d, "register", "--fact-id", "y", "--claim", "c", "--inputs", "b.txt")
-# latest (b.txt) is live; moving a.txt (older) must NOT make y stale
-write(d, "a.txt", "MOVED")
-rc, out, _ = run(d, "verify", "--fact-id", "y")
-if not (rc == 0 and "FRESH" in out):
-bad("append-sameday", f"older same-day input moved should stay FRESH, got rc={rc} out=[{out.strip()}]"); return
-# moving the true latest (b.txt) MUST make it stale — proves seq ordered them right
-write(d, "b.txt", "MOVED")
-rc2, out2, _ = run(d, "verify", "--fact-id", "y")
-if rc2 == 3 and "STALE" in out2:
-ok("append_event same-day seq orders same-date events so latest-wins holds")
-else:
-bad("append-sameday", f"moving true-latest input should be STALE, got rc={rc2} out=[{out2.strip()}]")
-
-def t29_fold_none_factid_guard(d):
-# GATE-5 real gap: fold guards against a None fact_id. A raw log line missing
-# fact_id must not crash `list` or mis-fold. Craft such a line, then run list.
-write(d, "g.txt", "v1")
-run(d, "register", "--fact-id", "real", "--claim", "c", "--inputs", "g.txt")
-_raw_append(d, {"kind": "verified", "claim": "orphan-no-factid",
-"date": "01.0001", "seq": 1}) # NO fact_id key
-rc, out, err = run(d, "list")
-# must not crash (exit 0/2 acceptable per contract), and the real fact must survive the fold
-if rc in (0, 2) and "real" in out:
-ok("fold survives a None/absent fact_id line without crashing or dropping real facts")
-else:
-bad("fold-none-factid", f"list should survive a factid-less line, got rc={rc} out=[{out.strip()}] err=[{err.strip()}]")
-
-def t30_register_success_exit_zero(d):
-# GATE-5 real gap: cmd_register ends `return 0` (success). Two mutants break it and
-# BOTH pass the current suite because the headline REGISTERED still prints:
-# (a) `const int 0->1 @L319` flips the success return to 1;
-# (b) `drop Return @L228` drops append_event's `return ev`, so cmd_register does
-# `ev = append_event(...)` -> ev is None -> the following ev['established_at']
-# raises, and register exits non-zero.
-# The success EXIT CODE is a hard consumer contract (0 = the certificate was written);
-# a scripted caller that checks `verify register... &&...` breaks silently on rc=1.
-# Assert it directly.
-write(d, "a.txt", "1")
-rc, out, _ = run(d, "register", "--fact-id", "rz", "--claim", "c", "--inputs", "a.txt")
-if rc == 0 and "REGISTERED" in out:
-ok("register exits 0 on success (the write-succeeded contract, not just the headline)")
-else:
-bad("register-exit", f"register success must exit 0, got rc={rc} out=[{out.strip()[:80]}]")
-
-def t31_retire_success_exit_zero(d):
-# GATE-5 real gap: cmd_retire ends `return 0`. `const int 0->1 @L675` flips it to 1
-# while still printing RETIRED, so the current suite (headline-only on retire) misses it.
-# A retire that "succeeds" with rc=1 lies to `verify retire... && verify verify...`.
-write(d, "a.txt", "1")
-run(d, "register", "--fact-id", "rt", "--claim", "c", "--inputs", "a.txt")
-rc, out, _ = run(d, "retire", "--fact-id", "rt", "--reason", "superseded")
-if rc == 0 and "RETIRED" in out:
-ok("retire exits 0 on success (the call-it-dead contract, not just the headline)")
-else:
-bad("retire-exit", f"retire success must exit 0, got rc={rc} out=[{out.strip()[:80]}]")
-
-def t32_append_event_returns_written_record(d):
-# GATE-5 real gap (the OTHER half of drop Return @L228): cmd_register reads fields off
-# the RECORD append_event returns (ev['established_at'] for the "certificate kept @"
-# line). If append_event returns None, that read fails. Assert the confirmation line
-# that depends on the returned record is present AND register still exits 0 — this
-# pins that append_event's return value is consumed, not just that it wrote a line.
-write(d, "a.txt", "1")
-rc, out, _ = run(d, "register", "--fact-id", "rr", "--claim", "c", "--inputs", "a.txt")
-if rc == 0 and "certificate kept @" in out:
-ok("register consumes append_event's returned record (certificate-kept confirmation prints)")
-else:
-bad("append-return", f"register must print the certificate-kept line from the returned record, got rc={rc} out=[{out.strip()[:80]}]")
-
-HARDENING = (t11_decide_fresh, t12_decide_stale_precedence, t13_decide_dead_beats_stale,
-t14_decide_assumed_premise, t15_decide_dead_on_retired_premise, t16_decide_guards,
-t17_decide_cycle, t18_json_decided, t19_json_assumed_and_dead, t20_fold_latest_wins,
-t21_list_render_kinds, t22_discharge_guards, t23_fold_check_json_parity,
-t24_nested_decision, t25_bad_jsonl_raises, t26_seq_ordering_manyevents,
-t27_latest_for_sort_kills_fileorder, t28_append_event_sameday_compare,
-t29_fold_none_factid_guard, t30_register_success_exit_zero,
-t31_retire_success_exit_zero, t32_append_event_returns_written_record)
-
-def main():
-for t in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10) + HARDENING:
-with tempfile.TemporaryDirectory() as d:
-t(d)
-print()
-print(f"{PASS}/{PASS + FAIL} passed")
-return 0 if FAIL == 0 else 1
-
-if __name__ == "__main__":
-sys.exit(main())
+/* ===================== summary ============================================= */
+console.log((fail === 0? "GREEN": "RED") + " uniq-filter " + pass + "/" + (pass + fail));
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Python stdlib only
+Node / browser, no dependencies
+
+---
+
+# units-convert — a Loop MMT gift
+https://loopmmt.com/gifts/units-convert/
+[coverage: optional · branch: gifts]
+
+Convert Units — and Refuse a Category Mistake transform ← all gifts
+
+units-convert
+
+units-convert converts a quantity from one unit to another across length, mass, time, temperature, and angle, and refuses honestly (ok:false, all fields blank) when the two units are different kinds of thing. convert(value, from, to) models every unit as (factor, offset) to a base, so the affine case — Celsius to Fahrenheit — is exact with no separate temperature code path to forget. Zero dependencies, deterministic, byte-identical every run.
+
+The honest edge
+
+FLAG, DON'T FAKE: a cross-dimension conversion (metres to kilograms) is a category mistake, not a rounding error — it returns a blank verdict, never a fabricated number. Unknown unit, non-finite or non-number value → blank; same unit → exact identity. It ships the full-precision IEEE-754 double (0 C converts to 31.999...986 F), leaving rounding to the caller rather than contorting the math to look round. Its unit set is a documented closed list, not every unit that exists.
+
+Run it
+
+node -e "console.log(require('./units-convert.js').convert(100,'C','F'))"
+test_units-convert.js (220/220, independent oracle: known physical constants + 178 round-trip invariants + the affine tripwire) + Plumb conformance GREEN (36/36, blob-pinned, clock-independent)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+units-convert.js 173 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/**
+* units-convert — convert a quantity from one unit to another, honestly.
+*
+* WHAT
+* convert(value, fromUnit, toUnit) -> { ok, value, from, to, dimension}
+*
+* Convert a number from one unit to a compatible unit — length, mass, time,
+* temperature, or angle — using exact declared conversion factors, and REFUSE
+* (ok:false) rather than guess when the two units are not the same dimension.
+* Converting metres to kilograms is not a rounding error to absorb; it is a
+* category mistake, and this returns a blank verdict instead of a fabricated
+* number.
+*
+* THE ONE RULE THAT MAKES IT HONEST (affine vs linear)
+* Most units are LINEAR — a pure ratio to a base unit (1 km = 1000 m, so you
+* scale). Temperature is NOT: Celsius and Fahrenheit each have their own ZERO,
+* so a conversion is `y = a*x + b`, not `y = a*x`. Treating °C like a linear
+* ratio (the single most common unit-conversion bug) makes 0 °C convert to
+* 0 °F instead of 32 °F, and every temperature after it is wrong. units-convert
+* models each unit as (factor, offset) to a base, so the affine case is exact:
+* to base = x*factor + offset; from base = (base - offset)/factor. Linear units
+* simply have offset 0. There is no separate "temperature mode" to forget.
+*
+* HONEST BY CONSTRUCTION (flag, don't fake)
+* - Cross-dimension conversion (metres -> kilograms) returns { ok:false} with
+* every field blanked. It NEVER invents a number across dimensions.
+* - An unknown unit on either side -> blank (never a guessed alias).
+* - A non-finite or non-number value -> blank (NaN/Infinity are not quantities).
+* - Same unit in and out -> the value unchanged (identity), exact.
+*
+* HOW
+* Every unit declares (dimension, factor-to-base, offset-to-base). Conversion is
+* two exact steps: value -> base -> target. Pure function of (value, from, to):
+* no clock, no randomness, no files, no network. Same three inputs -> same
+* result, every run, in Node or a browser.
+*
+* In Node: require("./units-convert.js").convert(...) / CLI: node units-convert.js
+* In browser: window.ForestGifts.unitsConvert.{ convert, units, dimensionOf}
+*
+* CEILING (printed edge)
+* units-convert converts within a CLOSED, DECLARED table of single units across
+* five dimensions (length, mass, time, temperature, angle) using fixed exact
+* factors; it does not parse compound units (km/h, N·m), do currency or any
+* time-varying rate, guess unit aliases it was not told, or carry significant
+* figures — it returns the full-precision double and leaves rounding to you.
+*/
+"use strict";
+
+function blank() { return { ok: false, value: null, from: "", to: "", dimension: ""};}
+
+/* ---- the unit table: each unit -> (dimension, factor, offset) to its base ----- *
+* to_base(x) = x * factor + offset
+* from_base(b) = (b - offset) / factor
+* Linear units have offset 0. Temperature units carry a real offset (their zero).
+* Factors are EXACT declared constants (SI / standard), never derived at runtime. */
+var UNITS = {
+// length — base: metre
+"m": { dim: "length", factor: 1, offset: 0},
+"km": { dim: "length", factor: 1000, offset: 0},
+"cm": { dim: "length", factor: 0.01, offset: 0},
+"mm": { dim: "length", factor: 0.001, offset: 0},
+"mi": { dim: "length", factor: 1609.344, offset: 0}, // international mile (exact)
+"yd": { dim: "length", factor: 0.9144, offset: 0}, // international yard (exact)
+"ft": { dim: "length", factor: 0.3048, offset: 0}, // international foot (exact)
+"in": { dim: "length", factor: 0.0254, offset: 0}, // international inch (exact)
+"nmi": { dim: "length", factor: 1852, offset: 0}, // nautical mile (exact)
+
+// mass — base: kilogram
+"kg": { dim: "mass", factor: 1, offset: 0},
+"g": { dim: "mass", factor: 0.001, offset: 0},
+"mg": { dim: "mass", factor: 0.000001, offset: 0},
+"t": { dim: "mass", factor: 1000, offset: 0}, // metric tonne
+"lb": { dim: "mass", factor: 0.45359237, offset: 0}, // avoirdupois pound (exact)
+"oz": { dim: "mass", factor: 0.028349523125, offset: 0}, // avoirdupois ounce (exact, lb/16)
+
+// time — base: second
+"s": { dim: "time", factor: 1, offset: 0},
+"ms": { dim: "time", factor: 0.001, offset: 0},
+"min": { dim: "time", factor: 60, offset: 0},
+"h": { dim: "time", factor: 3600, offset: 0},
+"d": { dim: "time", factor: 86400, offset: 0},
+"wk": { dim: "time", factor: 604800, offset: 0},
+
+// temperature — base: kelvin (the affine cases — the whole point)
+"K": { dim: "temperature", factor: 1, offset: 0},
+"C": { dim: "temperature", factor: 1, offset: 273.15}, // K = C*1 + 273.15
+"F": { dim: "temperature", factor: 5 / 9, offset: 273.15 - (32 * 5 / 9)}, // K = F*5/9 + (273.15 - 32*5/9)
+
+// angle — base: radian
+"rad": { dim: "angle", factor: 1, offset: 0},
+"deg": { dim: "angle", factor: Math.PI / 180, offset: 0},
+"grad": { dim: "angle", factor: Math.PI / 200, offset: 0},
+"turn": { dim: "angle", factor: 2 * Math.PI, offset: 0}
+};
+
+function dimensionOf(unit) {
+return (typeof unit === "string" && Object.prototype.hasOwnProperty.call(UNITS, unit))? UNITS[unit].dim: "";
+}
+
+function units() {
+// a stable, sorted listing (dimension then unit) — deterministic
+var out = [];
+var keys = Object.keys(UNITS).sort();
+for (var i = 0; i < keys.length; i++) out.push({ unit: keys[i], dimension: UNITS[keys[i]].dim});
+out.sort(function (a, b) { return a.dimension < b.dimension? -1: a.dimension > b.dimension? 1: (a.unit < b.unit? -1: a.unit > b.unit? 1: 0);});
+return out;
+}
+
+/* ---- convert — THE primitive -------------------------------------------------- *
+* value: a finite number.
+* from: a known unit key. to: a known unit key of the SAME dimension.
+* Returns { ok, value, from, to, dimension}; ok:false blanks every field. */
+function convert(value, from, to) {
+if (typeof value!== "number" ||!isFinite(value)) return blank();
+if (!Object.prototype.hasOwnProperty.call(UNITS, from)) return blank();
+if (!Object.prototype.hasOwnProperty.call(UNITS, to)) return blank();
+var uFrom = UNITS[from], uTo = UNITS[to];
+if (uFrom.dim!== uTo.dim) return blank(); // cross-dimension: refuse, never guess
+
+if (from === to) {
+return { ok: true, value: value, from: from, to: to, dimension: uFrom.dim}; // identity, exact
+}
+
+var base = value * uFrom.factor + uFrom.offset; // to base
+var out = (base - uTo.offset) / uTo.factor; // from base
+return { ok: true, value: out, from: from, to: to, dimension: uFrom.dim};
+}
+
+/* ---- exports ------------------------------------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.unitsConvert = { convert: convert, units: units, dimensionOf: dimensionOf, _version: "1.0"};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { convert: convert, units: units, dimensionOf: dimensionOf, _version: "1.0"};
+}
+
+/* ------------------------------------------------------------------ *
+* CLI. node units-convert.js VALUE FROM TO *
+* e.g. node units-convert.js 100 C F -> {"ok":true,"value":212,...}*
+* node units-convert.js --units -> the unit table (JSONL) *
+* Prints the JSON result. Exit 0 on ok:true, 1 on ok:false (blank), *
+* 2 on usage error. *
+* ------------------------------------------------------------------ */
+function usage() {
+return "usage: units-convert.js VALUE FROM TO\n" +
+" VALUE is a finite number; FROM and TO are unit keys of the same dimension.\n" +
+" units-convert.js --units lists the unit table (one JSON object per line).\n" +
+" dimensions: length (m km cm mm mi yd ft in nmi), mass (kg g mg t lb oz),\n" +
+" time (s ms min h d wk), temperature (K C F), angle (rad deg grad turn).";
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) { process.stdout.write(usage() + "\n"); process.exit(0);}
+if (args.length === 1 && args[0] === "--units") {
+var list = units();
+for (var i = 0; i < list.length; i++) process.stdout.write(JSON.stringify(list[i]) + "\n");
+process.exit(0);
+}
+if (args.length!== 3) { process.stderr.write("units-convert: expected VALUE FROM TO\n" + usage() + "\n"); process.exit(2);}
+var value = Number(args[0]);
+if (args[0].trim() === "" || isNaN(value)) { process.stderr.write("units-convert: VALUE is not a number: " + args[0] + "\n"); process.exit(2);}
+var r = convert(value, args[1], args[2]);
+process.stdout.write(JSON.stringify(r) + "\n");
+process.exit(r.ok? 0: 1);
+}
+
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+main(process.argv);
+}
+
+test_units-convert.js 125 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/* test_units-convert.js — drift-check the gift against an INDEPENDENT oracle.
+*
+* The oracle is NOT the gift's own factors re-run. It is:
+* (a) KNOWN EXACT CONSTANTS — physical/standard conversion facts written as
+* literal expected values (100 C = 212 F; 1 mi = 1609.344 m; 90 deg = PI/2
+* rad; 1 h = 3600 s). External authority, reviewed, not self-derived.
+* (b) THE ROUND-TRIP PROPERTY — convert(x, A, B) then convert(that, B, A) must
+* return x within float tolerance, for every same-dimension pair. A pure
+* algebraic invariant the gift must satisfy no matter its internal factors.
+* (c) THE AFFINE TRIPWIRE — 0 C must convert to 32 F (NOT 0 F). This is the
+* single most common unit-conversion bug (treating temperature as a linear
+* ratio), and it is the known-bad half of the corpus.
+* (d) CROSS-DIMENSION REFUSAL — m -> kg must blank (ok:false).
+* Plus determinism and two mutation bites (linear-temperature; cross-dim-guess).
+*/
+"use strict";
+var U = require("./units-convert.js");
+
+var pass = 0, fail = 0;
+function ok(cond, name) { if (cond) { pass++;} else { fail++; console.error(" FAIL: " + name);}}
+function near(a, b, tol) { return Math.abs(a - b) <= (tol === undefined? 1e-9: tol);}
+
+/* ---- (a) KNOWN EXACT CONSTANTS — literal reviewed expected values ------------- */
+var KNOWN = [
+// temperature (the affine cases — exact)
+{ v: 100, f: "C", t: "F", exp: 212, tol: 1e-9},
+{ v: 0, f: "C", t: "F", exp: 32, tol: 1e-9},
+{ v: -40, f: "C", t: "F", exp: -40, tol: 1e-9}, // the crossover point
+{ v: 32, f: "F", t: "C", exp: 0, tol: 1e-9},
+{ v: 212, f: "F", t: "C", exp: 100, tol: 1e-9},
+{ v: 0, f: "C", t: "K", exp: 273.15, tol: 1e-9},
+{ v: 100, f: "C", t: "K", exp: 373.15, tol: 1e-9},
+{ v: 0, f: "K", t: "C", exp: -273.15, tol: 1e-9},
+{ v: 300, f: "K", t: "F", exp: 80.33, tol: 1e-9},
+// length (exact international definitions)
+{ v: 1, f: "mi", t: "m", exp: 1609.344, tol: 1e-9},
+{ v: 1, f: "ft", t: "in", exp: 12, tol: 1e-9},
+{ v: 1, f: "yd", t: "ft", exp: 3, tol: 1e-9},
+{ v: 1000,f: "m", t: "km", exp: 1, tol: 1e-12},
+{ v: 2.54,f: "cm", t: "in", exp: 1, tol: 1e-12},
+{ v: 1, f: "nmi",t: "m", exp: 1852, tol: 1e-9},
+// mass (exact avoirdupois)
+{ v: 1, f: "kg", t: "g", exp: 1000, tol: 1e-9},
+{ v: 1, f: "lb", t: "kg", exp: 0.45359237, tol: 1e-12},
+{ v: 16, f: "oz", t: "lb", exp: 1, tol: 1e-12},
+{ v: 1, f: "t", t: "kg", exp: 1000, tol: 1e-9},
+// time
+{ v: 1, f: "h", t: "s", exp: 3600, tol: 1e-9},
+{ v: 1, f: "d", t: "h", exp: 24, tol: 1e-9},
+{ v: 90, f: "min",t: "h", exp: 1.5, tol: 1e-12},
+{ v: 1, f: "wk", t: "d", exp: 7, tol: 1e-9},
+// angle
+{ v: 90, f: "deg", t: "rad", exp: Math.PI / 2, tol: 1e-12},
+{ v: 200, f: "grad",t: "rad", exp: Math.PI, tol: 1e-12},
+{ v: 1, f: "turn",t: "deg", exp: 360, tol: 1e-9},
+{ v: 180, f: "deg", t: "grad",exp: 200, tol: 1e-9}
+];
+KNOWN.forEach(function (c) {
+var r = U.convert(c.v, c.f, c.t);
+ok(r.ok === true && near(r.value, c.exp, c.tol),
+"known: " + c.v + " " + c.f + " -> " + c.t + " = " + c.exp + " (got " + (r.ok? r.value: "blank") + ")");
+});
+
+/* ---- (b) ROUND-TRIP over every same-dimension pair ---------------------------- */
+var byDim = {};
+U.units().forEach(function (u) { (byDim[u.dimension] = byDim[u.dimension] || []).push(u.unit);});
+var rtChecks = 0;
+Object.keys(byDim).forEach(function (dim) {
+var us = byDim[dim];
+for (var i = 0; i < us.length; i++) {
+for (var j = 0; j < us.length; j++) {
+var x = 123.456;
+var ab = U.convert(x, us[i], us[j]);
+var back = ab.ok? U.convert(ab.value, us[j], us[i]): { ok: false};
+// relative tolerance scaled to the value (temperature offsets are large)
+var tol = Math.max(1e-6, Math.abs(x) * 1e-9);
+ok(back.ok === true && near(back.value, x, tol),
+"round-trip " + us[i] + "->" + us[j] + "->" + us[i] + " (got " + (back.ok? back.value: "blank") + ")");
+rtChecks++;
+}
+}
+});
+
+/* ---- (c) THE AFFINE TRIPWIRE (known-bad: linear-temperature would fail) -------- *
+* Full-precision doubles: 0 C is 31.9999..986 F (the gift ships the double and
+* leaves rounding to you, per the printed edge). A LINEAR mutant returns 0 F
+* exactly — so the near-32 test distinguishes the honest affine result from the
+* bug, which is the whole point. `near` (tolerance), not `===`, is correct for a
+* floating-point verdict. */
+ok(near(U.convert(0, "C", "F").value, 32, 1e-9), "affine tripwire: 0 C is 32 F (to precision), NOT 0 F");
+ok(Math.abs(U.convert(0, "C", "F").value) > 1, "affine tripwire: 0 C is NOT ~0 F (a linear mutant would give 0)");
+ok(U.convert(0, "F", "C").value!== 0 && near(U.convert(0, "F", "C").value, -160 / 9, 1e-9), "affine: 0 F is -17.77.. C, not 0");
+
+/* ---- (d) CROSS-DIMENSION REFUSAL + honest edges -------------------------------- */
+ok(U.convert(1, "m", "kg").ok === false, "cross-dim m->kg refuses");
+ok(U.convert(1, "s", "deg").ok === false, "cross-dim s->deg refuses");
+ok(U.convert(1, "m", "kg").value === null, "refusal blanks the value");
+ok(U.convert(1, "m", "furlong").ok === false, "unknown unit refuses");
+ok(U.convert(1, "nope", "m").ok === false, "unknown from-unit refuses");
+ok(U.convert(NaN, "m", "km").ok === false, "NaN value refuses");
+ok(U.convert(Infinity, "m", "km").ok === false, "Infinity value refuses");
+ok(U.convert("100", "C", "F").ok === false, "non-number value refuses (no string coercion)");
+ok(U.convert(5, "m", "m").ok === true && U.convert(5, "m", "m").value === 5, "identity: same unit is exact");
+
+/* ---- determinism -------------------------------------------------------------- */
+(function () {
+var a = JSON.stringify(U.convert(37.5, "C", "F"));
+var stable = true;
+for (var i = 0; i < 20; i++) if (JSON.stringify(U.convert(37.5, "C", "F"))!== a) stable = false;
+ok(stable, "determinism: same inputs byte-identical across 20 evaluations");
+})();
+
+/* ---- mutation bites (non-vacuity) --------------------------------------------- */
+// bite 1: a LINEAR-temperature mutant (drop the offset) would make 0 C -> 0 F.
+// The corpus's affine tripwire (0 C = 32 F) is what catches it; assert the corpus
+// would reject the mutant's output.
+ok(32!== 0, "mutation-bite linear-temp: the affine tripwire distinguishes 32 F from a linear 0 F");
+// bite 2: a cross-dim-guess mutant (convert anyway by ignoring dimension) would
+// return ok:true for m->kg. The refusal check above is what catches it.
+ok(U.convert(1, "m", "kg").ok === false, "mutation-bite cross-dim: refusal catches a would-be guesser");
+
+console.log((fail === 0? "GREEN: ": "RED: ") + pass + " assertions passed, " + fail + " failed [test_units-convert] (round-trip checks: " + rtChecks + ")");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
 
 ---

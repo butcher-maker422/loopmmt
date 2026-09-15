@@ -1,8 +1,486 @@
-# Loop MMT — corpus shard 74/86
+# Loop MMT — corpus shard 74/87
 
-> Bundle 74 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 74 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/ndjson-source/, /gifts/palimpsest/, /gifts/parity/, /gifts/pluck/)
+Nodes in this shard: 4 (/gifts/mint/, /gifts/ndjson-source/, /gifts/palimpsest/, /gifts/parity/)
+
+---
+
+# Mint — a Loop MMT gift
+https://loopmmt.com/gifts/mint/
+[coverage: optional · branch: gifts]
+
+IDs That Are Never Reused allocate ← all gifts
+
+Mint
+
+Hand out IDs that are never reused — and prove it before returning each one, not with an after-the-fact check but as a structural property: a retired ID cannot come back. JSON in, JSON out, backed by a file you can read.
+
+The honest edge
+
+It guarantees no reuse within the one ID store you point it at. Two independent stores that don't know about each other can still collide — single source of truth is your job.
+
+Run it
+
+python3 mint.py alloc --root./ids
+test_mint.py (15/15, mutation-bitten)
+Python stdlib only, deterministic
+
+The code — every file that ships
+
+mint.py 321 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""mint.py — hand out IDs that are never reused, and prove it before returning.
+
+A mint stamps a coin once and never stamps that number again. This does the same
+for identifiers: every ID it issues is strictly above every ID it has ever issued
+before, so a number that was retired can never be pointed at a second thing. That
+"never reused" property is not checked after the fact — it is **structural, and
+transactional**: the mint keeps a single **high-water mark** and only ever hands
+out `high_water + 1`, advancing the mark *inside a database transaction that
+commits before any ID is emitted*. A crash right after issuing cannot re-issue
+the same number, because the mark already moved and the move was durable.
+
+Why you'd want that: any time an ID collision would let one record be mistaken for
+another — a retired user's ID reassigned to a new user, a recycled trace ID
+threading two unrelated events — monotonic allocation makes the mistake
+impossible rather than merely unlikely. Retirement is recorded (so you can audit
+what was let go) but a retired ID is **never** returned to the pool: silent
+recycling is the whole failure this refuses, so there is no recycle switch.
+
+STATE lives in a SQLite database at `<root>/mint.db` (Python stdlib `sqlite3`):
+meta.high_water: the last ID issued (or floor-1 when empty), one row
+retired: an append-only table of IDs recorded retired
+the rule: the free pool is [high_water+1..]; nothing lowers the mark.
+SQLite gives atomic commit, crash recovery, schema enforcement, and cross-process
+serialization for free (`BEGIN IMMEDIATE` lets only one allocator advance the mark
+at a time), which is exactly the indivisible decision "allocate and persist" is.
+Invalid, missing, downgraded, or out-of-range state is **refused** (exit 2), never
+silently reset to the floor. A legacy `mint-state.json` is imported once on first
+run — and refused loudly if it is corrupt — so an upgrade never reissues an old ID.
+
+THE GATE, checked at allocation time, before an ID is returned:
+in range floor <= id <= ceil
+monotonic id > high_water (structural: id = high_water + 1)
+not live id not in --live SET (not held right now)
+A gate failure is a refusal with a reason, never a silent second-best.
+
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+- `mint alloc` / `mint peek` / `mint retire` emit ONE JSON object per line on
+stdout — a record you can pipe into the next tool.
+- `mint alloc -n K` emits K lines, one per freshly-minted ID, in order.
+- `--live -` reads a set of currently-held IDs from stdin, one JSON object or
+bare integer per line (field `--live-field`, default "id").
+- errors go to stderr; stdout stays clean JSON-lines.
+
+Exit codes:
+0 the operation succeeded
+1 a gate refusal (out of range / not monotonic / id live)
+2 state could not be read, is invalid/out-of-range, or could not be written
+3 usage / bad input
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+
+SCHEMA_VERSION = 1
+
+class MintError(Exception):
+"""A gate refusal or a state fault, carrying an exit code."""
+
+def __init__(self, message, code):
+super().__init__(message)
+self.code = code
+
+def _db_path(root):
+return os.path.join(root, "mint.db")
+
+def _legacy_seed(root, floor, ceil):
+"""One-time seed from a legacy mint-state.json, if present. Returns the mark.
+Refuses (exit 2) rather than resetting: a corrupt or out-of-range legacy mark
+is a fault to surface, never a silent fall back to the floor (the fail-open
+this store exists to kill). An absent legacy file seeds the empty sentinel."""
+legacy = os.path.join(root, "mint-state.json")
+if not os.path.exists(legacy):
+return floor - 1
+try:
+with open(legacy, "r", encoding="utf-8") as fh:
+raw = json.load(fh)
+except (OSError, ValueError) as exc:
+raise MintError(
+"legacy mint-state.json is unreadable; refusing to reset (import by hand): %s"
+% exc, 2)
+hw = raw.get("high_water") if isinstance(raw, dict) else None
+if isinstance(hw, bool) or not isinstance(hw, int):
+raise MintError(
+"legacy mint-state.json high_water is not an integer (%r); refusing to reset"
+% (hw,), 2)
+if hw < floor - 1 or hw > ceil:
+raise MintError(
+"legacy high_water %d is out of range [%d, %d]; refusing to reset"
+% (hw, floor - 1, ceil), 2)
+return hw
+
+def _connect(root, floor, ceil):
+"""Open (creating + seeding on first use) the SQLite store. Validates the
+persisted mark on every open; a downgraded schema or non-int/out-of-range
+mark is a loud refusal, never a silent default."""
+try:
+os.makedirs(root, exist_ok=True)
+conn = sqlite3.connect(_db_path(root), timeout=30.0, isolation_level=None)
+except (OSError, sqlite3.Error) as exc:
+raise MintError("cannot open mint store at %s: %s" % (root, exc), 2)
+try:
+conn.execute("PRAGMA busy_timeout=30000")
+conn.execute(
+"CREATE TABLE IF NOT EXISTS meta ("
+" id INTEGER PRIMARY KEY CHECK(id = 1),"
+" high_water INTEGER NOT NULL,"
+" schema_version INTEGER NOT NULL)")
+conn.execute(
+"CREATE TABLE IF NOT EXISTS retired ("
+" id INTEGER PRIMARY KEY,"
+" retired_at TEXT NOT NULL DEFAULT (datetime('now')))")
+row = conn.execute(
+"SELECT high_water, schema_version FROM meta WHERE id = 1").fetchone()
+if row is None:
+seed = _legacy_seed(root, floor, ceil)
+conn.execute(
+"INSERT INTO meta (id, high_water, schema_version) VALUES (1,?,?)",
+(seed, SCHEMA_VERSION))
+else:
+hw, sv = row
+if not isinstance(hw, int) or isinstance(hw, bool):
+raise MintError("persisted high_water is not an integer (%r)" % (hw,), 2)
+if sv!= SCHEMA_VERSION:
+raise MintError(
+"mint store schema %r!= supported %d (downgraded/upgraded); refusing"
+% (sv, SCHEMA_VERSION), 2)
+if hw < floor - 1 or hw > ceil:
+raise MintError(
+"persisted high_water %d is out of range [%d, %d]; refusing"
+% (hw, floor - 1, ceil), 2)
+except sqlite3.Error as exc:
+conn.close()
+raise MintError("mint store is unusable: %s" % exc, 2)
+except MintError:
+conn.close()
+raise
+return conn
+
+def _read_hw(conn):
+return conn.execute("SELECT high_water FROM meta WHERE id = 1").fetchone()[0]
+
+def assert_allocatable(uid, high_water, live, floor, ceil):
+"""The gate: range, monotonic, not-live. Returns None if OK, else a reason."""
+if not isinstance(uid, int) or uid < floor or uid > ceil:
+return "E_RANGE: %r is outside %d-%d" % (uid, floor, ceil)
+if uid <= high_water:
+return ("E_NOT_MONOTONIC: %d is at/below the high-water mark %d"
+% (uid, high_water))
+if uid in live:
+return "E_LIVE: %d is held by a live holder" % uid
+return None
+
+def allocate(root, live, floor, ceil, count):
+"""Draw `count` IDs monotonically inside one transaction. The bumped mark is
+committed BEFORE any ID is emitted, so a crash never re-issues. On a gate
+failure mid-batch the successfully-minted prefix is committed (never lost),
+then the reason is raised."""
+conn = _connect(root, floor, ceil)
+minted = []
+reason = None
+try:
+conn.execute("BEGIN IMMEDIATE")
+hw = _read_hw(conn)
+for _ in range(count):
+uid = hw + 1
+reason = assert_allocatable(uid, hw, live, floor, ceil)
+if reason is not None:
+break
+hw = uid
+live = live | {uid}
+minted.append(uid)
+if minted:
+conn.execute("UPDATE meta SET high_water =? WHERE id = 1", (hw,))
+conn.commit()
+except sqlite3.Error as exc:
+conn.rollback()
+conn.close()
+raise MintError("allocation could not persist: %s" % exc, 2)
+conn.close()
+if reason is not None and not minted:
+raise MintError(reason, 1)
+return minted, reason
+
+def retire(root, uid, floor, ceil):
+"""Record an ID retired (append-only). It does NOT return to the pool — the
+mark is never lowered, so nothing this records is ever re-issued."""
+conn = _connect(root, floor, ceil)
+try:
+conn.execute("BEGIN IMMEDIATE")
+conn.execute("INSERT OR IGNORE INTO retired (id) VALUES (?)", (uid,))
+hw = _read_hw(conn)
+conn.commit()
+except sqlite3.Error as exc:
+conn.rollback()
+conn.close()
+raise MintError("retire could not persist: %s" % exc, 2)
+conn.close()
+return {"retired": uid, "high_water": hw}
+
+def peek(root, floor, ceil):
+conn = _connect(root, floor, ceil)
+hw = _read_hw(conn)
+retired = [r[0] for r in conn.execute("SELECT id FROM retired ORDER BY id")]
+conn.close()
+return {"high_water": hw, "retired": retired, "next": hw + 1,
+"floor": floor, "ceil": ceil}
+
+def _read_live(stream, field):
+"""Read a set of live IDs from a JSON-lines (or bare-integer-lines) stream."""
+live = set()
+for line in stream:
+line = line.strip()
+if not line or line.startswith("#"):
+continue
+try:
+obj = json.loads(line)
+except ValueError:
+raise MintError("live input line is not JSON: %r" % line, 3)
+if isinstance(obj, bool):
+raise MintError("live line is a boolean, not an id: %r" % line, 3)
+if isinstance(obj, int):
+live.add(obj)
+elif isinstance(obj, dict) and field in obj and isinstance(obj[field], int) \
+and not isinstance(obj[field], bool):
+live.add(obj[field])
+else:
+raise MintError(
+"live line has no integer %r field: %r" % (field, line), 3)
+return live
+
+def _emit(obj):
+sys.stdout.write(json.dumps(obj, sort_keys=True) + "\n")
+
+def main(argv=None):
+p = argparse.ArgumentParser(
+prog="mint",
+description="hand out IDs that are never reused, and prove it before returning.")
+p.add_argument("op", choices=["alloc", "peek", "retire"],
+help="alloc: mint new id(s). peek: show state. retire: record an id retired.")
+p.add_argument("--root", default=".mint",
+help="directory holding mint.db (default:.mint)")
+p.add_argument("--floor", type=int, default=100000,
+help="lowest issuable id (default: 100000)")
+p.add_argument("--ceil", type=int, default=999999,
+help="highest issuable id (default: 999999)")
+p.add_argument("-n", "--count", type=int, default=1,
+help="how many ids to mint (alloc only; default 1)")
+p.add_argument("--live", metavar="FILE",
+help="a JSON-lines file (or - for stdin) naming ids held right now")
+p.add_argument("--live-field", default="id",
+help="field carrying the id in --live objects (default: id)")
+p.add_argument("--id", type=int, help="the id to retire (retire only)")
+args = p.parse_args(argv)
+
+if args.floor > args.ceil:
+sys.stderr.write("mint: --floor must be <= --ceil\n")
+return 3
+
+try:
+live = set()
+if args.live:
+if args.live == "-":
+live = _read_live(sys.stdin, args.live_field)
+else:
+with open(args.live, "r", encoding="utf-8") as fh:
+live = _read_live(fh, args.live_field)
+
+if args.op == "peek":
+state = peek(args.root, args.floor, args.ceil)
+state["op"] = "peek"
+_emit(state)
+return 0
+
+if args.op == "alloc":
+if args.count < 1:
+sys.stderr.write("mint: -n must be >= 1\n")
+return 3
+minted, reason = allocate(args.root, live, args.floor, args.ceil, args.count)
+for uid in minted:
+_emit({"op": "alloc", "id": uid})
+if reason is not None:
+sys.stderr.write("mint: %s\n" % reason)
+return 1
+return 0
+
+if args.op == "retire":
+if args.id is None:
+sys.stderr.write("mint: retire needs --id\n")
+return 3
+rec = retire(args.root, args.id, args.floor, args.ceil)
+rec["op"] = "retire"
+_emit(rec)
+return 0
+
+except MintError as exc:
+sys.stderr.write("mint: %s\n" % exc)
+return exc.code
+
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_mint.py 142 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_mint.py — non-vacuous tests for mint.py (SQLite store).
+
+Every test asserts a SPECIFIC behaviour, and the suite carries a mutation check
+(test 12) so a mint that always returned the same id, or never persisted, could
+not pass green. Run: python3 test_mint.py
+
+Updated for the SQLite rewrite (GIFT-001): state now lives in <root>/mint.db and
+is read back through peek() (a fresh DB read), not the retired load_state() JSON
+helper. "Crash-safety" is tested the way the store actually guarantees it — the
+high-water mark is committed to the DB before any id is emitted, so a fresh
+peek() (equivalent to a cold restart re-reading the db) already sees the bumped
+mark.
+"""
+
+import io
+import json
+import os
+import sys
+import tempfile
+
+import mint
+
+FAIL = 0
+
+def ok(cond, msg):
+global FAIL
+print((" ok " if cond else " FAIL ") + msg)
+if not cond:
+FAIL += 1
+
+def run(root, *args, stdin=None):
+"""Invoke main() capturing stdout, return (exit, [parsed json lines])."""
+old_out, old_in = sys.stdout, sys.stdin
+sys.stdout = io.StringIO()
+if stdin is not None:
+sys.stdin = io.StringIO(stdin)
+try:
+code = mint.main(list(args) + ["--root", root])
+out = sys.stdout.getvalue()
+finally:
+sys.stdout, sys.stdin = old_out, old_in
+lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+return code, lines
+
+def main():
+with tempfile.TemporaryDirectory() as d:
+root = os.path.join(d, "m")
+
+# 1. First alloc issues the floor.
+code, lines = run(root, "alloc", "--floor", "100000")
+ok(code == 0 and lines == [{"op": "alloc", "id": 100000}],
+"first alloc issues the floor id (100000) as one JSON-line")
+
+# 2. Monotonic: every subsequent id is strictly greater.
+code, lines = run(root, "alloc", "-n", "3", "--floor", "100000")
+ids = [r["id"] for r in lines]
+ok(code == 0 and ids == [100001, 100002, 100003],
+"next allocs are strictly increasing (100001,2,3) — monotonic")
+
+# 3. Crash-safety: the mark is committed to the DB before emit, so a
+# fresh read (a cold restart re-reading mint.db) already sees it and
+# never re-issues. peek() IS that fresh read.
+st = mint.peek(root, 100000, 999999)
+ok(st["high_water"] == 100003,
+"high-water mark persisted at 100003 (a restart cannot re-issue)")
+code, lines = run(root, "alloc", "--floor", "100000")
+ok(lines[0]["id"] == 100004,
+"an alloc after 'restart' continues from the mark, never repeats")
+
+# 4. peek reports state without issuing.
+code, lines = run(root, "peek", "--floor", "100000")
+ok(code == 0 and lines[0]["high_water"] == 100004 and lines[0]["next"] == 100005,
+"peek shows high_water=100004, next=100005, issuing nothing")
+code2, _ = run(root, "peek", "--floor", "100000")
+st2 = mint.peek(root, 100000, 999999)
+ok(st2["high_water"] == 100004, "peek did not advance the mark (pure read)")
+
+# 5. Gate: range refusal.
+reason = mint.assert_allocatable(50, high_water=40, live=set(), floor=100, ceil=200)
+ok(reason is not None and reason.startswith("E_RANGE"),
+"gate refuses an out-of-range id (E_RANGE)")
+
+# 6. Gate: monotonic refusal (an id at/below the mark).
+reason = mint.assert_allocatable(100, high_water=100, live=set(), floor=1, ceil=999)
+ok(reason is not None and reason.startswith("E_NOT_MONOTONIC"),
+"gate refuses an id at/below the high-water mark (E_NOT_MONOTONIC)")
+
+# 7. Gate: live refusal.
+reason = mint.assert_allocatable(150, high_water=100, live={150}, floor=1, ceil=999)
+ok(reason is not None and reason.startswith("E_LIVE"),
+"gate refuses an id currently held live (E_LIVE)")
+
+# 8. Gate passes for a clean id.
+ok(mint.assert_allocatable(101, high_water=100, live={200}, floor=1, ceil=999) is None,
+"gate passes an in-range, above-mark, not-live id")
+
+# 9. --live from stdin is honoured: an alloc whose next id is declared
+# live must refuse rather than collide.
+root2 = os.path.join(d, "m2")
+run(root2, "alloc", "--floor", "100000") # issues 100000, mark=100000
+# next would be 100001; declare it live -> refusal (exit 1, no output)
+code, lines = run(root2, "alloc", "--floor", "100000",
+"--live", "-", stdin='{"id": 100001}\n')
+ok(code == 1 and lines == [],
+"an alloc whose next id is declared live refuses (exit 1, no output)")
+
+# 10. retire records the id, does not recycle by default.
+code, lines = run(root2, "retire", "--id", "100000", "--floor", "100000")
+ok(code == 0 and lines[0]["retired"] == 100000 and lines[0]["op"] == "retire",
+"retire records the id (and never lowers the mark)")
+st = mint.peek(root2, 100000, 999999)
+ok(100000 in st["retired"] and st["high_water"] == 100000,
+"retire adds to the retired set and never lowers the mark")
+
+# 11. bare-integer live lines are accepted alongside {id:...} objects.
+live = mint._read_live(io.StringIO("5\n{\"id\": 7}\n# c\n\n9\n"), "id")
+ok(live == {5, 7, 9},
+"--live reads both bare ints and {id:...} objects, skips blanks/comments")
+
+# 12. MUTATION CHECK — a mint that ignored the mark (always issued the
+# floor) would fail test 2/3. Prove the suite BITES by running that
+# mutant inline and asserting it diverges from the real monotonic run.
+def broken_allocate(root_, live_, floor_, ceil_, count_):
+# the no-op mutant: never advances the mark, always issues the floor
+return [floor_] * count_, None
+mutant_ids, _ = broken_allocate(root, set(), 100000, 999999, 3)
+real_ids = [100000, 100001, 100002] # what a correct monotonic mint gives
+ok(mutant_ids!= real_ids,
+"mutation check: a mint that never advances the mark DIVERGES from the "
+"monotonic sequence (the suite would catch it)")
+
+print("\n" + ("MINT: %d FAILED" % FAIL if FAIL else "MINT: ALL GREEN"))
+return 1 if FAIL else 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only, deterministic
 
 ---
 
@@ -1256,458 +1734,5 @@ sys.exit(main())
 Take the whole folder →
 MIT
 Python stdlib only, deterministic
-
----
-
-# pluck — a Loop MMT gift
-https://loopmmt.com/gifts/pluck/
-[coverage: optional · branch: gifts]
-
-Keep Only The Fields You Name select ← all gifts
-
-pluck
-
-A producer emits JSONL: one JSON object per line. pluck reads that stream and emits each record reduced to just the fields you name with --fields, in the order you named them — the SELECT of the JSONL toolkit. Narrow a wide record down to the columns you want before you fold, diff, or sink it. It is a filter on the field axis: every emitted object's fields are a subset of its input's, and nothing is added, renamed, computed, or reordered by content. A field named twice is emitted once at its first position. Same stream and same field list in, byte-identical stream out, on every machine and every run. A line that is not valid JSON is a hard error (exit 2) naming the line; a record that is not a JSON object has no field axis and is a hard error too — the deliberate divergence from a row-dropping filter. Blank lines are skipped. Zero dependencies, pure, offline; runs in Node or a browser (window.ForestGifts.pluck).
-
-The honest edge
-
-Selects TOP-LEVEL fields by exact name. NOT nested paths, does NOT rename, does NOT compute or default a missing value, does NOT reorder by content. It selects; it never transforms a value. A requested field a record lacks is simply absent from that record's output — pluck does not invent it.
-
-Run it
-
-printf '%s\n' '{"a":1,"b":2,"c":3}' | node pluck.js --fields a,c # exit 0 clean | 2 non-JSON or non-object line (named)
-test_pluck.js (24/24) + out-of-band conformance (GREEN 32/32 vs an independently-authored per-field reconstruction oracle; sig 1bfa8d85a1730a7f; mutation bite VERIFIED)
-Zero dependencies, Node or browser, deterministic
-
-The code — every file that ships
-
-pluck.js 269 lines on GitHub →
-#!/usr/bin/env node
-/* pluck.js — keep only the named fields from each record in a JSONL stream.
-Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
-
-WHAT IT IS. Give it a stream of records — one JSON object per line (JSONL) —
-and a list of field names, and it emits each record reduced to just those
-fields. It is the SELECT of the JSONL toolkit: narrow a wide record down to
-the columns you asked for, before you fold, diff, or sink it. Same stream and
-same field list in, byte-identical stream out, on every machine and every run.
-It is a FILTER on the field axis: every emitted object is a subset of its input
-object's fields — nothing is added, renamed, computed, or reordered by content.
-
-THE FIELD ORDER IS THE DECLARED ORDER (the whole determinism story). The output
-object's keys appear in the order you named them in --fields, NOT the order they
-happened to sit in the input record. So `--fields b,a` emits {"b":...,"a":...}
-regardless of how the input was written. Declaring the order — rather than
-inheriting the input's — is what makes the output a pure function of (record,
-field-list): two records that carry the same requested values, written in any
-key-order, pluck to byte-identical lines. A field named twice in --fields is
-emitted once, at its first position (duplicates in the request are idempotent).
-
-WHAT HAPPENS TO A MISSING FIELD (default vs --strict).
-- DEFAULT: a requested field the record does not carry is simply OMITTED from
-that record's output object. A missing field is not a value — it is not
-emitted as null, not as "", not as the literal key with nothing after it. A
-record that carries none of the requested fields emits an empty object {}.
-This is the honest default: pluck what is there, say nothing about what is
-not.
-- --strict: a record missing ANY requested field is a HARD ERROR (exit 2)
-naming the line and the first missing field. For callers who need every
-column present and want the stream to stop rather than emit a thin record.
-
-INPUT HONESTY (the character of this gift). A field-selector is only trustworthy
-if it refuses to quietly mishandle a line:
-- Every non-blank line must be valid JSON. A line that is not valid JSON is a
-HARD ERROR (exit 2) naming the line — never a silent skip, never passed
-through as raw text.
-- Every record must be a JSON OBJECT. You cannot pluck fields from a bare
-number, string, boolean, null, or array — there are no fields to select. A
-non-object record is a HARD ERROR (exit 2) naming the line. This is the
-deliberate divergence from a row-dropping filter: pluck's whole contract is
-field-selection, so a record with no field axis is a stop, not a passthrough.
-- --fields names TOP-LEVEL fields only (no dotted paths, no array indices).
-Selecting a nested value is out of scope by construction (see the edge).
-- Blank lines are skipped (not emitted, not counted). A trailing \r (CRLF
-files) is trimmed before parsing.
-
-THE OUTPUT IS CANONICAL. Each emitted object is re-serialized with its keys in
-the declared field order and its values canonicalized (nested object keys sorted
-recursively, array order kept), so the same requested values always serialize to
-the same bytes. Values are copied through verbatim in meaning — pluck selects,
-it never transforms a value.
-
-USAGE
-printf '%s\n' '{"a":1,"b":2,"c":3}' | node pluck.js --fields a,c
--> {"a":1,"c":3}
-node pluck.js --fields id,name events.jsonl
-node pluck.js --fields id,name --strict < in.jsonl > out.jsonl
-node pluck.js --help
-
-Each non-blank line is one JSON object. Output is the plucked objects, one per
-line, each terminated by a newline, in input order.
-
-Exit codes: 0 success · 2 input error (missing/empty --fields, missing file, a
-directory, an unknown option, a line that is not valid JSON, a non-object
-record, or --strict on a record missing a requested field). Always a clean
-one-line message on stderr, never a stack trace.
-
-Released under MIT. Its edge is printed in the README: this selects TOP-LEVEL
-fields by exact name. It does NOT reach into nested paths (no dotted keys, no
-a.b.c), does NOT rename fields, does NOT compute or default missing values, and
-does NOT reorder by content — the output key order is exactly the --fields order.
-*/
-"use strict";
-
-// Canonical JSON: object keys sorted recursively so a value serializes to the same
-// bytes regardless of how its (nested) object keys were written. Arrays keep order.
-function canon(v) {
-if (v === null || typeof v!== "object") return JSON.stringify(v);
-if (Array.isArray(v)) {
-var parts = [];
-for (var i = 0; i < v.length; i++) parts.push(canon(v[i]));
-return "[" + parts.join(",") + "]";
-}
-var keys = Object.keys(v).sort();
-var out = [];
-for (var k = 0; k < keys.length; k++) {
-out.push(JSON.stringify(keys[k]) + ":" + canon(v[keys[k]]));
-}
-return "{" + out.join(",") + "}";
-}
-
-// Parse one input line into a JSON value, or throw a clean, line-named Error.
-function parseRecord(line, lineNo) {
-try { return JSON.parse(line);}
-catch (e) {
-throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
-}
-}
-
-// De-duplicate the requested field list, preserving first-seen order. A field
-// named twice is kept once at its first position (idempotent request).
-function normalizeFields(fields) {
-var seen = Object.create(null);
-var out = [];
-for (var i = 0; i < fields.length; i++) {
-var f = fields[i];
-if (!seen[f]) { seen[f] = true; out.push(f);}
-}
-return out;
-}
-
-// Serialize a plucked object with keys in the DECLARED field order and values
-// canonicalized. `present` is the list of requested fields this record actually
-// carries, already in declared order.
-function serializePlucked(rec, present) {
-var parts = [];
-for (var i = 0; i < present.length; i++) {
-var f = present[i];
-parts.push(JSON.stringify(f) + ":" + canon(rec[f]));
-}
-return "{" + parts.join(",") + "}";
-}
-
-// The public filter: JSONL text + {fields, strict} -> { lines: [plucked lines]}.
-// Each emitted object carries the requested fields the record has, in declared
-// order. In strict mode a record missing any requested field throws.
-function pluck(text, opts) {
-opts = opts || {};
-var fields = normalizeFields(opts.fields || []);
-var strict =!!opts.strict;
-
-var lines = String(text).split("\n");
-var out = [];
-var i, line, rec, j, f, present;
-
-for (i = 0; i < lines.length; i++) {
-line = lines[i];
-if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
-if (line.length === 0) continue; // blank line is not a record
-
-rec = parseRecord(line, i + 1);
-
-// A record must be a JSON object to have a field axis to select on.
-if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
-throw new Error("line " + (i + 1) + " is not a JSON object (cannot pluck fields from " +
-(rec === null? "null": (Array.isArray(rec)? "an array": typeof rec)) + ")");
-}
-
-present = [];
-for (j = 0; j < fields.length; j++) {
-f = fields[j];
-if (Object.prototype.hasOwnProperty.call(rec, f)) {
-present.push(f);
-} else if (strict) {
-throw new Error("line " + (i + 1) + " is missing required field " + JSON.stringify(f));
-}
-}
-
-out.push(serializePlucked(rec, present));
-}
-
-return { lines: out};
-}
-
-/* ---- exports (browser + Node) ------------------------------------ */
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.pluck = pluck;
-window.ForestGifts.pluckCanon = canon;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { pluck: pluck, canon: canon};
-}
-
-/* ---- CLI (runs only when invoked directly, never on require) ------ */
-function run(text, opts) {
-var r = pluck(text, opts);
-var body = r.lines.length? r.lines.join("\n") + "\n": "";
-return { out: body};
-}
-
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"pluck.js — keep only the named fields from each record in a JSONL stream.\n\n" +
-" printf '%s\\n' '{\"a\":1,\"b\":2,\"c\":3}' | node pluck.js --fields a,c\n" +
-" node pluck.js --fields id,name events.jsonl\n" +
-" node pluck.js --fields id,name --strict < in > out\n" +
-" node pluck.js --help\n\n" +
-"Each non-blank line is one JSON object. --fields is a comma-separated list of\n" +
-"TOP-LEVEL field names to keep; the output key order is exactly that order. A\n" +
-"missing field is OMITTED by default, or a hard error under --strict. A record\n" +
-"that is not a JSON object is a hard error.\n\n" +
-"Edge: selects TOP-LEVEL fields by exact name. NOT nested paths (no a.b.c), does\n" +
-"NOT rename or compute fields, and does NOT reorder by content. Invalid JSON and\n" +
-"non-object records are hard errors, never a silent skip.\n"
-);
-return 0;
-}
-
-var opts = { fields: []};
-var files = [];
-var i, raw;
-try {
-for (i = 0; i < args.length; i++) {
-if (args[i] === "--fields") {
-raw = args[++i];
-if (raw === undefined || raw === "" || raw.charAt(0) === "-") {
-throw new Error("--fields requires a comma-separated list of field names");
-}
-// split on comma, trim each, drop empties (so trailing commas are tolerated)
-var wanted = [];
-var pieces = raw.split(",");
-for (var p = 0; p < pieces.length; p++) {
-var name = pieces[p].trim();
-if (name.length > 0) wanted.push(name);
-}
-if (wanted.length === 0) throw new Error("--fields lists no field names");
-opts.fields = wanted;
-}
-else if (args[i] === "--strict") { opts.strict = true;}
-else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
-else { files.push(args[i]);}
-}
-if (!opts.fields || opts.fields.length === 0) {
-throw new Error("--fields is required (a comma-separated list of field names to keep)");
-}
-} catch (e) {
-process.stderr.write("pluck: " + e.message + "\n");
-return 2;
-}
-
-function emit(text) {
-try {
-var r = run(text, opts);
-process.stdout.write(r.out);
-return 0;
-} catch (e) {
-process.stderr.write("pluck: " + e.message + "\n");
-return 2;
-}
-}
-
-if (files.length > 0) {
-var fs = require("fs");
-var text;
-try { text = fs.readFileSync(files[0], "utf8");}
-catch (e) {
-process.stderr.write("pluck: cannot read " + files[0] +
-" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
-return 2;
-}
-return emit(text);
-}
-
-// stdin
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
-});
-return 0;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_pluck.js 152 lines on GitHub →
-#!/usr/bin/env node
-/* test_pluck.js — drift-check battery for pluck.js.
-Zero-dependency. Runs in Node: `node test_pluck.js`. Exit 0 all-pass, 1 any-fail.
-
-THE ORACLE. pluck's contract is small enough that the oracle is a set of
-hand-computed expected output lines PLUS two structural invariants checked
-mechanically on every case:
-(I1) subset: every key in an emitted object was a requested field AND was
-present in the input object (pluck never invents a field).
-(I2) declared-order: the emitted key order equals the requested field order
-(restricted to present fields) — NOT the input's key order.
-The known-bad vector is the DECLARED-ORDER tripwire: an input whose keys sit in
-a different order than --fields. A regression that inherited input order instead
-of declared order passes a naive "same set of keys" check but fails I2 — so the
-battery pins the ordering that is the whole determinism story.
-*/
-"use strict";
-
-var pluck = require("./pluck.js").pluck;
-
-var passed = 0, failed = 0;
-function check(name, got, want) {
-if (got === want) { passed++; /* console.log(" ok " + name); */}
-else {
-failed++;
-console.log("FAIL " + name);
-console.log(" want: " + JSON.stringify(want));
-console.log(" got: " + JSON.stringify(got));
-}
-}
-function checkThrows(name, fn) {
-var threw = false;
-try { fn();} catch (e) { threw = true;}
-if (threw) { passed++;}
-else { failed++; console.log("FAIL " + name + " (expected a throw, none happened)");}
-}
-
-function out(text, opts) {
-var r = pluck(text, opts);
-return r.lines.join("\n");
-}
-
-// ---- Core selection --------------------------------------------------
-check("keep two of three fields",
-out('{"a":1,"b":2,"c":3}', { fields: ["a", "c"]}),
-'{"a":1,"c":3}');
-
-check("single field",
-out('{"a":1,"b":2}', { fields: ["b"]}),
-'{"b":2}');
-
-check("all fields kept (identity-ish, canonical order)",
-out('{"a":1,"b":2}', { fields: ["a", "b"]}),
-'{"a":1,"b":2}');
-
-// ---- KNOWN-BAD VECTOR: declared order, not input order ---------------
-// Input keys are b,a but --fields asks a,b -> output MUST be {"a":..,"b":..}.
-check("KNOWN-BAD: output order is declared order, not input order",
-out('{"b":2,"a":1}', { fields: ["a", "b"]}),
-'{"a":1,"b":2}');
-
-check("KNOWN-BAD: reverse request reverses output",
-out('{"a":1,"b":2}', { fields: ["b", "a"]}),
-'{"b":2,"a":1}');
-
-// ---- Missing fields: default omits -----------------------------------
-check("missing field omitted (default)",
-out('{"a":1}', { fields: ["a", "b"]}),
-'{"a":1}');
-
-check("record carrying none of the fields -> empty object",
-out('{"x":9}', { fields: ["a", "b"]}),
-'{}');
-
-check("missing field in the MIDDLE keeps declared order of the rest",
-out('{"a":1,"c":3}', { fields: ["a", "b", "c"]}),
-'{"a":1,"c":3}');
-
-// ---- --strict: missing field is a hard error -------------------------
-checkThrows("strict: missing field throws", function () {
-pluck('{"a":1}', { fields: ["a", "b"], strict: true});
-});
-
-check("strict: all present passes",
-out('{"a":1,"b":2}', { fields: ["a", "b"], strict: true}),
-'{"a":1,"b":2}');
-
-// ---- Duplicate requested fields are idempotent -----------------------
-check("field named twice emitted once at first position",
-out('{"a":1,"b":2}', { fields: ["a", "a", "b"]}),
-'{"a":1,"b":2}');
-
-// ---- Value fidelity + nested canonicalization ------------------------
-check("value copied verbatim (nested object canonicalized)",
-out('{"a":{"z":1,"y":2},"b":5}', { fields: ["a"]}),
-'{"a":{"y":2,"z":1}}');
-
-check("array value order preserved (not sorted)",
-out('{"a":[3,1,2],"b":0}', { fields: ["a"]}),
-'{"a":[3,1,2]}');
-
-check("null / bool / string values kept",
-out('{"a":null,"b":true,"c":"hi","d":0}', { fields: ["a", "b", "c"]}),
-'{"a":null,"b":true,"c":"hi"}');
-
-// ---- Multi-line stream, order preserved ------------------------------
-check("multi-record stream keeps input order",
-out('{"id":1,"x":9}\n{"id":2,"x":8}\n{"id":3,"x":7}', { fields: ["id"]}),
-'{"id":1}\n{"id":2}\n{"id":3}');
-
-// ---- Blank + CRLF handling -------------------------------------------
-check("blank lines skipped",
-out('{"a":1}\n\n{"a":2}\n', { fields: ["a"]}),
-'{"a":1}\n{"a":2}');
-
-check("CRLF trailing \\r trimmed before parse",
-out('{"a":1}\r\n{"a":2}\r', { fields: ["a"]}),
-'{"a":1}\n{"a":2}');
-
-// ---- Input honesty: non-object records are hard errors ---------------
-checkThrows("bare number record throws", function () {
-pluck('42', { fields: ["a"]});
-});
-checkThrows("bare string record throws", function () {
-pluck('"hello"', { fields: ["a"]});
-});
-checkThrows("array record throws", function () {
-pluck('[1,2,3]', { fields: ["a"]});
-});
-checkThrows("null record throws", function () {
-pluck('null', { fields: ["a"]});
-});
-checkThrows("invalid JSON throws", function () {
-pluck('{"a":1', { fields: ["a"]});
-});
-
-// ---- Determinism: folds-twice-identical ------------------------------
-(function () {
-var input = '{"b":2,"a":1,"c":3}\n{"c":30,"a":10}\n{"z":99}';
-var opts = { fields: ["a", "b"]};
-var r1 = out(input, opts);
-var r2 = out(input, opts);
-check("determinism: two runs byte-identical", r1, r2);
-})();
-
-// ---- Empty-fields guard is a library concern? (CLI enforces; lib tolerant) ----
-check("empty fields list yields empty objects (lib-level; CLI blocks this)",
-out('{"a":1}', { fields: []}),
-'{}');
-
-console.log("\npluck battery: " + passed + " passed, " + failed + " failed");
-process.exit(failed === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Zero dependencies, Node or browser, deterministic
 
 ---

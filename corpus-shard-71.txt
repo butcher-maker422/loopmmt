@@ -1,8 +1,500 @@
-# Loop MMT — corpus shard 71/86
+# Loop MMT — corpus shard 71/87
 
-> Bundle 71 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 71 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/legible/, /gifts/life-fold/, /gifts/line-source/, /gifts/loop21-component-factory/)
+Nodes in this shard: 4 (/gifts/l21x-snapshot/, /gifts/legible/, /gifts/life-fold/, /gifts/line-source/)
+
+---
+
+# l21x-snapshot — a Loop MMT gift
+https://loopmmt.com/gifts/l21x-snapshot/
+[coverage: optional · branch: gifts]
+
+Browser Save Layer persist ← all gifts
+
+l21x-snapshot
+
+Encode any document to a self-describing base64 snapshot, keep a catalog of them with pure save/load/validate/sort, and fold a whole catalog into one portable blob — a zero-dependency save-file/catalog/archive layer for apps with no backend. No DOM, no filesystem, no network.
+
+The honest edge
+
+It persists structure, not identity — you supply ids and timestamps; snapshots are base64 (not compressed, not encrypted). It's a layer that hands you strings, not a store: it never touches localStorage, the disk, or the DOM itself.
+
+Run it
+
+node l21x-snapshot.js --demo
+test_l21x-snapshot.js (41/41)
+JavaScript, zero dependencies (Node + browser)
+
+The code — every file that ships
+
+l21x-snapshot.js 332 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+"use strict";
+/* l21x-snapshot.js — a zero-dependency browser document persistence layer.
+
+A save-file / catalog / archive layer for browser apps that hold documents in
+memory and need to persist, list, and move them without a backend. Three tiers,
+all pure functions over values you already hold — no DOM, no filesystem, no fetch:
+
+1. SNAPSHOT CODEC. encodeSnapshot(doc) -> a self-describing base64 string
+(an ".l21x" snapshot); decodeSnapshot(str) -> the document back, verified.
+A document is any JSON-serializable object; the codec stamps a format tag
+and a version so a snapshot names its own shape.
+
+2. CATALOG. An in-memory list of snapshot entries with pure save/load/validate/
+sort operations. catalogSave returns a NEW catalog (never mutates its input),
+keyed by a caller-supplied id; catalogLoad decodes an entry back to a doc;
+catalogValidate reports honest structural errors; catalogSort orders by a
+named field without touching the input.
+
+3. ARCHIVE. archiveExport(catalog) -> ONE base64 blob (a whole catalog as a
+single portable string, for a download-one-file / paste-into-another-tab
+move); archiveImport(blob) -> the catalog back. Round-trips exactly.
+
+The same code runs in Node (module.exports) or a browser
+(window.LoopGifts.l21x). It persists data you already hold as objects; it does
+not fetch, connect, read files, or touch the DOM. Base64 is computed in pure JS
+so the behavior is identical in both runtimes (no atob/btoa, no Buffer needed). */
+
+// ---- UTF-8 <-> bytes (pure; full multibyte) --------------------------------
+function utf8Encode(str) {
+var out = [], i, c;
+for (i = 0; i < str.length; i++) {
+c = str.charCodeAt(i);
+if (c < 0x80) { out.push(c);}
+else if (c < 0x800) {
+out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+} else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+// surrogate pair -> full code point
+var c2 = str.charCodeAt(i + 1);
+if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
+0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+i++;
+} else {
+out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+}
+} else {
+out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+}
+}
+return out;
+}
+function utf8Decode(bytes) {
+var out = "", i = 0, b, cp, n;
+while (i < bytes.length) {
+b = bytes[i];
+if (b < 0x80) { out += String.fromCharCode(b); i += 1; continue;}
+else if ((b & 0xe0) === 0xc0) { cp = b & 0x1f; n = 1;}
+else if ((b & 0xf0) === 0xe0) { cp = b & 0x0f; n = 2;}
+else if ((b & 0xf8) === 0xf0) { cp = b & 0x07; n = 3;}
+else { out += "\ufffd"; i += 1; continue;}
+if (i + n >= bytes.length + 1 && i + n > bytes.length) { out += "\ufffd"; break;}
+var ok = true;
+for (var k = 1; k <= n; k++) {
+var cont = bytes[i + k];
+if (cont === undefined || (cont & 0xc0)!== 0x80) { ok = false; break;}
+cp = (cp << 6) | (cont & 0x3f);
+}
+if (!ok) { out += "\ufffd"; i += 1; continue;}
+if (cp > 0xffff) {
+cp -= 0x10000;
+out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+} else {
+out += String.fromCharCode(cp);
+}
+i += n + 1;
+}
+return out;
+}
+
+// ---- base64 (pure; url-safe-tolerant on decode) ----------------------------
+var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function base64FromBytes(bytes) {
+var out = "", i;
+for (i = 0; i < bytes.length; i += 3) {
+var b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+var t = (b0 << 16) | ((b1 || 0) << 8) | (b2 || 0);
+out += B64.charAt((t >> 18) & 0x3f) + B64.charAt((t >> 12) & 0x3f);
+out += (i + 1 < bytes.length)? B64.charAt((t >> 6) & 0x3f): "=";
+out += (i + 2 < bytes.length)? B64.charAt(t & 0x3f): "=";
+}
+return out;
+}
+function bytesFromBase64(str) {
+var lut = bytesFromBase64._lut;
+if (!lut) {
+lut = bytesFromBase64._lut = {};
+for (var i = 0; i < B64.length; i++) lut[B64.charAt(i)] = i;
+lut["-"] = 62; lut["_"] = 63; // tolerate url-safe alphabet
+}
+var out = [], buffer = 0, bits = 0;
+for (var j = 0; j < str.length; j++) {
+var c = str.charAt(j);
+if (c === "=") break;
+var v = lut[c];
+if (v === undefined) continue; // skip whitespace/newlines
+buffer = (buffer << 6) | v; bits += 6;
+if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff);}
+}
+return out;
+}
+
+// ---- snapshot codec --------------------------------------------------------
+var FORMAT = "l21x";
+var FORMAT_VERSION = 1;
+
+/* encodeSnapshot(doc[, meta]) -> base64 string.
+doc: any JSON-serializable value (the document body).
+meta: optional {title, schema} recorded alongside. */
+function encodeSnapshot(doc, meta) {
+if (doc === undefined) throw new Error("encodeSnapshot: doc is required");
+meta = meta || {};
+var envelope = {
+fmt: FORMAT,
+v: FORMAT_VERSION,
+title: (meta.title === undefined)? null: String(meta.title),
+schema: (meta.schema === undefined)? null: String(meta.schema),
+doc: doc
+};
+var json;
+try { json = JSON.stringify(envelope);}
+catch (e) { throw new Error("encodeSnapshot: doc is not JSON-serializable (" + e.message + ")");}
+return base64FromBytes(utf8Encode(json));
+}
+
+/* decodeSnapshot(str) -> {title, schema, doc, v}. Throws on a malformed or
+foreign-format snapshot rather than returning a half-parsed value. */
+function decodeSnapshot(str) {
+if (typeof str!== "string" || str.length === 0)
+throw new Error("decodeSnapshot: expected a non-empty base64 string");
+var json = utf8Decode(bytesFromBase64(str));
+var env;
+try { env = JSON.parse(json);}
+catch (e) { throw new Error("decodeSnapshot: not a valid l21x snapshot (bad base64/JSON)");}
+if (!env || env.fmt!== FORMAT)
+throw new Error("decodeSnapshot: not an l21x snapshot (fmt=" + (env && env.fmt) + ")");
+if (typeof env.v!== "number" || env.v > FORMAT_VERSION)
+throw new Error("decodeSnapshot: unsupported snapshot version " + (env && env.v));
+return { title: env.title, schema: env.schema, doc: env.doc, v: env.v};
+}
+
+// ---- catalog (pure; never mutates its input) -------------------------------
+/* A catalog is an array of entries: {id, title, schema, updated, snapshot}.
+snapshot is the base64 string; updated is a caller-supplied sortable value. */
+
+/* catalogSave(catalog, id, doc[, meta]) -> a NEW catalog with id saved/replaced.
+meta.updated (optional) is recorded for sorting; defaults to null. */
+function catalogSave(catalog, id, doc, meta) {
+if (!isArray(catalog)) throw new Error("catalogSave: catalog must be an array");
+if (id === undefined || id === null || String(id) === "")
+throw new Error("catalogSave: id is required");
+meta = meta || {};
+var entry = {
+id: String(id),
+title: (meta.title === undefined)? null: String(meta.title),
+schema: (meta.schema === undefined)? null: String(meta.schema),
+updated: (meta.updated === undefined)? null: meta.updated,
+snapshot: encodeSnapshot(doc, meta)
+};
+var out = [], replaced = false, i;
+for (i = 0; i < catalog.length; i++) {
+if (catalog[i] && catalog[i].id === entry.id) { out.push(entry); replaced = true;}
+else { out.push(catalog[i]);}
+}
+if (!replaced) out.push(entry);
+return out;
+}
+
+/* catalogLoad(catalog, id) -> the decoded {title, schema, doc, v}, or null if
+the id is not present. */
+function catalogLoad(catalog, id) {
+if (!isArray(catalog)) throw new Error("catalogLoad: catalog must be an array");
+for (var i = 0; i < catalog.length; i++) {
+if (catalog[i] && catalog[i].id === String(id)) return decodeSnapshot(catalog[i].snapshot);
+}
+return null;
+}
+
+/* catalogValidate(catalog) -> {ok, errors[]}. Honest structural check: each entry
+has a non-empty id, ids are unique, and every snapshot decodes. Reports every
+problem it finds rather than throwing on the first. */
+function catalogValidate(catalog) {
+var errors = [];
+if (!isArray(catalog)) return { ok: false, errors: ["catalog is not an array"]};
+var seen = {};
+for (var i = 0; i < catalog.length; i++) {
+var e = catalog[i];
+if (!e || typeof e!== "object") { errors.push("entry " + i + ": not an object"); continue;}
+if (e.id === undefined || e.id === null || String(e.id) === "")
+errors.push("entry " + i + ": missing id");
+else if (seen[e.id]) errors.push("entry " + i + ": duplicate id '" + e.id + "'");
+else seen[e.id] = true;
+if (typeof e.snapshot!== "string") { errors.push("entry " + i + ": snapshot is not a string");}
+else { try { decodeSnapshot(e.snapshot);} catch (err) { errors.push("entry " + i + ": " + err.message);}}
+}
+return { ok: errors.length === 0, errors: errors};
+}
+
+/* catalogSort(catalog, key[, desc]) -> a NEW sorted catalog. key is an entry
+field ('title'|'id'|'updated'|'schema'). Stable, input untouched. */
+function catalogSort(catalog, key, desc) {
+if (!isArray(catalog)) throw new Error("catalogSort: catalog must be an array");
+key = key || "id";
+var indexed = [], i;
+for (i = 0; i < catalog.length; i++) indexed.push([catalog[i], i]);
+indexed.sort(function (a, b) {
+var av = a[0]? a[0][key]: undefined, bv = b[0]? b[0][key]: undefined;
+var aNull = (av === null || av === undefined), bNull = (bv === null || bv === undefined);
+// nulls ALWAYS last, independent of sort direction
+if (aNull && bNull) return a[1] - b[1];
+if (aNull) return 1;
+if (bNull) return -1;
+var cmp;
+if (av === bv) cmp = a[1] - b[1]; // stable on ties
+else cmp = (av < bv)? -1: 1;
+if (cmp === 0) return 0;
+return desc? -cmp: cmp;
+});
+var out = [];
+for (i = 0; i < indexed.length; i++) out.push(indexed[i][0]);
+return out;
+}
+
+// ---- archive (whole catalog <-> one base64 blob) ---------------------------
+var ARCHIVE_FORMAT = "l21x-archive";
+
+/* archiveExport(catalog) -> ONE base64 blob carrying the whole catalog. */
+function archiveExport(catalog) {
+if (!isArray(catalog)) throw new Error("archiveExport: catalog must be an array");
+var v = catalogValidate(catalog);
+if (!v.ok) throw new Error("archiveExport: refusing to export an invalid catalog (" + v.errors[0] + ")");
+var envelope = { fmt: ARCHIVE_FORMAT, v: FORMAT_VERSION, entries: catalog};
+return base64FromBytes(utf8Encode(JSON.stringify(envelope)));
+}
+
+/* archiveImport(blob) -> the catalog array. Throws on a foreign/malformed blob. */
+function archiveImport(blob) {
+if (typeof blob!== "string" || blob.length === 0)
+throw new Error("archiveImport: expected a non-empty base64 string");
+var env;
+try { env = JSON.parse(utf8Decode(bytesFromBase64(blob)));}
+catch (e) { throw new Error("archiveImport: not a valid l21x archive (bad base64/JSON)");}
+if (!env || env.fmt!== ARCHIVE_FORMAT)
+throw new Error("archiveImport: not an l21x archive (fmt=" + (env && env.fmt) + ")");
+if (!isArray(env.entries)) throw new Error("archiveImport: archive has no entries array");
+var v = catalogValidate(env.entries);
+if (!v.ok) throw new Error("archiveImport: archive failed validation (" + v.errors[0] + ")");
+return env.entries;
+}
+
+// ---- small helper ----------------------------------------------------------
+function isArray(x) { return Object.prototype.toString.call(x) === "[object Array]";}
+
+// ---- dual-runtime export ---------------------------------------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.l21x = {
+encodeSnapshot: encodeSnapshot, decodeSnapshot: decodeSnapshot,
+catalogSave: catalogSave, catalogLoad: catalogLoad,
+catalogValidate: catalogValidate, catalogSort: catalogSort,
+archiveExport: archiveExport, archiveImport: archiveImport
+};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = {
+encodeSnapshot: encodeSnapshot, decodeSnapshot: decodeSnapshot,
+catalogSave: catalogSave, catalogLoad: catalogLoad,
+catalogValidate: catalogValidate, catalogSort: catalogSort,
+archiveExport: archiveExport, archiveImport: archiveImport,
+FORMAT: FORMAT, FORMAT_VERSION: FORMAT_VERSION
+};
+}
+
+// ---- CLI (value-arg + --demo; reads NO files) ------------------------------
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+var DEMO_CATALOG = catalogSave(
+catalogSave([], "note-1", { title: "Groceries", items: ["milk", "eggs"]},
+{ title: "Groceries", updated: "2026-08-01"}),
+"note-2", { title: "Ideas — café ☕", body: "persistence without a backend"},
+{ title: "Ideas", updated: "2026-08-15"});
+
+function printDemo() {
+var archive = archiveExport(DEMO_CATALOG);
+var back = archiveImport(archive);
+var sorted = catalogSort(back, "updated", true);
+process.stdout.write("# l21x-snapshot demo\n");
+process.stdout.write("catalog entries: " + back.length + "\n");
+process.stdout.write("archive blob length (base64): " + archive.length + "\n");
+process.stdout.write("sorted by updated (desc): " +
+sorted.map(function (e) { return e.id;}).join(", ") + "\n");
+var loaded = catalogLoad(back, "note-2");
+process.stdout.write("loaded note-2 title: " + loaded.doc.title + "\n");
+process.stdout.write("round-trip ok: " +
+(archiveExport(archiveImport(archive)) === archive) + "\n");
+process.exit(0);
+}
+
+if (args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"l21x-snapshot — a zero-dependency browser document persistence layer\n\n" +
+" node l21x-snapshot.js --demo build a sample catalog, archive it,\n" +
+" round-trip it, and print the result\n" +
+" node l21x-snapshot.js '<json doc>' encode one JSON document as an.l21x\n" +
+" snapshot and print the base64\n\n" +
+"Library: encodeSnapshot/decodeSnapshot, catalogSave/Load/Validate/Sort,\n" +
+"archiveExport/archiveImport. Pure functions over values — no files, no DOM,\n" +
+"no network. Exit 0.\n");
+process.exit(0);
+}
+if (args[0] === "--demo" || args.length === 0) { printDemo();}
+else {
+// value-arg: treat the argument as a literal JSON document, encode it.
+var doc;
+try { doc = JSON.parse(args[0]);}
+catch (e) { process.stdout.write("not valid JSON; wrapping as a string document\n"); doc = args[0];}
+process.stdout.write(encodeSnapshot(doc, { title: "cli"}) + "\n");
+process.exit(0);
+}
+}
+
+test_l21x-snapshot.js 128 lines on GitHub →
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+/* test_l21x-snapshot.js — proves the persistence layer implements its contract.
+
+THE ORACLE. There is no stdlib that says "is this catalog persisted right?" — so
+the oracle is CURATED VECTORS expressed directly against what the functions
+promise: (1) snapshot encode->decode round-trips an arbitrary document, including
+full multibyte UTF-8; (2) decodeSnapshot REJECTS a foreign/garbage string rather
+than half-parsing; (3) catalogSave returns a NEW catalog, replaces by id, and
+never mutates its input; (4) catalogLoad returns the doc or null; (5)
+catalogValidate reports duplicate-id and bad-snapshot honestly; (6) catalogSort
+is stable, nulls-last, and leaves its input untouched; (7) archiveExport/Import
+round-trips a whole catalog exactly. Plus determinism (encode is a pure function)
+and a mutation-bite so a degenerate core (constant output / ignores input) fails.
+Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var m = require("./l21x-snapshot.js");
+
+var pass = 0, fail = 0;
+function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
+function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
+function threw(label, fn) {
+var did = false;
+try { fn();} catch (e) { did = true;}
+ok(label + " (throws)", did);
+}
+function deepEq(a, b) { return JSON.stringify(a) === JSON.stringify(b);}
+
+// ---- 1. snapshot codec round-trip (incl. multibyte) ------------------------
+var doc1 = { title: "Café ☕ — 日本語", n: 42, list: [1, 2, { deep: true}], nil: null};
+var snap1 = m.encodeSnapshot(doc1, { title: "t", schema: "note"});
+var back1 = m.decodeSnapshot(snap1);
+ok("snapshot round-trips the doc", deepEq(back1.doc, doc1));
+eq("snapshot carries title", back1.title, "t");
+eq("snapshot carries schema", back1.schema, "note");
+ok("snapshot is base64-ish (no raw braces)", snap1.indexOf("{") === -1);
+
+// primitive & array docs also round-trip
+ok("string doc round-trips", m.decodeSnapshot(m.encodeSnapshot("hi")).doc === "hi");
+ok("array doc round-trips", deepEq(m.decodeSnapshot(m.encodeSnapshot([1, "two", 3])).doc, [1, "two", 3]));
+
+// ---- 2. decode REJECTS foreign / malformed input ---------------------------
+threw("decode rejects empty string", function () { m.decodeSnapshot("");});
+threw("decode rejects non-string", function () { m.decodeSnapshot(null);});
+threw("decode rejects garbage base64->json", function () { m.decodeSnapshot("bm90IGpzb24=");}); // "not json"
+threw("decode rejects a foreign-fmt envelope", function () {
+// valid base64 of a JSON object whose fmt is wrong
+var foreign = Buffer? Buffer.from(JSON.stringify({ fmt: "other", v: 1, doc: 1})).toString("base64")
+: m.encodeSnapshot({}); // fallback; still non-l21x-fmt below
+m.decodeSnapshot(foreign);
+});
+threw("encode rejects undefined doc", function () { m.encodeSnapshot(undefined);});
+
+// ---- 3. catalogSave: new catalog, replace-by-id, no mutation ---------------
+var cat0 = [];
+var cat1 = m.catalogSave(cat0, "a", { v: 1}, { title: "A", updated: "2026-01-01"});
+eq("save grows the catalog", cat1.length, 1);
+eq("save does not mutate input", cat0.length, 0);
+ok("saved returns a NEW array", cat1!== cat0);
+var cat2 = m.catalogSave(cat1, "b", { v: 2}, { title: "B", updated: "2026-03-01"});
+eq("second save grows", cat2.length, 2);
+var cat2b = m.catalogSave(cat2, "a", { v: 99}, { title: "A2", updated: "2026-02-01"});
+eq("replace keeps length", cat2b.length, 2);
+eq("replace updates in place by id", m.catalogLoad(cat2b, "a").doc.v, 99);
+eq("replace does not mutate prior catalog", m.catalogLoad(cat2, "a").doc.v, 1);
+threw("save rejects empty id", function () { m.catalogSave([], "", {});});
+
+// ---- 4. catalogLoad --------------------------------------------------------
+ok("load returns null for missing id", m.catalogLoad(cat2b, "zzz") === null);
+ok("load decodes the stored doc", deepEq(m.catalogLoad(cat2b, "b").doc, { v: 2}));
+
+// ---- 5. catalogValidate: honest errors -------------------------------------
+var good = m.catalogValidate(cat2b);
+ok("valid catalog validates ok", good.ok === true && good.errors.length === 0);
+var dupe = cat2b.concat([{ id: "a", snapshot: cat2b[0].snapshot}]);
+var dupeRes = m.catalogValidate(dupe);
+ok("duplicate id is reported", dupeRes.ok === false &&
+dupeRes.errors.join("|").indexOf("duplicate")!== -1);
+var badSnap = [{ id: "x", snapshot: "@@not-base64-json@@"}];
+ok("bad snapshot is reported", m.catalogValidate(badSnap).ok === false);
+var missingId = [{ snapshot: cat2b[0].snapshot}];
+ok("missing id is reported", m.catalogValidate(missingId).ok === false);
+
+// ---- 6. catalogSort: stable, nulls-last, input untouched -------------------
+var sortSrc = [
+{ id: "c", title: "Cherry", updated: "2026-03"},
+{ id: "a", title: "Apple", updated: null},
+{ id: "b", title: "Banana", updated: "2026-01"}
+];
+var byTitle = m.catalogSort(sortSrc, "title");
+eq("sort by title asc first", byTitle[0].id, "a");
+eq("sort by title asc last", byTitle[2].id, "c");
+ok("sort does not mutate input", sortSrc[0].id === "c");
+var byUpdated = m.catalogSort(sortSrc, "updated");
+eq("nulls sort last on updated", byUpdated[2].id, "a");
+var byUpdatedDesc = m.catalogSort(sortSrc, "updated", true);
+eq("desc reverses order", byUpdatedDesc[0].id, "c");
+// stability: equal keys keep input order
+var ties = [{ id: "p", k: 1}, { id: "q", k: 1}, { id: "r", k: 1}];
+var tied = m.catalogSort(ties, "k");
+ok("sort is stable on ties", tied[0].id === "p" && tied[1].id === "q" && tied[2].id === "r");
+
+// ---- 7. archive round-trip -------------------------------------------------
+var arch = m.archiveExport(cat2b);
+ok("archive is one string", typeof arch === "string" && arch.length > 0);
+var imported = m.archiveImport(arch);
+ok("archive round-trips the catalog", deepEq(imported, cat2b));
+eq("imported catalog is usable", m.catalogLoad(imported, "a").doc.v, 99);
+threw("archiveExport refuses an invalid catalog", function () { m.archiveExport(dupe);});
+threw("archiveImport rejects garbage", function () { m.archiveImport("bm90IGFuIGFyY2hpdmU=");});
+threw("archiveImport rejects a snapshot-as-archive", function () { m.archiveImport(snap1);});
+
+// ---- 8. determinism (encode is a pure function of its input) ---------------
+ok("encode is deterministic", m.encodeSnapshot(doc1, { title: "t", schema: "note"}) === snap1);
+ok("archive is deterministic", m.archiveExport(cat2b) === arch);
+
+// ---- 9. mutation-bite ------------------------------------------------------
+// A degenerate encode that ignored its input (constant output) would make two
+// different docs encode identically. Prove they DON'T.
+ok("MUTATION-BITE: different docs encode differently",
+m.encodeSnapshot({ a: 1})!== m.encodeSnapshot({ a: 2}));
+// A degenerate catalogLoad that returned a constant would fail id discrimination.
+ok("MUTATION-BITE: load discriminates by id",
+m.catalogLoad(cat2b, "a").doc.v!== m.catalogLoad(cat2b, "b").doc.v);
+
+// ---- report ----------------------------------------------------------------
+console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+JavaScript, zero dependencies (Node + browser)
 
 ---
 
@@ -1169,631 +1661,5 @@ process.exitCode = fail === 0? 0: 1;
 Take the whole folder →
 MIT
 Node / browser, no dependencies
-
----
-
-# loop21:component-factory — a Loop MMT gift
-https://loopmmt.com/gifts/loop21-component-factory/
-[coverage: optional · branch: gifts]
-
-Logic Components as Composable Data source ← all gifts
-
-loop21:component-factory
-
-A factory for small logic components — a counter, a toggle, a clamp, an accumulator, a pattern-matcher — emitted not as live objects but as fully-specified JSONL specs one per line, so each component travels: you can pipe it, store it, diff it, hash it, or feed it to any consumer that knows the five built-in kinds. It is a source in the composition algebra (nothing in, JSONL out): the front door to a small, closed catalog of primitives. Every requested component is validated against its kind's parameter schema before a spec is emitted, so a missing required parameter, a bad type, or an out-of-range value is a reported error, never a silently emitted spec a downstream tool will choke on. Auto-generated names use a seeded counter, so --seed yields byte-identical JSONL on any machine, forever.
-
-The honest edge
-
-The factory declares components; it does not run them. An emitted spec is a validated description, not a live object — turning a spec into behavior is the consumer's job, and this tool makes no claim about whether any downstream runner implements a kind correctly. It guarantees the spec is well-formed and catalog-valid, not that anyone honors it.
-
-Run it
-
-python3 loop21-component-factory.py --demo
-test_loop21-component-factory.py (28 checks / 17 tests, mutation-bitten, pinned golden sha256 of a seeded batch)
-Python standard library only, deterministic under --seed, headless
-
-The code — every file that ships
-
-loop21-component-factory.py 408 lines on GitHub →
-#!/usr/bin/env python3
-"""loop21-component-factory — declare small logic components as composable data.
-
-A *source* in the composition algebra (∅ → JSONL): you name the logic
-primitives you want — a counter, a toggle, a clamp, an accumulator, a
-pattern-matcher — give each a small config, and the factory emits one
-fully-specified component **spec** per line of JSONL. Nothing is executed
-here; the factory's job is to *declare* components as portable data that a
-downstream transform, fold, or runner consumes.
-
-spec = {"component": "<kind>", "name": "<id>", "params": {...},
-"port": "transform"|"filter"|..., "spec_version": 1}
-
-WHY IT'S A FACTORY, NOT A LIBRARY
-
-A library hands you a function bound to the process that imported it. This
-hands you a *description* of a component — kind, name, parameters, and the
-composition port it fills — as a line of JSON. That description travels: you
-can pipe it, store it, diff it, hash it, or feed it to any consumer that
-knows the five built-in kinds. The factory is the front door to a small,
-closed catalog of logic primitives, emitted as a stream.
-
-WHY IT'S HONEST
-
-- **A closed, named catalog.** Five component kinds ship: `counter`,
-`toggle`, `clamp`, `accumulator`, `pattern-match`. Each has a declared
-parameter schema and a declared composition port. Ask for a kind that
-isn't in the catalog and the factory refuses loudly (it never emits a
-spec it can't stand behind).
-
-- **Deterministic by construction.** The emitted stream is a pure function
-of the requested specs. Auto-generated names use a seeded, reproducible
-counter, so `--seed 42` yields byte-identical JSONL on any machine,
-forever. Keys are sorted; there is no wall-clock, no RNG that isn't
-seeded, nothing that drifts between runs.
-
-- **Validated at the door.** Every requested component is checked against
-its kind's parameter schema *before* a spec is emitted. A missing
-required parameter, an out-of-range value, or an unknown parameter is a
-reported error (to stderr, non-zero exit) — never a silently emitted
-spec that a downstream consumer will choke on.
-
-- **The spec is the whole contract.** A consumer needs nothing from this
-tool but the JSONL. The `spec_version` field pins the shape so a consumer
-can reject a spec it doesn't understand rather than mis-read it.
-
-THE HONEST EDGE
-
-The factory *declares* components; it does not *run* them. An emitted spec
-is a validated description, not a live object — turning a spec into behavior
-is the consumer's job, and this tool makes no claim about whether any
-downstream runner implements a kind correctly. It guarantees the spec is
-well-formed and catalog-valid, not that anyone honors it.
-
-USAGE
-# one component from a kind + inline params
-python3 loop21-component-factory.py --make counter:start=0,step=2
-
-# several at once, one JSONL line each
-python3 loop21-component-factory.py \
---make counter:start=0 --make toggle:initial=false \
---make clamp:lo=0,hi=100
-
-# read a batch request from a JSON file ([{kind,name,params},...])
-python3 loop21-component-factory.py --batch request.json
-
-# list the catalog (kinds, params, ports) as JSONL and exit
-python3 loop21-component-factory.py --catalog
-
-# a short, reproducible demonstration
-python3 loop21-component-factory.py --demo
-
-MIT licensed. Python standard library only. Deterministic under --seed; headless.
-"""
-# SPDX-License-Identifier: MIT
-from __future__ import annotations
-
-import argparse
-import json
-import sys
-from typing import Any
-
-SPEC_VERSION = 1
-
-# ---------------------------------------------------------------------------
-# The catalog — a closed, named set of logic-component kinds.
-#
-# Each kind declares:
-# port: the composition port the component fills (source/transform/
-# filter/fold/sink) — this is what a MAP tool reads.
-# params: {name: schema} where schema is
-# {"type": "int"|"number"|"bool"|"string",
-# "required": bool,
-# "default": <value>, # when not required
-# "min": <n>, "max": <n>} # optional bounds (numeric)
-# summary: one line, human-facing.
-# ---------------------------------------------------------------------------
-CATALOG: dict[str, dict[str, Any]] = {
-"counter": {
-"port": "transform",
-"summary": "advances a running integer by a fixed step each item",
-"params": {
-"start": {"type": "int", "required": False, "default": 0},
-"step": {"type": "int", "required": False, "default": 1},
-},
-},
-"toggle": {
-"port": "transform",
-"summary": "flips a boolean on each item, starting from an initial state",
-"params": {
-"initial": {"type": "bool", "required": False, "default": False},
-},
-},
-"clamp": {
-"port": "transform",
-"summary": "constrains a numeric field to an inclusive [lo, hi] range",
-"params": {
-"lo": {"type": "number", "required": True},
-"hi": {"type": "number", "required": True},
-},
-},
-"accumulator": {
-"port": "fold",
-"summary": "reduces a stream to a single running total under an operation",
-"params": {
-"op": {
-"type": "string",
-"required": False,
-"default": "sum",
-"choices": ["sum", "product", "min", "max", "count"],
-},
-"seed": {"type": "number", "required": False, "default": 0},
-},
-},
-"pattern-match": {
-"port": "filter",
-"summary": "passes items whose field matches a fixed literal or set",
-"params": {
-"field": {"type": "string", "required": True},
-"equals": {"type": "string", "required": False, "default": None},
-"in": {"type": "string", "required": False, "default": None},
-},
-},
-}
-
-class FactoryError(Exception):
-"""A requested component could not be produced (unknown kind or bad params)."""
-
-# ---------------------------------------------------------------------------
-# Parameter parsing + coercion
-# ---------------------------------------------------------------------------
-def _coerce(kind: str, pname: str, raw: Any, schema: dict[str, Any]) -> Any:
-"""Coerce a raw parameter value to its declared type, or raise FactoryError."""
-t = schema["type"]
-try:
-if t == "int":
-val = int(raw)
-elif t == "number":
-val = float(raw)
-if val.is_integer():
-val = int(val) # canonical: 3.0 -> 3, keeps JSONL stable
-elif t == "bool":
-if isinstance(raw, bool):
-val = raw
-else:
-s = str(raw).strip().lower()
-if s in ("true", "1", "yes", "on"):
-val = True
-elif s in ("false", "0", "no", "off"):
-val = False
-else:
-raise ValueError(s)
-elif t == "string":
-val = str(raw)
-else: # pragma: no cover - guarded by catalog authorship
-raise FactoryError(f"{kind}.{pname}: unknown schema type {t!r}")
-except (ValueError, TypeError):
-raise FactoryError(
-f"{kind}.{pname}: value {raw!r} is not a valid {t}"
-)
-
-if "choices" in schema and val not in schema["choices"]:
-raise FactoryError(
-f"{kind}.{pname}: {val!r} not in {schema['choices']}"
-)
-for bound, cmp_ok in (("min", lambda v, b: v >= b), ("max", lambda v, b: v <= b)):
-if bound in schema and not cmp_ok(val, schema[bound]):
-raise FactoryError(
-f"{kind}.{pname}: {val!r} violates {bound}={schema[bound]}"
-)
-return val
-
-def build_spec(kind: str, name: str, params: dict[str, Any]) -> dict[str, Any]:
-"""Validate a request against the catalog and return a component spec dict.
-
-Raises FactoryError on an unknown kind, an unknown param, a missing
-required param, or a value that fails coercion/bounds.
-"""
-if kind not in CATALOG:
-raise FactoryError(
-f"unknown component kind {kind!r}; catalog: {', '.join(sorted(CATALOG))}"
-)
-entry = CATALOG[kind]
-schema = entry["params"]
-
-unknown = set(params) - set(schema)
-if unknown:
-raise FactoryError(
-f"{kind}: unknown param(s) {', '.join(sorted(unknown))}; "
-f"allowed: {', '.join(sorted(schema)) or '(none)'}"
-)
-
-resolved: dict[str, Any] = {}
-for pname, pschema in schema.items():
-if pname in params:
-resolved[pname] = _coerce(kind, pname, params[pname], pschema)
-elif pschema.get("required"):
-raise FactoryError(f"{kind}: missing required param {pname!r}")
-else:
-resolved[pname] = pschema.get("default")
-
-if kind == "pattern-match" and resolved.get("equals") is None and resolved.get("in") is None:
-raise FactoryError("pattern-match: exactly one of 'equals' or 'in' is required")
-if kind == "pattern-match" and resolved.get("equals") is not None and resolved.get("in") is not None:
-raise FactoryError("pattern-match: give only one of 'equals' or 'in', not both")
-
-return {
-"component": kind,
-"name": name,
-"params": resolved,
-"port": entry["port"],
-"spec_version": SPEC_VERSION,
-}
-
-# ---------------------------------------------------------------------------
-# Request parsing
-# ---------------------------------------------------------------------------
-def parse_make(expr: str) -> tuple[str, dict[str, Any]]:
-"""Parse a --make expression 'kind:k=v,k2=v2' -> (kind, {params})."""
-if ":" in expr:
-kind, _, param_str = expr.partition(":")
-else:
-kind, param_str = expr, ""
-kind = kind.strip()
-params: dict[str, Any] = {}
-if param_str.strip():
-for pair in param_str.split(","):
-if "=" not in pair:
-raise FactoryError(f"bad param {pair!r} in {expr!r} (want k=v)")
-k, _, v = pair.partition("=")
-params[k.strip()] = v.strip()
-return kind, params
-
-def _auto_name(kind: str, ordinal: int) -> str:
-"""Deterministic auto-name: kind + zero-padded seeded ordinal."""
-return f"{kind}-{ordinal:04d}"
-
-def produce(
-requests: list[dict[str, Any]],
-*,
-seed: int = 0,
-) -> list[dict[str, Any]]:
-"""Turn a list of {kind, name?, params} requests into validated specs.
-
-Auto-generated names are deterministic: they use a per-kind ordinal that
-starts from `seed` and increments in request order, so the same requests
-under the same seed yield byte-identical specs.
-"""
-specs: list[dict[str, Any]] = []
-counters: dict[str, int] = {}
-for req in requests:
-kind = req["kind"]
-params = req.get("params", {})
-name = req.get("name")
-if not name:
-ordinal = counters.get(kind, seed)
-counters[kind] = ordinal + 1
-name = _auto_name(kind, ordinal)
-specs.append(build_spec(kind, name, params))
-return specs
-
-def catalog_lines() -> list[dict[str, Any]]:
-"""The catalog itself, as JSONL-emittable dicts (one per kind)."""
-out = []
-for kind in sorted(CATALOG):
-entry = CATALOG[kind]
-out.append(
-{
-"component": kind,
-"port": entry["port"],
-"summary": entry["summary"],
-"params": {
-p: {k: v for k, v in schema.items()}
-for p, schema in entry["params"].items()
-},
-}
-)
-return out
-
-# ---------------------------------------------------------------------------
-# Emit
-# ---------------------------------------------------------------------------
-def emit(objs: list[dict[str, Any]], stream=None) -> None:
-"""Write objects as JSONL — one per line, keys sorted (deterministic)."""
-stream = sys.stdout if stream is None else stream
-for obj in objs:
-stream.write(json.dumps(obj, sort_keys=True, ensure_ascii=False) + "\n")
-
-def demo(*, seed: int = 42) -> str:
-"""A short reproducible demonstration — returns the JSONL block as a string."""
-reqs = [
-{"kind": "counter", "params": {"start": "0", "step": "2"}},
-{"kind": "toggle", "params": {"initial": "false"}},
-{"kind": "clamp", "params": {"lo": "0", "hi": "100"}},
-{"kind": "accumulator", "params": {"op": "sum"}},
-{"kind": "pattern-match", "params": {"field": "status", "equals": "open"}},
-]
-specs = produce(reqs, seed=seed)
-return "\n".join(
-json.dumps(s, sort_keys=True, ensure_ascii=False) for s in specs
-)
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def _build_arg_parser() -> argparse.ArgumentParser:
-p = argparse.ArgumentParser(
-prog="loop21-component-factory",
-description="Declare small logic components as composable JSONL specs.",
-)
-p.add_argument(
-"--make",
-action="append",
-default=[],
-metavar="KIND:k=v,...",
-help="a component to emit (repeatable)",
-)
-p.add_argument(
-"--batch",
-metavar="FILE",
-help="a JSON file: [{kind, name?, params?},...]",
-)
-p.add_argument("--catalog", action="store_true", help="emit the catalog as JSONL and exit")
-p.add_argument("--demo", action="store_true", help="print a short reproducible demonstration")
-p.add_argument("--seed", type=int, default=0, help="seed for deterministic auto-names")
-return p
-
-def main(argv: list[str] | None = None) -> int:
-parser = _build_arg_parser()
-args = parser.parse_args(argv)
-
-if args.catalog:
-emit(catalog_lines())
-return 0
-
-if args.demo:
-sys.stdout.write(demo() + "\n")
-return 0
-
-requests: list[dict[str, Any]] = []
-try:
-if args.batch:
-with open(args.batch, encoding="utf-8") as fh:
-loaded = json.load(fh)
-if not isinstance(loaded, list):
-raise FactoryError("--batch file must be a JSON array of requests")
-for item in loaded:
-if not isinstance(item, dict) or "kind" not in item:
-raise FactoryError("each --batch item needs a 'kind' field")
-requests.append(
-{
-"kind": item["kind"],
-"name": item.get("name"),
-"params": item.get("params", {}),
-}
-)
-for expr in args.make:
-kind, params = parse_make(expr)
-requests.append({"kind": kind, "params": params})
-
-if not requests:
-parser.error("nothing to make: give --make, --batch, --catalog, or --demo")
-
-specs = produce(requests, seed=args.seed)
-except FactoryError as exc:
-sys.stderr.write(f"loop21-component-factory: {exc}\n")
-return 2
-except (OSError, json.JSONDecodeError) as exc:
-sys.stderr.write(f"loop21-component-factory: {exc}\n")
-return 2
-
-emit(specs)
-return 0
-
-if __name__ == "__main__":
-raise SystemExit(main())
-
-test_loop21-component-factory.py 219 lines on GitHub →
-#!/usr/bin/env python3
-"""test_loop21-component-factory.py — the certifying properties of the factory gift.
-
-Run: python3 test_loop21-component-factory.py (exit 0 = all pass, 1 = failure)
-
-MUTATION-BITTEN: each test is here because a plausible mutation of the tool makes
-it fail loud. The determinism test pins a GOLDEN sha256 of a seeded batch rather
-than checking self-equality — a weak self-equality test passes benign reorders
-(the Loop MMT sudoku lesson), a pinned golden does not.
-"""
-import hashlib
-import importlib.util
-import io
-import json
-import os
-import sys
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location(
-"lcf", os.path.join(_HERE, "loop21-component-factory.py")
-)
-lcf = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lcf)
-
-# --- pinned goldens: regenerate ONLY on an intentional change ----------------
-DEMO_GOLDEN_SHA256 = "ba304b3fd40715875b8298b68dd6281d64844f641263bc7121ce27c35da00a08"
-BATCH_GOLDEN_SHA256 = "566171366bffaa9bcfd9001523666585fafe7547f11e3f2851b0cf36288680fe"
-CATALOG_KIND_COUNT = 5
-
-_FAILURES: list[str] = []
-_PASSES = 0
-
-def check(cond: bool, msg: str) -> None:
-global _PASSES
-if cond:
-_PASSES += 1
-else:
-_FAILURES.append(msg)
-
-def _sha(block: str) -> str:
-return hashlib.sha256(block.encode()).hexdigest()
-
-# --- determinism -------------------------------------------------------------
-def test_seeded_demo_reproduces_pinned_golden():
-"""The seeded demo output is byte-identical to a pinned sha256, forever."""
-block = lcf.demo(seed=42)
-check(_sha(block) == DEMO_GOLDEN_SHA256,
-f"demo golden drift: got {_sha(block)}")
-
-def test_seeded_batch_reproduces_pinned_golden():
-"""A seeded produce() batch is byte-identical to a pinned sha256."""
-reqs = [
-{"kind": "counter", "params": {"start": "5", "step": "3"}},
-{"kind": "accumulator", "params": {"op": "max", "seed": "0"}},
-{"kind": "clamp", "params": {"lo": "-10", "hi": "10"}},
-]
-specs = lcf.produce(reqs, seed=100)
-block = "\n".join(json.dumps(s, sort_keys=True, ensure_ascii=False) for s in specs)
-check(_sha(block) == BATCH_GOLDEN_SHA256,
-f"batch golden drift: got {_sha(block)}")
-
-def test_same_seed_twice_is_identical():
-"""Two runs with the same seed produce identical specs (self-consistency)."""
-reqs = [{"kind": "counter", "params": {}}, {"kind": "toggle", "params": {}}]
-a = lcf.produce(reqs, seed=7)
-b = lcf.produce(reqs, seed=7)
-check(a == b, "same-seed runs diverged")
-
-# --- catalog is a closed, named set ------------------------------------------
-def test_catalog_is_the_declared_five_kinds():
-"""The catalog holds exactly the five declared component kinds."""
-check(len(lcf.CATALOG) == CATALOG_KIND_COUNT,
-f"catalog size changed: {sorted(lcf.CATALOG)}")
-check(set(lcf.CATALOG) == {"counter", "toggle", "clamp", "accumulator", "pattern-match"},
-f"catalog kinds changed: {sorted(lcf.CATALOG)}")
-
-def test_every_catalog_kind_declares_a_valid_port():
-"""Every kind's port is one of the five composition-algebra verbs."""
-valid = {"source", "transform", "filter", "fold", "sink"}
-for kind, entry in lcf.CATALOG.items():
-check(entry["port"] in valid, f"{kind}: bad port {entry['port']!r}")
-
-# --- validation at the door --------------------------------------------------
-def test_unknown_kind_refuses():
-"""An unknown component kind raises FactoryError, never emits a spec."""
-try:
-lcf.build_spec("frobnicate", "x", {})
-check(False, "unknown kind did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_missing_required_param_refuses():
-"""A missing required param (clamp.hi) raises, never emits a spec."""
-try:
-lcf.build_spec("clamp", "c", {"lo": 0})
-check(False, "missing required param did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_unknown_param_refuses():
-"""An unknown param raises rather than being silently dropped or emitted."""
-try:
-lcf.build_spec("counter", "c", {"bogus": 5})
-check(False, "unknown param did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_bad_type_refuses():
-"""A non-int for an int param raises rather than coercing to garbage."""
-try:
-lcf.build_spec("counter", "c", {"step": "abc"})
-check(False, "bad-type param did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_out_of_choice_refuses():
-"""An accumulator op outside the declared choices raises."""
-try:
-lcf.build_spec("accumulator", "a", {"op": "divide"})
-check(False, "out-of-choice op did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_pattern_match_requires_exactly_one_selector():
-"""pattern-match with neither equals nor in raises; with both raises."""
-try:
-lcf.build_spec("pattern-match", "p", {"field": "s"})
-check(False, "pattern-match with no selector did not raise")
-except lcf.FactoryError:
-check(True, "")
-try:
-lcf.build_spec("pattern-match", "p", {"field": "s", "equals": "a", "in": "b"})
-check(False, "pattern-match with both selectors did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-# --- spec shape --------------------------------------------------------------
-def test_spec_carries_version_and_port():
-"""Every emitted spec pins spec_version and declares its port."""
-s = lcf.build_spec("counter", "c", {"start": 0})
-check(s["spec_version"] == lcf.SPEC_VERSION, "spec_version missing/wrong")
-check(s["port"] == "transform", "counter port wrong")
-check(s["component"] == "counter", "component field wrong")
-
-def test_number_type_canonicalizes_integer_floats():
-"""A number param given as 3.0 canonicalizes to 3 so JSONL stays stable."""
-s = lcf.build_spec("clamp", "c", {"lo": "0.0", "hi": "100"})
-check(s["params"]["lo"] == 0 and isinstance(s["params"]["lo"], int),
-f"number did not canonicalize: {s['params']['lo']!r}")
-
-def test_bool_coercion_accepts_words_and_refuses_garbage():
-"""bool params accept true/false words; garbage raises."""
-s = lcf.build_spec("toggle", "t", {"initial": "true"})
-check(s["params"]["initial"] is True, "bool 'true' not coerced")
-try:
-lcf.build_spec("toggle", "t", {"initial": "maybe"})
-check(False, "garbage bool did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-# --- CLI exit codes ----------------------------------------------------------
-def test_cli_bad_request_exits_2():
-"""The CLI returns 2 (not 0, not a traceback) on a bad request."""
-rc = lcf.main(["--make", "counter:step=abc"])
-check(rc == 2, f"bad CLI request returned {rc}, want 2")
-
-def test_cli_catalog_and_demo_exit_0():
-"""--catalog and --demo both succeed (exit 0)."""
-check(lcf.main(["--catalog"]) == 0, "--catalog did not exit 0")
-check(lcf.main(["--demo"]) == 0, "--demo did not exit 0")
-
-def test_auto_names_are_ordinal_and_seeded():
-"""Auto-generated names increment per-kind from the seed, deterministically."""
-specs = lcf.produce(
-[{"kind": "counter", "params": {}}, {"kind": "counter", "params": {}}],
-seed=10,
-)
-check(specs[0]["name"] == "counter-0010", f"first name {specs[0]['name']!r}")
-check(specs[1]["name"] == "counter-0011", f"second name {specs[1]['name']!r}")
-
-def _run() -> int:
-tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-for t in tests:
-try:
-t()
-except Exception as exc: # a test itself throwing is a failure
-_FAILURES.append(f"{t.__name__} raised {exc!r}")
-total = _PASSES + len(_FAILURES)
-if _FAILURES:
-print(f"FAIL — {_PASSES}/{total} checks passed; {len(_FAILURES)} failure(s):")
-for f in _FAILURES:
-print(f" ✗ {f}")
-return 1
-print(f"OK — {_PASSES}/{total} checks passed across {len(tests)} tests.")
-return 0
-
-if __name__ == "__main__":
-raise SystemExit(_run())
-
-Take the whole folder →
-MIT
-Python standard library only, deterministic under --seed, headless
 
 ---

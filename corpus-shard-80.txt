@@ -1,8 +1,845 @@
-# Loop MMT — corpus shard 80/86
+# Loop MMT — corpus shard 80/87
 
-> Bundle 80 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 80 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/sudoku/, /gifts/svg-sink/, /gifts/switchboard/)
+Nodes in this shard: 4 (/gifts/seq-source/, /gifts/sha256/, /gifts/sparkline-sink/, /gifts/sudoku/)
+
+---
+
+# seq-source — a Loop MMT gift
+https://loopmmt.com/gifts/seq-source/
+[coverage: optional · branch: gifts]
+
+Generate a Deterministic Sequence to Feed Your Pipe source ← all gifts
+
+seq-source
+
+seq-source takes no input — it GENERATES one: give it --count N (and optionally --start, --step, --field) and it emits N JSON objects, one per line, each the next term of an integer arithmetic sequence { NAME: start + i*step}. It is the front of a pipe, a deterministic generator you feed INTO the fold/filter/transform gifts — seq-source --count 100 | range-filter --num n 10 20 yields exactly the records 10..20. Zero dependencies, runs unchanged in Node or a browser, same options yield byte-identical output every run.
+
+The honest edge
+
+seq-source emits an INTEGER arithmetic sequence only — it does not do geometric or floating-point sequences (those drift and would not be byte-deterministic), reads no input, and does not randomize. count/start/step must be integers; a non-integer or negative count/start/step, an empty field, or a positional argument is refused (exit 2) rather than emit a drifting or malformed stream. A deterministic generator you can pin, not a fixture you have to store.
+
+Run it
+
+node seq-source.js --count 5 --start 10 --step 5 # -> {"n":10}..{"n":30}
+test_seq-source.js (24/24, independent accumulator-route oracle) + Plumb conformance GREEN (16/16, signed 2026-09-12, clock-independent, mutation-bite non-vacuous)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+seq-source.js 160 lines on GitHub →
+#!/usr/bin/env node
+/* seq-source.js — emit a deterministic arithmetic sequence as a JSONL record stream.
+Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
+
+WHAT IT IS. A SOURCE: it takes no input stream — it GENERATES one. Give it a count
+(and optionally a start, a step, and a field name) and it emits that many JSON
+objects, one per line (JSONL), each holding the next term of an integer arithmetic
+sequence: start, start+step, start+2*step,... It is the front of a pipe — a
+deterministic generator you feed INTO the fold/filter/transform gifts, so you can
+produce a known stream to test or drive them without hand-writing a file.
+
+seq-source --count 5 -> {"n":0}..{"n":4}
+seq-source --count 5 --start 10 --step 5 -> {"n":10} {"n":15}.. {"n":30}
+seq-source --count 3 --field id --start 100 -> {"id":100} {"id":101} {"id":102}
+
+INTEGERS ONLY (the honesty axis). count, start, and step must be INTEGERS. This is
+deliberate, not a limitation to apologize for: a floating-point sequence drifts —
+0 + 0.1 + 0.1 + 0.1 is not 0.3 — so its output would not be byte-deterministic, and
+a "source" that emits subtly different bytes on different machines is not a source
+you can pin. seq-source REFUSES a non-integer count/start/step (exit 2) rather than
+emit a drifting sequence. Every emitted term is an exact integer; the sequence is
+byte-identical on every machine and every run. (Terms are exact while they stay
+within +/-2^53, JavaScript's exact-integer range; a run that would cross it is a
+caller asking for more than a JSON number can hold honestly — keep counts sane.)
+
+THE MODEL
+--count N REQUIRED. How many terms to emit. An integer >= 0 (0 emits nothing,
+exit 0 — an empty stream is a valid stream, not an error).
+--start S The first term. An integer, default 0.
+--step D The common difference. An integer, default 1 (may be 0 or negative).
+--field NAME The object key each term is emitted under. Default "n". Non-empty.
+
+Each term i (0-based) is emitted as the single-key object { NAME: S + i*D}, one per
+line. The output is a stream the JSONL gifts consume: `seq-source --count 100 |
+range-filter --num n 10 20` produces exactly the records 10..20.
+
+DETERMINISM. generate(opts) is a pure function — no clock, no randomness, no files,
+no stdin — so the same options yield byte-identical output every run.
+
+USAGE
+node seq-source.js --count 10
+node seq-source.js --count 5 --start 100 --step -1 --field seq
+node seq-source.js --help
+
+Exit codes: 0 success (including an empty stream) · 2 input error (missing/non-integer
+count, non-integer start/step, negative count, empty field name, unknown option).
+Always a clean one-line message on stderr, never a stack trace.
+
+Released under MIT. Its edge is printed in the README: seq-source emits an INTEGER
+arithmetic sequence only — it does not do geometric or floating-point sequences, does
+not read any input, and does not randomize. It is a deterministic generator; a source
+you can pin, not a fixture you have to store.
+*/
+"use strict";
+
+/* ---- the pure core ------------------------------------------------ */
+
+function isInt(x) { return typeof x === "number" && isFinite(x) && Math.floor(x) === x;}
+
+// Generate the sequence as an array of single-key records. Throws a clean Error on
+// any invalid option — the CLI turns that into exit 2. Pure; no side effects.
+function generate(opts) {
+opts = opts || {};
+var count = opts.count;
+var start = opts.start === undefined? 0: opts.start;
+var step = opts.step === undefined? 1: opts.step;
+var field = opts.field === undefined? "n": opts.field;
+
+if (!isInt(count)) throw new Error("--count must be an integer (got " + JSON.stringify(count) + ")");
+if (count < 0) throw new Error("--count must be >= 0 (got " + count + ")");
+if (!isInt(start)) throw new Error("--start must be an integer (got " + JSON.stringify(start) + ")");
+if (!isInt(step)) throw new Error("--step must be an integer (got " + JSON.stringify(step) + ")");
+if (typeof field!== "string" || field.length === 0) throw new Error("--field must be a non-empty name");
+
+var out = [];
+for (var i = 0; i < count; i++) {
+var rec = {};
+rec[field] = start + i * step;
+out.push(rec);
+}
+return out;
+}
+
+// Render the records as JSONL text (one JSON object per line, trailing newline if any).
+function toJSONL(records) {
+var s = "";
+for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
+return s;
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.seqSource = { generate: generate, toJSONL: toJSONL};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { generate: generate, toJSONL: toJSONL};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+
+function parseArgs(args) {
+var opts = {};
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a === "--count" || a === "--start" || a === "--step") {
+var raw = args[i + 1];
+if (raw === undefined) throw new Error(a + " requires an integer value");
+var n = Number(raw);
+if (raw === "" ||!isFinite(n)) throw new Error(a + " must be an integer (got " + JSON.stringify(raw) + ")");
+opts[a.slice(2)] = n;
+i += 2;
+} else if (a === "--field") {
+var f = args[i + 1];
+if (f === undefined) throw new Error("--field requires a name");
+opts.field = f;
+i += 2;
+} else if (a.charAt(0) === "-") {
+throw new Error("unknown option " + a);
+} else {
+throw new Error("unexpected argument " + JSON.stringify(a) + " (seq-source takes no positional input)");
+}
+}
+if (opts.count === undefined) throw new Error("--count is required");
+return opts;
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"seq-source.js — emit a deterministic integer arithmetic sequence as JSONL.\n\n" +
+" node seq-source.js --count 10\n" +
+" node seq-source.js --count 5 --start 100 --step -1 --field seq\n" +
+" node seq-source.js --help\n\n" +
+" --count N REQUIRED. number of terms to emit (integer >= 0)\n" +
+" --start S first term (integer, default 0)\n" +
+" --step D common difference (integer, default 1; may be 0 or negative)\n" +
+" --field NAME object key each term is emitted under (default \"n\")\n\n" +
+"Emits N objects, one per line: { NAME: S + i*D} for i in 0..N-1.\n\n" +
+"Edge: an INTEGER arithmetic sequence only. It does not do geometric or\n" +
+"floating-point sequences (those drift and would not be byte-deterministic),\n" +
+"reads no input, and does not randomize. A deterministic generator you can pin.\n"
+);
+return 0;
+}
+var opts;
+try { opts = parseArgs(args);}
+catch (e) { process.stderr.write("seq-source: " + e.message + "\n"); return 2;}
+var records;
+try { records = generate(opts);}
+catch (e) { process.stderr.write("seq-source: " + e.message + "\n"); return 2;}
+process.stdout.write(toJSONL(records));
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_seq-source.js 81 lines on GitHub →
+#!/usr/bin/env node
+/* test_seq-source.js — out-of-band battery for the seq-source gift.
+
+Cross-checks generate() against an INDEPENDENT oracle — a from-spec second builder
+that constructs each term with an explicit accumulator loop (start += step) rather
+than the gift's `start + i*step` closed form, so the two routes agree only if the
+arithmetic is right — plus hand goldens and every documented honesty edge.
+Node only; no dependencies. Exit 0 all-pass / 1 fail.
+*/
+"use strict";
+var ss = require("./seq-source.js");
+
+var pass = 0, fail = 0;
+function check(name, cond) { if (cond) pass++; else { fail++; console.log(" FAIL " + name);}}
+function J(v) { return JSON.stringify(v);}
+
+/* ---- independent oracle: accumulator route (not the closed form) --------- */
+function oracle(opts) {
+var count = opts.count, start = opts.start === undefined? 0: opts.start;
+var step = opts.step === undefined? 1: opts.step, field = opts.field === undefined? "n": opts.field;
+var out = [], acc = start;
+for (var i = 0; i < count; i++) { var r = {}; r[field] = acc; out.push(r); acc += step;}
+return out;
+}
+function giftJSONL(opts) { return ss.toJSONL(ss.generate(opts));}
+function oracleJSONL(opts) { return ss.toJSONL(oracle(opts));}
+
+/* ---- gift == independent oracle across a grid ---------------------------- */
+var grid = [
+{ count: 5},
+{ count: 5, start: 10, step: 5},
+{ count: 3, start: 100, step: -1, field: "id"},
+{ count: 1, start: -7},
+{ count: 4, start: 0, step: 0}, // constant sequence
+{ count: 10, start: -5, step: 2},
+{ count: 0}, // empty stream
+{ count: 6, step: -3}
+];
+grid.forEach(function (o) {
+check("gift == oracle [" + J(o) + "]", giftJSONL(o) === oracleJSONL(o));
+});
+
+/* ---- hand goldens -------------------------------------------------------- */
+check("golden: count 5 default == {n:0}..{n:4}",
+giftJSONL({ count: 5}) === '{"n":0}\n{"n":1}\n{"n":2}\n{"n":3}\n{"n":4}\n');
+check("golden: count 3 start 10 step 5",
+giftJSONL({ count: 3, start: 10, step: 5}) === '{"n":10}\n{"n":15}\n{"n":20}\n');
+check("golden: count 3 field id start 100",
+giftJSONL({ count: 3, start: 100, field: "id"}) === '{"id":100}\n{"id":101}\n{"id":102}\n');
+check("golden: negative step counts down",
+giftJSONL({ count: 4, start: 3, step: -1}) === '{"n":3}\n{"n":2}\n{"n":1}\n{"n":0}\n');
+
+/* ---- count 0 emits empty, is a valid stream ------------------------------ */
+check("count 0 -> empty string", giftJSONL({ count: 0}) === "");
+check("count 0 -> generate returns []", J(ss.generate({ count: 0})) === J([]));
+
+/* ---- single-key records + correct field ---------------------------------- */
+(function () {
+var recs = ss.generate({ count: 2, field: "x", start: 9, step: 3});
+check("records single-key with declared field", J(recs) === J([{ x: 9}, { x: 12}]));
+})();
+
+/* ---- determinism --------------------------------------------------------- */
+check("deterministic across two generate() calls",
+giftJSONL({ count: 20, start: -3, step: 7}) === giftJSONL({ count: 20, start: -3, step: 7}));
+
+/* ---- honesty: flag-don't-fake (throw on bad opts) ------------------------ */
+function throws(opts) { try { ss.generate(opts); return false;} catch (e) { return true;}}
+check("missing count throws", throws({ start: 5}));
+check("non-integer count throws", throws({ count: 2.5}));
+check("negative count throws", throws({ count: -1}));
+check("non-integer start throws", throws({ count: 3, start: 1.5}));
+check("non-integer step throws", throws({ count: 3, step: 0.1}));
+check("empty field throws", throws({ count: 3, field: ""}));
+check("string count throws (no coercion at the API)", throws({ count: "5"}));
+check("valid opts do NOT throw",!throws({ count: 3, start: 0, step: 1, field: "n"}));
+
+console.log("");
+var verdict = fail === 0? "PASS": "FAIL";
+console.log(verdict + ": " + pass + " checks passed, " + fail + " failed [test_seq-source]");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# Sha256 — a Loop MMT gift
+https://loopmmt.com/gifts/sha256/
+[coverage: optional · branch: gifts]
+
+Sync Hash That Matches Your Backend hash ← all gifts
+
+Sha256
+
+A dependency-free, synchronous SHA-256 (hex out) that returns the same 64-char digest as your Node backend's crypto.createHash for the same string — so a browser can mirror a server-side integrity check without turning the verify path async. The load-bearing rule: it hashes the UTF-8 bytes, so multibyte input (names, emoji) stays byte-identical instead of diverging silently.
+
+The honest edge
+
+It's a hash, not an HMAC and not encryption — it proves two inputs match, keeps no secret, and is not a password KDF. A from-scratch port for portability, not a hardened crypto library: where a vetted native lib is available and async is fine, prefer it.
+
+Run it
+
+node sha256.js "a string"
+test_sha256.js (24/24, drift-checked vs node crypto)
+Node, no dependencies
+
+The code — every file that ships
+
+sha256.js 176 lines on GitHub →
+#!/usr/bin/env node
+/* sha256.js — a dependency-free, synchronous SHA-256 (hex out) that is
+byte-identical to your backend's hash for the same string.
+
+WHY THIS EXISTS. The usual browser answer, crypto.subtle.digest, is
+ASYNCHRONOUS — it returns a Promise, so the moment you need a hash inside an
+otherwise-synchronous verify path (parse an envelope, check an integrity
+field, decide tamper/no-tamper), it forces that whole path to go async and
+ripple through everything that calls it. This is a small, pure, sync
+FIPS-180-4 SHA-256 that returns the SAME 64-char hex as Node's
+crypto.createHash('sha256').update(String(x)).digest('hex') — so a browser
+can mirror a Node integrity check without turning the call site async.
+
+THE ONE FIDELITY RULE (the whole reason to trust it). Node hashes the UTF-8
+BYTES of String(input). This encodes with the same UTF-8 byte stream, so the
+digest is identical — including for multibyte characters (accented names,
+emoji, non-Latin scripts). Never hash char codes: multibyte input would
+diverge silently and a tamper check would read a FALSE verdict. The test
+battery carries a multibyte vector precisely to catch that, checked against
+Node's own crypto as the oracle.
+
+Pure function of its input. No dependencies. Same code runs in a browser
+(attach sha256Hex to your namespace) or on Node (this CLI / require()).
+
+USAGE
+node sha256.js "the string to hash" # hash an argument
+echo -n "the string" | node sha256.js # hash stdin (exact bytes, no newline added)
+node sha256.js --help
+
+Released under MIT. Its edge is printed in the README: this is a HASH, not
+an HMAC and not encryption — it proves two inputs match, it does not keep a
+secret and it is not a password-storage KDF.
+*/
+"use strict";
+
+// SHA-256 round constants — FIPS 180-4 §4.2.2 (first 32 bits of the fractional
+// parts of the cube roots of the first 64 primes).
+var K = [
+0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
+
+function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
+
+// Encode a JS string to its UTF-8 bytes — the SAME bytes Node's
+//.update(String(s)) hashes. TextEncoder is present in every modern browser and
+// in Node; the manual fallback (surrogate-pair aware) produces the same stream.
+function utf8Bytes(str) {
+if (typeof TextEncoder!== "undefined") {
+return new TextEncoder().encode(str);
+}
+var out = [], i, c, lo;
+for (i = 0; i < str.length; i++) {
+c = str.charCodeAt(i);
+if (c < 0x80) { out.push(c);}
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) { // high surrogate
+lo = str.charCodeAt(++i);
+c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
+out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
+}
+return out;
+}
+
+function toHex8(x) {
+var h = (x >>> 0).toString(16);
+return "00000000".slice(h.length) + h;
+}
+
+// sha256Hex(input) -> 64-char lowercase hex, byte-identical to Node's
+// crypto.createHash('sha256').update(String(input)).digest('hex').
+function sha256Hex(input) {
+var bytes = utf8Bytes(String(input));
+var len = bytes.length;
+
+// Padding: append 0x80, then 0x00s, then the 64-bit big-endian bit length,
+// rounding up to a multiple of 64 bytes.
+var bitLenHi = Math.floor(len / 0x20000000); // high 32 bits of (len*8)
+var bitLenLo = (len * 8) >>> 0; // low 32 bits of (len*8)
+var withOne = len + 1;
+var padded = (withOne + 8 + 63) & ~63;
+var msg = new Uint8Array(padded);
+var i;
+for (i = 0; i < len; i++) msg[i] = bytes[i];
+msg[len] = 0x80;
+msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
+msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
+msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
+msg[padded - 5] = bitLenHi & 0xff;
+msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
+msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
+msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
+msg[padded - 1] = bitLenLo & 0xff;
+
+var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
+h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+
+var w = new Array(64), t, blk;
+for (blk = 0; blk < padded; blk += 64) {
+for (t = 0; t < 16; t++) {
+w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
+(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
+}
+for (t = 16; t < 64; t++) {
+var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+}
+var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
+for (t = 0; t < 64; t++) {
+var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+var ch = (e & f) ^ (~e & g);
+var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
+var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+var maj = (a & b) ^ (a & c) ^ (b & c);
+var temp2 = (S0 + maj) >>> 0;
+hh = g; g = f; f = e; e = (d + temp1) >>> 0;
+d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+}
+h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
+}
+
+return toHex8(h0) + toHex8(h1) + toHex8(h2) + toHex8(h3) +
+toHex8(h4) + toHex8(h5) + toHex8(h6) + toHex8(h7);
+}
+
+// Browser: attach to a namespace. Node/require: export. CLI: run below.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.sha256Hex = sha256Hex;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { sha256Hex: sha256Hex};
+}
+
+// ---- CLI (runs only when invoked directly, never on require) ----------------
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"sha256.js — dependency-free sync SHA-256, hex out (byte-identical to Node crypto).\n\n" +
+" node sha256.js \"a string\" hash the argument\n" +
+" echo -n \"a string\" | node sha256.js hash stdin (exact bytes, no newline added)\n" +
+" node sha256.js --help\n\n" +
+"Edge: this is a hash, not an HMAC and not encryption. It proves two inputs\n" +
+"match; it keeps no secret and is not a password KDF.\n"
+);
+return 0;
+}
+if (args.length > 0) {
+process.stdout.write(sha256Hex(args[0]) + "\n");
+return 0;
+}
+// stdin: hash the exact bytes received (no trailing newline added).
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var buf = Buffer.concat(chunks);
+// Hash the exact received bytes: decode as UTF-8 back to the string whose
+// UTF-8 bytes are these bytes (round-trips for valid UTF-8 input).
+process.stdout.write(sha256Hex(buf.toString("utf8")) + "\n");
+});
+return 0;
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_sha256.js 73 lines on GitHub →
+#!/usr/bin/env node
+/* test_sha256.js — proves sha256Hex is byte-identical to Node's own crypto.
+
+The oracle is Node's crypto.createHash('sha256'): for every vector we compute
+the digest BOTH ways and require they match. That is the honest proof — not
+"it matches a hardcoded string I typed" but "it matches the reference
+implementation for the same bytes", including the multibyte case that is the
+whole point of the fidelity rule. Also checks the two canonical FIPS-180-4
+vectors as fixed anchors, and mutation-bites the core so a no-op test can't
+pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var crypto = require("crypto");
+var sha256Hex = require("./sha256.js").sha256Hex;
+
+var pass = 0, fail = 0;
+function check(name, got, want) {
+if (got === want) { pass++;}
+else { fail++; console.error("FAIL " + name + "\n got: " + got + "\n want: " + want);}
+}
+function nodeHash(s) {
+return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+
+// 1. Canonical FIPS-180-4 anchors (fixed, independent of Node).
+check("empty string", sha256Hex(""),
+"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+check("abc", sha256Hex("abc"),
+"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+// 2. Drift-check against Node crypto over a vector battery (the real proof).
+var vectors = [
+"",
+"abc",
+"a",
+"The quick brown fox jumps over the lazy dog",
+"The quick brown fox jumps over the lazy dog.", // one-byte change -> avalanche
+"0123456789",
+"x".repeat(55), // one byte under a block boundary
+"x".repeat(56), // padding crosses into a new block
+"x".repeat(63),
+"x".repeat(64), // exact block
+"x".repeat(65),
+"x".repeat(1000), // multi-block
+"café", // multibyte: é is 2 UTF-8 bytes
+"naïve façade Zürich", // several multibyte
+"日本語テスト", // CJK, 3 bytes each
+"🦌", // the deer glyph — 4-byte surrogate pair
+"order:🦌×3 café", // mixed ASCII + multibyte + emoji
+"line1\nline2\ttabbed", // control chars
+];
+for (var i = 0; i < vectors.length; i++) {
+var v = vectors[i];
+var label = v.length > 24? (v.slice(0, 21) + "..."): v;
+check("drift[" + i + "] '" + label + "'", sha256Hex(v), nodeHash(v));
+}
+
+// 3. Determinism — same input twice, same digest.
+check("deterministic", sha256Hex("repeat me"), sha256Hex("repeat me"));
+
+// 4. Non-vacuity / mutation bite: a WRONG expected value MUST be caught.
+// (If the harness were a no-op, this "should fail" case would slip through.)
+var deliberatelyWrong = "0000000000000000000000000000000000000000000000000000000000000000";
+var mutationCaught = (sha256Hex("abc")!== deliberatelyWrong);
+if (mutationCaught) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: core did not distinguish a wrong digest");}
+
+// 5. String coercion parity with Node (numbers, etc. -> String()).
+check("number coercion 42", sha256Hex(42), nodeHash(42));
+check("boolean coercion", sha256Hex(true), nodeHash(true));
+
+console.log("\nsha256: " + pass + " passed, " + fail + " failed" +
+" (" + vectors.length + " drift vectors vs node crypto, incl. multibyte + emoji)");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node, no dependencies
+
+---
+
+# Sparkline-sink — a Loop MMT gift
+https://loopmmt.com/gifts/sparkline-sink/
+[coverage: optional · branch: gifts]
+
+Numbers In, One Inline Sparkline Out render ← all gifts
+
+Sparkline-sink
+
+sparkline-sink turns a numeric series into one inline unicode sparkline with zero dependencies — a single line of eight block levels (▁▂▃▄▅▆▇█), one glyph per value. It renders no axis, labels, numbers, or color — only the shape — so it drops straight into a log line, a commit message, a terminal, or a table cell where a chart library would be absurd. The load-bearing property: because each value maps to an INTEGER bucket, no float ever reaches the output, so the same series in produces byte-identical glyphs out — in Node or a browser, committable and diffable.
+
+The honest edge
+
+sparkline-sink is a GLYPH sparkline, not a chart: one line of 8 discrete block levels, one glyph per value, no axis, labels, numbers, color, or scale markers. Two values in the same eighth of the range draw the SAME glyph — it shows TREND, not magnitude, and it is not a substitute for the number. It takes NUMBERS ONLY (no caller text reaches the output, so there is no escaping surface). A non-finite value is a hard error, never a guessed point. Same series in → byte-identical line out.
+
+Run it
+
+echo '[3,1,4,1,5,9,2,6]' | node sparkline-sink.js # ▃▁▄▁▅█▂▆ (--min N / --max N to pin the domain)
+test_sparkline-sink.js (12/12, out-of-band hand-computed glyph oracle) + Plumb conformance GREEN (I1-I5, signed, clock-independent)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+sparkline-sink.js 156 lines on GitHub →
+#!/usr/bin/env node
+/*
+* sparkline-sink — turn a numeric series into one inline unicode sparkline, no deps.
+* MIT · zero-dependency · standalone gift · lane: sink (consumes data, emits an artifact).
+*
+* THE PRINTED EDGE (read before trusting the output):
+* This is a GLYPH sparkline, not a chart. It emits ONE line of unicode block
+* characters (▁▂▃▄▅▆▇█), one glyph per value, mapping each value to one of
+* EXACTLY 8 discrete levels across the data's [min,max] range. It renders NO
+* axis, labels, numbers, color, or scale markers — only the shape. Because there
+* are only 8 levels, two values in the same eighth of the range draw the SAME
+* glyph: it shows TREND, not magnitude, and it is not a substitute for the number.
+* It takes NUMBERS ONLY — no caller text ever reaches the output, so there is no
+* escaping surface. A non-finite value (NaN / Infinity) is a hard error, never a
+* silently-dropped or guessed point. Output is a PURE FUNCTION of the input: same
+* series in → byte-identical line out.
+*
+* USAGE:
+* echo '[3,1,4,1,5,9,2,6]' | node sparkline-sink.js # ▃▁▄▁▅█▂▆ (+ newline)
+* echo '[0,1,2,3,4,5,6,7]' | node sparkline-sink.js # ▁▂▃▄▅▆▇█
+* echo '{"series":[5],"min":0,"max":10}' | node sparkline-sink.js
+* node sparkline-sink.js --help
+*
+* INPUT (stdin, JSON): either
+* - a bare array of numbers -> [1,2,3]
+* - a spec object { series, min, max} -> pin the domain instead of auto-fit
+* CLI flags (--min --max) OVERRIDE object fields.
+*
+* OUTPUT (stdout): one line of block glyphs (UTF-8), trailing newline. Empty series -> a bare newline.
+*
+* DETERMINISM: each value maps to an INTEGER level (a bucket), so no float noise or
+* platform drift can reach the output. Same series → same bytes, in Node or a browser.
+* PORTABILITY: pure JS on a plain array — identical in Node and the browser.
+*/
+'use strict';
+
+// The ONLY output alphabet: 8 block levels, low to high. U+2581.. U+2588.
+var LEVELS = ['\u2581', '\u2582', '\u2583', '\u2584', '\u2585', '\u2586', '\u2587', '\u2588'];
+
+function finite(v, j) {
+if (typeof v!== 'number' ||!isFinite(v)) {
+throw new Error('series[' + j + '] is not a finite number: ' + JSON.stringify(v));
+}
+return v;
+}
+
+// Shared shape with svg-sink's domain(): auto-fit [min(data),max(data)] unless pinned;
+// a flat series opens to a unit window so every value lands mid-scale (never a divide-by-0).
+function domain(series, min, max) {
+var lo = (min!= null)? Number(min): Infinity;
+var hi = (max!= null)? Number(max): -Infinity;
+if (min == null || max == null) {
+for (var j = 0; j < series.length; j++) {
+var v = series[j];
+if (min == null && v < lo) lo = v;
+if (max == null && v > hi) hi = v;
+}
+}
+if (!isFinite(lo)) lo = 0;
+if (!isFinite(hi)) hi = 0;
+if (lo === hi) { lo -= 1; hi += 1;} // flat series -> unit window, drawn mid-scale
+return { lo: lo, hi: hi};
+}
+
+function level(v, lo, hi) {
+var k = Math.floor(((v - lo) / (hi - lo)) * LEVELS.length);
+if (k < 0) k = 0;
+if (k >= LEVELS.length) k = LEVELS.length - 1; // v == hi -> 8 clamps to 7
+return k;
+}
+
+function normalize(input, flags) {
+var spec = {};
+var seriesRaw;
+if (input &&!Array.isArray(input) && typeof input === 'object') {
+seriesRaw = input.series;
+if (input.min!= null) spec.min = input.min;
+if (input.max!= null) spec.max = input.max;
+} else {
+seriesRaw = input;
+}
+flags = flags || {};
+if (flags.min!= null) spec.min = flags.min; // CLI flags override object fields
+if (flags.max!= null) spec.max = flags.max;
+
+if (!Array.isArray(seriesRaw)) {
+throw new Error('input has no numeric series (expected an array or a {series:...} object)');
+}
+if (seriesRaw.length > 0 && Array.isArray(seriesRaw[0])) {
+throw new Error('sparkline-sink takes ONE series (a flat array of numbers), not nested arrays');
+}
+spec.series = seriesRaw.map(function (v, j) { return finite(v, j);});
+if (spec.min!= null) { spec.min = numOrThrow(spec.min, 'min');}
+if (spec.max!= null) { spec.max = numOrThrow(spec.max, 'max');}
+if (spec.min!= null && spec.max!= null && spec.min >= spec.max) {
+throw new Error('min must be < max (got min=' + spec.min + ', max=' + spec.max + ')');
+}
+return spec;
+}
+function numOrThrow(v, name) {
+var n = Number(v);
+if (typeof n!== 'number' ||!isFinite(n)) throw new Error(name + ' must be a finite number, got ' + JSON.stringify(v));
+return n;
+}
+
+// ---- the gift: series -> one line of block glyphs -------------------------------
+function sparkline(input, flags) {
+var spec = normalize(input, flags);
+var d = domain(spec.series, spec.min, spec.max);
+var out = '';
+for (var j = 0; j < spec.series.length; j++) {
+out += LEVELS[level(spec.series[j], d.lo, d.hi)];
+}
+return out + '\n';
+}
+
+// ---- exports (Node require + browser attach) ------------------------------------
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { sparkline: sparkline, normalize: normalize, domain: domain, LEVELS: LEVELS};
+}
+if (typeof window!== 'undefined') {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts['sparkline-sink'] = { sparkline: sparkline, LEVELS: LEVELS};
+}
+
+// ---- CLI ------------------------------------------------------------------------
+function main() {
+var argv = process.argv.slice(2);
+if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) {
+process.stdout.write(
+'sparkline-sink — numbers -> one inline unicode sparkline (' + LEVELS.join('') + '), zero deps.\n\n' +
+'USAGE:\n' +
+" echo '[3,1,4,1,5,9,2,6]' | node sparkline-sink.js [--min N] [--max N]\n\n" +
+'INPUT (stdin, JSON): a bare array of numbers, or { "series": [...], "min": N, "max": N}.\n' +
+'OUTPUT: one line of 8-level block glyphs, trailing newline. Numbers only; non-finite is a hard error.\n' +
+'EDGE: 8 discrete levels — shows shape, not magnitude; no axis/labels/color.\n');
+return;
+}
+var flags = {};
+for (var i = 0; i < argv.length; i++) {
+if (argv[i] === '--min') flags.min = Number(argv[++i]);
+else if (argv[i] === '--max') flags.max = Number(argv[++i]);
+}
+var chunks = [];
+process.stdin.on('data', function (c) { chunks.push(c);});
+process.stdin.on('end', function () {
+var raw = chunks.join('').trim();
+if (!raw) { process.stdout.write('\n'); return;} // empty stdin -> empty sparkline
+var input;
+try { input = JSON.parse(raw);}
+catch (e) { process.stderr.write('sparkline-sink: input is not valid JSON: ' + e.message + '\n'); process.exit(1);}
+try { process.stdout.write(sparkline(input, flags));}
+catch (e) { process.stderr.write('sparkline-sink: ' + e.message + '\n'); process.exit(1);}
+});
+}
+if (typeof require!== 'undefined' && require.main === module) { main();}
+
+test_sparkline-sink.js 95 lines on GitHub →
+#!/usr/bin/env node
+/*
+* test_sparkline-sink.js — drift-check battery for the sparkline-sink gift.
+*
+* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The expected glyph lines below are
+* hand-computed from the documented level math — level(v) = clamp(floor((v-lo)/(hi-lo)*8), 0, 7),
+* lo/hi the auto-fit or pinned domain — written independently of the emitter, not captured
+* from its output. A build cannot certify itself, so the expected strings are the author's fact.
+* The remaining checks are contract properties (determinism, honest errors, alphabet-closed).
+*
+* Run: node test_sparkline-sink.js (exit 0 = all pass; nonzero = a named failure)
+*/
+'use strict';
+const assert = require('assert');
+const { sparkline, LEVELS} = require('./sparkline-sink.js');
+const [L0, L1, L2, L3, L4, L5, L6, L7] = LEVELS; // ▁▂▃▄▅▆▇█
+
+let n = 0, passed = 0;
+function check(name, fn) {
+n++;
+try { fn(); passed++; console.log(' ok ' + name);}
+catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
+}
+
+// 1 — the clean 8-step ramp: [0..7] auto-domain [0,7] -> one glyph per level, in order.
+check('ramp: [0..7] -> ▁▂▃▄▅▆▇█ (every level, in order)', () => {
+assert.strictEqual(sparkline([0, 1, 2, 3, 4, 5, 6, 7]), '\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588\n');
+});
+
+// 2 — flat series: all equal -> unit window -> all mid-scale (level 4 = ▅), never a divide-by-0.
+check('flat: [1,1,1] -> ▅▅▅ (mid-scale, no NaN)', () => {
+assert.strictEqual(sparkline([1, 1, 1]), L4 + L4 + L4 + '\n');
+});
+
+// 3 — single value: flat window -> one mid-scale glyph.
+check('single: [5] -> ▅', () => {
+assert.strictEqual(sparkline([5]), L4 + '\n');
+});
+
+// 4 — two-point extremes: [0,10] auto [0,10] -> low, high (10 clamps 8->7).
+check('extremes: [0,10] -> ▁█', () => {
+assert.strictEqual(sparkline([0, 10]), L0 + L7 + '\n');
+});
+
+// 5 — negatives across zero: [-4,0,4] auto [-4,4] -> ▁▅█.
+check('negatives: [-4,0,4] -> ▁▅█', () => {
+assert.strictEqual(sparkline([-4, 0, 4]), L0 + L4 + L7 + '\n');
+});
+
+// 6 — the classic: [3,1,4,1,5,9,2,6] auto [1,9] (hi-lo=8 -> level=floor(v-1)).
+// 3->2 4->3 1->0 5->4 9->8clamp7 2->1 6->5 => ▃▁▄▁▅█▂▆
+check('classic: [3,1,4,1,5,9,2,6] -> ▃▁▄▁▅█▂▆', () => {
+assert.strictEqual(sparkline([3, 1, 4, 1, 5, 9, 2, 6]), L2 + L0 + L3 + L0 + L4 + L7 + L1 + L5 + '\n');
+});
+
+// 7 — pinned domain: [5] with min0 max10 -> ▅ (level 4), overriding the flat-window auto-fit.
+check('pinned: {series:[5],min:0,max:10} -> ▅', () => {
+assert.strictEqual(sparkline({ series: [5], min: 0, max: 10}), L4 + '\n');
+// CLI flags override object fields:
+assert.strictEqual(sparkline({ series: [5], min: 0, max: 10}, { min: 0, max: 2}), L7 + '\n'); // 5 > max2 -> clamp high
+});
+
+// 8 — empty series -> a bare newline, never a crash.
+check('empty: [] -> "\\n"', () => {
+assert.strictEqual(sparkline([]), '\n');
+});
+
+// 9 — determinism: same series -> byte-identical output, twice.
+check('determinism: repeated render is byte-identical', () => {
+const s = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5];
+assert.strictEqual(sparkline(s), sparkline(s));
+});
+
+// 10 — alphabet is CLOSED: every output char is one of the 8 block levels or the trailing \n.
+check('closed alphabet: only ▁▂▃▄▅▆▇█ (+ newline) ever appear', () => {
+const out = sparkline([3, -2, 7, 0, 5, -4, 9, 1, 8]);
+const body = out.replace(/\n$/, '');
+for (const ch of body) assert.ok(LEVELS.indexOf(ch)!== -1, 'unexpected char ' + JSON.stringify(ch));
+assert.strictEqual(body.length, 9, 'one glyph per value');
+});
+
+// 11 — non-finite is a hard, named error (never a guessed point).
+check('non-finite value throws, naming the position', () => {
+assert.throws(() => sparkline([1, NaN, 3]), /series\[1\] is not a finite number/);
+assert.throws(() => sparkline([1, 2, Infinity]), /series\[2\]/);
+});
+
+// 12 — honest input errors: nested arrays and bad min/max throw rather than mis-render.
+check('nested arrays and inverted domain throw', () => {
+assert.throws(() => sparkline([[1, 2], [3, 4]]), /ONE series/);
+assert.throws(() => sparkline({ series: [1, 2], min: 5, max: 5}), /min must be < max/);
+});
+
+console.log('\n' + passed + '/' + n + ' passed');
+if (passed!== n) process.exit(1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
 
 ---
 
@@ -784,1098 +1621,5 @@ sys.exit(0 if _fail == 0 else 1)
 Take the whole folder →
 MIT
 Python standard library only, deterministic + headless
-
----
-
-# SVG-sink — a Loop MMT gift
-https://loopmmt.com/gifts/svg-sink/
-[coverage: optional · branch: gifts]
-
-Numbers In, a Committable SVG Chart Out render ← all gifts
-
-SVG-sink
-
-svg-sink turns a numeric series into a self-contained SVG chart with zero dependencies — line, bar, or scatter, one series or many. Turning a list of numbers into a chart normally drags in a charting library (a dependency, a build step, a runtime); this is the coordinate arithmetic and the SVG string and nothing else. The load-bearing property: the same spec in produces byte-identical SVG out, so the chart can be committed, diffed, and cached — and it runs identically in Node or a browser because the core is a pure function on plain arrays.
-
-The honest edge
-
-svg-sink is a chart PRIMITIVE, not a charting library: geometry only — no axes, gridlines, tick labels, legend, title, or interactivity, and no embedded fonts, CSS, or script. It takes NUMBERS ONLY (no caller text reaches the output, so there is no escaping surface to get wrong); colors come from a fixed named palette, never caller input. A non-finite value is a hard error, never a guessed point. If you need axes or labels, wrap it — it hands you the clean geometry to build on.
-
-Run it
-
-echo '[3,1,4,1,5,9,2,6]' | node svg-sink.js # line chart; --kind bar|scatter
-test_svg-sink.js (12/12, out-of-band hand-computed SVG oracle) + Plumb conformance GREEN (I1-I5, signed, clock-independent)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-svg-sink.js 277 lines on GitHub →
-#!/usr/bin/env node
-/*
-* svg-sink — turn numeric series into a standalone, deterministic SVG chart, no deps.
-* MIT · zero-dependency · standalone gift · lane: sink (consumes data, emits an artifact).
-*
-* THE PRINTED EDGE (read before trusting the output):
-* This is a CHART PRIMITIVE, not a charting library. It draws GEOMETRY ONLY — a
-* <polyline> per series (line), a <rect> per value (bar), or a <circle> per value
-* (scatter) inside a plain <svg> frame. It renders NO axes, gridlines, tick marks,
-* tick labels, legend, title, or interactivity, and it embeds NO fonts, NO CSS, and
-* NO <script>. It takes NUMBERS ONLY — no caller text ever reaches the output, so
-* there is no text-escaping surface to get wrong. Colors are NOT free-form input:
-* series are painted from a fixed, named palette (index = series order), so the
-* output can never carry an attacker-chosen attribute string. A non-finite value
-* (NaN / Infinity) is a hard error, never a silently-dropped or guessed point.
-* Output is a PURE FUNCTION of the input: same spec in → byte-identical SVG out.
-*
-* USAGE:
-* echo '[3,1,4,1,5,9,2,6]' | node svg-sink.js # line chart, defaults
-* echo '[3,1,4,1,5,9]' | node svg-sink.js --kind bar
-* echo '[[1,2,3],[3,2,1]]' | node svg-sink.js --kind scatter # two series
-* echo '{"series":[1,2,3],"kind":"line","width":400,"height":120}' | node svg-sink.js
-* node svg-sink.js --help
-*
-* INPUT (stdin, JSON): either
-* - a bare array of numbers -> one series, e.g. [1,2,3]
-* - a bare array of arrays of numbers -> many series, e.g. [[1,2],[3,4]]
-* - a spec object { series, kind, width, height, pad, min, max, palette}
-* where `series` is either of the two array forms above.
-* CLI flags (--kind --width --height --pad --palette) OVERRIDE object fields.
-*
-* OUTPUT (stdout): one SVG document string (UTF-8), trailing newline.
-*
-* DETERMINISM: no wall-clock, no randomness, fixed 3-decimal coordinate precision,
-* stable attribute order, palette indexed by series position. Same spec → same bytes.
-* PORTABILITY: pure JS on plain arrays/strings — identical in Node and the browser.
-*/
-'use strict';
-
-// ---- palettes (the ONLY source of color; no free-form color input) --------------
-// Named, closed sets. A series at index i is painted PALETTES[name][i % len].
-var PALETTES = {
-loop: ['#2f6f8f', '#c25b3a', '#4a8a52', '#8a6d3b', '#6d4a8a', '#3b6d8a'],
-mono: ['#111111', '#555555', '#999999', '#bbbbbb'],
-warm: ['#c25b3a', '#d98a3a', '#b23b3b', '#8a5a2b'],
-cool: ['#2f6f8f', '#4a8a8a', '#3b5a8a', '#5a6d8a']
-};
-var DEFAULTS = { kind: 'line', width: 300, height: 100, pad: 6, palette: 'loop'};
-var KINDS = { line: 1, bar: 1, scatter: 1};
-
-// ---- deterministic number formatting -------------------------------------------
-// Round to 3 decimals, strip trailing zeros (and a bare trailing dot), normalize -0.
-// The whole determinism guarantee of a coordinate emitter rests on this one function:
-// float arithmetic that fed toString() directly would leak platform-dependent digits.
-var PRECISION = 3, SCALE = 1000; // 10 ** 3
-function num(x) {
-var r = Math.round(x * SCALE) / SCALE;
-var s = r.toFixed(PRECISION); // always has a '.' and PRECISION digits
-s = s.replace(/\.?0+$/, ''); // "12.300"->"12.3", "10.000"->"10"
-return (s === '' || s === '-0')? '0': s;
-}
-
-// ---- input normalization -------------------------------------------------------
-// Accept: number[] | number[][] | {series,...}. Return a validated spec.
-function normalize(input, flags) {
-var spec = {};
-var seriesRaw;
-if (input &&!Array.isArray(input) && typeof input === 'object') {
-seriesRaw = input.series;
-if (input.kind!= null) spec.kind = input.kind;
-if (input.width!= null) spec.width = input.width;
-if (input.height!= null) spec.height = input.height;
-if (input.pad!= null) spec.pad = input.pad;
-if (input.min!= null) spec.min = input.min;
-if (input.max!= null) spec.max = input.max;
-if (input.palette!= null) spec.palette = input.palette;
-} else {
-seriesRaw = input;
-}
-// CLI flags override object fields.
-flags = flags || {};
-for (var k in flags) if (flags[k]!= null) spec[k] = flags[k];
-
-// series -> number[][]
-if (!Array.isArray(seriesRaw)) throw new Error('input has no numeric series (expected an array or a {series:...} object)');
-var series;
-if (seriesRaw.length > 0 && Array.isArray(seriesRaw[0])) {
-series = seriesRaw.map(function (s, i) {
-if (!Array.isArray(s)) throw new Error('series ' + i + ' is not an array');
-return s.map(function (v, j) { return finite(v, i, j);});
-});
-} else {
-series = [seriesRaw.map(function (v, j) { return finite(v, 0, j);})];
-}
-
-spec.series = series;
-spec.kind = (spec.kind!= null)? String(spec.kind): DEFAULTS.kind;
-spec.width = int(spec.width, DEFAULTS.width, 'width');
-spec.height = int(spec.height, DEFAULTS.height, 'height');
-spec.pad = int(spec.pad, DEFAULTS.pad, 'pad');
-spec.palette = (spec.palette!= null)? String(spec.palette): DEFAULTS.palette;
-
-if (!KINDS[spec.kind]) throw new Error('unknown kind "' + spec.kind + '" (expected line | bar | scatter)');
-if (!PALETTES[spec.palette]) throw new Error('unknown palette "' + spec.palette + '" (expected ' + Object.keys(PALETTES).join(' | ') + ')');
-if (spec.width <= 2 * spec.pad || spec.height <= 2 * spec.pad) throw new Error('width/height too small for pad (need width,height > 2*pad)');
-return spec;
-}
-function finite(v, i, j) {
-if (typeof v!== 'number' ||!isFinite(v)) throw new Error('series ' + i + '[' + j + '] is not a finite number: ' + JSON.stringify(v));
-return v;
-}
-function int(v, dflt, name) {
-if (v == null) return dflt;
-var n = Number(v);
-if (!isFinite(n) || Math.floor(n)!== n || n < 0) throw new Error(name + ' must be a non-negative integer, got ' + JSON.stringify(v));
-return n;
-}
-
-// ---- scale (shared y-domain across all series) ---------------------------------
-function domain(series, min, max) {
-var lo = (min!= null)? Number(min): Infinity;
-var hi = (max!= null)? Number(max): -Infinity;
-if (min == null || max == null) {
-for (var i = 0; i < series.length; i++)
-for (var j = 0; j < series[i].length; j++) {
-var v = series[i][j];
-if (min == null && v < lo) lo = v;
-if (max == null && v > hi) hi = v;
-}
-}
-if (!isFinite(lo)) lo = 0;
-if (!isFinite(hi)) hi = 0;
-if (lo === hi) { lo -= 1; hi += 1;} // flat series -> a unit window, drawn mid-frame
-return { lo: lo, hi: hi};
-}
-
-// ---- core: renderSVG(spec) -> string (pure, the whole gift) --------------------
-function renderSVG(input, flags) {
-var spec = normalize(input, flags);
-var W = spec.width, H = spec.height, pad = spec.pad;
-var series = spec.series;
-var dom = domain(series, spec.min, spec.max);
-// Bar charts baseline at zero: extend an AUTO-computed domain to include 0 so the
-// zero line is on-canvas and bar heights read value-proportional (the bar convention).
-// An explicit min/max is honored as-is — the caller's window wins.
-if (spec.kind === 'bar') {
-if (spec.min == null) dom.lo = Math.min(dom.lo, 0);
-if (spec.max == null) dom.hi = Math.max(dom.hi, 0);
-}
-var pal = PALETTES[spec.palette];
-var innerW = W - 2 * pad, innerH = H - 2 * pad;
-
-// index i (0..n-1) -> x within [pad, W-pad]; value v -> y (inverted) within [pad, H-pad]
-function X(i, n) { return n <= 1? pad + innerW / 2: pad + (i / (n - 1)) * innerW;}
-function Y(v) { return (H - pad) - ((v - dom.lo) / (dom.hi - dom.lo)) * innerH;}
-
-var body = [];
-if (spec.kind === 'line') body = lineBody(series, pal, X, Y);
-else if (spec.kind === 'bar') body = barBody(series, pal, X, Y, W, pad, dom);
-else if (spec.kind === 'scatter') body = scatterBody(series, pal, X, Y);
-
-// Fixed attribute order; xmlns first so the fragment is a valid standalone document.
-var open = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '">';
-return open + '\n' + (body.length? body.join('\n') + '\n': '') + '</svg>\n';
-}
-
-function lineBody(series, pal, X, Y) {
-var out = [];
-for (var s = 0; s < series.length; s++) {
-var pts = series[s];
-var n = pts.length;
-if (n === 0) continue;
-var coords = [];
-for (var i = 0; i < n; i++) coords.push(num(X(i, n)) + ',' + num(Y(pts[i])));
-var color = pal[s % pal.length];
-if (n === 1) {
-// a single point is drawn as a dot so it is not invisible
-var p = coords[0].split(',');
-out.push('<circle cx="' + p[0] + '" cy="' + p[1] + '" r="1.5" fill="' + color + '" />');
-} else {
-out.push('<polyline fill="none" stroke="' + color + '" stroke-width="1.5" points="' + coords.join(' ') + '" />');
-}
-}
-return out;
-}
-
-function scatterBody(series, pal, X, Y) {
-var out = [];
-for (var s = 0; s < series.length; s++) {
-var pts = series[s], n = pts.length, color = pal[s % pal.length];
-for (var i = 0; i < n; i++)
-out.push('<circle cx="' + num(X(i, n)) + '" cy="' + num(Y(pts[i])) + '" r="2" fill="' + color + '" />');
-}
-return out;
-}
-
-function barBody(series, pal, X, Y, W, pad, dom) {
-var out = [];
-var nSeries = series.length;
-// baseline: 0 if the domain straddles it, else the domain floor.
-var baseV = (dom.lo <= 0 && dom.hi >= 0)? 0: dom.lo;
-var baseY = Y(baseV);
-// slot = horizontal room per index; bars for multiple series subdivide the slot.
-var maxN = 0;
-for (var s = 0; s < nSeries; s++) if (series[s].length > maxN) maxN = series[s].length;
-if (maxN === 0) return out;
-var innerW = W - 2 * pad;
-var slot = innerW / maxN;
-var groupW = slot * 0.8; // 20% gap between index groups
-var barW = groupW / nSeries;
-for (var si = 0; si < nSeries; si++) {
-var pts = series[si], color = pal[si % pal.length];
-for (var i = 0; i < pts.length; i++) {
-var v = pts[i];
-var y = Y(v);
-var top = Math.min(y, baseY), h = Math.abs(y - baseY);
-var x = pad + i * slot + (slot - groupW) / 2 + si * barW;
-out.push('<rect x="' + num(x) + '" y="' + num(top) + '" width="' + num(barW) + '" height="' + num(h) + '" fill="' + color + '" />');
-}
-}
-return out;
-}
-
-// ---- cli -----------------------------------------------------------------------
-var HELP =
-'svg-sink — numeric series -> a standalone, deterministic SVG chart, zero deps.\n\n' +
-' echo \'[3,1,4,1,5]\' | node svg-sink.js line chart (default)\n' +
-' echo \'[3,1,4,1,5]\' | node svg-sink.js --kind bar\n' +
-' echo \'[[1,2,3],[3,2,1]]\' | node svg-sink.js --kind scatter two series\n' +
-' echo \'{"series":[1,2,3],"width":400,"height":120}\' | node svg-sink.js\n\n' +
-'Flags (override object fields): --kind line|bar|scatter --width N --height N\n' +
-' --pad N --palette loop|mono|warm|cool\n\n' +
-'Geometry only: no axes, labels, legend, fonts, CSS, or script. Numbers in, shapes\n' +
-'out. Colors come from a fixed named palette (not caller input). Non-finite -> error.\n';
-
-function parseFlags(argv) {
-var f = {};
-for (var i = 0; i < argv.length; i++) {
-var a = argv[i];
-if (a === '--kind') f.kind = argv[++i];
-else if (a === '--width') f.width = argv[++i];
-else if (a === '--height') f.height = argv[++i];
-else if (a === '--pad') f.pad = argv[++i];
-else if (a === '--palette') f.palette = argv[++i];
-}
-return f;
-}
-
-function main() {
-var argv = process.argv.slice(2);
-if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) { process.stdout.write(HELP); return;}
-var flags = parseFlags(argv);
-var chunks = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { chunks += d;});
-process.stdin.on('end', function () {
-var input;
-try { input = JSON.parse(chunks);}
-catch (e) { process.stderr.write('svg-sink: input is not valid JSON: ' + e.message + '\n'); process.exitCode = 1; return;}
-var svg;
-try { svg = renderSVG(input, flags);}
-catch (e) { process.stderr.write('svg-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
-process.stdout.write(svg);
-});
-}
-
-// ---- triple export (browser attach · require · direct run) ---------------------
-if (typeof window!== 'undefined') {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts['svg-sink'] = { renderSVG: renderSVG};
-}
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { renderSVG: renderSVG, num: num, normalize: normalize, PALETTES: PALETTES};
-}
-if (typeof require!== 'undefined' && require.main === module) {
-main();
-}
-
-test_svg-sink.js 133 lines on GitHub →
-#!/usr/bin/env node
-/*
-* test_svg-sink.js — drift-check battery for the svg-sink gift.
-*
-* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The exact-SVG expectations below are
-* hand-computed from the documented scale math (X = pad + i/(n-1)*innerW; Y inverted),
-* written independently of the emitter — not captured from the emitter's own output.
-* A build cannot certify itself, so the expected strings are the test author's fact.
-* The remaining checks are contract properties (determinism, in-viewBox, honest errors).
-*
-* Run: node test_svg-sink.js (exit 0 = all pass; nonzero = a named failure)
-*/
-'use strict';
-const assert = require('assert');
-const { renderSVG, num} = require('./svg-sink.js');
-
-let n = 0, passed = 0;
-function check(name, fn) {
-n++;
-try { fn(); passed++; console.log(' ok ' + name);}
-catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
-}
-const OPEN = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">';
-
-// 1 — line, exact bytes. [0,10] on 100x100 pad10 -> x:10,90 y:90,10
-check('line: exact SVG for a hand-computed 2-point series', () => {
-const got = renderSVG([0, 10], { kind: 'line', width: 100, height: 100, pad: 10, palette: 'mono'});
-const want = OPEN + '\n' +
-'<polyline fill="none" stroke="#111111" stroke-width="1.5" points="10,90 90,10" />' + '\n' +
-'</svg>\n';
-assert.strictEqual(got, want);
-});
-
-// 2 — scatter, exact bytes. single point [5] -> flat domain [4,6], centered at (50,50)
-check('scatter: single point centers via flat-domain rule', () => {
-const got = renderSVG([5], { kind: 'scatter', width: 100, height: 100, pad: 10});
-const want = OPEN + '\n<circle cx="50" cy="50" r="2" fill="#2f6f8f" />\n</svg>\n';
-assert.strictEqual(got, want);
-});
-
-// 3 — bar, exact bytes. [2,10] on 100x100 pad10 -> ZERO-baselined; heights 16:80 == 2:10.
-// The 1:5 height ratio is only true if bars baseline at 0 (not the domain floor of 2).
-check('bar: zero-baselined rects with value-proportional heights', () => {
-const got = renderSVG([2, 10], { kind: 'bar', width: 100, height: 100, pad: 10, palette: 'mono'});
-const want = OPEN + '\n' +
-'<rect x="14" y="74" width="32" height="16" fill="#111111" />' + '\n' +
-'<rect x="54" y="10" width="32" height="80" fill="#111111" />' + '\n' +
-'</svg>\n';
-assert.strictEqual(got, want);
-});
-
-// 4 — multi-series line: two polylines, palette by series index
-check('line: two series -> two polylines, indexed palette', () => {
-const got = renderSVG([[0, 10], [10, 0]], { kind: 'line', width: 100, height: 100, pad: 10, palette: 'loop'});
-const lines = got.split('\n').filter(l => l.indexOf('<polyline') === 0);
-assert.strictEqual(lines.length, 2, 'expected 2 polylines');
-assert.ok(lines[0].indexOf('stroke="#2f6f8f"')!== -1, 'series 0 uses palette[0]');
-assert.ok(lines[1].indexOf('stroke="#c25b3a"')!== -1, 'series 1 uses palette[1]');
-assert.ok(lines[0].indexOf('points="10,90 90,10"')!== -1);
-assert.ok(lines[1].indexOf('points="10,10 90,90"')!== -1);
-});
-
-// 5 — determinism: same spec -> byte-identical output, twice
-check('determinism: repeated render is byte-identical', () => {
-const spec = { series: [3, 1, 4, 1, 5, 9, 2, 6], kind: 'line', width: 320, height: 90};
-const a = renderSVG(spec.series, { kind: spec.kind, width: spec.width, height: spec.height});
-const b = renderSVG(spec.series, { kind: spec.kind, width: spec.width, height: spec.height});
-assert.strictEqual(a, b);
-});
-
-// 6 — all emitted coordinates fall inside the viewBox (no overflow)
-check('containment: every coordinate lies within [0,W]x[0,H]', () => {
-const W = 300, H = 100;
-['line', 'bar', 'scatter'].forEach(kind => {
-const svg = renderSVG([3, -2, 7, 0, 5, -4, 9], { kind, width: W, height: H, pad: 6});
-// pull the geometry attrs specifically and assert each is in-frame:
-const attrs = svg.match(/(?:cx|cy|x|y|width|height)="(-?\d+(?:\.\d+)?)"/g) || [];
-attrs.forEach(a => {
-const v = Number(a.split('"')[1]);
-assert.ok(v >= -0.001 && v <= Math.max(W, H) + 0.001, 'coord ' + v + ' out of frame in ' + kind);
-});
-// points= list too
-const pm = svg.match(/points="([^"]*)"/g) || [];
-pm.forEach(p => p.slice(8, -1).split(/[,]/).map(Number).forEach(v => {
-assert.ok(v >= -0.001 && v <= Math.max(W, H) + 0.001, 'point ' + v + ' out of frame');
-}));
-});
-});
-
-// 7 — empty series -> a valid empty frame, never a crash
-check('empty series -> valid empty <svg> frame', () => {
-const got = renderSVG([], { kind: 'line', width: 100, height: 100, pad: 10});
-assert.strictEqual(got, OPEN + '\n</svg>\n');
-});
-
-// 8 — non-finite is a hard, named error (never a guessed point)
-check('non-finite value throws, naming the position', () => {
-assert.throws(() => renderSVG([1, NaN, 3]), /series 0\[1\] is not a finite number/);
-assert.throws(() => renderSVG([[1, 2], [3, Infinity]]), /series 1\[1\]/);
-});
-
-// 9 — unknown kind / palette are honest errors, not silent fallbacks
-check('unknown kind and palette throw', () => {
-assert.throws(() => renderSVG([1, 2], { kind: 'pie'}), /unknown kind/);
-assert.throws(() => renderSVG([1, 2], { palette: 'neon'}), /unknown palette/);
-});
-
-// 10 — the number formatter: rounding, trailing-zero strip, -0 normalization
-check('num(): deterministic 3-dp formatting', () => {
-assert.strictEqual(num(12.3), '12.3');
-assert.strictEqual(num(10), '10');
-assert.strictEqual(num(12.3006),'12.301');
-assert.strictEqual(num(5.12), '5.12');
-assert.strictEqual(num(-0.0001),'0'); // normalizes -0
-assert.strictEqual(num(100.5), '100.5');
-});
-
-// 11 — spec object with CLI-flag override precedence
-check('spec object: CLI flag overrides object field', () => {
-const svg = renderSVG({ series: [1, 2], kind: 'line', width: 100, height: 100, pad: 10}, { kind: 'scatter'});
-assert.ok(svg.indexOf('<circle')!== -1, 'flag kind=scatter should win over object kind=line');
-assert.ok(svg.indexOf('<polyline') === -1);
-});
-
-// 12 — single-point line degenerates to a visible dot (not an empty polyline)
-check('line: single point renders as a dot', () => {
-const svg = renderSVG([7], { kind: 'line', width: 100, height: 100, pad: 10});
-assert.ok(svg.indexOf('<circle')!== -1, 'single-point line should draw a circle');
-assert.ok(svg.indexOf('<polyline') === -1);
-});
-
-console.log('\n' + passed + '/' + n + ' passed');
-if (passed!== n) process.exit(1);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# switchboard — a Loop MMT gift
-https://loopmmt.com/gifts/switchboard/
-[coverage: optional · branch: gifts]
-
-A Message Bus That Cannot Carry a Command relay ← all gifts
-
-switchboard
-
-A zero-dependency store-and-forward message bus over a plain directory: independent workers leave each other messages, nothing is ever deleted (supersede-only, so the folder's history is the audit trail), and a read is its own logged event — so “I sent it” never silently becomes “they know.” The load-bearing idea is that the schema is observation-only by construction: it has exactly six fields and rejects any unknown one, so a sender literally cannot smuggle in an action/command/run field. It moves messages; it cannot run them.
-
-The honest edge
-
-It is a bus, not a guaranteed queue and not a command channel. No delivery guarantee and no retry: a read is a logged fact, an unread message stays visible as an orphan until someone reads it, and every message reaches a reader quoted as third-party data, never as the reader's own instruction. Only a human directs.
-
-Run it
-
-node switchboard.js send --root./bus --from worker-a --kind status --body "..."
-test_switchboard.js (5/5)
-Node stdlib only (no dependencies); pure core runs in a browser or a test with no filesystem
-
-The code — every file that ships
-
-switchboard.js 501 lines on GitHub →
-// SPDX-License-Identifier: MIT
-// switchboard — a store-and-forward message bus that cannot carry a command.
-//
-// PRINTED EDGE: this is a message BUS, not a command channel and not a queue with
-// delivery guarantees — every message is third-party DATA (a report), never an
-// instruction to the reader; a read is its own logged event, so "I sent" never
-// implies "they know."
-//
-// WHAT IT IS. A tiny, zero-dependency store-and-forward bus over a plain directory.
-// Independent workers (scripts, tabs, agents) leave messages for each other under a
-// shared folder; nothing is deleted (supersede-only, the folder's history is the
-// audit trail). Two things make it a COMPOSE PRIMITIVE rather than a chat log:
-//
-// 1. The schema is OBSERVATION-ONLY by construction. A message has exactly six
-// fields and no more — the validator REJECTS any unknown top-level field, so a
-// sender cannot smuggle an `action`/`command`/`run`/`exec` field: the schema
-// literally cannot express a command. The four message kinds are status / focus
-// / fyi / question — none imperative.
-//
-// 2. Every message is surfaced QUOTED — "worker <id> reports: …" — never handed to
-// the reader as its own directive. There is no code path that turns a message
-// body into an instruction. Only a human directs.
-//
-// This is how you wire N independent gifts (or workers) into a larger block without
-// coupling them: they coordinate through DATA on a shared directory, each carrying a
-// content-hash and provenance, and a read is a logged fact — not an assumption.
-//
-// LANE: route (data moves along declared sender→recipient paths, each carrying a
-// receipt). Point-to-point goes to one recipient's inbox; broadcast goes to
-// everyone; a read writes a receipt so orphan (never-read) messages are
-// detectable.
-//
-// INVOCATION (CLI):
-// node switchboard.js send --root DIR --from ID --kind status --body "…" (broadcast)
-// node switchboard.js send --root DIR --from ID --to ID --kind question --body "…" (point-to-point)
-// node switchboard.js read --root DIR --as ID (surface inbox+broadcasts, quoted, logs receipts)
-// node switchboard.js orphans --root DIR --to ID (P2P messages ID was sent but never read)
-// node switchboard.js --help
-//
-// BROWSER / NODE ATTACH: the pure functions (validate, canonicalPayload, contentHash,
-// renderQuoted, and an in-memory Bus) are exported for use without a filesystem — so
-// the schema + quoting discipline compose into a page or a test with no disk at all.
-//
-// Zero dependencies. Node stdlib only (fs/path/crypto for the CLI; the pure core uses
-// none). MIT. Strip provenance: the internal Switchboard tool (AGPL) — the pure schema +
-// send/read/orphan path, with the git transport and the internal credential gate cut.
-
-'use strict';
-
-// ── The schema (the structural half of "cannot express a command") ──────────────
-
-var SCHEMA_ID = 'loopmmt.switchboard.message/v1';
-
-// The four observation-only kinds. There is deliberately NO imperative kind.
-var KINDS = ['status', 'focus', 'fyi', 'question'];
-
-// The CLOSED set of top-level fields. Anything else is rejected — this is why the
-// schema cannot carry a command: `action`, `command`, `run`, `exec` are not in it.
-var ALLOWED_TOP = ['schema', 'sender', 'content_hash', 'kind', 'recipient', 'body'];
-var SENDER_FIELDS = ['session_id', 'branch', 'ts']; // provenance; session_id required
-
-var BROADCAST = 'broadcast';
-
-function MessageRejected(msg) {
-this.name = 'MessageRejected';
-this.message = msg;
-}
-MessageRejected.prototype = Object.create(Error.prototype);
-MessageRejected.prototype.constructor = MessageRejected;
-
-// ── Pure helpers (no filesystem, browser-safe) ──────────────────────────────────
-
-function isoNow() {
-// UTC, second precision, no locale — the same clock everywhere.
-return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-}
-
-function has(obj, k) { return Object.prototype.hasOwnProperty.call(obj, k);}
-
-// A stable JSON serialization: keys sorted at every level, compact separators.
-// This is the byte-truth the content_hash covers and the file bytes we write.
-function stableStringify(x) {
-if (x === null || typeof x!== 'object') return JSON.stringify(x);
-if (Array.isArray(x)) return '[' + x.map(stableStringify).join(',') + ']';
-var keys = Object.keys(x).sort();
-var parts = [];
-for (var i = 0; i < keys.length; i++) {
-parts.push(JSON.stringify(keys[i]) + ':' + stableStringify(x[keys[i]]));
-}
-return '{' + parts.join(',') + '}';
-}
-
-// The bytes the content_hash covers: provenance + kind + recipient + body, canonically
-// serialized. Hashing the sender block binds provenance INTO the hash — tampering with
-// who-sent-it breaks the hash.
-function canonicalPayload(sender, kind, recipient, body) {
-return stableStringify({
-body: body,
-kind: kind,
-recipient: recipient,
-sender: sender
-});
-}
-
-// A minimal, dependency-free sha-256 hex (FIPS-180-4) so contentHash works in the
-// browser AND in Node without importing anything. Bytes are the UTF-8 bytes of the
-// input string (multibyte-faithful), matching node crypto over the same string.
-function sha256Hex(str) {
-function utf8Bytes(s) {
-var out = [], i, c, c2;
-for (i = 0; i < s.length; i++) {
-c = s.charCodeAt(i);
-if (c < 0x80) out.push(c);
-else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
-else if (c >= 0xd800 && c <= 0xdbff) {
-c2 = s.charCodeAt(++i);
-var u = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
-out.push(0xf0 | (u >> 18), 0x80 | ((u >> 12) & 0x3f),
-0x80 | ((u >> 6) & 0x3f), 0x80 | (u & 0x3f));
-} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
-}
-return out;
-}
-var K = [
-0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
-var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
-function rotr(n, x) { return (x >>> n) | (x << (32 - n));}
-var bytes = utf8Bytes(str);
-var l = bytes.length, bitLen = l * 8;
-bytes.push(0x80);
-while (bytes.length % 64!== 56) bytes.push(0);
-for (var j = 7; j >= 0; j--) bytes.push((bitLen / Math.pow(2, j * 8)) & 0xff);
-var w = new Array(64);
-for (var off = 0; off < bytes.length; off += 64) {
-for (var t = 0; t < 16; t++) {
-w[t] = (bytes[off+4*t]<<24)|(bytes[off+4*t+1]<<16)|(bytes[off+4*t+2]<<8)|(bytes[off+4*t+3]);
-}
-for (t = 16; t < 64; t++) {
-var s0 = rotr(7,w[t-15])^rotr(18,w[t-15])^(w[t-15]>>>3);
-var s1 = rotr(17,w[t-2])^rotr(19,w[t-2])^(w[t-2]>>>10);
-w[t] = (w[t-16]+s0+w[t-7]+s1)|0;
-}
-var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
-for (t = 0; t < 64; t++) {
-var S1 = rotr(6,e)^rotr(11,e)^rotr(25,e);
-var ch = (e&f)^(~e&g);
-var t1 = (h+S1+ch+K[t]+w[t])|0;
-var S0 = rotr(2,a)^rotr(13,a)^rotr(22,a);
-var maj = (a&b)^(a&c)^(b&c);
-var t2 = (S0+maj)|0;
-h=g; g=f; f=e; e=(d+t1)|0; d=c; c=b; b=a; a=(t1+t2)|0;
-}
-H[0]=(H[0]+a)|0; H[1]=(H[1]+b)|0; H[2]=(H[2]+c)|0; H[3]=(H[3]+d)|0;
-H[4]=(H[4]+e)|0; H[5]=(H[5]+f)|0; H[6]=(H[6]+g)|0; H[7]=(H[7]+h)|0;
-}
-var hex = '';
-for (var k = 0; k < 8; k++) hex += ('00000000' + (H[k]>>>0).toString(16)).slice(-8);
-return hex;
-}
-
-function contentHash(sender, kind, recipient, body) {
-return sha256Hex(canonicalPayload(sender, kind, recipient, body));
-}
-
-// Validate a candidate message. Throws MessageRejected on ANY violation — refuse loud,
-// never store. This is the load-bearing gate: the closed field set is what makes the
-// schema unable to express a command.
-function validate(msg) {
-if (msg === null || typeof msg!== 'object' || Array.isArray(msg)) {
-throw new MessageRejected('message must be an object');
-}
-// Closed field set — reject any unknown top-level field (the command firewall).
-var keys = Object.keys(msg);
-for (var i = 0; i < keys.length; i++) {
-if (ALLOWED_TOP.indexOf(keys[i]) === -1) {
-throw new MessageRejected(
-'unknown top-level field "' + keys[i] + '" — the schema is closed; ' +
-'it cannot carry a command');
-}
-}
-for (i = 0; i < ALLOWED_TOP.length; i++) {
-if (!has(msg, ALLOWED_TOP[i])) {
-throw new MessageRejected('missing required field "' + ALLOWED_TOP[i] + '"');
-}
-}
-if (msg.schema!== SCHEMA_ID) {
-throw new MessageRejected('schema must be "' + SCHEMA_ID + '"');
-}
-if (KINDS.indexOf(msg.kind) === -1) {
-throw new MessageRejected(
-'kind must be one of ' + KINDS.join('/') + ' (no imperative kind exists)');
-}
-if (typeof msg.recipient!== 'string' || msg.recipient.length === 0) {
-throw new MessageRejected('recipient must be a non-empty string ("broadcast" or an id)');
-}
-if (typeof msg.body!== 'string') {
-throw new MessageRejected('body must be a string (data, never a directive)');
-}
-// Sender provenance
-var s = msg.sender;
-if (s === null || typeof s!== 'object' || Array.isArray(s)) {
-throw new MessageRejected('sender must be a provenance object');
-}
-if (typeof s.session_id!== 'string' || s.session_id.length === 0) {
-throw new MessageRejected('sender.session_id is required');
-}
-var skeys = Object.keys(s);
-for (i = 0; i < skeys.length; i++) {
-if (SENDER_FIELDS.indexOf(skeys[i]) === -1) {
-throw new MessageRejected('unknown sender field "' + skeys[i] + '"');
-}
-}
-// content_hash must match the payload — provenance/body tampering breaks it.
-var expect = contentHash(s, msg.kind, msg.recipient, msg.body);
-if (msg.content_hash!== expect) {
-throw new MessageRejected(
-'content_hash mismatch (message was tampered or malformed): ' +
-'expected ' + expect.slice(0, 12) + '…');
-}
-return true;
-}
-
-// Compose a valid message object (fills schema + content_hash). Throws if the result
-// would not validate — you cannot build an invalid message with this.
-function compose(sender, kind, recipient, body) {
-if (typeof sender === 'string') sender = { session_id: sender, ts: isoNow()};
-else if (sender &&!sender.ts) sender = assign({}, sender, { ts: isoNow()});
-var msg = {
-schema: SCHEMA_ID,
-sender: sender,
-kind: kind,
-recipient: recipient,
-body: body,
-content_hash: contentHash(sender, kind, recipient, body)
-};
-validate(msg);
-return msg;
-}
-
-function assign(target) {
-for (var i = 1; i < arguments.length; i++) {
-var src = arguments[i];
-if (src) for (var k in src) if (has(src, k)) target[k] = src[k];
-}
-return target;
-}
-
-// Surface a message as QUOTED third-party data — never as an instruction to the reader.
-// There is no other render path: a body cannot reach the reader as its own directive.
-function renderQuoted(msg) {
-var who = msg.sender.session_id;
-var to = msg.recipient === BROADCAST? 'all': msg.recipient;
-return 'worker ' + who + ' reports (' + msg.kind + ' → ' + to + '): ' + msg.body;
-}
-
-// ── An in-memory Bus (no filesystem) — composes into a test or a page ───────────
-
-function Bus() {
-this._broadcast = []; // list of messages
-this._inbox = {}; // recipient -> list of messages
-this._reads = {}; // reader -> set of content_hash
-}
-Bus.prototype.send = function (sender, kind, recipient, body) {
-var msg = compose(sender, kind, recipient, body);
-if (recipient === BROADCAST) this._broadcast.push(msg);
-else (this._inbox[recipient] = this._inbox[recipient] || []).push(msg);
-return msg;
-};
-Bus.prototype.read = function (readerId, logReceipt) {
-var out = (this._inbox[readerId] || []).concat(this._broadcast);
-if (logReceipt!== false) {
-var set = this._reads[readerId] = this._reads[readerId] || {};
-for (var i = 0; i < out.length; i++) set[out[i].content_hash] = true;
-}
-return out;
-};
-Bus.prototype.orphans = function (recipientId) {
-// P2P messages this recipient was sent but never read (never sent a receipt for).
-var sent = this._inbox[recipientId] || [];
-var read = this._reads[recipientId] || {};
-var out = [];
-for (var i = 0; i < sent.length; i++) {
-if (!read[sent[i].content_hash]) out.push(sent[i]);
-}
-return out;
-};
-
-// ── Filesystem transport (CLI only; append-by-create never conflicts) ───────────
-// Layout under --root:
-// <root>/broadcast/<ts>-<sender>-<hash8>.json
-// <root>/inbox/<recipient>/<ts>-<sender>-<hash8>.json
-// <root>/reads/<reader>/<ts>-<reader>-reads-<hash8>.json
-
-function _fsLayer() {
-var fs = require('fs');
-var path = require('path');
-
-function safeId(id) {
-// ids in filenames must be ref/path-safe; refuse anything with a separator.
-if (!/^[A-Za-z0-9._-]+$/.test(id)) {
-throw new MessageRejected('id "' + id + '" is not path-safe (allowed: A-Za-z0-9._-)');
-}
-return id;
-}
-function ensureDir(d) { fs.mkdirSync(d, { recursive: true});}
-function stamp() { return isoNow().replace(/[:]/g, '');}
-
-function writeMessage(root, msg) {
-validate(msg);
-var hash8 = msg.content_hash.slice(0, 8);
-var name = stamp() + '-' + safeId(msg.sender.session_id) + '-' + hash8 + '.json';
-var dir;
-if (msg.recipient === BROADCAST) dir = path.join(root, 'broadcast');
-else dir = path.join(root, 'inbox', safeId(msg.recipient));
-ensureDir(dir);
-var full = path.join(dir, name);
-// append-by-create: a fresh filename per message never collides, so two writers
-// never conflict on the same file.
-fs.writeFileSync(full, stableStringify(msg) + '\n');
-return full;
-}
-
-function readDirMessages(dir) {
-var out = [];
-if (!fs.existsSync(dir)) return out;
-var files = fs.readdirSync(dir).filter(function (f) { return /\.json$/.test(f);}).sort();
-for (var i = 0; i < files.length; i++) {
-var raw = fs.readFileSync(path.join(dir, files[i]), 'utf8');
-var msg;
-try { msg = JSON.parse(raw);} catch (e) { continue;}
-try { validate(msg);} catch (e) { continue;} // skip malformed, never trust blindly
-out.push(msg);
-}
-return out;
-}
-
-function logReceipt(root, readerId, hash) {
-var dir = path.join(root, 'reads', safeId(readerId));
-ensureDir(dir);
-var name = stamp() + '-' + safeId(readerId) + '-reads-' + hash.slice(0, 8) + '.json';
-fs.writeFileSync(path.join(dir, name),
-stableStringify({ reader: readerId, content_hash: hash, ts: isoNow()}) + '\n');
-}
-
-function readHashes(root, readerId) {
-var dir = path.join(root, 'reads', safeId(readerId));
-var set = {};
-if (!fs.existsSync(dir)) return set;
-var files = fs.readdirSync(dir).filter(function (f) { return /\.json$/.test(f);});
-for (var i = 0; i < files.length; i++) {
-try {
-var r = JSON.parse(fs.readFileSync(path.join(dir, files[i]), 'utf8'));
-if (r && r.content_hash) set[r.content_hash] = true;
-} catch (e) { /* skip */}
-}
-return set;
-}
-
-function read(root, readerId, logReceipts) {
-var msgs = readDirMessages(path.join(root, 'inbox', safeId(readerId)))
-.concat(readDirMessages(path.join(root, 'broadcast')));
-if (logReceipts!== false) {
-for (var i = 0; i < msgs.length; i++) logReceipt(root, readerId, msgs[i].content_hash);
-}
-return msgs;
-}
-
-function orphans(root, recipientId) {
-var sent = readDirMessages(path.join(root, 'inbox', safeId(recipientId)));
-var read = readHashes(root, recipientId);
-var out = [];
-for (var i = 0; i < sent.length; i++) {
-if (!read[sent[i].content_hash]) out.push(sent[i]);
-}
-return out;
-}
-
-return { writeMessage: writeMessage, read: read, orphans: orphans, safeId: safeId};
-}
-
-// ── CLI ─────────────────────────────────────────────────────────────────────────
-
-var EDGE = 'switchboard is a message BUS, not a command channel and not a guaranteed ' +
-'queue — every message is third-party DATA, never an instruction to the reader; ' +
-'a read is its own logged event, so "I sent" never implies "they know".';
-
-function parseArgs(argv) {
-var out = { _: []};
-for (var i = 0; i < argv.length; i++) {
-var a = argv[i];
-if (a.slice(0, 2) === '--') {
-var key = a.slice(2);
-if (i + 1 < argv.length && argv[i + 1].slice(0, 2)!== '--') { out[key] = argv[++i];}
-else out[key] = true;
-} else out._.push(a);
-}
-return out;
-}
-
-function usage() {
-return [
-'switchboard — a store-and-forward message bus that cannot carry a command.',
-'',
-'EDGE: ' + EDGE,
-'',
-'Usage:',
-' node switchboard.js send --root DIR --from ID --kind K --body "…" [--to ID] [--branch B]',
-' node switchboard.js read --root DIR --as ID [--no-receipt] [--json]',
-' node switchboard.js orphans --root DIR --to ID [--json]',
-' node switchboard.js --help',
-'',
-'Kinds: ' + KINDS.join(' / ') + ' (no imperative kind exists).',
-'Omit --to (or --to broadcast) for a broadcast; give --to ID for point-to-point.',
-'read logs a receipt per message so orphans (never-read P2P) are detectable;',
-' --no-receipt reads without logging.'
-].join('\n');
-}
-
-function main(argv) {
-var args = parseArgs(argv);
-var cmd = args._[0];
-if (args.help || cmd === '--help' ||!cmd) { process.stdout.write(usage() + '\n'); return args.help ||!cmd? 0: 0;}
-
-var fsl;
-try { fsl = _fsLayer();} catch (e) { process.stderr.write(String(e.message || e) + '\n'); return 2;}
-
-try {
-if (cmd === 'send') {
-if (!args.root ||!args.from ||!args.kind || args.body === undefined) {
-process.stderr.write('send needs --root --from --kind --body\n'); return 2;
-}
-var sender = { session_id: args.from, ts: isoNow()};
-if (args.branch) sender.branch = args.branch;
-var recipient = (!args.to || args.to === true)? BROADCAST: args.to;
-var msg = compose(sender, args.kind, recipient, String(args.body));
-var p = fsl.writeMessage(args.root, msg);
-process.stdout.write('sent ' + msg.content_hash.slice(0, 12) + '… → ' +
-(recipient === BROADCAST? 'broadcast': recipient) + ' (' + p + ')\n');
-return 0;
-}
-if (cmd === 'read') {
-if (!args.root ||!args.as) { process.stderr.write('read needs --root --as\n'); return 2;}
-var msgs = fsl.read(args.root, args.as,!args['no-receipt']);
-if (args.json) { process.stdout.write(stableStringify(msgs) + '\n'); return 0;}
-if (msgs.length === 0) { process.stdout.write('(no messages for ' + args.as + ')\n'); return 0;}
-for (var i = 0; i < msgs.length; i++) process.stdout.write(renderQuoted(msgs[i]) + '\n');
-return 0;
-}
-if (cmd === 'orphans') {
-if (!args.root ||!args.to) { process.stderr.write('orphans needs --root --to\n'); return 2;}
-var orph = fsl.orphans(args.root, args.to);
-if (args.json) { process.stdout.write(stableStringify(orph) + '\n'); return 0;}
-if (orph.length === 0) { process.stdout.write('(no orphans — every P2P message to ' + args.to + ' was read)\n'); return 0;}
-process.stdout.write(orph.length + ' orphan(s) — sent to ' + args.to + ' but never read:\n');
-for (var j = 0; j < orph.length; j++) process.stdout.write(' ' + renderQuoted(orph[j]) + '\n');
-return 0;
-}
-process.stderr.write('unknown command "' + cmd + '" — see --help\n');
-return 2;
-} catch (e) {
-process.stderr.write(String(e.message || e) + '\n');
-return 1;
-}
-}
-
-// ── Exports (browser attach + Node require) ─────────────────────────────────────
-
-var api = {
-SCHEMA_ID: SCHEMA_ID,
-KINDS: KINDS,
-BROADCAST: BROADCAST,
-MessageRejected: MessageRejected,
-validate: validate,
-compose: compose,
-canonicalPayload: canonicalPayload,
-contentHash: contentHash,
-sha256Hex: sha256Hex,
-renderQuoted: renderQuoted,
-stableStringify: stableStringify,
-Bus: Bus,
-EDGE: EDGE
-};
-
-if (typeof window!== 'undefined') {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.switchboard = api;
-}
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = api;
-}
-
-if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
-process.exit(main(process.argv.slice(2)));
-}
-
-test_switchboard.js 118 lines on GitHub →
-// SPDX-License-Identifier: MIT
-// test_switchboard.js — drift-check the switchboard gift against out-of-band oracles.
-//
-// Two oracles, neither produced by the gift:
-// 1. node:crypto — the content_hash's sha256 must equal node crypto over the same
-// canonical bytes (so provenance-binding is real, not self-certified).
-// 2. The command-firewall property — the schema MUST reject any top-level field
-// outside its closed set, so it cannot express a command. This is a structural
-// oracle: a would-be-command message must be rejected.
-//
-// Plus determinism, orphan/receipt semantics, quoting discipline, and a mutation bite
-// (a green suite that cannot catch a wrong hash proves nothing).
-
-'use strict';
-var crypto = require('crypto');
-var sb = require('./switchboard.js');
-
-var pass = 0, fail = 0;
-function ok(cond, name) {
-if (cond) { pass++;}
-else { fail++; console.error('FAIL: ' + name);}
-}
-function throws(fn, name) {
-try { fn(); fail++; console.error('FAIL (expected throw): ' + name);}
-catch (e) { pass++;}
-}
-
-// ── 1. sha256 drift-check vs node crypto (the hash oracle) ──────────────────────
-// I1 UTF-8 byte fidelity — the known-bad tripwire is multibyte input.
-var vectors = ['', 'abc', 'a', 'The quick brown fox jumps over the lazy dog',
-'0123456789', 'café', 'naïve façade Zürich', '日本語テスト', '🦌',
-'order:🦌×3 café', 'line1\nline2\ttabbed'];
-for (var i = 0; i < vectors.length; i++) {
-var mine = sb.sha256Hex(vectors[i]);
-var oracle = crypto.createHash('sha256').update(String(vectors[i]), 'utf8').digest('hex');
-ok(mine === oracle, 'sha256 drift vs node crypto: ' + JSON.stringify(vectors[i]));
-}
-// FIPS anchors independent of the oracle.
-ok(sb.sha256Hex('') === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', 'FIPS anchor: empty');
-ok(sb.sha256Hex('abc') === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'FIPS anchor: abc');
-
-// ── 2. The command-firewall (structural oracle) ─────────────────────────────────
-// A valid message composes and validates.
-var good = sb.compose('worker-a', 'status', 'broadcast', 'hello');
-ok(sb.validate(good) === true, 'valid message validates');
-
-// A message with an imperative field is REJECTED — the schema cannot carry a command.
-['action', 'command', 'run', 'exec', 'do'].forEach(function (verb) {
-var m = sb.compose('worker-a', 'status', 'broadcast', 'hi');
-m[verb] = 'rm -rf /'; // try to smuggle a command
-throws(function () { sb.validate(m);}, 'command-firewall rejects "' + verb + '" field');
-});
-
-// An imperative KIND does not exist.
-throws(function () { sb.compose('worker-a', 'command', 'broadcast', 'x');}, 'no imperative kind');
-throws(function () { sb.compose('worker-a', 'run', 'broadcast', 'x');}, 'no "run" kind');
-
-// content_hash tamper is caught (provenance binding is real).
-var t = sb.compose('worker-a', 'status', 'broadcast', 'original');
-t.body = 'tampered'; // change body without recomputing hash
-throws(function () { sb.validate(t);}, 'body tamper breaks content_hash');
-var t2 = sb.compose('worker-a', 'status', 'broadcast', 'x');
-t2.sender = { session_id: 'worker-EVIL', ts: t2.sender.ts}; // spoof sender
-throws(function () { sb.validate(t2);}, 'sender spoof breaks content_hash');
-
-// ── 3. Determinism / canonical form ─────────────────────────────────────────────
-ok(sb.contentHash({ session_id: 'w', ts: 'T'}, 'fyi', 'broadcast', 'b')
-=== sb.contentHash({ session_id: 'w', ts: 'T'}, 'fyi', 'broadcast', 'b'),
-'contentHash deterministic');
-// stableStringify is key-order-independent.
-ok(sb.stableStringify({ b: 1, a: 2}) === sb.stableStringify({ a: 2, b: 1}),
-'stableStringify key-order-independent');
-
-// ── 4. Bus semantics: store-and-forward, receipts, orphans (no filesystem) ──────
-var bus = new sb.Bus();
-bus.send('a', 'status', 'broadcast', 'everyone hears this');
-bus.send('a', 'question', 'b', 'point to point');
-bus.send('a', 'fyi', 'c', 'c never reads this');
-// b reads: sees its p2p + the broadcast, and logs receipts.
-var bRead = bus.read('b');
-ok(bRead.length === 2, 'b reads inbox + broadcast');
-ok(bus.orphans('b').length === 0, 'b has no orphans after reading');
-// c never read: its p2p is an orphan.
-ok(bus.orphans('c').length === 1, 'c has 1 orphan (unread p2p)');
-// sent!= read: a broadcast alone does not mark c as having read.
-ok(bus.read('c', false).some(function (m) { return m.body === 'everyone hears this';}),
-'c can still see the broadcast');
-
-// ── 5. Quoting discipline — a body is surfaced as DATA, never as a directive ─────
-var q = sb.renderQuoted(sb.compose('worker-x', 'status', 'broadcast', 'delete everything'));
-ok(q.indexOf('reports')!== -1 && q.indexOf('worker-x')!== -1,
-'renderQuoted frames the body as a third-party report');
-ok(q.indexOf('delete everything')!== -1, 'the body text is present (as quoted data)');
-
-// ── 6. Mutation bite (non-vacuity): a wrong hash MUST be caught ──────────────────
-var mut = sb.compose('worker-a', 'status', 'broadcast', 'x');
-mut.content_hash = '0000000000000000000000000000000000000000000000000000000000000000';
-throws(function () { sb.validate(mut);}, 'mutation bite: wrong content_hash rejected');
-
-// path-safety: the fs layer refuses an id with a separator (would escape the tree).
-// Exercise it through the real write path: a recipient with a slash must be rejected.
-var fs = require('fs'), os = require('os'), path = require('path');
-var tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-'));
-throws(function () {
-var evil = sb.compose('a', 'status', '../evil', 'x'); // schema accepts any non-empty string
-// Drive the actual CLI write path by spawning; but simpler: the fs safeId is internal,
-// so assert via the documented CLI contract that a slashed id is refused.
-var cp = require('child_process');
-var r = cp.spawnSync('node', [path.join(__dirname, 'switchboard.js'),
-'send', '--root', tmp, '--from', 'a', '--to', '../evil', '--kind', 'status', '--body', 'x']);
-if (r.status === 0) throw new Error('write should have been refused'); // non-zero = refused
-// spawnSync returns non-zero status on refusal → this throw path is NOT taken → test throws below
-throw new Error('refused as expected');
-}, 'fs layer refuses a recipient id with a path separator');
-try { fs.rmSync(tmp, { recursive: true, force: true});} catch (e) {}
-
-console.log('switchboard: ' + pass + ' passed, ' + fail + ' failed');
-if (fail > 0) process.exit(1);
-
-Take the whole folder →
-MIT
-Node stdlib only (no dependencies); pure core runs in a browser or a test with no filesystem
 
 ---

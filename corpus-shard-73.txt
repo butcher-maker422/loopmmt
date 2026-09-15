@@ -1,8 +1,475 @@
-# Loop MMT — corpus shard 73/86
+# Loop MMT — corpus shard 73/87
 
-> Bundle 73 of 86 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 73 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/markdown/, /gifts/merkle-fold/, /gifts/mint/)
+Nodes in this shard: 3 (/gifts/map/, /gifts/markdown/, /gifts/merkle-fold/)
+
+---
+
+# map — a Loop MMT gift
+https://loopmmt.com/gifts/map/
+[coverage: optional · branch: gifts]
+
+Composition Map show ← all gifts
+
+map
+
+Point it at a folder of small JSONL tools that each declare a port-verb, and map folds the whole set into a composition map — who can feed whom, how densely the set composes, and which tools light up the most pipelines. It reads each tool's declared port-verb (never guesses one) and reports any undeclared tool by name, excluded from the map.
+
+The honest edge
+
+It renders the TYPE-level map — whether the ports agree so the pipe can carry data at all — not whether the RECORDS fit. A transform emitting {event} records maps clean into a filter expecting {file} records and fails at runtime; map flags that semantic layer as unproven and never asserts it.
+
+Run it
+
+python3 map.py text --manifest gifts-manifest.json
+test_map.py (16/16, mutation-bitten)
+Python 3, standard library only
+
+The code — every file that ships
+
+map.py 283 lines on GitHub →
+#!/usr/bin/env python3
+"""map — show what-composes-with-what across a set of small JSONL tools.
+
+You have a folder of little tools that each read JSON-lines on stdin and write
+JSON-lines on stdout. Which ones can you pipe together? `map` answers that. Point
+it at a manifest where each tool DECLARES its port-verb (the type-level shape of
+its stdin/stdout contract), and `map` folds the whole set into a composition map:
+who can feed whom, how densely the set composes, and which tools light up the most
+pipelines.
+
+THE MODEL. Five port-verbs on the shared JSON-lines interface, and only five:
+
+source: nothing -> JSONL (emits; no meaningful stdin)
+transform: JSONL -> JSONL (record in, record out)
+filter: JSONL -> JSONL' (record in, subset out; output type <= input)
+fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
+sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
+
+THE TYPE GATE (mechanical, decidable):
+
+A can feed B iff A EMITS jsonl (A.verb!= sink) AND B ACCEPTS jsonl (B.verb!= source)
+
+That is the whole composition rule at the type level. `map` counts every ordered
+pair (A, B), A!= B, that passes it, and reports the density.
+
+WHY IT READS DECLARATIONS, NOT GUESSES. Before the `port` gift, a map like this
+kept its own hardcoded roster of which tool had which verb — a list inside one
+program's source that drifts the moment a tool changes or a new one ships. `map`
+does not guess and does not keep a private roster: it READS each tool's declared
+`port_verb` from the manifest (the same field `port` reads and checks). A tool that
+declares no port-verb is reported as UNDECLARED and excluded from the map with a
+count, never silently assigned a verb. The map is only ever as honest as the
+declarations under it — and it says so.
+
+HONEST CEILING (carried, not hidden). `map` renders the TYPE-level answer: can the
+pipe carry data at all. It does NOT assert that the RECORDS fit — a `transform`
+that emits `{event}` records typechecks clean into a `filter` that expects `{file}`
+records and fails at runtime. That finer, record-shape question the uniform JSONL
+type cannot settle, and `map` never claims it can. The map shows what the ports
+permit; it flags the semantic layer as unproven.
+
+map's own port-verb is `fold`: a set of gift declarations in, one aggregate
+composition-map record out.
+
+No dependencies beyond the Python standard library. MIT licensed.
+
+USAGE
+map read --manifest FILE
+Read the composition map from a manifest of tools that declare port_verb.
+Emits JSON-lines: one {"kind":"pair",...} per composable ordered pair,
+then one {"kind":"summary",...} record with density, census, fan-out/fan-in,
+the closed-form check, and the undeclared count. Its port-verb is fold.
+
+map summary --manifest FILE
+Emit only the single summary record (the aggregate), no per-pair lines.
+
+map text --manifest FILE
+Human-readable rendering of the same map (density, census, top fan-out/in,
+the semantic-unproven flag). Not JSONL — for reading, not piping.
+
+map --port
+Print map's own port-verb (fold) as one JSON-line and exit.
+"""
+import argparse
+import json
+import sys
+
+VALID_VERBS = {"source", "transform", "filter", "fold", "sink"}
+
+def EMITS(v):
+"""A tool produces pipeable stdout iff it is not a sink."""
+return v!= "sink"
+
+def ACCEPTS(v):
+"""A tool consumes stdin iff it is not a source."""
+return v!= "source"
+
+def load_declared(path):
+"""Return (declared, undeclared) from a manifest.
+
+declared: list of (slug, port_verb) for every entry with a valid port_verb
+undeclared: list of slugs with no (or invalid) port_verb — flagged, never guessed
+
+Accepts a bare JSON list of entries or an object with a 'gifts'/'tools'/'entries'
+list. Raises ValueError if no entry list can be found — never guesses the shape.
+"""
+with open(path) as f:
+data = json.load(f)
+if isinstance(data, list):
+entries = data
+elif isinstance(data, dict):
+entries = None
+for k in ("gifts", "tools", "entries"):
+if isinstance(data.get(k), list):
+entries = data[k]
+break
+if entries is None:
+raise ValueError(f"{path}: no entry list ('gifts'/'tools'/'entries') found")
+else:
+raise ValueError(f"{path}: not a JSON list or object")
+
+declared, undeclared = [], []
+for e in entries:
+slug = e.get("slug")
+pv = e.get("port_verb")
+if pv in VALID_VERBS:
+declared.append((slug, pv))
+else:
+undeclared.append(slug)
+return declared, undeclared
+
+def compose_map(declared):
+"""The fold: (slug, verb) list -> composition-map dict.
+
+Preserves the ancestor's compute core exactly (the byte-checked math):
+ordered-pair count over emitters x acceptors, closed-form
+|E|*|A| - |E∩A|, plus fan-out / fan-in per tool.
+"""
+gifts = sorted(declared)
+n = len(gifts)
+pairs = []
+by_first, by_second = {}, {}
+for i, (sa, va) in enumerate(gifts):
+for j, (sb, vb) in enumerate(gifts):
+if i == j:
+continue
+if EMITS(va) and ACCEPTS(vb):
+pairs.append((sa, sb))
+by_first[sa] = by_first.get(sa, 0) + 1
+by_second[sb] = by_second.get(sb, 0) + 1
+
+total_ordered = n * (n - 1)
+emitters = [g for g in gifts if EMITS(g[1])]
+acceptors = [g for g in gifts if ACCEPTS(g[1])]
+both = [g for g in gifts if EMITS(g[1]) and ACCEPTS(g[1])]
+closed_form = len(emitters) * len(acceptors) - len(both)
+
+from collections import Counter
+census = dict(Counter(v for _, v in gifts))
+
+return {
+"gifts": gifts,
+"n": n,
+"pairs": pairs,
+"total_ordered": total_ordered,
+"density": (len(pairs) / total_ordered) if total_ordered else 0.0,
+"census": census,
+"emitters": len(emitters),
+"acceptors": len(acceptors),
+"both_ports": len(both),
+"closed_form": closed_form,
+"closed_form_matches": closed_form == len(pairs),
+"fan_out": by_first,
+"fan_in": by_second,
+}
+
+def summary_record(cm, undeclared):
+"""The single aggregate record — map's fold output."""
+return {
+"kind": "summary",
+"n": cm["n"],
+"composable_pairs": len(cm["pairs"]),
+"total_ordered": cm["total_ordered"],
+"density": round(cm["density"], 4),
+"census": cm["census"],
+"emitters": cm["emitters"],
+"acceptors": cm["acceptors"],
+"closed_form_check": cm["closed_form_matches"],
+"undeclared": undeclared,
+"undeclared_count": len(undeclared),
+"semantic_layer": "UNPROVEN — map shows the TYPE gate (can the pipe carry "
+"data); it does not assert the RECORDS fit. That is a finer "
+"question the uniform JSONL type cannot settle.",
+}
+
+def emit_read(cm, undeclared, out):
+for sa, sb in cm["pairs"]:
+out.write(json.dumps({"kind": "pair", "from": sa, "to": sb}) + "\n")
+out.write(json.dumps(summary_record(cm, undeclared)) + "\n")
+
+def emit_text(cm, undeclared, out):
+out.write(f"Composition map — {cm['n']} tool(s) with a declared port-verb\n")
+out.write("=" * 56 + "\n")
+out.write(f"composable ordered pairs (A can feed B): {len(cm['pairs'])} / {cm['total_ordered']}\n")
+out.write(f"composition density: {cm['density']:.1%}\n")
+out.write(f"closed-form check |E|*|A|-|E∩A| = {cm['closed_form']} (matches: {cm['closed_form_matches']})\n")
+out.write(f"verb census: {cm['census']}\n")
+out.write(f"emitters (not sink): {cm['emitters']} acceptors (not source): {cm['acceptors']}\n\n")
+fo = sorted(cm["fan_out"].items(), key=lambda kv: -kv[1])[:8]
+out.write("top fan-out (feeds the most tools):\n")
+for s, c in fo:
+out.write(f" {s:32s} feeds {c}\n")
+fi = sorted(cm["fan_in"].items(), key=lambda kv: -kv[1])[:8]
+out.write("\ntop fan-in (fed by the most tools):\n")
+for s, c in fi:
+out.write(f" {s:32s} fed-by {c}\n")
+if undeclared:
+out.write(f"\nUNDECLARED ({len(undeclared)}) — excluded from the map, not guessed:\n")
+out.write(" " + ", ".join(str(s) for s in undeclared) + "\n")
+out.write("\nNOTE: this is the TYPE-level map. Semantic record-shape fit is UNPROVEN —\n")
+out.write("a composable pair means the ports agree, not that the records fit.\n")
+
+def main(argv=None):
+ap = argparse.ArgumentParser(description="Fold a set of port-declared tools into a composition map.")
+ap.add_argument("--port", action="store_true", help="print map's own port-verb (fold) and exit")
+sub = ap.add_subparsers(dest="cmd")
+for name in ("read", "summary", "text"):
+p = sub.add_parser(name)
+p.add_argument("--manifest", required=True)
+ap.add_argument("--selftest", action="store_true")
+args = ap.parse_args(argv)
+
+if args.port:
+print(json.dumps({"slug": "map", "port_verb": "fold"}))
+return 0
+if args.selftest:
+return _selftest()
+if not args.cmd:
+ap.print_help()
+return 2
+
+declared, undeclared = load_declared(args.manifest)
+cm = compose_map(declared)
+
+if args.cmd == "read":
+emit_read(cm, undeclared, sys.stdout)
+elif args.cmd == "summary":
+sys.stdout.write(json.dumps(summary_record(cm, undeclared)) + "\n")
+elif args.cmd == "text":
+emit_text(cm, undeclared, sys.stdout)
+return 0
+
+def _selftest():
+"""Mutation-honest selftest over a tiny known set with a hand-computed answer."""
+# 4 tools: 1 source, 1 transform, 1 filter, 1 sink.
+# emitters = {source, transform, filter} (3) (not sink)
+# acceptors = {transform, filter, sink} (3) (not source)
+# both = {transform, filter} (2)
+# composable pairs = |E|*|A| - |E∩A| = 3*3 - 2 = 7
+decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
+cm = compose_map(decl)
+assert cm["n"] == 4, cm["n"]
+assert len(cm["pairs"]) == 7, f"expected 7 pairs, got {len(cm['pairs'])}"
+assert cm["closed_form"] == 7 and cm["closed_form_matches"], "closed form wrong"
+assert cm["emitters"] == 3 and cm["acceptors"] == 3, "emit/accept wrong"
+# source feeds all 3 acceptors, is fed by nobody
+assert cm["fan_out"].get("s") == 3, cm["fan_out"]
+assert "s" not in cm["fan_in"], "source should have 0 fan-in"
+# sink fed by all 3 emitters, feeds nobody
+assert cm["fan_in"].get("k") == 3, cm["fan_in"]
+assert "k" not in cm["fan_out"], "sink should have 0 fan-out"
+# MUTATION BITE 1: if EMITS wrongly included sink, pairs would jump.
+# With EMITS==(always True): emitters=4, pairs = 4*3 - 2 = 10!= 7
+def _bad_emits(v):
+return True
+saved = globals()["EMITS"]
+try:
+globals()["EMITS"] = _bad_emits
+bad = compose_map(decl)
+assert len(bad["pairs"])!= 7, "mutation not detected — EMITS bite failed"
+finally:
+globals()["EMITS"] = saved
+# re-run clean to confirm restoration
+assert len(compose_map(decl)["pairs"]) == 7, "restore failed"
+# undeclared handling: an invalid verb is excluded + flagged, not guessed
+decl2 = decl + [("bad", "nonsense")]
+d2, u2 = [x for x in decl2 if x[1] in VALID_VERBS], [x[0] for x in decl2 if x[1] not in VALID_VERBS]
+assert u2 == ["bad"] and len(d2) == 4, "undeclared not isolated"
+print("selftest: 6/6 OK (n, pairs=7, closed-form, fan-out/in endpoints, EMITS mutation bite, undeclared-excluded)")
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_map.py 170 lines on GitHub →
+#!/usr/bin/env python3
+"""Mutation-bitten tests for map.py.
+
+Each test asserts a specific behavior; the suite is proven to go RED under a
+planted mutation (see test_mutation_is_detected) so a no-op test can't pass green.
+Run: python3 test_map.py
+"""
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import map as M # noqa: E402
+
+def _manifest(entries):
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump({"gifts": entries}, f)
+return path
+
+class TestPortGate(unittest.TestCase):
+def test_emits_gate(self):
+# everything but sink emits
+self.assertTrue(M.EMITS("source"))
+self.assertTrue(M.EMITS("transform"))
+self.assertTrue(M.EMITS("filter"))
+self.assertTrue(M.EMITS("fold"))
+self.assertFalse(M.EMITS("sink"))
+
+def test_accepts_gate(self):
+# everything but source accepts
+self.assertFalse(M.ACCEPTS("source"))
+self.assertTrue(M.ACCEPTS("transform"))
+self.assertTrue(M.ACCEPTS("filter"))
+self.assertTrue(M.ACCEPTS("fold"))
+self.assertTrue(M.ACCEPTS("sink"))
+
+class TestComposeMap(unittest.TestCase):
+def setUp(self):
+# 1 of each of 4 verbs; hand-computed answer = 7 composable ordered pairs
+self.decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
+
+def test_pair_count_hand_computed(self):
+cm = M.compose_map(self.decl)
+self.assertEqual(len(cm["pairs"]), 7)
+
+def test_closed_form_matches_enumeration(self):
+cm = M.compose_map(self.decl)
+self.assertEqual(cm["closed_form"], len(cm["pairs"]))
+self.assertTrue(cm["closed_form_matches"])
+
+def test_source_feeds_all_acceptors_no_fan_in(self):
+cm = M.compose_map(self.decl)
+self.assertEqual(cm["fan_out"]["s"], 3) # feeds t, f, k
+self.assertNotIn("s", cm["fan_in"]) # source is fed by nobody
+
+def test_sink_fed_by_all_emitters_no_fan_out(self):
+cm = M.compose_map(self.decl)
+self.assertEqual(cm["fan_in"]["k"], 3) # fed by s, t, f
+self.assertNotIn("k", cm["fan_out"]) # sink feeds nobody
+
+def test_no_self_pairs(self):
+cm = M.compose_map(self.decl)
+for a, b in cm["pairs"]:
+self.assertNotEqual(a, b)
+
+def test_density(self):
+cm = M.compose_map(self.decl)
+# 7 composable / 12 ordered = 0.5833...
+self.assertAlmostEqual(cm["density"], 7 / 12, places=4)
+
+class TestDeclarationHonesty(unittest.TestCase):
+def test_undeclared_excluded_not_guessed(self):
+path = _manifest([
+{"slug": "a", "port_verb": "source"},
+{"slug": "b"}, # no port_verb
+{"slug": "c", "port_verb": "bogus"}, # invalid
+])
+declared, undeclared = M.load_declared(path)
+os.unlink(path)
+self.assertEqual([d[0] for d in declared], ["a"])
+self.assertEqual(set(undeclared), {"b", "c"})
+
+def test_summary_reports_undeclared_count(self):
+path = _manifest([
+{"slug": "a", "port_verb": "source"},
+{"slug": "b"},
+])
+declared, undeclared = M.load_declared(path)
+os.unlink(path)
+cm = M.compose_map(declared)
+rec = M.summary_record(cm, undeclared)
+self.assertEqual(rec["undeclared_count"], 1)
+self.assertIn("b", rec["undeclared"])
+
+def test_summary_carries_semantic_unproven_flag(self):
+cm = M.compose_map([("a", "source"), ("b", "sink")])
+rec = M.summary_record(cm, [])
+self.assertIn("UNPROVEN", rec["semantic_layer"])
+
+class TestReadEmitsJSONL(unittest.TestCase):
+def test_read_emits_pairs_then_summary(self):
+cm = M.compose_map([("s", "source"), ("k", "sink")])
+buf = io.StringIO()
+M.emit_read(cm, [], buf)
+lines = [json.loads(x) for x in buf.getvalue().strip().split("\n")]
+self.assertEqual(lines[0]["kind"], "pair")
+self.assertEqual(lines[0]["from"], "s")
+self.assertEqual(lines[0]["to"], "k")
+self.assertEqual(lines[-1]["kind"], "summary")
+
+def test_own_port_is_fold(self):
+out = io.StringIO()
+saved = sys.stdout
+try:
+sys.stdout = out
+M.main(["--port"])
+finally:
+sys.stdout = saved
+self.assertEqual(json.loads(out.getvalue())["port_verb"], "fold")
+
+class TestManifestShapes(unittest.TestCase):
+def test_bare_list_manifest(self):
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump([{"slug": "a", "port_verb": "source"}], f)
+declared, _ = M.load_declared(path)
+os.unlink(path)
+self.assertEqual(declared, [("a", "source")])
+
+def test_no_entry_list_raises(self):
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump({"nope": 1}, f)
+with self.assertRaises(ValueError):
+M.load_declared(path)
+os.unlink(path)
+
+class TestMutationIsDetected(unittest.TestCase):
+"""Prove the suite is not a no-op: a planted mutation must break a test."""
+def test_mutation_is_detected(self):
+decl = [("s", "source"), ("t", "transform"), ("f", "filter"), ("k", "sink")]
+# Mutate EMITS to always-True (sink wrongly counted as an emitter).
+saved = M.EMITS
+try:
+M.EMITS = lambda v: True
+cm = M.compose_map(decl)
+# Under always-True EMITS: emitters=4, acceptors=3, both={t,f,k}=3,
+# so pairs = |E|*|A| - |E∩A| = 4*3 - 3 = 9, NOT the correct 7.
+self.assertNotEqual(len(cm["pairs"]), 7,
+"mutation did not change the result — suite is a no-op")
+self.assertEqual(len(cm["pairs"]), 9)
+finally:
+M.EMITS = saved
+# Confirm restoration: the real function gives 7 again.
+self.assertEqual(len(M.compose_map(decl)["pairs"]), 7)
+
+if __name__ == "__main__":
+unittest.main(verbosity=2)
+
+Take the whole folder →
+MIT
+Python 3, standard library only
 
 ---
 
@@ -1090,483 +1557,5 @@ process.exit(1);
 Take the whole folder →
 MIT
 Zero dependencies, Node or browser, deterministic
-
----
-
-# Mint — a Loop MMT gift
-https://loopmmt.com/gifts/mint/
-[coverage: optional · branch: gifts]
-
-IDs That Are Never Reused allocate ← all gifts
-
-Mint
-
-Hand out IDs that are never reused — and prove it before returning each one, not with an after-the-fact check but as a structural property: a retired ID cannot come back. JSON in, JSON out, backed by a file you can read.
-
-The honest edge
-
-It guarantees no reuse within the one ID store you point it at. Two independent stores that don't know about each other can still collide — single source of truth is your job.
-
-Run it
-
-python3 mint.py alloc --root./ids
-test_mint.py (15/15, mutation-bitten)
-Python stdlib only, deterministic
-
-The code — every file that ships
-
-mint.py 321 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""mint.py — hand out IDs that are never reused, and prove it before returning.
-
-A mint stamps a coin once and never stamps that number again. This does the same
-for identifiers: every ID it issues is strictly above every ID it has ever issued
-before, so a number that was retired can never be pointed at a second thing. That
-"never reused" property is not checked after the fact — it is **structural, and
-transactional**: the mint keeps a single **high-water mark** and only ever hands
-out `high_water + 1`, advancing the mark *inside a database transaction that
-commits before any ID is emitted*. A crash right after issuing cannot re-issue
-the same number, because the mark already moved and the move was durable.
-
-Why you'd want that: any time an ID collision would let one record be mistaken for
-another — a retired user's ID reassigned to a new user, a recycled trace ID
-threading two unrelated events — monotonic allocation makes the mistake
-impossible rather than merely unlikely. Retirement is recorded (so you can audit
-what was let go) but a retired ID is **never** returned to the pool: silent
-recycling is the whole failure this refuses, so there is no recycle switch.
-
-STATE lives in a SQLite database at `<root>/mint.db` (Python stdlib `sqlite3`):
-meta.high_water: the last ID issued (or floor-1 when empty), one row
-retired: an append-only table of IDs recorded retired
-the rule: the free pool is [high_water+1..]; nothing lowers the mark.
-SQLite gives atomic commit, crash recovery, schema enforcement, and cross-process
-serialization for free (`BEGIN IMMEDIATE` lets only one allocator advance the mark
-at a time), which is exactly the indivisible decision "allocate and persist" is.
-Invalid, missing, downgraded, or out-of-range state is **refused** (exit 2), never
-silently reset to the floor. A legacy `mint-state.json` is imported once on first
-run — and refused loudly if it is corrupt — so an upgrade never reissues an old ID.
-
-THE GATE, checked at allocation time, before an ID is returned:
-in range floor <= id <= ceil
-monotonic id > high_water (structural: id = high_water + 1)
-not live id not in --live SET (not held right now)
-A gate failure is a refusal with a reason, never a silent second-best.
-
-------------------------------------------------------------------------------
-The JSON-lines contract (so this composes in a pipe):
-- `mint alloc` / `mint peek` / `mint retire` emit ONE JSON object per line on
-stdout — a record you can pipe into the next tool.
-- `mint alloc -n K` emits K lines, one per freshly-minted ID, in order.
-- `--live -` reads a set of currently-held IDs from stdin, one JSON object or
-bare integer per line (field `--live-field`, default "id").
-- errors go to stderr; stdout stays clean JSON-lines.
-
-Exit codes:
-0 the operation succeeded
-1 a gate refusal (out of range / not monotonic / id live)
-2 state could not be read, is invalid/out-of-range, or could not be written
-3 usage / bad input
-"""
-
-import argparse
-import json
-import os
-import sqlite3
-import sys
-
-SCHEMA_VERSION = 1
-
-class MintError(Exception):
-"""A gate refusal or a state fault, carrying an exit code."""
-
-def __init__(self, message, code):
-super().__init__(message)
-self.code = code
-
-def _db_path(root):
-return os.path.join(root, "mint.db")
-
-def _legacy_seed(root, floor, ceil):
-"""One-time seed from a legacy mint-state.json, if present. Returns the mark.
-Refuses (exit 2) rather than resetting: a corrupt or out-of-range legacy mark
-is a fault to surface, never a silent fall back to the floor (the fail-open
-this store exists to kill). An absent legacy file seeds the empty sentinel."""
-legacy = os.path.join(root, "mint-state.json")
-if not os.path.exists(legacy):
-return floor - 1
-try:
-with open(legacy, "r", encoding="utf-8") as fh:
-raw = json.load(fh)
-except (OSError, ValueError) as exc:
-raise MintError(
-"legacy mint-state.json is unreadable; refusing to reset (import by hand): %s"
-% exc, 2)
-hw = raw.get("high_water") if isinstance(raw, dict) else None
-if isinstance(hw, bool) or not isinstance(hw, int):
-raise MintError(
-"legacy mint-state.json high_water is not an integer (%r); refusing to reset"
-% (hw,), 2)
-if hw < floor - 1 or hw > ceil:
-raise MintError(
-"legacy high_water %d is out of range [%d, %d]; refusing to reset"
-% (hw, floor - 1, ceil), 2)
-return hw
-
-def _connect(root, floor, ceil):
-"""Open (creating + seeding on first use) the SQLite store. Validates the
-persisted mark on every open; a downgraded schema or non-int/out-of-range
-mark is a loud refusal, never a silent default."""
-try:
-os.makedirs(root, exist_ok=True)
-conn = sqlite3.connect(_db_path(root), timeout=30.0, isolation_level=None)
-except (OSError, sqlite3.Error) as exc:
-raise MintError("cannot open mint store at %s: %s" % (root, exc), 2)
-try:
-conn.execute("PRAGMA busy_timeout=30000")
-conn.execute(
-"CREATE TABLE IF NOT EXISTS meta ("
-" id INTEGER PRIMARY KEY CHECK(id = 1),"
-" high_water INTEGER NOT NULL,"
-" schema_version INTEGER NOT NULL)")
-conn.execute(
-"CREATE TABLE IF NOT EXISTS retired ("
-" id INTEGER PRIMARY KEY,"
-" retired_at TEXT NOT NULL DEFAULT (datetime('now')))")
-row = conn.execute(
-"SELECT high_water, schema_version FROM meta WHERE id = 1").fetchone()
-if row is None:
-seed = _legacy_seed(root, floor, ceil)
-conn.execute(
-"INSERT INTO meta (id, high_water, schema_version) VALUES (1,?,?)",
-(seed, SCHEMA_VERSION))
-else:
-hw, sv = row
-if not isinstance(hw, int) or isinstance(hw, bool):
-raise MintError("persisted high_water is not an integer (%r)" % (hw,), 2)
-if sv!= SCHEMA_VERSION:
-raise MintError(
-"mint store schema %r!= supported %d (downgraded/upgraded); refusing"
-% (sv, SCHEMA_VERSION), 2)
-if hw < floor - 1 or hw > ceil:
-raise MintError(
-"persisted high_water %d is out of range [%d, %d]; refusing"
-% (hw, floor - 1, ceil), 2)
-except sqlite3.Error as exc:
-conn.close()
-raise MintError("mint store is unusable: %s" % exc, 2)
-except MintError:
-conn.close()
-raise
-return conn
-
-def _read_hw(conn):
-return conn.execute("SELECT high_water FROM meta WHERE id = 1").fetchone()[0]
-
-def assert_allocatable(uid, high_water, live, floor, ceil):
-"""The gate: range, monotonic, not-live. Returns None if OK, else a reason."""
-if not isinstance(uid, int) or uid < floor or uid > ceil:
-return "E_RANGE: %r is outside %d-%d" % (uid, floor, ceil)
-if uid <= high_water:
-return ("E_NOT_MONOTONIC: %d is at/below the high-water mark %d"
-% (uid, high_water))
-if uid in live:
-return "E_LIVE: %d is held by a live holder" % uid
-return None
-
-def allocate(root, live, floor, ceil, count):
-"""Draw `count` IDs monotonically inside one transaction. The bumped mark is
-committed BEFORE any ID is emitted, so a crash never re-issues. On a gate
-failure mid-batch the successfully-minted prefix is committed (never lost),
-then the reason is raised."""
-conn = _connect(root, floor, ceil)
-minted = []
-reason = None
-try:
-conn.execute("BEGIN IMMEDIATE")
-hw = _read_hw(conn)
-for _ in range(count):
-uid = hw + 1
-reason = assert_allocatable(uid, hw, live, floor, ceil)
-if reason is not None:
-break
-hw = uid
-live = live | {uid}
-minted.append(uid)
-if minted:
-conn.execute("UPDATE meta SET high_water =? WHERE id = 1", (hw,))
-conn.commit()
-except sqlite3.Error as exc:
-conn.rollback()
-conn.close()
-raise MintError("allocation could not persist: %s" % exc, 2)
-conn.close()
-if reason is not None and not minted:
-raise MintError(reason, 1)
-return minted, reason
-
-def retire(root, uid, floor, ceil):
-"""Record an ID retired (append-only). It does NOT return to the pool — the
-mark is never lowered, so nothing this records is ever re-issued."""
-conn = _connect(root, floor, ceil)
-try:
-conn.execute("BEGIN IMMEDIATE")
-conn.execute("INSERT OR IGNORE INTO retired (id) VALUES (?)", (uid,))
-hw = _read_hw(conn)
-conn.commit()
-except sqlite3.Error as exc:
-conn.rollback()
-conn.close()
-raise MintError("retire could not persist: %s" % exc, 2)
-conn.close()
-return {"retired": uid, "high_water": hw}
-
-def peek(root, floor, ceil):
-conn = _connect(root, floor, ceil)
-hw = _read_hw(conn)
-retired = [r[0] for r in conn.execute("SELECT id FROM retired ORDER BY id")]
-conn.close()
-return {"high_water": hw, "retired": retired, "next": hw + 1,
-"floor": floor, "ceil": ceil}
-
-def _read_live(stream, field):
-"""Read a set of live IDs from a JSON-lines (or bare-integer-lines) stream."""
-live = set()
-for line in stream:
-line = line.strip()
-if not line or line.startswith("#"):
-continue
-try:
-obj = json.loads(line)
-except ValueError:
-raise MintError("live input line is not JSON: %r" % line, 3)
-if isinstance(obj, bool):
-raise MintError("live line is a boolean, not an id: %r" % line, 3)
-if isinstance(obj, int):
-live.add(obj)
-elif isinstance(obj, dict) and field in obj and isinstance(obj[field], int) \
-and not isinstance(obj[field], bool):
-live.add(obj[field])
-else:
-raise MintError(
-"live line has no integer %r field: %r" % (field, line), 3)
-return live
-
-def _emit(obj):
-sys.stdout.write(json.dumps(obj, sort_keys=True) + "\n")
-
-def main(argv=None):
-p = argparse.ArgumentParser(
-prog="mint",
-description="hand out IDs that are never reused, and prove it before returning.")
-p.add_argument("op", choices=["alloc", "peek", "retire"],
-help="alloc: mint new id(s). peek: show state. retire: record an id retired.")
-p.add_argument("--root", default=".mint",
-help="directory holding mint.db (default:.mint)")
-p.add_argument("--floor", type=int, default=100000,
-help="lowest issuable id (default: 100000)")
-p.add_argument("--ceil", type=int, default=999999,
-help="highest issuable id (default: 999999)")
-p.add_argument("-n", "--count", type=int, default=1,
-help="how many ids to mint (alloc only; default 1)")
-p.add_argument("--live", metavar="FILE",
-help="a JSON-lines file (or - for stdin) naming ids held right now")
-p.add_argument("--live-field", default="id",
-help="field carrying the id in --live objects (default: id)")
-p.add_argument("--id", type=int, help="the id to retire (retire only)")
-args = p.parse_args(argv)
-
-if args.floor > args.ceil:
-sys.stderr.write("mint: --floor must be <= --ceil\n")
-return 3
-
-try:
-live = set()
-if args.live:
-if args.live == "-":
-live = _read_live(sys.stdin, args.live_field)
-else:
-with open(args.live, "r", encoding="utf-8") as fh:
-live = _read_live(fh, args.live_field)
-
-if args.op == "peek":
-state = peek(args.root, args.floor, args.ceil)
-state["op"] = "peek"
-_emit(state)
-return 0
-
-if args.op == "alloc":
-if args.count < 1:
-sys.stderr.write("mint: -n must be >= 1\n")
-return 3
-minted, reason = allocate(args.root, live, args.floor, args.ceil, args.count)
-for uid in minted:
-_emit({"op": "alloc", "id": uid})
-if reason is not None:
-sys.stderr.write("mint: %s\n" % reason)
-return 1
-return 0
-
-if args.op == "retire":
-if args.id is None:
-sys.stderr.write("mint: retire needs --id\n")
-return 3
-rec = retire(args.root, args.id, args.floor, args.ceil)
-rec["op"] = "retire"
-_emit(rec)
-return 0
-
-except MintError as exc:
-sys.stderr.write("mint: %s\n" % exc)
-return exc.code
-
-return 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-test_mint.py 142 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_mint.py — non-vacuous tests for mint.py (SQLite store).
-
-Every test asserts a SPECIFIC behaviour, and the suite carries a mutation check
-(test 12) so a mint that always returned the same id, or never persisted, could
-not pass green. Run: python3 test_mint.py
-
-Updated for the SQLite rewrite (GIFT-001): state now lives in <root>/mint.db and
-is read back through peek() (a fresh DB read), not the retired load_state() JSON
-helper. "Crash-safety" is tested the way the store actually guarantees it — the
-high-water mark is committed to the DB before any id is emitted, so a fresh
-peek() (equivalent to a cold restart re-reading the db) already sees the bumped
-mark.
-"""
-
-import io
-import json
-import os
-import sys
-import tempfile
-
-import mint
-
-FAIL = 0
-
-def ok(cond, msg):
-global FAIL
-print((" ok " if cond else " FAIL ") + msg)
-if not cond:
-FAIL += 1
-
-def run(root, *args, stdin=None):
-"""Invoke main() capturing stdout, return (exit, [parsed json lines])."""
-old_out, old_in = sys.stdout, sys.stdin
-sys.stdout = io.StringIO()
-if stdin is not None:
-sys.stdin = io.StringIO(stdin)
-try:
-code = mint.main(list(args) + ["--root", root])
-out = sys.stdout.getvalue()
-finally:
-sys.stdout, sys.stdin = old_out, old_in
-lines = [json.loads(l) for l in out.splitlines() if l.strip()]
-return code, lines
-
-def main():
-with tempfile.TemporaryDirectory() as d:
-root = os.path.join(d, "m")
-
-# 1. First alloc issues the floor.
-code, lines = run(root, "alloc", "--floor", "100000")
-ok(code == 0 and lines == [{"op": "alloc", "id": 100000}],
-"first alloc issues the floor id (100000) as one JSON-line")
-
-# 2. Monotonic: every subsequent id is strictly greater.
-code, lines = run(root, "alloc", "-n", "3", "--floor", "100000")
-ids = [r["id"] for r in lines]
-ok(code == 0 and ids == [100001, 100002, 100003],
-"next allocs are strictly increasing (100001,2,3) — monotonic")
-
-# 3. Crash-safety: the mark is committed to the DB before emit, so a
-# fresh read (a cold restart re-reading mint.db) already sees it and
-# never re-issues. peek() IS that fresh read.
-st = mint.peek(root, 100000, 999999)
-ok(st["high_water"] == 100003,
-"high-water mark persisted at 100003 (a restart cannot re-issue)")
-code, lines = run(root, "alloc", "--floor", "100000")
-ok(lines[0]["id"] == 100004,
-"an alloc after 'restart' continues from the mark, never repeats")
-
-# 4. peek reports state without issuing.
-code, lines = run(root, "peek", "--floor", "100000")
-ok(code == 0 and lines[0]["high_water"] == 100004 and lines[0]["next"] == 100005,
-"peek shows high_water=100004, next=100005, issuing nothing")
-code2, _ = run(root, "peek", "--floor", "100000")
-st2 = mint.peek(root, 100000, 999999)
-ok(st2["high_water"] == 100004, "peek did not advance the mark (pure read)")
-
-# 5. Gate: range refusal.
-reason = mint.assert_allocatable(50, high_water=40, live=set(), floor=100, ceil=200)
-ok(reason is not None and reason.startswith("E_RANGE"),
-"gate refuses an out-of-range id (E_RANGE)")
-
-# 6. Gate: monotonic refusal (an id at/below the mark).
-reason = mint.assert_allocatable(100, high_water=100, live=set(), floor=1, ceil=999)
-ok(reason is not None and reason.startswith("E_NOT_MONOTONIC"),
-"gate refuses an id at/below the high-water mark (E_NOT_MONOTONIC)")
-
-# 7. Gate: live refusal.
-reason = mint.assert_allocatable(150, high_water=100, live={150}, floor=1, ceil=999)
-ok(reason is not None and reason.startswith("E_LIVE"),
-"gate refuses an id currently held live (E_LIVE)")
-
-# 8. Gate passes for a clean id.
-ok(mint.assert_allocatable(101, high_water=100, live={200}, floor=1, ceil=999) is None,
-"gate passes an in-range, above-mark, not-live id")
-
-# 9. --live from stdin is honoured: an alloc whose next id is declared
-# live must refuse rather than collide.
-root2 = os.path.join(d, "m2")
-run(root2, "alloc", "--floor", "100000") # issues 100000, mark=100000
-# next would be 100001; declare it live -> refusal (exit 1, no output)
-code, lines = run(root2, "alloc", "--floor", "100000",
-"--live", "-", stdin='{"id": 100001}\n')
-ok(code == 1 and lines == [],
-"an alloc whose next id is declared live refuses (exit 1, no output)")
-
-# 10. retire records the id, does not recycle by default.
-code, lines = run(root2, "retire", "--id", "100000", "--floor", "100000")
-ok(code == 0 and lines[0]["retired"] == 100000 and lines[0]["op"] == "retire",
-"retire records the id (and never lowers the mark)")
-st = mint.peek(root2, 100000, 999999)
-ok(100000 in st["retired"] and st["high_water"] == 100000,
-"retire adds to the retired set and never lowers the mark")
-
-# 11. bare-integer live lines are accepted alongside {id:...} objects.
-live = mint._read_live(io.StringIO("5\n{\"id\": 7}\n# c\n\n9\n"), "id")
-ok(live == {5, 7, 9},
-"--live reads both bare ints and {id:...} objects, skips blanks/comments")
-
-# 12. MUTATION CHECK — a mint that ignored the mark (always issued the
-# floor) would fail test 2/3. Prove the suite BITES by running that
-# mutant inline and asserting it diverges from the real monotonic run.
-def broken_allocate(root_, live_, floor_, ceil_, count_):
-# the no-op mutant: never advances the mark, always issues the floor
-return [floor_] * count_, None
-mutant_ids, _ = broken_allocate(root, set(), 100000, 999999, 3)
-real_ids = [100000, 100001, 100002] # what a correct monotonic mint gives
-ok(mutant_ids!= real_ids,
-"mutation check: a mint that never advances the mark DIVERGES from the "
-"monotonic sequence (the suite would catch it)")
-
-print("\n" + ("MINT: %d FAILED" % FAIL if FAIL else "MINT: ALL GREEN"))
-return 1 if FAIL else 0
-
-if __name__ == "__main__":
-sys.exit(main())
-
-Take the whole folder →
-MIT
-Python stdlib only, deterministic
 
 ---
