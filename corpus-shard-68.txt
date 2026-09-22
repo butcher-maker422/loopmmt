@@ -1,1410 +1,1199 @@
-# Loop MMT — corpus shard 68/87
+# Loop MMT — corpus shard 68/91
 
-> Bundle 68 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 68 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/hmac-webhook/, /gifts/hunkhole/, /gifts/ini-source/)
-
----
-
-# hmac-webhook — a Loop MMT gift
-https://loopmmt.com/gifts/hmac-webhook/
-[coverage: optional · branch: gifts]
-
-Verify an HMAC-Signed Webhook in Constant Time filter ← all gifts
-
-hmac-webhook
-
-hmac-webhook recomputes HMAC-SHA256(secret, rawBody) and checks it against the signature a webhook sender put in a header (conventionally X-Signature: sha256=<hex>), answering one question — is this body authentic and unmodified, from someone who holds the secret? It answers in CONSTANT TIME, so a forger cannot learn the correct signature one character at a time from how long a rejection takes. verify(body, header, secret) returns {ok, reason}; ok:false always names why — no-signature, bad-format, unsupported-scheme, length-mismatch, or hmac-mismatch — never a partial match. HMAC-SHA256 is RFC 2104 exactly, with the SHA-256 core vendored byte-for-byte from the shipped sha256 gift, so the result is byte-identical to Node's crypto.createHmac and to openssl dgst -sha256 -hmac. Same body, header, and secret in → same verdict out, in Node or a browser.
-
-The honest edge
-
-hmac-webhook verifies AUTHENTICITY — nothing more. It is NOT a secret store (you supply the secret; it is never persisted), NOT a replay defender (it proves THIS body is authentic, not that it is fresh — pair it with a timestamp or nonce check for that), NOT a TLS or transport check, NOT an authorization system (authentic is not the same as allowed), and NOT a multi-algorithm negotiator (it verifies the one scheme you name, default sha256).
-
-Run it
-
-printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --signature "sha256=<hex>" # prints 'ok' exit 0 if authentic; reason + exit 1 otherwise; --sign to emit a signature; exit 2 usage/input error
-test_hmac-webhook.js (40/40: RFC 4231 TC2, Node-crypto parity over 10 shapes incl. multibyte + 63/64/65-byte block-boundary keys + multi-block body, sign→verify round-trip, and the known-bad half — tampered body / wrong secret / flipped sig / truncated / 5 malformed headers / 2 wrong-scheme / uppercase-hex normalize / whitespace tolerate — plus determinism 3x and constant-time-compare correctness)
-Zero dependencies, Node or browser, deterministic, constant-time
-
-The code — every file that ships
-
-hmac-webhook.js 351 lines on GitHub →
-#!/usr/bin/env node
-/**
-* hmac-webhook — verify an HMAC-signed webhook before you trust its body.
-*
-* WHAT
-* A webhook sender (GitHub, Stripe, Shopify, a Loop module) signs each request
-* body with a shared secret and puts the signature in a header, conventionally
-* X-Signature: sha256=<hex>
-* hmac-webhook recomputes HMAC-SHA256(secret, rawBody) and checks it against the
-* signature the sender sent. It answers ONE question — is this body authentic and
-* unmodified, from someone who holds the secret? — and answers it in CONSTANT TIME
-* so a forger cannot learn the right signature one byte at a time from timing.
-*
-* verify(rawBody, signatureHeader, secret) -> { ok, reason}
-*
-* ok:true the body is authentic (the computed MAC equals the presented one).
-* ok:false reason names WHY it failed — never a partial match, never a maybe:
-* "no-signature" the header is empty / missing.
-* "bad-format" the header is not "<scheme>=<hex>" with an even-length
-* lowercase-normalizable hex body.
-* "unsupported-scheme" a scheme other than the one asked for (default sha256).
-* "length-mismatch" the presented digest is not 64 hex chars (32 bytes).
-* "hmac-mismatch" well-formed, right length, but the MAC does not match —
-* the body was altered, the secret is wrong, or it is a forgery.
-*
-* HOW
-* HMAC-SHA256 is RFC 2104 exactly: with block size B=64 and the SHA-256 core
-* vendored from the shipped `sha256` gift (FIPS 180-4, byte-faithful),
-* K' = key if len(key) <= B, else SHA-256(key) then zero-padded to B
-* HMAC = SHA-256( (K' XOR opad) || SHA-256( (K' XOR ipad) || message))
-* ipad is 0x36 repeated B times, opad is 0x5c repeated B times. Everything runs on
-* RAW BYTES — the message and the key are UTF-8 encoded once — so a multibyte secret
-* or body is hashed byte-for-byte the same as Node's crypto.createHmac('sha256').
-* The comparison is a fixed-time XOR-accumulate over the full digest width: it looks
-* at every byte regardless of where the first difference is, so the pass/fail timing
-* carries no information about the correct signature.
-*
-* Pure function of (body, header, secret). No clock, no randomness, no files, no
-* network. Same three inputs -> same verdict, every run, in Node or a browser.
-*
-* USAGE
-* node hmac-webhook.js --secret SECRET --signature "sha256=<hex>" [FILE] # body from FILE or stdin
-* node hmac-webhook.js --secret SECRET --sign [FILE] # PRINT the signature for a body (sender side)
-* printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --sign
-* -> sha256=<hex>
-* printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --signature "sha256=<hex>"
-* -> exits 0 (authentic) and prints "ok"; exits 1 and prints the reason otherwise.
-* --scheme NAME signature scheme label to require/emit (default "sha256").
-* --help
-*
-* In a browser: window.ForestGifts.hmacWebhook.{verify, sign, hmacSha256Hex}.
-*
-* EXIT CODES (CLI)
-* 0 verify: authentic. (--sign always exits 0 on success.)
-* 1 verify: NOT authentic — the reason is printed on stdout (one word) + stderr.
-* 2 usage / input error: missing --secret, missing --signature (without --sign),
-* a file that is a directory or cannot be read. One clean line on stderr.
-*
-* EDGE (what this is NOT)
-* NOT a signer's secret store — you supply the secret; it is never persisted.
-* NOT a replay defender — it proves authenticity of THIS body, not that the body
-* is fresh; pair it with a timestamp/nonce check if you need replay protection.
-* NOT a TLS or transport check, NOT an authorization system (authentic!= allowed),
-* and NOT a multi-algorithm negotiator — it verifies ONE scheme (sha256) you name.
-*
-* Zero dependencies. Node builtin `require('fs')` for file reads only; runs in a
-* browser with no require. MIT.
-*/
-"use strict";
-
-/* ------------------------------------------------------------------ *
-* SHA-256 core — vendored from the `sha256` gift (FIPS 180-4), *
-* byte-faithful, with the raw-bytes entry HMAC needs. The block *
-* machinery is IDENTICAL to the shipped sha256 gift and to *
-* Node crypto's sha256; a mismatch here is a rebuild failure. *
-* ------------------------------------------------------------------ */
-
-// Round constants — FIPS 180-4 §4.2.2.
-var K = [
-0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-];
-
-function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
-
-// UTF-8 encode a JS string to a byte array — the SAME bytes Node's
-//.update(String(s)) hashes (surrogate-pair aware fallback matches TextEncoder).
-function utf8Bytes(str) {
-if (typeof TextEncoder!== "undefined") {
-return Array.prototype.slice.call(new TextEncoder().encode(str));
-}
-var out = [], i, c, lo;
-for (i = 0; i < str.length; i++) {
-c = str.charCodeAt(i);
-if (c < 0x80) { out.push(c);}
-else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
-else if (c >= 0xd800 && c <= 0xdbff) {
-lo = str.charCodeAt(++i);
-c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
-out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
-}
-return out;
-}
-
-// sha256 of RAW BYTES (array-like of 0..255) -> a 32-byte Array digest.
-function sha256Digest(bytes) {
-var len = bytes.length;
-var bitLenHi = Math.floor(len / 0x20000000);
-var bitLenLo = (len * 8) >>> 0;
-var withOne = len + 1;
-var padded = (withOne + 8 + 63) & ~63;
-var msg = new Array(padded);
-var i;
-for (i = 0; i < padded; i++) msg[i] = 0;
-for (i = 0; i < len; i++) msg[i] = bytes[i] & 0xff;
-msg[len] = 0x80;
-msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
-msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
-msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
-msg[padded - 5] = bitLenHi & 0xff;
-msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
-msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
-msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
-msg[padded - 1] = bitLenLo & 0xff;
-
-var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
-h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
-
-var w = new Array(64), t, blk;
-for (blk = 0; blk < padded; blk += 64) {
-for (t = 0; t < 16; t++) {
-w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
-(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
-}
-for (t = 16; t < 64; t++) {
-var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
-var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
-w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
-}
-var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
-for (t = 0; t < 64; t++) {
-var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-var ch = (e & f) ^ (~e & g);
-var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
-var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-var maj = (a & b) ^ (a & c) ^ (b & c);
-var temp2 = (S0 + maj) >>> 0;
-hh = g; g = f; f = e; e = (d + temp1) >>> 0;
-d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
-}
-h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
-h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
-}
-
-var out = new Array(32), words = [h0, h1, h2, h3, h4, h5, h6, h7], wi;
-for (wi = 0; wi < 8; wi++) {
-out[wi * 4] = (words[wi] >>> 24) & 0xff;
-out[wi * 4 + 1] = (words[wi] >>> 16) & 0xff;
-out[wi * 4 + 2] = (words[wi] >>> 8) & 0xff;
-out[wi * 4 + 3] = words[wi] & 0xff;
-}
-return out;
-}
-
-function byteToHex(b) {
-var h = (b & 0xff).toString(16);
-return h.length === 1? "0" + h: h;
-}
-function bytesToHex(bytes) {
-var s = "", i;
-for (i = 0; i < bytes.length; i++) s += byteToHex(bytes[i]);
-return s;
-}
-
-/* ------------------------------------------------------------------ *
-* HMAC-SHA256 — RFC 2104. *
-* ------------------------------------------------------------------ */
-
-var BLOCK = 64; // SHA-256 block size in bytes (RFC 2104 "B").
-
-// key: byte array. Returns the B-byte K' (hashed-if-long, zero-padded).
-function normalizeKey(keyBytes) {
-var k = keyBytes;
-if (k.length > BLOCK) k = sha256Digest(k); // K longer than a block -> hash it first.
-var out = new Array(BLOCK), i;
-for (i = 0; i < BLOCK; i++) out[i] = (i < k.length? (k[i] & 0xff): 0);
-return out;
-}
-
-// HMAC-SHA256 over raw byte arrays -> 32-byte digest array.
-function hmacSha256Bytes(keyBytes, msgBytes) {
-var kp = normalizeKey(keyBytes);
-var ipad = new Array(BLOCK), opad = new Array(BLOCK), i;
-for (i = 0; i < BLOCK; i++) {
-ipad[i] = kp[i] ^ 0x36;
-opad[i] = kp[i] ^ 0x5c;
-}
-var inner = sha256Digest(ipad.concat(msgBytes)); // H((K' ^ ipad) || m)
-return sha256Digest(opad.concat(inner)); // H((K' ^ opad) || inner)
-}
-
-// HMAC-SHA256 hex of (secret string, message string), UTF-8 encoded — byte-identical
-// to Node crypto.createHmac('sha256', secret).update(message).digest('hex').
-function hmacSha256Hex(secret, message) {
-return bytesToHex(hmacSha256Bytes(utf8Bytes(String(secret)), utf8Bytes(String(message))));
-}
-
-/* ------------------------------------------------------------------ *
-* The verifier. *
-* ------------------------------------------------------------------ */
-
-var HEX_RE = /^[0-9a-f]+$/;
-
-// Constant-time equality of two equal-length lowercase-hex strings. Looks at every
-// character; the running OR of per-char differences carries no early-exit timing.
-// Caller MUST have already checked the lengths match (a length difference is not a
-// secret — it is public structure — so it is decided before this point).
-function constantTimeHexEqual(a, b) {
-var diff = 0, i;
-for (i = 0; i < a.length; i++) diff |= (a.charCodeAt(i) ^ b.charCodeAt(i));
-return diff === 0;
-}
-
-// Parse "<scheme>=<hex>" -> { scheme, hex} or null if it is not that shape.
-function parseSignatureHeader(header) {
-if (typeof header!== "string") return null;
-var s = header.trim();
-var eq = s.indexOf("=");
-if (eq <= 0 || eq === s.length - 1) return null; // no scheme, or nothing after '='
-var scheme = s.slice(0, eq);
-var hex = s.slice(eq + 1).toLowerCase();
-if (!HEX_RE.test(hex) || (hex.length % 2)!== 0) return null; // must be even-length hex
-return { scheme: scheme, hex: hex};
-}
-
-/**
-* Verify a signed webhook body.
-* @param {string} rawBody the exact bytes the sender signed (a string; UTF-8 hashed).
-* @param {string} signatureHeader e.g. "sha256=abcd..." from the request header.
-* @param {string} secret the shared secret.
-* @param {{scheme?: string}} [opts] scheme to require (default "sha256").
-* @returns {{ok: boolean, reason: string}} reason is "" on success.
-*/
-function verify(rawBody, signatureHeader, secret, opts) {
-opts = opts || {};
-var wantScheme = opts.scheme || "sha256";
-if (signatureHeader === undefined || signatureHeader === null || String(signatureHeader).trim() === "") {
-return { ok: false, reason: "no-signature"};
-}
-var parsed = parseSignatureHeader(String(signatureHeader));
-if (!parsed) return { ok: false, reason: "bad-format"};
-if (parsed.scheme!== wantScheme) return { ok: false, reason: "unsupported-scheme"};
-// A SHA-256 digest is exactly 32 bytes = 64 hex chars. Length is public structure,
-// decided before the constant-time compare (which requires equal lengths).
-if (parsed.hex.length!== 64) return { ok: false, reason: "length-mismatch"};
-var expected = hmacSha256Hex(secret, rawBody); // always 64 lowercase hex chars
-if (constantTimeHexEqual(expected, parsed.hex)) return { ok: true, reason: ""};
-return { ok: false, reason: "hmac-mismatch"};
-}
-
-/**
-* Produce the signature header a sender would send for a body (the sender side).
-* @returns {string} e.g. "sha256=abcd..."
-*/
-function sign(rawBody, secret, opts) {
-opts = opts || {};
-var scheme = opts.scheme || "sha256";
-return scheme + "=" + hmacSha256Hex(secret, rawBody);
-}
-
-/* ---- exports ---- */
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.hmacWebhook = {
-verify: verify, sign: sign, hmacSha256Hex: hmacSha256Hex,
-parseSignatureHeader: parseSignatureHeader
-};
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = {
-verify: verify, sign: sign, hmacSha256Hex: hmacSha256Hex,
-parseSignatureHeader: parseSignatureHeader, constantTimeHexEqual: constantTimeHexEqual
-};
-}
-
-/* ------------------------------------------------------------------ *
-* CLI. *
-* ------------------------------------------------------------------ */
-
-function readAll(stream, cb) {
-var chunks = [];
-stream.on("data", function (d) { chunks.push(d);});
-stream.on("end", function () { cb(Buffer.concat(chunks).toString("utf8"));});
-}
-
-function usage() {
-return "usage: hmac-webhook.js --secret SECRET (--sign | --signature 'sha256=<hex>') [--scheme NAME] [FILE]";
-}
-
-function main(argv) {
-var args = argv.slice(2);
-var secret = null, signature = null, scheme = "sha256", doSign = false, file = null, i;
-for (i = 0; i < args.length; i++) {
-var a = args[i];
-if (a === "--help" || a === "-h") { process.stdout.write(usage() + "\n"); process.exit(0);}
-else if (a === "--secret") { secret = args[++i];}
-else if (a === "--signature") { signature = args[++i];}
-else if (a === "--scheme") { scheme = args[++i];}
-else if (a === "--sign") { doSign = true;}
-else if (a.slice(0, 2) === "--") { process.stderr.write("hmac-webhook: unknown option " + a + "\n" + usage() + "\n"); process.exit(2);}
-else { file = a;}
-}
-if (secret === null || secret === undefined) { process.stderr.write("hmac-webhook: --secret is required\n" + usage() + "\n"); process.exit(2);}
-if (!doSign && (signature === null || signature === undefined)) {
-process.stderr.write("hmac-webhook: --signature is required (or use --sign to produce one)\n" + usage() + "\n");
-process.exit(2);
-}
-
-function run(body) {
-if (doSign) {
-process.stdout.write(sign(body, secret, { scheme: scheme}) + "\n");
-process.exit(0);
-}
-var r = verify(body, signature, secret, { scheme: scheme});
-if (r.ok) { process.stdout.write("ok\n"); process.exit(0);}
-process.stdout.write(r.reason + "\n");
-process.stderr.write("hmac-webhook: verification failed (" + r.reason + ")\n");
-process.exit(1);
-}
-
-if (file) {
-var fs = require("fs");
-var stat;
-try { stat = fs.statSync(file);} catch (e) { process.stderr.write("hmac-webhook: cannot read " + file + "\n"); process.exit(2);}
-if (stat.isDirectory()) { process.stderr.write("hmac-webhook: " + file + " is a directory\n"); process.exit(2);}
-run(fs.readFileSync(file, "utf8"));
-} else {
-readAll(process.stdin, run);
-}
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-main(process.argv);
-}
-
-test_hmac-webhook.js 142 lines on GitHub →
-#!/usr/bin/env node
-/**
-* test_hmac-webhook — out-of-band battery for the hmac-webhook gift.
-*
-* The gift verifies HMAC-SHA256 webhook signatures. The oracle here is INDEPENDENT
-* of the gift's own SHA-256/HMAC code in two ways:
-* (1) RFC 4231 published HMAC-SHA256 test vectors (known-good, external authority);
-* (2) Node's built-in crypto.createHmac('sha256') (a different implementation).
-* A gift MAC that disagrees with either is a rebuild failure, not a warning.
-*
-* The known-bad half is real defect shapes: a tampered body, a wrong secret, a
-* bit-flipped signature, a truncated digest, a malformed header, a wrong scheme.
-*
-* GREEN means every assertion RAN and passed. A battery that executes nothing fails.
-*/
-"use strict";
-
-var crypto = require("crypto");
-var G = require("./hmac-webhook.js");
-
-var passed = 0, failed = 0, ran = 0;
-function check(name, cond) {
-ran++;
-if (cond) { passed++;}
-else { failed++; console.error("FAIL: " + name);}
-}
-function eq(name, got, want) {
-check(name + " (got=" + JSON.stringify(got) + " want=" + JSON.stringify(want) + ")", got === want);
-}
-
-/* ---- 1. RFC 4231 HMAC-SHA256 known-good vectors ----
-* Keys/data given as hex/ascii in RFC 4231 §4. We feed the byte-exact inputs.
-* hmacSha256Hex takes STRINGS (UTF-8), so we only use the vectors whose key and
-* data are plain ASCII (no embedded non-UTF8 bytes) — vectors 2 and 7-ascii-part.
-* For the binary-key vectors we cross-check against Node crypto below on raw bytes
-* via the same public gift API used on strings, keeping the oracle independent.
-*/
-
-// RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?"
-eq("rfc4231-tc2",
-G.hmacSha256Hex("Jefe", "what do ya want for nothing?"),
-"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
-
-/* ---- 2. Cross-check against Node crypto over a spread of inputs ---- */
-function nodeHmac(secret, msg) {
-return crypto.createHmac("sha256", secret).update(msg, "utf8").digest("hex");
-}
-var samples = [
-["", ""],
-["s3cr3t", ""],
-["", "body-with-empty-secret"],
-["shared-hmac-secret", '{"event":"ping","id":1}'],
-["key", "The quick brown fox jumps over the lazy dog"],
-// multibyte secret AND body — the byte-faithfulness trap
-["ключ-🔑", "日本語のペイロード — π ≈ 3.14159"],
-// a secret longer than the 64-byte block (forces the K'=SHA256(K) path)
-["x".repeat(65), "block-boundary body"],
-["x".repeat(64), "exactly one block key"],
-["x".repeat(63), "just under one block key"],
-// long body spanning many blocks
-["k", "A".repeat(1000)]
-];
-samples.forEach(function (s, idx) {
-eq("node-crypto-parity[" + idx + "]", G.hmacSha256Hex(s[0], s[1]), nodeHmac(s[0], s[1]));
-});
-
-/* ---- 3. sign() round-trips through verify() ---- */
-var secret = "shared-hmac-secret";
-var body = '{"event":"order.created","id":"ord_123","amount":4200}';
-var header = G.sign(body, secret);
-check("sign-emits-sha256-scheme", /^sha256=[0-9a-f]{64}$/.test(header));
-eq("sign-matches-node", header, "sha256=" + nodeHmac(secret, body));
-eq("verify-authentic", G.verify(body, header, secret).ok, true);
-eq("verify-authentic-reason-empty", G.verify(body, header, secret).reason, "");
-
-/* ---- 4. KNOWN-BAD: real forgery / tamper shapes must be rejected ---- */
-
-// 4a. tampered body — one byte changed
-var tampered = body.replace("4200", "9900");
-eq("reject-tampered-body.ok", G.verify(tampered, header, secret).ok, false);
-eq("reject-tampered-body.reason", G.verify(tampered, header, secret).reason, "hmac-mismatch");
-
-// 4b. wrong secret
-eq("reject-wrong-secret.ok", G.verify(body, header, "not-the-secret").ok, false);
-eq("reject-wrong-secret.reason", G.verify(body, header, "not-the-secret").reason, "hmac-mismatch");
-
-// 4c. bit-flipped signature (last hex nibble changed, still 64 hex chars)
-var flipped = header.slice(0, -1) + (header.slice(-1) === "0"? "1": "0");
-eq("reject-flipped-sig.ok", G.verify(body, flipped, secret).ok, false);
-eq("reject-flipped-sig.reason", G.verify(body, flipped, secret).reason, "hmac-mismatch");
-
-// 4d. truncated digest (right prefix, wrong length) -> length-mismatch, not a compare
-var truncated = "sha256=" + header.slice("sha256=".length, "sha256=".length + 40);
-eq("reject-truncated.reason", G.verify(body, truncated, secret).reason, "length-mismatch");
-
-// 4e. empty / missing signature
-eq("reject-empty-sig", G.verify(body, "", secret).reason, "no-signature");
-eq("reject-null-sig", G.verify(body, null, secret).reason, "no-signature");
-eq("reject-undefined-sig", G.verify(body, undefined, secret).reason, "no-signature");
-
-// 4f. malformed header shapes -> bad-format
-eq("reject-no-eq", G.verify(body, "sha256" + header.slice("sha256=".length), secret).reason, "bad-format");
-eq("reject-no-scheme", G.verify(body, "=" + "a".repeat(64), secret).reason, "bad-format");
-eq("reject-non-hex", G.verify(body, "sha256=" + "z".repeat(64), secret).reason, "bad-format");
-eq("reject-odd-hex", G.verify(body, "sha256=" + "a".repeat(63), secret).reason, "bad-format");
-eq("reject-nothing-after-eq", G.verify(body, "sha256=", secret).reason, "bad-format");
-
-// 4g. wrong scheme -> unsupported-scheme
-eq("reject-md5-scheme", G.verify(body, "md5=" + "a".repeat(64), secret).reason, "unsupported-scheme");
-eq("reject-sha1-scheme", G.verify(body, "sha1=" + "a".repeat(40), secret).reason, "unsupported-scheme");
-
-// 4h. uppercase hex in the presented sig is normalized and still verifies
-var upperHeader = "sha256=" + nodeHmac(secret, body).toUpperCase();
-eq("accept-uppercase-hex", G.verify(body, upperHeader, secret).ok, true);
-
-// 4i. leading/trailing whitespace in the header is tolerated
-eq("accept-padded-header", G.verify(body, " " + header + " ", secret).ok, true);
-
-/* ---- 5. custom scheme label round-trips ---- */
-var h2 = G.sign(body, secret, { scheme: "loop"});
-check("custom-scheme-format", /^loop=[0-9a-f]{64}$/.test(h2));
-eq("custom-scheme-verify", G.verify(body, h2, secret, { scheme: "loop"}).ok, true);
-eq("custom-scheme-default-rejects", G.verify(body, h2, secret).reason, "unsupported-scheme");
-
-/* ---- 6. determinism: same inputs -> byte-identical MAC across repeated calls ---- */
-var d1 = G.hmacSha256Hex(secret, body);
-var d2 = G.hmacSha256Hex(secret, body);
-var d3 = G.hmacSha256Hex(secret, body);
-check("determinism-3x-identical", d1 === d2 && d2 === d3);
-
-/* ---- 7. constant-time compare correctness (function-level) ---- */
-eq("ct-equal-true", G.constantTimeHexEqual("abcdef", "abcdef"), true);
-eq("ct-equal-false", G.constantTimeHexEqual("abcdef", "abcdff"), false);
-
-/* ---- summary ---- */
-if (failed === 0 && ran > 0) {
-console.log("GREEN: " + passed + " assertions passed, 0 failed [test_hmac-webhook] (ran=" + ran + ")");
-process.exit(0);
-} else {
-console.error("RED: " + failed + " failed / " + ran + " ran [test_hmac-webhook]");
-process.exit(1);
-}
-
-Take the whole folder →
-MIT
-Zero dependencies, Node or browser, deterministic, constant-time
+Nodes in this shard: 3 (/gifts/harness-fold/, /gifts/heatmap-sink/, /gifts/histogram-fold/)
 
 ---
 
-# Hunkhole — a Loop MMT gift
-https://loopmmt.com/gifts/hunkhole/
+# harness-fold — a Loop MMT gift
+https://loopmmt.com/gifts/harness-fold/
 [coverage: optional · branch: gifts]
 
-The Change Git Hides filter ← all gifts
+Fold Ordered Stages into the Wiring Topology plan-harness ← all gifts
 
-Hunkhole
+harness-fold
 
-Git tells you which FILES changed. It does not tell you when a stale working tree, a bad merge, or a clumsy restore quietly REVERTED part of a file while leaving the file itself in place — a file-presence check reads that as a clean recovery. Hunkhole is the one command that catches it: it diffs the set of named top-level definitions (function / const / exports / def) between two git revisions and reports the ones that vanished. A symbol present before and gone after, with nothing renamed to take its place, is the reverted-hunk shape. Read-only, deterministic, stdlib-only.
+harness-fold folds the ordered pipe stages into the harness edge-list (the ∘ sequencing edges) plus the one ⊗ fork/join — the wiring topology expressed as data.
 
 The honest edge
 
-Every hit is a QUESTION, not a verdict — a symbol you renamed or retired reads exactly like one that was reverted away, so hunkhole hands you the finite list and you rule on each. And a clean run is NOT a clean bill: it sees NAMED TOP-LEVEL definitions only, so a hunk reverted inside a surviving function body is invisible to it. Visibility, not immunity.
+Extracted verbatim from compile_recipe_spine.py::compile_spine and proven byte-identical to the compiler's inline logic on all 9 spines (roundtrip_selfhost.py 9/9, including the compiler's own Schematic). The served page documents the fold; the byte-truth is the Python fold + its passing selftest. A full standalone JS port is a later beat — the fold logic is what the fixed-point gate covers.
 
 Run it
 
-python3 hunkhole.py --help
-test_hunkhole.py (30 checks / 8 tests, mutation-bitten, pinned golden vanished-set + throwaway-repo end-to-end)
-Python standard library only, read-only, deterministic
+printf '{"pipe_stages": [{"primitive": "s0"}, {"primitive": "s1"}], "fork": null}' | python3 harness_fold.py # -> [[s0 to s1], null]
+smoke_test.py runs the in-module selftest: sequential edge-list (n-1), fork/join feeds declared target, degenerate None cases, folds-twice-identical
+Python 3 stdlib, no dependencies (pure fold)
 
 The code — every file that ships
 
-hunkhole.py 177 lines on GitHub →
+harness_fold.py 166 lines on GitHub →
 #!/usr/bin/env python3
-"""hunkhole — find the change that git's own tools hide: a reverted hunk.
+# SPDX-License-Identifier: MIT
+"""harness-fold -- compute a pipeline's wiring topology as data, as a standalone gift.
 
-THE HOLE THIS FILLS
+Give it an ordered list of pipe stages (and, optionally, one parallel fork), and
+it emits the wiring topology: the sequential (∘) edge-list connecting consecutive
+stages, plus the one parallel (⊗) fork/join describing which sources run
+independently and where they rejoin the chain. It's the "how does this pipeline
+actually wire together" step, computed rather than drawn.
 
-Git tells you which *files* changed. It does not tell you when a stale working
-tree, a bad merge, or a clumsy restore quietly *reverted* part of a file while
-leaving the file itself in place. A file-presence check reads that as a clean
-recovery — the file is there, so nothing looks wrong — while a load-bearing
-definition that used to live inside it is simply gone.
-
-That failure is real and it hides well: a stale tree can revert tens of
-thousands of lines across dozens of files, a later restore returns every *file*,
-and because every file is present, no one notices the definitions that never
-came back. hunkhole is the one command that would have found it.
-
-THE PROBE
-
-Not "did this file change" (forward work changes files constantly) but "is a
-named, top-level definition that existed at BEFORE absent at AFTER." A symbol
-present in the old revision and gone in the new one, with nothing renamed to
-take its place, is the reverted-hunk shape. hunkhole diffs the *set of defined
-names* between two git revisions and reports the ones that vanished.
-
-WHY IT'S HONEST — read this before trusting a clean run
-
-- **Every hit is a QUESTION, not a verdict.** A symbol you deliberately renamed
-or retired reads exactly like one that was reverted away. hunkhole hands you
-the finite list of vanished names; you rule on each. It never claims a symbol
-"should" still be there.
-
-- **A clean run is NOT a clean bill.** hunkhole sees *named top-level*
-definitions (function / const / exports / def). A hunk reverted *inside* a
-surviving function body is invisible to it — the function name is still there.
-Absence of a finding is not proof of a clean restore, and the tool says so in
-its own output.
-
-- **It is read-only.** It writes nothing, changes nothing, fixes nothing. It
-reads two revisions out of git and compares symbol sets.
-
-Visibility, not immunity. You are the witness.
+printf '{"pipe_stages": [...], "fork": {...}|null}' | python3 harness_fold.py
 
 USAGE
-python3 hunkhole.py <BEFORE> [AFTER]
-BEFORE a git revision (sha, tag, branch) — the "known-good" side
-AFTER a git revision to compare against (default: HEAD)
+printf '<json>' | python3 harness_fold.py (stdin -> stdout)
+python3 harness_fold.py --help
+python3 harness_fold.py --selftest
 
-python3 hunkhole.py <BEFORE> <AFTER> --against <CLOBBER>
---against limit the sweep to files touched by one suspect commit,
-instead of every file that differs between BEFORE and AFTER
+INPUT CONTRACT
+One JSON object on stdin whose keys are the fold's keyword arguments:
+pipe_stages [{"primitive": <id>},...] ordered, in data-flow order
+fork {"members": [{"primitive": <id>},...], "reason": <s?>,
+"feeds": <id?>} -- or null for a pipeline with no fork
 
-EXIT 0 = no vanished symbols · 3 = findings (the alarm) · 2 = error/usage
+OUTPUT
+A JSON array [harness_edges, fork_join]:
+harness_edges the ∘ chain: {"from","to","op":"∘"} for each consecutive pair
+fork_join the one ⊗ fork, or null when there's no fork (or no chain to
+feed). A fork feeds its declared "feeds" target, falling back
+to the pipe head only when none is declared.
 
-MIT licensed. Python standard library only. Read-only. Deterministic.
+EDGE (printed, honest)
+It computes the topology it is HANDED -- it does not check that the stage
+order is correct or that a declared "feeds" target exists in the chain. Give
+it a wrong order and it faithfully wires the wrong pipeline. It renders the
+graph, it does not validate the plan.
+
+PROVENANCE
+The fold body is extracted verbatim from a recipe-compiler's harness-plan
+block. This gift wraps that pure fold in a stdin->stdout CLI; the wrapper adds
+only I/O, so the gift's determinism is exactly the fold's.
+
+Zero dependencies (Python 3 stdlib only), offline, deterministic.
 """
-from __future__ import annotations
 
-import re
-import subprocess
+import argparse
+import json
 import sys
 
-# Named top-level definitions across the common scripting languages.
-# JS: function foo / const foo = / foo: function / exports.foo · Python: def foo
-_DEF_PATTERN = re.compile(
-r"^\s*(?:"
-r"function\s+(\w+)"
-r"|const\s+(\w+)\s*="
-r"|(\w+)\s*:\s*function"
-r"|exports\.(\w+)"
-r"|def\s+(\w+)"
-r")",
-re.M,
+def harness_fold(pipe_stages, fork):
+"""ordered pipe_stages (+ optional ⊗ fork) -> (harness_edges[], fork_join)."""
+harness_edges = []
+for i in range(len(pipe_stages) - 1):
+harness_edges.append({
+"from": pipe_stages[i]["primitive"],
+"to": pipe_stages[i + 1]["primitive"],
+"op": "\u2218",
+})
+fork_join = None
+if fork and pipe_stages:
+# feeds: the spine's DECLARED join target (threaded in via fork["feeds"]),
+# falling back to the pipe head only when a fork declares none. The head
+# is right for a head-feeding fork (photoshop's pixel stream) and WRONG
+# for a fork that rejoins deeper (the compiler's fork -> harness-plan).
+feeds = fork.get("feeds") or pipe_stages[0]["primitive"]
+note = (
+"parallel-independent reads: none of the \u2297 sources consumes another's "
+f"output, so they run independently and rejoin the \u2218 chain at {feeds}. "
+"Order-independent (a trivial braid)."
 )
-_CODE_SUFFIXES = (".js", ".py", ".sh", ".mjs", ".cjs")
+fork_join = {
+"op": "\u2297",
+"sources": [st["primitive"] for st in fork["members"]],
+"feeds": feeds,
+# the spine's own ⊗-justification, carried verbatim (honest, per-spine).
+"reason": fork.get("reason", ""),
+"note": note,
+}
+return harness_edges, fork_join
 
-def git(*args: str) -> str | None:
-"""Run a git command; return stdout on success, None on failure."""
-r = subprocess.run(["git", *args], capture_output=True, text=True)
-return r.stdout if r.returncode == 0 else None
+def _die(msg, code=2):
+sys.stderr.write("harness-fold: " + msg + "\n")
+sys.exit(code)
 
-def symbols(text: str) -> set[str]:
-"""The set of named top-level definitions found in a blob of source text."""
-return {name for groups in _DEF_PATTERN.findall(text) for name in groups if name}
+def _read_stdin_object():
+"""Read one JSON object from stdin -> a dict of kwargs. Crash-clean on bad
+or empty input: a nonzero exit and a one-line message, never a traceback."""
+data = sys.stdin.read()
+if not data.strip():
+_die("no input on stdin -- pipe a JSON object with keys pipe_stages, fork", 2)
+try:
+obj = json.loads(data)
+except json.JSONDecodeError as e:
+_die("stdin is not valid JSON: %s" % e, 2)
+if not isinstance(obj, dict):
+_die("stdin JSON must be an object mapping kwargs "
+"(pipe_stages, fork), got a %s" % type(obj).__name__, 2)
+return obj
 
-def vanished_symbols(before_text: str, after_text: str) -> list[str]:
-"""Names defined in `before_text` but not in `after_text`, sorted."""
-return sorted(symbols(before_text) - symbols(after_text))
+def main(argv=None):
+argv = list(sys.argv[1:] if argv is None else argv)
+if "--selftest" in argv:
+return 0 if _selftest() else 1
 
-def is_code(path: str) -> bool:
-"""True iff the path has a suffix hunkhole probes for symbols."""
-return path.endswith(_CODE_SUFFIXES)
+p = argparse.ArgumentParser(
+prog="harness_fold.py", add_help=True,
+description="Compute a pipeline's wiring topology (\u2218 edge-list + one \u2297 "
+"fork/join). Reads a JSON object {\"pipe_stages\":[...], \"fork\":{...}|null} "
+"from stdin.",
+epilog="example: printf '{\"pipe_stages\": [{\"primitive\": \"s0\"}, "
+"{\"primitive\": \"s1\"}], \"fork\": null}' | python3 harness_fold.py")
+p.parse_args(argv)
 
-def scan(before: str, after: str = "HEAD", against: str | None = None):
-"""Compare two revisions; return (files_swept, holes, absent).
+obj = _read_stdin_object()
+try:
+result = harness_fold(**obj)
+except TypeError as e:
+_die("stdin object keys must be exactly the fold's args "
+"(pipe_stages, fork): %s" % e, 2)
+except (KeyError, AttributeError) as e:
+_die("malformed input structure: %s" % e, 2)
+sys.stdout.write(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+return 0
 
-holes — list of (path, [vanished names]) for surviving code files.
-absent — list of paths present at `before` and absent at `after`
-(a whole-file drop; reported alongside hunk holes).
-Returns (None, None, None) if the underlying diff can't be produced.
-"""
-listing = git("diff", "--name-only", before, against or after)
-if listing is None:
-return None, None, None
-files = sorted(listing.split())
+def _selftest():
+"""Prove: ∘ edge-list is n-1 consecutive edges; fork_join feeds the chain
+head; fork_join=None with no fork or no chain; folds-twice-identical."""
+stages = [{"primitive": "s0"}, {"primitive": "s1"}, {"primitive": "s2"}]
+fork = {"op": "\u2297", "members": [{"primitive": "f0"}, {"primitive": "f1"}], "reason": "r"}
 
-holes: list[tuple[str, list[str]]] = []
-absent: list[str] = []
-for f in files:
-a = git("show", f"{before}:{f}")
-if a is None:
-continue # born after BEFORE — not hunkhole's business
-b = git("show", f"{after}:{f}")
-if b is None:
-absent.append(f) # whole-file drop — reported, not hunkhole's core probe
-continue
-if not is_code(f):
-continue # symbols are a code probe; data files need a different lens
-gone = vanished_symbols(a, b)
-if gone:
-holes.append((f, gone))
-return files, holes, absent
+edges, fj = harness_fold(stages, fork)
+assert [(e["from"], e["to"]) for e in edges] == [("s0", "s1"), ("s1", "s2")], edges
+assert all(e["op"] == "\u2218" for e in edges)
+# no declared feeds -> fall back to the pipe head (s0)
+assert fj["sources"] == ["f0", "f1"] and fj["feeds"] == "s0", fj
+assert "s0" in fj["note"], fj # the note names the real join target
+# folds-twice-identical
+assert harness_fold(stages, fork) == (edges, fj)
 
-def render(before: str, after: str, against: str | None, files, holes, absent) -> str:
-"""Render a scan result as the human-readable report text."""
-header = f"hunkhole: {before[:9]} -> {after}"
-if against:
-header += f" (files touched by {against[:9]})"
-header += f" · {len(files)} file(s) swept"
-lines = [header, "-" * 78]
-for f in absent:
-lines.append(f"FILE ABSENT {f}")
-for f, gone in holes:
-lines.append(f"HOLE {f}")
-for s in gone:
-lines.append(f" gone: {s}()")
-if not holes and not absent:
-lines.append("no named definition present at BEFORE is missing at AFTER.")
-lines.append("(NOT a clean bill — a hunk inside a surviving function body is invisible here.)")
-lines.append("-" * 78)
-n = len(holes) + len(absent)
-lines.append(
-f"{n} finding(s). Each is a QUESTION, not a verdict — a rename reads the same as a revert."
-)
-return "\n".join(lines)
+# DECLARED join target: fork["feeds"] overrides the pipe-head fallback.
+fork_declared = {"op": "\u2297", "members": [{"primitive": "f0"}], "reason": "r2", "feeds": "s2"}
+_, fjd = harness_fold(stages, fork_declared)
+assert fjd["feeds"] == "s2", fjd # declared target wins, NOT head s0
+assert fjd["reason"] == "r2", fjd # spine's ⊗-reason carried verbatim
 
-def main(argv: list[str]) -> int:
-if not argv or argv[0] in ("-h", "--help"):
-sys.stdout.write(__doc__)
-return 2
-before = argv[0]
-after = argv[1] if len(argv) > 1 and not argv[1].startswith("--") else "HEAD"
-against = None
-if "--against" in argv:
-i = argv.index("--against")
-if i + 1 >= len(argv):
-sys.stderr.write("hunkhole: --against needs a revision\n")
-return 2
-against = argv[i + 1]
-
-files, holes, absent = scan(before, after, against)
-if files is None:
-sys.stderr.write(f"hunkhole: cannot diff {before}..{against or after}\n")
-return 2
-
-sys.stdout.write(render(before, after, against, files, holes, absent) + "\n")
-return 3 if (holes or absent) else 0
+# no fork -> fork_join None, edges still computed
+e2, fj2 = harness_fold(stages, None)
+assert fj2 is None and len(e2) == 2, (e2, fj2)
+# fork but empty chain -> fork_join None (nothing to feed), no edges
+e3, fj3 = harness_fold([], fork)
+assert e3 == [] and fj3 is None, (e3, fj3)
+# single stage -> 0 edges
+e4, _ = harness_fold([{"primitive": "only"}], None)
+assert e4 == [], e4
+print("harness-fold selftest: \u2218 edge-list (n-1); \u2297 fork/join feeds declared "
+"target (falls back to head), reason carried; degenerate None cases; "
+"folds-twice-identical.")
+return True
 
 if __name__ == "__main__":
-raise SystemExit(main(sys.argv[1:]))
+sys.exit(main())
 
-test_hunkhole.py 185 lines on GitHub →
+smoke_test.py 23 lines on GitHub →
 #!/usr/bin/env python3
-"""test_hunkhole.py — the certifying properties of the hunkhole gift.
+# SPDX-License-Identifier: MIT
+"""smoke_test.py -- harness-fold's shipped smoke check. Runs the in-module --selftest
+battery and exits non-zero on any failure, so a stranger can prove the gift works
+in their tree with one command:
 
-Run: python3 test_hunkhole.py (exit 0 = all pass, 1 = a failure)
-
-hunkhole's git-facing shell is exercised end-to-end in a throwaway repo; its
-symbol-diff CORE (symbols / vanished_symbols / is_code / render) is pure and is
-tested directly on fixtures. Each test is MUTATION-BITTEN: it is here because a
-plausible mutation of hunkhole.py makes it fail loud. The core-diff test pins a
-GOLDEN sorted vanished-set — a rename reading identically to a revert is the
-exact property that must hold, and a golden proves the set, not just its size.
+python3 smoke_test.py
 """
-import hashlib
 import os
 import subprocess
 import sys
-import tempfile
 
-import hunkhole as h
+HERE = os.path.dirname(os.path.abspath(__file__))
 
-_FAILURES: list[str] = []
-_PASSES = 0
-
-def check(cond: bool, msg: str) -> None:
-global _PASSES
-if cond:
-_PASSES += 1
-else:
-_FAILURES.append(msg)
-
-# ---- fixtures: before/after source blobs -----------------------------------
-BEFORE_JS = """\
-function alpha() { return 1;}
-const beta = () => 2;
-gamma: function () { return 3;}
-exports.delta = function () {};
-function survivor() {
-let innerReverted = 9; // a hunk inside a surviving body (not def-shaped)
-return innerReverted;
-}
-"""
-AFTER_JS = """\
-const beta = () => 2;
-exports.delta = function () {};
-function survivor() {
-return 0; // innerReverted hunk reverted, name survives
-}
-"""
-
-BEFORE_PY = """\
-def one(): pass
-def two(): pass
-def three(): pass
-"""
-AFTER_PY = """\
-def one(): pass
-def three(): pass
-"""
-
-# ---- 1. the core diff: vanished top-level names, pinned golden --------------
-def test_vanished_golden():
-gone_js = h.vanished_symbols(BEFORE_JS, AFTER_JS)
-# alpha (function) and gamma (obj-method) vanished; beta/delta/survivor stayed.
-check(gone_js == ["alpha", "gamma"], f"JS vanished set wrong: {gone_js}")
-# the hunk INSIDE survivor() is invisible — survivor is not reported gone
-check("survivor" not in gone_js, "survivor should NOT be flagged (in-body hunk is invisible)")
-# pin a golden signature over a combined fixture run
-gone_py = h.vanished_symbols(BEFORE_PY, AFTER_PY)
-check(gone_py == ["two"], f"PY vanished set wrong: {gone_py}")
-sig = hashlib.sha256(("|".join(gone_js) + "#" + "|".join(gone_py)).encode()).hexdigest()
-golden = "72e9237f911294dc57a66b67e296fb888a0d43373cbb485118d4f73a4df09f8b"
-check(sig == golden, f"golden vanished-set signature drifted: got {sig[:16]}...")
-
-# ---- 2. a rename reads the same as a revert (the honest-edge property) ------
-def test_rename_reads_as_revert():
-before = "def compute(): pass\n"
-after = "def calculate(): pass\n" # renamed
-gone = h.vanished_symbols(before, after)
-check(gone == ["compute"], f"rename should surface old name as gone: {gone}")
-# kills a mutation that tried to be 'smart' and suppress renames
-
-# ---- 3. no false hole when nothing vanished --------------------------------
-def test_no_false_hole():
-same = "def a(): pass\ndef b(): pass\n"
-check(h.vanished_symbols(same, same) == [], "identical source must yield no vanished names")
-# a purely ADDED symbol is not a hole
-added = "def a(): pass\ndef b(): pass\ndef c(): pass\n"
-check(h.vanished_symbols(same, added) == [], "an added symbol must not read as vanished")
-
-# ---- 4. symbols() sees each definition form; kills a dropped alternative ----
-def test_symbol_forms():
-src = "function f(){}\nconst g=1\nh: function(){}\nexports.i=1\ndef j(): pass\n"
-got = h.symbols(src)
-for name in ("f", "g", "h", "i", "j"):
-check(name in got, f"symbol form not detected: {name} (pattern lost an alternative)")
-
-# ---- 5. is_code gate: symbols probed only on code suffixes -----------------
-def test_is_code():
-for ok in ("x.js", "y.py", "z.sh", "a.mjs", "b.cjs"):
-check(h.is_code(ok), f"{ok} should be code")
-for no in ("data.json", "notes.md", "image.png", "LICENSE"):
-check(not h.is_code(no), f"{no} should NOT be treated as code")
-
-# ---- 6. render marks a clean run as NOT a clean bill ------------------------
-def test_render_clean_caveat():
-out = h.render("abc123def", "HEAD", None, files=["a.py"], holes=[], absent=[])
-check("NOT a clean bill" in out, "clean render must carry the not-a-clean-bill caveat")
-check("0 finding(s)" in out, "clean render must report 0 findings")
-
-# ---- 7. render shows holes and absent files distinctly ---------------------
-def test_render_findings():
-out = h.render(
-"abc123def", "HEAD", None,
-files=["a.py", "b.py"],
-holes=[("a.py", ["gone_one", "gone_two"])],
-absent=["b.py"],
-)
-check("HOLE a.py" in out, "hole line missing")
-check("gone: gone_one()" in out, "vanished symbol not rendered")
-check("FILE ABSENT b.py" in out, "absent-file line missing")
-check("2 finding(s)" in out, "finding count wrong (1 hole + 1 absent = 2)")
-check("QUESTION, not a verdict" in out, "the question-not-verdict disclaimer must render")
-
-# ---- 8. END-TO-END against a real throwaway git repo -----------------------
-def _run_git(cwd, *args):
-subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
-
-def test_end_to_end_reverted_hunk():
-with tempfile.TemporaryDirectory() as repo:
-_run_git(repo, "init", "-q")
-_run_git(repo, "config", "user.email", "t@t")
-_run_git(repo, "config", "user.name", "t")
-p = os.path.join(repo, "mod.py")
-with open(p, "w") as fh:
-fh.write("def keeper(): pass\ndef doomed(): pass\n")
-_run_git(repo, "add", "mod.py")
-_run_git(repo, "commit", "-qm", "before")
-before_sha = subprocess.run(
-["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
-).stdout.strip()
-# revert the 'doomed' definition, keep the file
-with open(p, "w") as fh:
-fh.write("def keeper(): pass\n")
-_run_git(repo, "commit", "-aqm", "after (doomed reverted)")
-
-cwd0 = os.getcwd()
-os.chdir(repo)
-try:
-files, holes, absent = h.scan(before_sha, "HEAD")
-finally:
-os.chdir(cwd0)
-check(holes == [("mod.py", ["doomed"])], f"end-to-end hole not found: {holes}")
-check(absent == [], f"nothing should be absent: {absent}")
-
-def run() -> int:
-tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-for t in tests:
-try:
-t()
-except Exception as exc:
-_FAILURES.append(f"{t.__name__} raised: {exc!r}")
-total = _PASSES + len(_FAILURES)
-if _FAILURES:
-print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
-for f in _FAILURES:
-print(f" ✗ {f}")
-return 1
-print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
-return 0
+def main():
+r = subprocess.run([sys.executable,
+os.path.join(HERE, "harness_fold.py"), "--selftest"])
+sys.exit(r.returncode)
 
 if __name__ == "__main__":
-sys.exit(run())
+main()
 
 Take the whole folder →
 MIT
-Python standard library only, read-only, deterministic
+Python 3 stdlib, no dependencies (pure fold)
 
 ---
 
-# ini-source — a Loop MMT gift
-https://loopmmt.com/gifts/ini-source/
+# Heatmap-sink — a Loop MMT gift
+https://loopmmt.com/gifts/heatmap-sink/
 [coverage: optional · branch: gifts]
 
-Parse Sectioned INI Config into a JSONL Record Stream source ← all gifts
+Cells In, One Heatmap SVG Out render ← all gifts
 
-ini-source
+Heatmap-sink
 
-ini-source reads sectioned INI /.gitconfig-style config text (a FILE arg, or stdin) and emits one uniform JSON object per assignment — {"section":S,"key":K,"value":V}, all strings — tagged with the section it lives under, the front of a pipe you feed into the fold/filter/transform gifts (ini-source app.ini | pluck --fields key,value). Lines split on the FIRST '=', full-line; and # comments and blank lines skipped, section headers set the tag, outer quotes stripped, CRLF==LF, BOM stripped. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+heatmap-sink turns a stream of (x,y,value) cells into one standalone, deterministic heatmap SVG with zero dependencies — one <rect> per grid cell, painted from a fixed 5-bucket color scale. It renders no axes, labels, legend, colorbar, or title — only the field — so it drops straight into a README, a report, or a CI comment where a plotting library would be overkill. The load-bearing property: integer grid coordinates and INTEGER color buckets mean no float ever reaches the output, and cells are drawn row-major regardless of arrival order, so the same set of cells produces byte-identical SVG out — in Node or a browser, committable and diffable.
 
 The honest edge
 
-ini-source parses sectioned INI text into uniform string records only — it does not coerce types ("8080" stays a string), does not interpolate ${VAR}, does not honor inline comments, and does not process escapes inside quotes. Its own honesty axis: a DUPLICATE key within a section, or a REPEATED [section] header, is REFUSED (exit 2, line-numbered) — never a silent overwrite (the common INI-parser behaviour that changes your data without telling you). A malformed line, an illegal/empty key, or a field-name collision is exit 2. An honest, pinnable parse — not a full INI runtime.
+heatmap-sink is a grid-of-rects heatmap primitive, not a plotting library: one <rect> per (x,y) cell, no axes, labels, legend, colorbar, or title, no fonts/CSS/script. It takes NUMBERS ONLY — (x,y,v) triples — so no caller text reaches the output and there is no escaping surface. Colors come from a fixed named 5-bucket scale (missing cells take a fixed empty fill) — never caller-chosen. Two values in the same band draw the SAME color: it shows the FIELD, not the exact magnitude. A non-finite value, a bad coordinate, or a duplicate (x,y) is a hard error, never a guessed cell. Same cells in → byte-identical SVG out, independent of order.
 
 Run it
 
-printf '[s]\nk=v\n' | node ini-source.js # -> {"section":"s","key":"k","value":"v"}
-test_ini-source.js (43/43, independent regex-route oracle) + Plumb conformance GREEN (28/28, signed 2026-09-12, clock-independent, 2 mutation-bites non-vacuous)
+printf '[0,0,0]\n[1,0,1]\n[0,1,2]\n[1,1,3]\n' | node heatmap-sink.js # a 2x2 heatmap SVG (--palette heat|cool|mono|viridis · --cell N · --min/--max to pin)
+test_heatmap-sink.js (16/16, out-of-band hand-computed SVG oracle) + Plumb conformance GREEN (I1-I5, signed, clock-independent)
 Node / browser, no dependencies
 
 The code — every file that ships
 
-ini-source.js 301 lines on GitHub →
+heatmap-sink.js 314 lines on GitHub →
 #!/usr/bin/env node
-/* ini-source.js — parse INI /.gitconfig-style sectioned config text into a uniform
-JSONL record stream. Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
+/*
+* heatmap-sink — turn (x,y,v) cells into one standalone, deterministic heatmap SVG, no deps.
+* MIT · zero-dependency · standalone gift · lane: sink (consumes data, emits an artifact).
+*
+* THE PRINTED EDGE (read before trusting the output):
+* This is a GRID-OF-RECTS heatmap primitive, not a plotting library. It draws GEOMETRY
+* ONLY — one <rect> per (x,y) grid cell inside a plain <svg> frame. It renders NO axes,
+* tick marks, tick labels, legend, colorbar, title, or interactivity, and it embeds NO
+* fonts, NO CSS, and NO <script>. It takes NUMBERS ONLY — (x,y,v) triples — so no caller
+* text ever reaches the output, and there is no text-escaping surface to get wrong.
+* Colors are NOT free-form input: each cell is painted from a fixed, named, DISCRETE color
+* scale (value → one of N buckets across the data's [min,max]), and missing cells take a
+* fixed empty fill — so the output can never carry an attacker-chosen attribute string.
+* Because there are only N buckets, two values in the same band draw the SAME color: it
+* shows the FIELD, not the exact magnitude, and it is not a substitute for the number. A
+* non-finite v, a non-integer or negative coordinate, a duplicate (x,y), or a cell outside
+* a pinned grid is a HARD ERROR, never silently dropped or guessed. Output is a PURE
+* FUNCTION of the input, independent of cell ORDER: same cells in → byte-identical SVG out.
+*
+* USAGE:
+* printf '[0,0,0]\n[1,0,1]\n[0,1,2]\n[1,1,3]\n' | node heatmap-sink.js # 2x2 heatmap
+* printf '{"x":0,"y":0,"v":9}\n' | node heatmap-sink.js # object cells
+* printf '[0,0,5]\n[1,0,5]\n' | node heatmap-sink.js --palette cool --min 0 --max 10
+* echo '{"cells":[[0,0,1],[1,1,9]],"palette":"mono"}' | node heatmap-sink.js # spec object
+* node heatmap-sink.js --help
+*
+* INPUT (stdin): either
+* - JSONL — one cell per line, each `[x,y,v]` or `{"x":X,"y":Y,"v":V}` (the streaming form)
+* - a single JSON spec object { cells, min, max, palette, cell, cols, rows, empty}
+* x,y are NON-NEGATIVE INTEGER grid coordinates (column, row); v is a finite number.
+* CLI flags (--palette --cell --min --max --cols --rows --empty) OVERRIDE object fields.
+*
+* OUTPUT (stdout): one SVG document string (UTF-8), trailing newline. No cells → an empty frame.
+*
+* DETERMINISM: integer grid coordinates, integer cell size, INTEGER color buckets, cells drawn
+* in row-major order regardless of input order, 3-decimal coordinate precision, stable
+* attribute order. No wall-clock, no randomness. Same cells → same bytes, in Node or a browser.
+* PORTABILITY: pure JS on plain arrays/strings — identical in Node and the browser.
+*/
+'use strict';
 
-WHAT IT IS. A SOURCE: it turns non-JSONL sectioned config text (an.ini, a
-.gitconfig-style file, an editorconfig-shaped file) into the front of a pipe — one JSON
-object per line (JSONL) that the fold/filter/transform gifts consume. Give it a file (or
-pipe text on stdin) and it emits one uniform record per assignment, tagged with the
-section it lives under:
+// ---- color scales (the ONLY source of cell color; no free-form color input) -----
+// Named, closed sets of N=5 discrete colors, low value → high value. A value v is painted
+// SCALES[name][level(v)]; level is an integer bucket, so no float ever reaches the output.
+var N_BUCKETS = 5;
+var SCALES = {
+heat: ['#ffffcc', '#fed976', '#fd8d3c', '#e31a1c', '#800026'], // light yellow → deep red
+cool: ['#f7fbff', '#c6dbef', '#6baed6', '#2171b5', '#08306b'], // light → deep blue
+mono: ['#f7f7f7', '#cccccc', '#969696', '#636363', '#252525'], // light → dark gray
+viridis: ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725'] // dark purple → yellow
+};
+// Empty (missing) cells: a closed choice, never caller free-form. 'none' omits the rect.
+var EMPTY_FILLS = { light: '#eeeeee', dark: '#333333', none: null};
+var DEFAULTS = { palette: 'heat', cell: 16, empty: 'light'};
 
-[server] -> (sets the current section)
-host = localhost -> {"section":"server","key":"host","value":"localhost"}
-port = 8080 -> {"section":"server","key":"port","value":"8080"}
-; a comment -> (skipped)
-[client]
-host = 10.0.0.1 -> {"section":"client","key":"host","value":"10.0.0.1"}
+// ---- deterministic number formatting (verbatim from svg-sink) -------------------
+// Round to 3 decimals, strip trailing zeros (and a bare trailing dot), normalize -0.
+var PRECISION = 3, SCALE = 1000;
+function num(x) {
+var r = Math.round(x * SCALE) / SCALE;
+var s = r.toFixed(PRECISION);
+s = s.replace(/\.?0+$/, '');
+return (s === '' || s === '-0')? '0': s;
+}
 
-Every record has the same three string fields, so it drops straight into a generic
-filter or fold: ini-source app.ini | range-filter... / ini-source app.ini | pluck...
+// ---- validation helpers --------------------------------------------------------
+function finiteV(v, x, y) {
+if (typeof v!== 'number' ||!isFinite(v)) {
+throw new Error('cell (' + x + ',' + y + ') value is not a finite number: ' + JSON.stringify(v));
+}
+return v;
+}
+function coord(c, which, cellRepr) {
+if (typeof c!== 'number' ||!isFinite(c) || Math.floor(c)!== c) {
+throw new Error(which + ' coordinate must be a non-negative integer, got ' + JSON.stringify(c) + ' in cell ' + cellRepr);
+}
+if (c < 0) throw new Error(which + ' coordinate must be a non-negative integer, got ' + JSON.stringify(c) + ' in cell ' + cellRepr);
+return c;
+}
+function posInt(v, dflt, name) {
+if (v == null) return dflt;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n <= 0) throw new Error(name + ' must be a positive integer, got ' + JSON.stringify(v));
+return n;
+}
+function nonNegIntOrNull(v, name) {
+if (v == null) return null;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n < 0) throw new Error(name + ' must be a non-negative integer, got ' + JSON.stringify(v));
+return n;
+}
 
-THE SHAPE (the design decision that makes it compose). One record per key-assignment,
-the FLAT uniform triple {section, key, value} — NOT one nested record per section. A
-nested {section, entries:{...}} record would carry the section's structure but would not
-compose with the flat fold/filter/transform gifts (they cannot reach into a per-record
-sub-object with a generic --field). The flat triple lets a downstream gift filter by
-section, pluck the key/value, or fold across sections without knowing the file's shape.
-Keys that appear BEFORE any [section] header (a global preamble, as in.gitconfig) are
-emitted with section "" — the honest "no section" marker, never an invented default name.
+// ---- one cell -> {x,y,v} (accepts [x,y,v] or {x,y,v}) --------------------------
+function asCell(raw) {
+var repr = JSON.stringify(raw);
+var x, y, v;
+if (Array.isArray(raw)) {
+if (raw.length!== 3) throw new Error('cell array must be [x,y,v] (3 numbers), got ' + repr);
+x = raw[0]; y = raw[1]; v = raw[2];
+} else if (raw && typeof raw === 'object') {
+if (!('x' in raw) ||!('y' in raw) ||!('v' in raw)) throw new Error('cell object must have x,y,v, got ' + repr);
+x = raw.x; y = raw.y; v = raw.v;
+} else {
+throw new Error('cell must be [x,y,v] or {x,y,v}, got ' + repr);
+}
+coord(x, 'x', repr); coord(y, 'y', repr); finiteV(v, x, y);
+return { x: x, y: y, v: v};
+}
 
-STRINGS ONLY (inherited honesty axis). Values are emitted as LITERAL STRINGS —
-ini-source does not guess types. "8080" stays the string "8080"; "true" stays "true".
-The moment a parser coerces (is 08 octal? is 1e3 a number? is TRUE a boolean?) the SAME
-file parses to different bytes under different tools, and a source you cannot pin is not
-a source. For the same reason it does NOT interpolate ${VAR}/%VAR%, does NOT honor inline
-(trailing) comments, and does NOT process backslash escapes inside a quoted value — each
-is a context-dependent guess that would break byte determinism. It parses the grammar it
-was given and REFUSES the rest, loudly.
+// ---- scale (shared value-domain across all cells; shape from svg-sink/sparkline) --
+function domain(values, min, max) {
+var lo = (min!= null)? Number(min): Infinity;
+var hi = (max!= null)? Number(max): -Infinity;
+if (min == null || max == null) {
+for (var i = 0; i < values.length; i++) {
+var v = values[i];
+if (min == null && v < lo) lo = v;
+if (max == null && v > hi) hi = v;
+}
+}
+if (!isFinite(lo)) lo = 0;
+if (!isFinite(hi)) hi = 0;
+if (lo === hi) { lo -= 1; hi += 1;} // flat field -> unit window, painted mid-scale
+return { lo: lo, hi: hi};
+}
+function level(v, lo, hi) {
+var k = Math.floor(((v - lo) / (hi - lo)) * N_BUCKETS);
+if (k < 0) k = 0;
+if (k >= N_BUCKETS) k = N_BUCKETS - 1; // v == hi -> N clamps to N-1
+return k;
+}
 
-THE HONESTY AXIS THAT IS ITS OWN (fail-closed on a duplicated key). A key that appears
-TWICE within the same section is a HARD ERROR (exit 2), naming the line, the key, and the
-section. This is the whole reason ini-source exists as its own gift rather than a flag on
-kv-source: the common INI-parser behaviour is to silently keep the last (or the first) of
-a duplicated key — which changes the caller's data without telling them. ini-source
-refuses. The same key in DIFFERENT sections is fine (that is what sections are for); a
-key repeated in the global preamble (section "") is a duplicate. A repeated [section]
-HEADER is likewise refused (exit 2): merging or overriding two blocks of the same name is
-the same silent guess one level up.
+// ---- input normalization -------------------------------------------------------
+// Accept: [[x,y,v],...] | [{x,y,v},...] | {cells,...}. Return a validated spec.
+function normalize(input, flags) {
+var spec = {};
+var cellsRaw;
+if (input &&!Array.isArray(input) && typeof input === 'object') {
+cellsRaw = input.cells;
+if (input.min!= null) spec.min = input.min;
+if (input.max!= null) spec.max = input.max;
+if (input.palette!= null) spec.palette = input.palette;
+if (input.cell!= null) spec.cell = input.cell;
+if (input.cols!= null) spec.cols = input.cols;
+if (input.rows!= null) spec.rows = input.rows;
+if (input.empty!= null) spec.empty = input.empty;
+} else {
+cellsRaw = input;
+}
+flags = flags || {};
+for (var k in flags) if (flags[k]!= null) spec[k] = flags[k];
 
-THE GRAMMAR (declared, so it is pinnable)
-* A leading UTF-8 BOM on the first line is stripped (Windows INI files often carry one).
-* Lines split on newline; a trailing CR (CRLF files) is stripped, so a file parses
-identically whether it uses LF or CRLF.
-* A whitespace-only line emits nothing.
-* A line whose first non-whitespace character is ';' or '#' is a full-line COMMENT and
-emits nothing. (There are no inline/trailing comments — a ';' inside a value is part
-of the value.)
-* A line that, trimmed, is [ NAME] — begins with '[' and ends with ']' — is a SECTION
-HEADER. NAME is the inner text trimmed; it must be non-empty and contain no '[' or
-']'. An empty [] or a malformed header is a hard error (exit 2). The section it names
-becomes the current section. A section name may appear only once.
-* Any other non-blank line MUST be KEY=VALUE. It is split on the FIRST '='; everything
-before is the key, everything after is the value.
-- KEY is trimmed and MUST match [A-Za-z_][A-Za-z0-9_.-]* — a non-empty name. An
-empty key, or a key with spaces/illegal characters, is a hard error (exit 2).
-- VALUE is trimmed. If, after trimming, it both begins and ends with a matching
-'"' or "'" (length >= 2), those OUTER quotes are stripped and the inner text is
-the literal value (no escape processing). Otherwise the trimmed remainder is the
-literal value.
-* A non-blank, non-comment, non-header line with no '=' is a MALFORMED line (exit 2).
+if (cellsRaw == null) cellsRaw = [];
+if (!Array.isArray(cellsRaw)) throw new Error('input has no cells (expected [[x,y,v],...] or a {cells:...} object)');
 
-THE MODEL
-[FILE] The INI file to parse. If omitted, read stdin.
---section-field NAME The object key the SECTION is emitted under. Default "section".
---key-field NAME The object key the parsed KEY is emitted under. Default "key".
---value-field NAME The object key the parsed VALUE is emitted under. Default "value".
-The three field names must be pairwise distinct (else the record
-would collapse) — a collision is exit 2.
---global NAME The section name given to keys that appear before any header.
-Default "" (empty string).
+var cells = cellsRaw.map(asCell);
 
-DETERMINISM. parse(text, opts) is a pure function — no clock, no randomness, no network —
-so the same text yields byte-identical output every run and every machine.
+spec.palette = (spec.palette!= null)? String(spec.palette): DEFAULTS.palette;
+spec.empty = (spec.empty!= null)? String(spec.empty): DEFAULTS.empty;
+spec.cell = posInt(spec.cell, DEFAULTS.cell, 'cell');
+spec.pinCols = nonNegIntOrNull(spec.cols, 'cols');
+spec.pinRows = nonNegIntOrNull(spec.rows, 'rows');
+if (spec.min!= null) spec.min = numOrThrow(spec.min, 'min');
+if (spec.max!= null) spec.max = numOrThrow(spec.max, 'max');
+if (spec.min!= null && spec.max!= null && spec.min >= spec.max) {
+throw new Error('min must be < max (got min=' + spec.min + ', max=' + spec.max + ')');
+}
+if (!SCALES[spec.palette]) throw new Error('unknown palette "' + spec.palette + '" (expected ' + Object.keys(SCALES).join(' | ') + ')');
+if (!(spec.empty in EMPTY_FILLS)) throw new Error('unknown empty "' + spec.empty + '" (expected ' + Object.keys(EMPTY_FILLS).join(' | ') + ')');
+
+// build the cell map; a duplicate (x,y) is a HARD error (ambiguous cell, no silent last-wins)
+var mapKey = {}, maxX = -1, maxY = -1;
+for (var i = 0; i < cells.length; i++) {
+var c = cells[i], key = c.x + ',' + c.y;
+if (Object.prototype.hasOwnProperty.call(mapKey, key)) {
+throw new Error('duplicate cell at (' + c.x + ',' + c.y + ') — each grid position may appear at most once');
+}
+mapKey[key] = c.v;
+if (c.x > maxX) maxX = c.x;
+if (c.y > maxY) maxY = c.y;
+}
+var cols = (spec.pinCols!= null)? spec.pinCols: maxX + 1;
+var rows = (spec.pinRows!= null)? spec.pinRows: maxY + 1;
+if (spec.pinCols!= null && maxX >= spec.pinCols) throw new Error('cell x=' + maxX + ' is outside the pinned grid cols=' + spec.pinCols);
+if (spec.pinRows!= null && maxY >= spec.pinRows) throw new Error('cell y=' + maxY + ' is outside the pinned grid rows=' + spec.pinRows);
+if (cols < 0) cols = 0;
+if (rows < 0) rows = 0;
+
+spec.cellMap = mapKey;
+spec.cols = cols;
+spec.rows = rows;
+spec.values = cells.map(function (c) { return c.v;});
+return spec;
+}
+function numOrThrow(v, name) {
+var n = Number(v);
+if (typeof n!== 'number' ||!isFinite(n)) throw new Error(name + ' must be a finite number, got ' + JSON.stringify(v));
+return n;
+}
+
+// ---- core: renderHeatmap(spec) -> string (pure, the whole gift) ----------------
+function heatmap(input, flags) {
+var spec = normalize(input, flags);
+var cell = spec.cell, cols = spec.cols, rows = spec.rows;
+var W = cols * cell, H = rows * cell;
+var scale = SCALES[spec.palette];
+var emptyFill = EMPTY_FILLS[spec.empty]; // may be null (omit empty rects)
+var dom = domain(spec.values, spec.min, spec.max);
+
+var body = [];
+// row-major order — INPUT-ORDER-INDEPENDENT and deterministic.
+for (var y = 0; y < rows; y++) {
+for (var x = 0; x < cols; x++) {
+var key = x + ',' + y;
+var fill;
+if (Object.prototype.hasOwnProperty.call(spec.cellMap, key)) {
+fill = scale[level(spec.cellMap[key], dom.lo, dom.hi)];
+} else if (emptyFill == null) {
+continue; // 'none' -> omit the rect entirely
+} else {
+fill = emptyFill;
+}
+body.push('<rect x="' + num(x * cell) + '" y="' + num(y * cell) +
+'" width="' + num(cell) + '" height="' + num(cell) + '" fill="' + fill + '" />');
+}
+}
+
+// Fixed attribute order; xmlns first so the fragment is a valid standalone document.
+var open = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '">';
+return open + '\n' + (body.length? body.join('\n') + '\n': '') + '</svg>\n';
+}
+
+// ---- exports (browser attach · require · direct run) ---------------------------
+if (typeof window!== 'undefined') {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts['heatmap-sink'] = { heatmap: heatmap, SCALES: SCALES, EMPTY_FILLS: EMPTY_FILLS};
+}
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { heatmap: heatmap, num: num, normalize: normalize, domain: domain, SCALES: SCALES, EMPTY_FILLS: EMPTY_FILLS, N_BUCKETS: N_BUCKETS};
+}
+
+// ---- cli -----------------------------------------------------------------------
+var HELP =
+'heatmap-sink — (x,y,v) cells -> a standalone, deterministic heatmap SVG, zero deps.\n\n' +
+" printf '[0,0,0]\\n[1,0,1]\\n[0,1,2]\\n[1,1,3]\\n' | node heatmap-sink.js\n" +
+" printf '{\"x\":0,\"y\":0,\"v\":9}\\n' | node heatmap-sink.js\n" +
+" printf '[0,0,5]\\n[1,0,5]\\n' | node heatmap-sink.js --palette cool --min 0 --max 10\n" +
+" echo '{\"cells\":[[0,0,1],[1,1,9]]}' | node heatmap-sink.js --cell 24\n\n" +
+'INPUT (stdin): JSONL of [x,y,v] or {x,y,v} cells (one per line), OR a {cells,...} spec object.\n' +
+'Flags (override object fields): --palette heat|cool|mono|viridis --cell N --min N --max N\n' +
+' --cols N --rows N --empty light|dark|none\n\n' +
+'Geometry only: one <rect> per cell, no axes/labels/legend/fonts/CSS/script. Numbers in, a\n' +
+'grid out. Colors come from a fixed named 5-bucket scale (not caller input). A non-finite v,\n' +
+'a bad coordinate, or a duplicate (x,y) -> error.\n';
+
+function parseFlags(argv) {
+var f = {};
+for (var i = 0; i < argv.length; i++) {
+var a = argv[i];
+if (a === '--palette') f.palette = argv[++i];
+else if (a === '--cell') f.cell = Number(argv[++i]);
+else if (a === '--min') f.min = Number(argv[++i]);
+else if (a === '--max') f.max = Number(argv[++i]);
+else if (a === '--cols') f.cols = Number(argv[++i]);
+else if (a === '--rows') f.rows = Number(argv[++i]);
+else if (a === '--empty') f.empty = argv[++i];
+}
+return f;
+}
+
+// Parse stdin: a single JSON spec object {cells:...} passes through; otherwise treat the
+// input as JSONL — one cell per non-empty line. Blank lines are skipped.
+function parseStdin(raw) {
+var trimmed = raw.trim();
+if (trimmed === '') return { cells: []};
+// single-object spec form?
+if (trimmed.charAt(0) === '{') {
+try {
+var obj = JSON.parse(trimmed);
+if (obj &&!Array.isArray(obj) && typeof obj === 'object' && 'cells' in obj) return obj;
+} catch (e) { /* fall through to JSONL (multi-line objects) */}
+}
+var cells = [];
+var lines = trimmed.split('\n');
+for (var i = 0; i < lines.length; i++) {
+var ln = lines[i].trim();
+if (ln === '') continue;
+var cell;
+try { cell = JSON.parse(ln);}
+catch (e) { throw new Error('line ' + (i + 1) + ' is not valid JSON: ' + e.message);}
+cells.push(cell);
+}
+return { cells: cells};
+}
+
+function main() {
+var argv = process.argv.slice(2);
+if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) { process.stdout.write(HELP); return;}
+var flags = parseFlags(argv);
+var chunks = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (d) { chunks += d;});
+process.stdin.on('end', function () {
+var input;
+try { input = parseStdin(chunks);}
+catch (e) { process.stderr.write('heatmap-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+var svg;
+try { svg = heatmap(input, flags);}
+catch (e) { process.stderr.write('heatmap-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+process.stdout.write(svg);
+});
+}
+if (typeof require!== 'undefined' && require.main === module) { main();}
+
+test_heatmap-sink.js 168 lines on GitHub →
+#!/usr/bin/env node
+/*
+* test_heatmap-sink.js — drift-check battery for the heatmap-sink gift.
+*
+* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The expected SVG documents below are
+* hand-computed from the documented math — level(v) = clamp(floor((v-lo)/(hi-lo)*5), 0, 4),
+* lo/hi the auto-fit or pinned domain (flat field -> unit window), cells drawn row-major at
+* (x*cell, y*cell) — written independently of the emitter, not captured from its output. A
+* build cannot certify itself, so the expected strings are the author's fact. The remaining
+* checks are contract properties (determinism, order-independence, closed palette, honest errors).
+*
+* Run: node test_heatmap-sink.js (exit 0 = all pass; nonzero = a named failure)
+*/
+'use strict';
+const assert = require('assert');
+const { heatmap, SCALES, EMPTY_FILLS} = require('./heatmap-sink.js');
+
+let n = 0, passed = 0;
+function check(name, fn) {
+n++;
+try { fn(); passed++; console.log(' ok ' + name);}
+catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
+}
+
+// ---- hand-computed expected SVGs (heat palette, cell=16, empty=light) ------------
+// heat = #ffffcc #fed976 #fd8d3c #e31a1c #800026; empty light = #eeeeee
+const RAMP_2x2 =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fed976" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#e31a1c" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
+
+// 1 — full 2x2 grid, values 0..3 auto-domain [0,3] -> one bucket per corner, in order.
+// level(0)=0 level(1)=floor(1/3*5)=1 level(2)=floor(2/3*5)=3 level(3)=clamp(5)=4
+check('ramp 2x2: [0,1,2,3] -> #ffffcc #fed976 #e31a1c #800026', () => {
+assert.strictEqual(heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]}), RAMP_2x2);
+});
+
+// 2 — flat field: all equal -> unit window -> every cell mid-scale (bucket 2 = #fd8d3c).
+check('flat field: [5,5,5,5] -> all #fd8d3c (mid-scale, no divide-by-0)', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,5],[1,0,5],[0,1,5],[1,1,5]]}), exp);
+});
+
+// 3 — single cell -> flat window -> one mid-scale rect, 16x16 frame.
+check('single cell: [0,0,7] -> one #fd8d3c rect', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,7]]}), exp);
+});
+
+// 4 — sparse input: two corners set, 3x3 grid, the 7 missing cells take the empty fill.
+check('sparse: [(0,0)=0,(2,2)=10] -> corners painted, 7 empty #eeeeee', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="0" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="0" y="32" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="16" y="32" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="32" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,0],[2,2,10]]}), exp);
+});
+
+// 5 — pinned domain overrides the flat-window auto-fit: [5,5] on [0,10] -> bucket 2.
+check('pinned: {cells:[5,5],min:0,max:10} -> both #fd8d3c', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 16" width="32" height="16">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,5],[1,0,5]], min: 0, max: 10}), exp);
+});
+
+// 6 — empty input -> a valid, empty 0x0 frame, never a crash.
+check('empty: {cells:[]} -> empty <svg> frame', () => {
+assert.strictEqual(heatmap({ cells: []}),
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 0 0" width="0" height="0">\n</svg>\n');
+});
+
+// 7 — 'none' empty omits missing rects entirely.
+check("empty:none -> missing cells produce no rect", () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,0],[1,1,10]], empty: 'none'}), exp);
+});
+
+// 8 — object-form cells {x,y,v} render identically to array-form.
+check('object cells {x,y,v} == array cells [x,y,v]', () => {
+const a = heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]});
+const o = heatmap({ cells: [{x:0,y:0,v:0},{x:1,y:0,v:1},{x:0,y:1,v:2},{x:1,y:1,v:3}]});
+assert.strictEqual(o, a);
+assert.strictEqual(o, RAMP_2x2);
+});
+
+// 9 — INPUT-ORDER-INDEPENDENCE: scrambled cell order -> byte-identical SVG (a heatmap is a SET).
+check('order-independent: scrambled cells -> identical bytes', () => {
+const scrambled = heatmap({ cells: [[1,1,3],[0,0,0],[1,0,1],[0,1,2]]});
+assert.strictEqual(scrambled, RAMP_2x2);
+});
+
+// 10 — determinism: same cells -> byte-identical output, twice.
+check('determinism: repeated render is byte-identical', () => {
+const c = { cells: [[0,0,3],[1,0,1],[2,0,4],[0,1,1],[1,1,5],[2,1,9]]};
+assert.strictEqual(heatmap(c), heatmap(c));
+});
+
+// 11 — closed palette + no text: every fill is in the named scale (∪ empty); no <text|script|style.
+check('closed palette: only scale colors + empty, no text/script/style', () => {
+const out = heatmap({ cells: [[0,0,0],[1,0,50],[0,1,100],[1,1,25]], palette: 'cool', min: 0, max: 100});
+const allowed = new Set(SCALES.cool.concat([EMPTY_FILLS.light]));
+const fills = out.match(/fill="([^"]*)"/g).map(s => s.slice(6, -1));
+for (const f of fills) assert.ok(allowed.has(f), 'unexpected fill ' + f);
+assert.ok(!/<text|<script|<style|font/.test(out), 'output must contain no text/script/style/font');
+assert.ok(out.startsWith('<svg ') && out.endsWith('</svg>\n'), 'well-formed svg frame');
+});
+
+// 12 — non-finite value is a hard, named error (never a guessed color).
+check('non-finite value throws, naming the cell', () => {
+assert.throws(() => heatmap({ cells: [[0,0,0],[1,0,NaN]]}), /cell \(1,0\) value is not a finite number/);
+assert.throws(() => heatmap({ cells: [[0,0,Infinity]]}), /is not a finite number/);
+});
+
+// 13 — bad coordinates throw: negative and non-integer are both refused.
+check('negative / non-integer coordinate throws', () => {
+assert.throws(() => heatmap({ cells: [[-1,0,5]]}), /coordinate must be a non-negative integer/);
+assert.throws(() => heatmap({ cells: [[0.5,0,5]]}), /coordinate must be a non-negative integer/);
+});
+
+// 14 — a duplicate (x,y) is a hard error (no silent last-wins).
+check('duplicate cell throws', () => {
+assert.throws(() => heatmap({ cells: [[0,0,1],[0,0,2]]}), /duplicate cell at \(0,0\)/);
+});
+
+// 15 — a cell outside a pinned grid throws (no silent clipping); unknown palette throws.
+check('out-of-grid cell and unknown palette throw', () => {
+assert.throws(() => heatmap({ cells: [[3,0,1]], cols: 2}), /outside the pinned grid/);
+assert.throws(() => heatmap({ cells: [[0,0,1]], palette: 'nope'}), /unknown palette/);
+});
+
+// 16 — mutation bite (non-vacuity): a deliberately-wrong SVG (last fill bumped one bucket down)
+// MUST NOT equal the real render.
+check('mutation bite: a wrong-color SVG is rejected', () => {
+const wrong = RAMP_2x2.replace('fill="#800026"', 'fill="#e31a1c"');
+const got = heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]});
+assert.strictEqual(got, RAMP_2x2);
+assert.notStrictEqual(got, wrong);
+});
+
+console.log('\n' + passed + '/' + n + ' passed');
+if (passed!== n) process.exit(1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# Histogram-fold — a Loop MMT gift
+https://loopmmt.com/gifts/histogram-fold/
+[coverage: optional · branch: gifts]
+
+One Bucketed Histogram Over a Numeric Stream fold ← all gifts
+
+Histogram-fold
+
+histogram-fold reads a stream of numbers — one JSON number per line (JSON Lines) — and folds them in ONE PASS into a single aggregate record: a contiguous list of fixed-width buckets with a count in each, plus the total count and the observed min and max, with zero dependencies. Buckets are fixed-width by a fixed origin (--width, --origin), so a value's bucket (floor((x-origin)/width), range [lo,hi) lower-closed) never depends on the rest of the stream — that is what makes it one pass. The same numbers in any order fold to a byte-identical record (a histogram is a multiset fold). Non-finite or non-number input is a hard error, never a silent skip, and the IEEE-754 bucket boundary is a documented, pinned rule. Same stream in → byte-identical record out, in Node or a browser.
+
+The honest edge
+
+histogram-fold COUNTS values into fixed-width buckets — it is NOT density estimation (no smoothing or KDE), NOT a quantile/percentile summary (it keeps no per-value order statistics beyond min and max), and it does NOT choose data-driven ‘nice’ bin edges (that would make a value's bin depend on the whole stream and cost the one-pass property). The output is a JSON aggregate, not a chart: hand it to a plotter, a test, or a diff.
+
+Run it
+
+printf '%s\n' 1 2 2 5 | node histogram-fold.js # {bins:[{lo,hi,count}..],width,origin,count,min,max}; --width W --origin O; exit 0 ok | 2 input error
+test_histogram-fold.js (27/27: frozen hand goldens cross-checked by an independent range-membership oracle, order-independence (shuffled==base), the pinned IEEE-754 float boundary (0.3@width0.1->bin 2), numeric-honesty hard errors (Infinity/string/bad-JSON/bad-width), contiguity + exact shared edges, blank-skip + CRLF, mutation bite lower-closed vs upper-closed)
+Zero dependencies, Node or browser, deterministic
+
+The code — every file that ships
+
+histogram-fold.js 237 lines on GitHub →
+#!/usr/bin/env node
+/* histogram-fold.js — fold a JSONL numeric stream into ONE bucketed histogram.
+Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
+
+WHAT IT IS. Give it a stream of numbers — one JSON number per line (JSONL) —
+and it folds them into a single aggregate record: a contiguous list of
+fixed-width buckets with a count in each, plus the total count and the observed
+min and max. Same stream in, byte-identical record out, on every machine and
+every run. It is a FOLD, not a chart: the output is a JSON aggregate, not a
+picture — hand it to a plotter, a test, or a diff.
+
+HOW THE BUCKETS ARE DEFINED (the whole determinism story). Buckets are
+FIXED-WIDTH with a fixed origin, so a value's bucket never depends on the rest
+of the stream — which is exactly what makes the fold ONE PASS (no need to see
+every value first to learn a min/max range). For a value x:
+
+bucket index i = floor((x - origin) / width)
+bucket range [ origin + i*width, origin + (i+1)*width) (lower-closed,
+upper-open)
+
+The default origin is 0 and the default width is 1, so a bare stream of numbers
+buckets into unit integer bins. Override with --width and --origin.
+
+The output bins are CONTIGUOUS from the lowest occupied bucket to the highest,
+with any empty interior bucket carried as a count of 0 — a histogram has no
+holes. Each bin's `hi` equals the next bin's `lo` exactly, because both edges
+are computed as origin + k*width for an integer k (never lo + width, which could
+round differently). An empty stream folds to `{bins:[], count:0, min:null,
+max:null}`.
+
+NUMERIC HONESTY (the character of this gift). A fold over numbers is only
+trustworthy if it refuses to quietly mishandle a number:
+- Every line must be a FINITE JSON number. A line that is not valid JSON, is
+not a number (a string, object, bool, null), or is a number that overflows
+to +/-Infinity (e.g. 1e999, which `JSON.parse` yields as Infinity) or is NaN
+is a HARD ERROR (exit 2) naming the line — never a silent skip.
+- Counts are integers and stay integers.
+- The bucket index is `Math.floor((x - origin) / width)` in IEEE-754 double.
+This is a DELIBERATE, PINNED specification, not an accident: on a float
+boundary the double arithmetic decides the bin, so with width 0.1 the value
+0.3 lands in bin 2 ([0.2,0.3)), because (0.3 - 0) / 0.1 === 2.9999999999996
+in IEEE-754, not 3. The gift does not paper this over with an epsilon (which
+would trade one surprise for a subtler one) — it states the rule, and the
+battery pins the 0.3-with-width-0.1 case so the behavior is a documented
+invariant. For clean boundaries, use an integer or exactly-representable
+width (1, 2, 5, 10, 0.5, 0.25).
 
 USAGE
-node ini-source.js app.ini
-cat app.ini | node ini-source.js
-node ini-source.js app.ini --section-field s --key-field k --value-field v
-node ini-source.js --help
+printf '%s\n' 1 2 2 5 | node histogram-fold.js # unit integer bins
+node histogram-fold.js --width 10 nums.jsonl # width-10 buckets
+node histogram-fold.js --width 10 --origin 5 < nums.jsonl # origin at 5
+node histogram-fold.js --help
 
-Exit codes: 0 success (including an empty stream from empty input) · 2 input error
-(malformed line, illegal/empty key, empty/malformed header, DUPLICATE key in a section,
-REPEATED section header, field-name collision, empty field name, unknown option,
-unreadable file). Always a clean one-line message on stderr, never a stack trace.
+Each non-blank line is one number. Blank lines are skipped. A trailing \r
+(CRLF files) is trimmed. Output is one line of compact JSON (the aggregate
+record) followed by a newline.
 
-Released under MIT.
+Exit codes: 0 success · 2 input error (missing file, a directory, a bad
+--width/--origin, a line that is not a finite JSON number, or a bucket range so
+large it would exhaust memory). Always a clean one-line message on stderr,
+never a stack trace.
+
+Released under MIT. Its edge is printed in the README: this COUNTS values into
+fixed-width buckets. It is NOT a density estimate (no smoothing, no KDE), NOT a
+quantile/percentile summary (it keeps no per-value order statistics beyond min
+and max), and the buckets are fixed-width by a fixed origin — it does NOT choose
+"nice" bin edges from the data (that would make a value's bin depend on the
+whole stream and cost the one-pass property).
 */
 "use strict";
 
-/* ---- the pure core ------------------------------------------------ */
+var MAX_BINS = 10000000; // guard: a range/width so large it would exhaust memory
 
-var KEY_RE = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
-
-// Strip one pair of matching outer quotes from an already-trimmed value, if present.
-function stripQuotes(v) {
-if (v.length >= 2) {
-var a = v.charAt(0), b = v.charAt(v.length - 1);
-if ((a === '"' && b === '"') || (a === "'" && b === "'")) {
-return v.slice(1, v.length - 1);
+// Parse one input line into a finite number, or throw a clean, line-named Error.
+// (JSON.parse("1e999") === Infinity, so the finite check is load-bearing, not
+// redundant with the parse.)
+function parseNumber(line, lineNo) {
+var v;
+try { v = JSON.parse(line);}
+catch (e) {
+throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
 }
+if (typeof v!== "number") {
+throw new Error("line " + lineNo + " is not a number (got " +
+(v === null? "null": Array.isArray(v)? "array": typeof v) + "): " +
+JSON.stringify(line.slice(0, 40)));
+}
+if (!isFinite(v)) {
+throw new Error("line " + lineNo + " is not a finite number (" + String(v) + ")");
 }
 return v;
 }
 
-function trim(s) { return s.replace(/^\s+/, "").replace(/\s+$/, "");}
-
-// Parse INI text into an array of uniform three-field records. Throws a clean Error on any
-// malformed input — the CLI turns that into exit 2. Pure; no side effects.
-function parse(text, opts) {
+// The public fold: JSONL text + {width, origin} -> the aggregate record.
+// { bins: [ {lo, hi, count},...], // contiguous, lowest..highest occupied
+// width, origin,
+// count, // total values folded
+// min, max} // observed value extremes, null if empty
+function fold(text, opts) {
 opts = opts || {};
-var sectionField = opts.sectionField === undefined? "section": opts.sectionField;
-var keyField = opts.keyField === undefined? "key": opts.keyField;
-var valueField = opts.valueField === undefined? "value": opts.valueField;
-var globalName = opts.global === undefined? "": opts.global;
-
-if (typeof sectionField!== "string" || sectionField.length === 0) throw new Error("--section-field must be a non-empty name");
-if (typeof keyField!== "string" || keyField.length === 0) throw new Error("--key-field must be a non-empty name");
-if (typeof valueField!== "string" || valueField.length === 0) throw new Error("--value-field must be a non-empty name");
-if (sectionField === keyField || sectionField === valueField || keyField === valueField) {
-throw new Error("--section-field, --key-field and --value-field must be pairwise distinct");
+var width = opts.width === undefined? 1: opts.width;
+var origin = opts.origin === undefined? 0: opts.origin;
+if (typeof width!== "number" ||!isFinite(width) || width <= 0) {
+throw new Error("width must be a finite number greater than 0 (got " + String(width) + ")");
 }
-if (typeof globalName!== "string") throw new Error("--global must be a string");
-if (typeof text!== "string") throw new Error("input must be text");
-
-// strip a leading UTF-8 BOM on the whole document
-if (text.charAt(0) === "\uFEFF") text = text.slice(1);
-
-var out = [];
-var current = globalName;
-var seenSections = {}; // section name -> true (a section may appear once)
-var seenKeys = {}; // section name -> { key -> true} (dup key in a section)
-seenKeys[current] = {};
-
-var lines = text.split("\n");
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i];
-if (line.charAt(line.length - 1) === "\r") line = line.slice(0, line.length - 1); // CRLF==LF
-
-var t = trim(line);
-if (t.length === 0) continue; // blank line
-var c0 = t.charAt(0);
-if (c0 === ";" || c0 === "#") continue; // full-line comment
-
-// section header?
-if (c0 === "[" && t.charAt(t.length - 1) === "]") {
-var name = trim(t.slice(1, t.length - 1));
-if (name.length === 0) throw new Error("empty section header on line " + (i + 1) + ": " + JSON.stringify(line));
-if (name.indexOf("[")!== -1 || name.indexOf("]")!== -1) {
-throw new Error("malformed section header on line " + (i + 1) + " (name contains '[' or ']'): " + JSON.stringify(line));
-}
-if (seenSections[name]) throw new Error("repeated section header [" + name + "] on line " + (i + 1) + " (a section may appear only once)");
-seenSections[name] = true;
-current = name;
-if (seenKeys[current] === undefined) seenKeys[current] = {};
-continue;
+if (typeof origin!== "number" ||!isFinite(origin)) {
+throw new Error("origin must be a finite number (got " + String(origin) + ")");
 }
 
-// key = value
-var eq = line.indexOf("=");
-if (eq === -1) throw new Error("malformed line " + (i + 1) + " (not a comment, section header, or KEY=VALUE): " + JSON.stringify(line));
+var lines = String(text).split("\n");
+var counts = Object.create(null); // bucket index -> count
+var total = 0, min = null, max = null, minIdx = null, maxIdx = null;
+var i, line, x, idx;
 
-var key = trim(line.slice(0, eq));
-var value = trim(line.slice(eq + 1));
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line is not a value
 
-if (!KEY_RE.test(key)) throw new Error("illegal key on line " + (i + 1) + ": " + JSON.stringify(key) + " (keys must match [A-Za-z_][A-Za-z0-9_.-]*)");
+x = parseNumber(line, i + 1);
+idx = Math.floor((x - origin) / width); // IEEE-754; boundary behavior is pinned
 
-if (seenKeys[current][key]) {
-throw new Error("duplicate key " + JSON.stringify(key) + " in section [" + current + "] on line " + (i + 1) + " (a key may appear once per section; refusing to silently overwrite)");
-}
-seenKeys[current][key] = true;
-
-value = stripQuotes(value);
-
-var rec = {};
-rec[sectionField] = current;
-rec[keyField] = key;
-rec[valueField] = value;
-out.push(rec);
-}
-return out;
+counts[idx] = (counts[idx] || 0) + 1;
+total += 1;
+if (min === null || x < min) min = x;
+if (max === null || x > max) max = x;
+if (minIdx === null || idx < minIdx) minIdx = idx;
+if (maxIdx === null || idx > maxIdx) maxIdx = idx;
 }
 
-// Render records as JSONL text (one JSON object per line, trailing newline if any).
-function toJSONL(records) {
-var s = "";
-for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
-return s;
+var bins = [];
+if (total > 0) {
+var span = maxIdx - minIdx + 1;
+if (span > MAX_BINS) {
+throw new Error("bucket range too large (" + span + " bins > " + MAX_BINS +
+"): widen --width or narrow the input range");
+}
+for (idx = minIdx; idx <= maxIdx; idx++) {
+bins.push({
+lo: origin + idx * width,
+hi: origin + (idx + 1) * width,
+count: counts[idx] || 0
+});
+}
+}
+
+return { bins: bins, width: width, origin: origin, count: total, min: min, max: max};
 }
 
 /* ---- exports (browser + Node) ------------------------------------ */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.iniSource = { parse: parse, toJSONL: toJSONL};
+window.ForestGifts.histogramFold = fold;
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { parse: parse, toJSONL: toJSONL};
+module.exports = { fold: fold, MAX_BINS: MAX_BINS};
 }
 
 /* ---- CLI (runs only when invoked directly, never on require) ------ */
-
-function parseArgs(args) {
-var opts = {};
-var file;
-var i = 0;
-while (i < args.length) {
-var a = args[i];
-if (a === "--section-field") {
-if (args[i + 1] === undefined) throw new Error("--section-field requires a name");
-opts.sectionField = args[i + 1]; i += 2;
-} else if (a === "--key-field") {
-if (args[i + 1] === undefined) throw new Error("--key-field requires a name");
-opts.keyField = args[i + 1]; i += 2;
-} else if (a === "--value-field") {
-if (args[i + 1] === undefined) throw new Error("--value-field requires a name");
-opts.valueField = args[i + 1]; i += 2;
-} else if (a === "--global") {
-if (args[i + 1] === undefined) throw new Error("--global requires a name");
-opts.global = args[i + 1]; i += 2;
-} else if (a.charAt(0) === "-" && a!== "-") {
-throw new Error("unknown option " + a);
-} else {
-if (file!== undefined) throw new Error("only one input file may be given (got a second: " + JSON.stringify(a) + ")");
-file = a; i += 1;
-}
-}
-return { file: file, opts: opts};
+function run(text, opts) {
+return JSON.stringify(fold(text, opts)) + "\n";
 }
 
-function readAll(stream) {
-return new Promise(function (resolve, reject) {
-var chunks = [];
-stream.on("data", function (c) { chunks.push(c);});
-stream.on("end", function () { resolve(Buffer.concat(chunks).toString("utf8"));});
-stream.on("error", reject);
-});
+// Parse a numeric CLI option value; throw a clean Error on a bad value.
+function numOpt(name, raw) {
+var v = Number(raw);
+if (raw === undefined || raw === "" ||!isFinite(v)) {
+throw new Error(name + " requires a finite number (got " + JSON.stringify(raw) + ")");
 }
-
-function helpText() {
-return (
-"ini-source.js — parse INI /.gitconfig-style sectioned config into a uniform JSONL stream.\n\n" +
-" node ini-source.js app.ini\n" +
-" cat app.ini | node ini-source.js\n" +
-" node ini-source.js app.ini --section-field s --key-field k --value-field v\n" +
-" node ini-source.js --help\n\n" +
-" [FILE] INI file to parse (default: read stdin)\n" +
-" --section-field NAME field the SECTION is emitted under (default \"section\")\n" +
-" --key-field NAME field the parsed KEY is emitted under (default \"key\")\n" +
-" --value-field NAME field the parsed VALUE is emitted under (default \"value\")\n" +
-" --global NAME section name for keys before any header (default \"\")\n\n" +
-"Emits one JSON object per assignment: { section: S, key: K, value: V}, one per line.\n" +
-"Full-line; and # comments and blank lines are skipped; lines split on the first '='.\n\n" +
-"Edge: STRINGS ONLY — no type coercion, no ${VAR} interpolation, no inline comments, no\n" +
-"escapes. A duplicate key within a section, or a repeated [section], is REFUSED (exit 2) —\n" +
-"ini-source never silently overwrites. An honest, pinnable parse.\n"
-);
+return v;
 }
 
 function main(argv) {
 var args = argv.slice(2);
 if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(helpText());
-return Promise.resolve(0);
-}
-var parsed;
-try { parsed = parseArgs(args);}
-catch (e) { process.stderr.write("ini-source: " + e.message + "\n"); return Promise.resolve(2);}
-
-var getText;
-if (parsed.file!== undefined) {
-getText = new Promise(function (resolve, reject) {
-require("fs").readFile(parsed.file, "utf8", function (err, data) {
-if (err) reject(new Error("cannot read " + JSON.stringify(parsed.file) + ": " + err.code));
-else resolve(data);
-});
-});
-} else {
-getText = readAll(process.stdin);
-}
-
-return getText.then(function (text) {
-var records = parse(text, parsed.opts); // throws -> caught below
-process.stdout.write(toJSONL(records));
+process.stdout.write(
+"histogram-fold.js — fold a JSONL numeric stream into one bucketed histogram.\n\n" +
+" printf '%s\\n' 1 2 2 5 | node histogram-fold.js unit integer bins\n" +
+" node histogram-fold.js --width 10 nums.jsonl width-10 buckets\n" +
+" node histogram-fold.js --width 10 --origin 5 < in origin at 5\n" +
+" node histogram-fold.js --help\n\n" +
+"Each non-blank line is one FINITE JSON number. A value x lands in bucket\n" +
+"floor((x - origin) / width); buckets are [lo, hi) (lower-closed). Output is\n" +
+"one line of JSON: {bins:[{lo,hi,count}..], width, origin, count, min, max},\n" +
+"bins contiguous from the lowest to the highest occupied bucket.\n\n" +
+"Edge: this COUNTS into fixed-width buckets. It is NOT density estimation,\n" +
+"NOT a quantile summary, and it does NOT pick 'nice' data-driven bin edges\n" +
+"(that would cost the one-pass property). Non-finite or non-number input is\n" +
+"a hard error, never a silent skip.\n"
+);
 return 0;
-}).catch(function (e) {
-process.stderr.write("ini-source: " + e.message + "\n");
+}
+
+var opts = {};
+var files = [];
+var i;
+try {
+for (i = 0; i < args.length; i++) {
+if (args[i] === "--width") { opts.width = numOpt("--width", args[++i]);}
+else if (args[i] === "--origin") { opts.origin = numOpt("--origin", args[++i]);}
+else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
+else { files.push(args[i]);}
+}
+} catch (e) {
+process.stderr.write("histogram-fold: " + e.message + "\n");
 return 2;
+}
+
+function emit(text) {
+try { process.stdout.write(run(text, opts)); return 0;}
+catch (e) { process.stderr.write("histogram-fold: " + e.message + "\n"); return 2;}
+}
+
+if (files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(files[0], "utf8");}
+catch (e) {
+process.stderr.write("histogram-fold: cannot read " + files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
+}
+
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
 });
+return 0;
 }
 
 if (typeof require!== "undefined" && require.main === module) {
-main(process.argv).then(function (code) { process.exitCode = code;});
+process.exitCode = main(process.argv);
 }
 
-test_ini-source.js 172 lines on GitHub →
+test_histogram-fold.js 196 lines on GitHub →
 #!/usr/bin/env node
-/* test_ini-source.js — executable battery for ini-source. `node test_ini-source.js` ->
-exit 0 PASS / non-zero FAIL. Zero dependencies.
+/* test_histogram-fold.js — golden battery for the histogram-fold gift.
 
-Coverage: frozen hand goldens; a differential grid cross-checked against an
-INDEPENDENT regex-route oracle (a different parse route than the gift's indexOf-split);
-the {section,key,value} uniform + strings-only contract; custom field names + --global;
-every fail-closed throw (malformed line, illegal key, empty/malformed header, DUP key in
-a section, REPEATED section, field collision, empty field, non-string input); CRLF==LF,
-BOM strip, quote strip, first-'=' split, '#'/';' inside a value literal; determinism
-across two parses; toJSONL shape; and in-battery MUTATION TRIPWIRES (a sabotaged parse
-must go RED, so a green run is non-vacuous).
+Out-of-band and self-verifying. The oracle is TWO independent things, neither a
+copy of the gift's streaming floor-and-tally loop:
+
+(1) RANGE-MEMBERSHIP counting — for a bin [lo, hi), the count is
+values.filter(x => x >= lo && x < hi).length. This is a genuinely
+different algorithm (predicate over the whole set per bin, O(bins*n))
+than the gift's one-pass Map tally, and it uses NO floor-index math. It
+is valid where the bin edges are exact (integer widths), where
+floor-index and range-membership provably agree.
+
+(2) FROZEN hand-computed golden records, pinned by hand from the spec —
+including the deliberate IEEE-754 float-boundary case, where floor-index
+and range-membership DIVERGE (see §7). That divergence is the documented
+numeric-honesty invariant, not a bug, so the pin is checked against the
+hand golden, never against the range oracle.
+
+A planted mutation (the bite, §9) MUST be caught — if the suite passes with the
+mutation live, the suite proves nothing.
+
+Run: node test_histogram-fold.js -> exit 0 GREEN / non-zero RED
 */
 "use strict";
-var G = require("./ini-source.js");
+var hf = require("./histogram-fold.js");
 
 var pass = 0, fail = 0;
-function ok(name, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL: " + name);}}
-function eq(name, a, b) { ok(name, JSON.stringify(a) === JSON.stringify(b));}
-function throws(name, fn) {
-var threw = false;
-try { fn();} catch (e) { threw = true;}
-ok(name, threw);
+function ok(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.log(" FAIL " + name);}
+}
+function foldRec(nums, opts) { return hf.fold(nums.join("\n"), opts);}
+function J(v) { return JSON.stringify(v);}
+
+/* ---- independent range-membership oracle (no floor-index math) ------------ */
+function rangeCount(values, lo, hi) {
+var n = 0, i;
+for (i = 0; i < values.length; i++) if (values[i] >= lo && values[i] < hi) n++;
+return n;
 }
 
-/* ---- INDEPENDENT ORACLE (regex-route, from spec, shares no code with the gift) ---- */
-function oracle(text, opts) {
-opts = opts || {};
-var sf = opts.sectionField || "section", kf = opts.keyField || "key", vf = opts.valueField || "value";
-var gl = opts.global === undefined? "": opts.global;
-if (sf === kf || sf === vf || kf === vf) throw new Error("field collision");
-if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-var HDR = /^\[([^\[\]]+)\]$/, KV = /^([^=]*)=([\s\S]*)$/, KEY = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
-var out = [], cur = gl, secs = {}, keys = {}; keys[cur] = {};
-var ls = text.split("\n");
-for (var i = 0; i < ls.length; i++) {
-var line = ls[i].replace(/\r$/, "");
-var t = line.replace(/^\s+|\s+$/g, "");
-if (!t) continue;
-if (t[0] === ";" || t[0] === "#") continue;
-var hm = t.match(HDR);
-if (t[0] === "[" && t[t.length - 1] === "]") {
-if (!hm) throw new Error("bad header");
-var nm = hm[1].replace(/^\s+|\s+$/g, "");
-if (!nm) throw new Error("empty header");
-if (secs[nm]) throw new Error("repeat section");
-secs[nm] = 1; cur = nm; if (!keys[cur]) keys[cur] = {}; continue;
-}
-var m = line.match(KV);
-if (!m) throw new Error("no =");
-var k = m[1].replace(/^\s+|\s+$/g, ""), v = m[2].replace(/^\s+|\s+$/g, "");
-if (!KEY.test(k)) throw new Error("bad key");
-if (keys[cur][k]) throw new Error("dup key");
-keys[cur][k] = 1;
-if (v.length >= 2) { var a = v[0], b = v[v.length - 1]; if ((a === '"' && b === '"') || (a === "'" && b === "'")) v = v.slice(1, -1);}
-var r = {}; r[sf] = cur; r[kf] = k; r[vf] = v; out.push(r);
-}
-return out;
-}
-
-/* ---- frozen hand goldens ---- */
-eq("basic section", G.parse("[s]\na=1\nb=2\n"),
-[{section:"s",key:"a",value:"1"},{section:"s",key:"b",value:"2"}]);
-eq("two sections, same key ok",
-G.parse("[server]\nhost=a\n[client]\nhost=b\n"),
-[{section:"server",key:"host",value:"a"},{section:"client",key:"host",value:"b"}]);
-eq("global preamble -> section ''",
-G.parse("x=1\n[s]\ny=2\n"),
-[{section:"",key:"x",value:"1"},{section:"s",key:"y",value:"2"}]);
-eq("comments (; and #) + blank lines skipped",
-G.parse("; a comment\n[s]\n# another\n\nk=v\n"),
-[{section:"s",key:"k",value:"v"}]);
-eq("first-'=' split (value contains '=')",
-G.parse("[s]\nurl=a=b=c\n"), [{section:"s",key:"url",value:"a=b=c"}]);
-eq("value trim + double-quote strip",
-G.parse('[s]\nk = " hi there " \n'), [{section:"s",key:"k",value:" hi there "}]);
-eq("single-quote strip", G.parse("[s]\nk='x'\n"), [{section:"s",key:"k",value:"x"}]);
-eq("empty value", G.parse("[s]\nk=\n"), [{section:"s",key:"k",value:""}]);
-eq("'#'/';' inside a value are literal",
-G.parse("[s]\nk=a#b;c\n"), [{section:"s",key:"k",value:"a#b;c"}]);
-eq("CRLF == LF", G.parse("[s]\r\nk=v\r\n"), G.parse("[s]\nk=v\n"));
-eq("leading BOM stripped", G.parse("\uFEFF[s]\nk=v\n"), [{section:"s",key:"k",value:"v"}]);
-eq("empty input -> empty stream", G.parse(""), []);
-eq("section name trimmed", G.parse("[ srv]\nk=v\n"), [{section:"srv",key:"k",value:"v"}]);
-eq("custom fields + --global",
-G.parse("g=1\n[s]\nk=v\n", {sectionField:"S",keyField:"K",valueField:"V",global:"root"}),
-[{S:"root",K:"g",V:"1"},{S:"s",K:"k",V:"v"}]);
-
-/* ---- the honesty axis: fail-closed edges ---- */
-throws("DUP key in a section -> throw", function(){ G.parse("[s]\nk=1\nk=2\n");});
-throws("DUP key in global -> throw", function(){ G.parse("k=1\nk=2\n");});
-throws("REPEATED section header -> throw", function(){ G.parse("[s]\na=1\n[s]\nb=2\n");});
-throws("malformed line (no '=') -> throw", function(){ G.parse("[s]\nnope\n");});
-throws("unclosed header is a no-'=' line -> throw", function(){ G.parse("[s\nk=v\n");});
-throws("empty section [] -> throw", function(){ G.parse("[]\nk=v\n");});
-throws("illegal key (space) -> throw", function(){ G.parse("[s]\nbad key=v\n");});
-throws("illegal key (digit lead) -> throw", function(){ G.parse("[s]\n1k=v\n");});
-throws("empty key -> throw", function(){ G.parse("[s]\n=v\n");});
-throws("field collision -> throw", function(){ G.parse("[s]\nk=v\n", {keyField:"section"});});
-throws("empty field name -> throw", function(){ G.parse("[s]\nk=v\n", {keyField:""});});
-throws("non-string input -> throw", function(){ G.parse(42);});
-
-/* ---- strings-only contract (no coercion) ---- */
-eq("numbers stay strings", G.parse("[s]\nn=8080\nf=1e3\nb=true\n"),
-[{section:"s",key:"n",value:"8080"},{section:"s",key:"f",value:"1e3"},{section:"s",key:"b",value:"true"}]);
-eq("no ${VAR} interpolation", G.parse("[s]\nk=${HOME}\n"), [{section:"s",key:"k",value:"${HOME}"}]);
-(function(){
-var recs = G.parse("[s]\nk=v\n");
-ok("record has exactly the 3 declared fields", Object.keys(recs[0]).length === 3 &&
-"section" in recs[0] && "key" in recs[0] && "value" in recs[0]);
-})();
-
-/* ---- differential grid vs the independent oracle ---- */
-var grid = [
-"[s]\nk=v\n",
-"a=1\n[x]\nb=2\n[y]\nb=3\n",
-"[s]\nurl=http://a=b\n",
-'[s]\nk="quoted"\n',
-"; c\n[s]\nk = v \n\n",
-"\uFEFF[s]\nk=v\n",
-"[s]\r\nk=v\r\n",
-"",
+/* ---- 1. Frozen hand golden: unit bins, cross-checked by range membership -- *
+values [1,2,2,5], width 1, origin 0.
+floor: 1->1, 2->2, 2->2, 5->5; occupied 1..5; contiguous with empty 3,4. */
+(function () {
+var vals = [1, 2, 2, 5];
+var rec = foldRec(vals);
+var goldenBins = [
+{ lo: 1, hi: 2, count: 1},
+{ lo: 2, hi: 3, count: 2},
+{ lo: 3, hi: 4, count: 0},
+{ lo: 4, hi: 5, count: 0},
+{ lo: 5, hi: 6, count: 1}
 ];
-for (var gi = 0; gi < grid.length; gi++) {
-eq("grid[" + gi + "] gift==oracle", G.parse(grid[gi]), oracle(grid[gi]));
-}
-// grid with custom opts
-var o2 = {sectionField:"S",keyField:"K",valueField:"V",global:"root"};
-eq("grid custom-opts gift==oracle", G.parse("g=1\n[s]\nk=v\n", o2), oracle("g=1\n[s]\nk=v\n", o2));
-
-/* ---- determinism ---- */
-eq("two parses byte-identical",
-G.toJSONL(G.parse("[a]\nk=1\n[b]\nk=2\n")), G.toJSONL(G.parse("[a]\nk=1\n[b]\nk=2\n")));
-
-/* ---- toJSONL shape ---- */
-eq("toJSONL one object per line + trailing NL",
-G.toJSONL([{section:"s",key:"k",value:"v"}]), '{"section":"s","key":"k","value":"v"}\n');
-eq("toJSONL empty -> empty", G.toJSONL([]), "");
-
-/* ---- MUTATION TRIPWIRES: a sabotaged parse must diverge from the honest oracle ---- */
-// Mutant A: dup-key check removed (silent last-wins). Must NOT match oracle on a dup vector.
-function mutantA(text) {
-var out = [], cur = "", secs = {};
-var ls = text.split("\n");
-for (var i = 0; i < ls.length; i++) {
-var line = ls[i].replace(/\r$/, ""), t = line.replace(/^\s+|\s+$/g, "");
-if (!t || t[0] === ";" || t[0] === "#") continue;
-if (t[0] === "[" && t[t.length - 1] === "]") { cur = t.slice(1, -1).replace(/^\s+|\s+$/g, ""); continue;}
-var eq2 = line.indexOf("="); if (eq2 === -1) throw new Error("no =");
-out.push({section:cur,key:line.slice(0,eq2).replace(/^\s+|\s+$/g,""),value:line.slice(eq2+1).replace(/^\s+|\s+$/g,"")});
-}
-return out; // NO dup check
-}
-(function(){
-var dupText = "[s]\nk=1\nk=2\n";
-var honestThrew = false; try { oracle(dupText);} catch(e){ honestThrew = true;}
-var mutantDidNot = false; try { mutantA(dupText); mutantDidNot = true;} catch(e){}
-ok("mutation bite: dropping the dup-key check diverges from the honest oracle", honestThrew && mutantDidNot);
-})();
-// Mutant B: split on LAST '=' instead of first. Must diverge on a value containing '='.
-function mutantB(text) {
-var line = "k=a=b", last = line.lastIndexOf("=");
-return line.slice(last + 1); // "b" — wrong; honest first-split value is "a=b"
-}
-(function(){
-var honest = G.parse("[s]\nk=a=b\n")[0].value; // "a=b"
-ok("mutation bite: last-'=' split diverges from first-'=' honest value", honest === "a=b" && mutantB()!== honest);
+ok("unit bins == frozen hand golden", J(rec.bins) === J(goldenBins));
+ok("unit bins: count/min/max", rec.count === 4 && rec.min === 1 && rec.max === 5);
+// independent cross-check: every golden bin count == range membership count
+var allMatch = goldenBins.every(function (b) { return b.count === rangeCount(vals, b.lo, b.hi);});
+ok("unit bins == independent range-membership oracle", allMatch);
 })();
 
-/* ---- summary ---- */
-console.log((fail === 0? "PASS": "FAIL") + " — " + pass + "/" + (pass + fail));
-process.exit(fail === 0? 0: 1);
+/* ---- 2. width/origin override, cross-checked by range membership ---------- *
+values [5,12,13,27], width 10, origin 0 -> floor 0,1,1,2; occupied 0..2. */
+(function () {
+var vals = [5, 12, 13, 27], opts = { width: 10, origin: 0};
+var rec = foldRec(vals, opts);
+var golden = [
+{ lo: 0, hi: 10, count: 1},
+{ lo: 10, hi: 20, count: 2},
+{ lo: 20, hi: 30, count: 1}
+];
+ok("width-10 bins == frozen hand golden", J(rec.bins) === J(golden));
+ok("width-10 == range-membership oracle",
+golden.every(function (b) { return b.count === rangeCount(vals, b.lo, b.hi);}));
+// origin shift: same values, origin 5, width 10 -> floor((x-5)/10): 0,0,0,2
+var rec2 = foldRec(vals, { width: 10, origin: 5});
+ok("origin shift changes bucketing",
+J(rec2.bins) === J([
+{ lo: 5, hi: 15, count: 3},
+{ lo: 15, hi: 25, count: 0},
+{ lo: 25, hi: 35, count: 1}
+]));
+})();
+
+/* ---- 3. Empty stream folds to the empty record --------------------------- */
+(function () {
+var rec = foldRec([]);
+ok("empty stream -> empty record",
+J(rec) === J({ bins: [], width: 1, origin: 0, count: 0, min: null, max: null}));
+})();
+
+/* ---- 4. Order-independence: a histogram is a MULTISET fold --------------- *
+This is THE fold-lane invariant that separates histogram from an ordered fold
+(merkle): shuffle the stream and the record is byte-identical. */
+(function () {
+var base = [5, 1, 9, 2, 5, 5, 1, 8, 3, 2, 9, 1];
+var shuffled = [9, 1, 2, 5, 8, 1, 5, 3, 2, 9, 5, 1];
+var reversed = base.slice().reverse();
+ok("order-independent: shuffled == base", J(foldRec(shuffled)) === J(foldRec(base)));
+ok("order-independent: reversed == base", J(foldRec(reversed)) === J(foldRec(base)));
+})();
+
+/* ---- 5. Determinism: folds twice byte-identical -------------------------- */
+(function () {
+var vals = [1, 2, 3, 4, 5, 6, 7];
+ok("folds-twice-identical", J(foldRec(vals)) === J(foldRec(vals)));
+})();
+
+/* ---- 6. Contiguity + exact shared edges ---------------------------------- *
+No holes: empty interior buckets are carried as count 0, and bin[i].hi is
+byte-exactly bin[i+1].lo (both edges are origin + k*width, never lo+width). */
+(function () {
+var rec = foldRec([0, 30], { width: 10, origin: 0}); // occupied 0 and 3; 1,2 empty
+ok("contiguous incl. empty interior bins (count 0)",
+rec.bins.length === 4 && rec.bins[1].count === 0 && rec.bins[2].count === 0);
+var sharedEdges = true, i;
+for (i = 0; i + 1 < rec.bins.length; i++) if (rec.bins[i].hi!== rec.bins[i + 1].lo) sharedEdges = false;
+ok("adjacent bins share an exact edge (hi[i] === lo[i+1])", sharedEdges);
+})();
+
+/* ---- 7. The pinned IEEE-754 float boundary (numeric-honesty invariant) ---- *
+With width 0.1, origin 0, the value 0.3 lands in bin index 2 ([0.2,0.3)),
+because (0.3 - 0) / 0.1 === 2.9999999999999996 and floor of that is 2, NOT 3.
+This is the DOCUMENTED behavior, not a bug: the gift does not epsilon-fudge it.
+Checked against the hand golden (index 2), NOT the range oracle — range
+membership would put 0.3 in bin 3, and that divergence IS the trap being
+pinned. A single value -> a single-bin record whose lone bin is index 2. */
+(function () {
+var rec = foldRec([0.3], { width: 0.1, origin: 0});
+ok("float-boundary pin: 0.3 @ width 0.1 -> bin index 2 (lo≈0.2)",
+rec.bins.length === 1 && Math.abs(rec.bins[0].lo - 0.2) < 1e-12);
+// sanity: the arithmetic really does floor to 2 here (documents the trap)
+ok("float-boundary: floor((0.3-0)/0.1) === 2 (the IEEE-754 fact)",
+Math.floor((0.3 - 0) / 0.1) === 2);
+})();
+
+/* ---- 8. Numeric honesty: non-finite / non-number / bad JSON are hard errors */
+(function () {
+function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
+ok("1e999 (overflows to Infinity) is a hard error",
+throws(function () { hf.fold("1e999");}));
+ok("a string line is a hard error", throws(function () { hf.fold("\"12\"");}));
+ok("a null line is a hard error", throws(function () { hf.fold("null");}));
+ok("a bool line is a hard error", throws(function () { hf.fold("true");}));
+ok("an object line is a hard error", throws(function () { hf.fold("{\"v\":1}");}));
+ok("invalid JSON line is a hard error", throws(function () { hf.fold("not-a-number");}));
+ok("width <= 0 is a hard error", throws(function () { hf.fold("1\n2", { width: 0});}));
+ok("non-finite width is a hard error", throws(function () { hf.fold("1\n2", { width: Infinity});}));
+ok("non-finite origin is a hard error", throws(function () { hf.fold("1", { origin: NaN});}));
+})();
+
+/* ---- 9. Blank lines skipped, CRLF trimmed -------------------------------- */
+(function () {
+ok("blank lines skipped (not a value)", J(hf.fold("1\n\n2\n")) === J(hf.fold("1\n2")));
+ok("CRLF trimmed: \\r\\n folds like \\n", J(hf.fold("1\r\n2\r\n")) === J(hf.fold("1\n2")));
+ok("integer counts stay integers",
+hf.fold("1\n1\n1").bins[0].count === 3 && Number.isInteger(hf.fold("1\n1\n1").bins[0].count));
+})();
+
+/* ---- 10. THE MUTATION BITE (non-vacuity) --------------------------------- *
+A WRONG construction: upper-closed bins (lo, hi] via ceil-1 instead of the
+spec's lower-closed [lo, hi) via floor. On a value exactly on an integer edge
+(10, width 10, origin 0) the two disagree: floor-spec -> bin index 1 ([10,20));
+the wrong upper-closed construction -> bin index 0 ((0,10]). The gift's record
+MUST NOT match the wrong one, proving the suite would catch that regression. */
+(function () {
+function wrongFold(vals, width, origin) {
+// upper-closed (lo, hi]: index = ceil((x-origin)/width) - 1
+var counts = {}, minI = null, maxI = null;
+vals.forEach(function (x) {
+var idx = Math.ceil((x - origin) / width) - 1;
+counts[idx] = (counts[idx] || 0) + 1;
+if (minI === null || idx < minI) minI = idx;
+if (maxI === null || idx > maxI) maxI = idx;
+});
+var bins = [];
+for (var i = minI; i <= maxI; i++) bins.push({ lo: origin + i * width, hi: origin + (i + 1) * width, count: counts[i] || 0});
+return bins;
+}
+var vals = [10, 10, 5];
+var gift = foldRec(vals, { width: 10, origin: 0}).bins;
+var wrong = wrongFold(vals, 10, 0);
+ok("mutation bite: lower-closed [lo,hi)!= upper-closed (lo,hi] on an edge value",
+J(gift)!== J(wrong));
+})();
+
+/* ---- report -------------------------------------------------------------- */
+console.log("");
+if (fail === 0) {
+console.log("GREEN: " + pass + " assertions passed, 0 failed [test_histogram-fold]");
+process.exit(0);
+} else {
+console.log("RED: " + pass + " passed, " + fail + " FAILED [test_histogram-fold]");
+process.exit(1);
+}
 
 Take the whole folder →
 MIT
-Node / browser, no dependencies
+Zero dependencies, Node or browser, deterministic
 
 ---

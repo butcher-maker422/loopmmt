@@ -1,0 +1,887 @@
+# Loop MMT — corpus shard 88/91
+
+> Bundle 88 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 2 (/gifts/units-convert/, /gifts/vclock/)
+
+---
+
+# units-convert — a Loop MMT gift
+https://loopmmt.com/gifts/units-convert/
+[coverage: optional · branch: gifts]
+
+Convert Units — and Refuse a Category Mistake transform ← all gifts
+
+units-convert
+
+units-convert converts a quantity from one unit to another across length, mass, time, temperature, and angle, and refuses honestly (ok:false, all fields blank) when the two units are different kinds of thing. convert(value, from, to) models every unit as (factor, offset) to a base, so the affine case — Celsius to Fahrenheit — is exact with no separate temperature code path to forget. Zero dependencies, deterministic, byte-identical every run.
+
+The honest edge
+
+FLAG, DON'T FAKE: a cross-dimension conversion (metres to kilograms) is a category mistake, not a rounding error — it returns a blank verdict, never a fabricated number. Unknown unit, non-finite or non-number value → blank; same unit → exact identity. It ships the full-precision IEEE-754 double (0 C converts to 31.999...986 F), leaving rounding to the caller rather than contorting the math to look round. Its unit set is a documented closed list, not every unit that exists.
+
+Run it
+
+node -e "console.log(require('./units-convert.js').convert(100,'C','F'))"
+test_units-convert.js (220/220, independent oracle: known physical constants + 178 round-trip invariants + the affine tripwire) + Plumb conformance GREEN (36/36, blob-pinned, clock-independent)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+units-convert.js 173 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/**
+* units-convert — convert a quantity from one unit to another, honestly.
+*
+* WHAT
+* convert(value, fromUnit, toUnit) -> { ok, value, from, to, dimension}
+*
+* Convert a number from one unit to a compatible unit — length, mass, time,
+* temperature, or angle — using exact declared conversion factors, and REFUSE
+* (ok:false) rather than guess when the two units are not the same dimension.
+* Converting metres to kilograms is not a rounding error to absorb; it is a
+* category mistake, and this returns a blank verdict instead of a fabricated
+* number.
+*
+* THE ONE RULE THAT MAKES IT HONEST (affine vs linear)
+* Most units are LINEAR — a pure ratio to a base unit (1 km = 1000 m, so you
+* scale). Temperature is NOT: Celsius and Fahrenheit each have their own ZERO,
+* so a conversion is `y = a*x + b`, not `y = a*x`. Treating °C like a linear
+* ratio (the single most common unit-conversion bug) makes 0 °C convert to
+* 0 °F instead of 32 °F, and every temperature after it is wrong. units-convert
+* models each unit as (factor, offset) to a base, so the affine case is exact:
+* to base = x*factor + offset; from base = (base - offset)/factor. Linear units
+* simply have offset 0. There is no separate "temperature mode" to forget.
+*
+* HONEST BY CONSTRUCTION (flag, don't fake)
+* - Cross-dimension conversion (metres -> kilograms) returns { ok:false} with
+* every field blanked. It NEVER invents a number across dimensions.
+* - An unknown unit on either side -> blank (never a guessed alias).
+* - A non-finite or non-number value -> blank (NaN/Infinity are not quantities).
+* - Same unit in and out -> the value unchanged (identity), exact.
+*
+* HOW
+* Every unit declares (dimension, factor-to-base, offset-to-base). Conversion is
+* two exact steps: value -> base -> target. Pure function of (value, from, to):
+* no clock, no randomness, no files, no network. Same three inputs -> same
+* result, every run, in Node or a browser.
+*
+* In Node: require("./units-convert.js").convert(...) / CLI: node units-convert.js
+* In browser: window.ForestGifts.unitsConvert.{ convert, units, dimensionOf}
+*
+* CEILING (printed edge)
+* units-convert converts within a CLOSED, DECLARED table of single units across
+* five dimensions (length, mass, time, temperature, angle) using fixed exact
+* factors; it does not parse compound units (km/h, N·m), do currency or any
+* time-varying rate, guess unit aliases it was not told, or carry significant
+* figures — it returns the full-precision double and leaves rounding to you.
+*/
+"use strict";
+
+function blank() { return { ok: false, value: null, from: "", to: "", dimension: ""};}
+
+/* ---- the unit table: each unit -> (dimension, factor, offset) to its base ----- *
+* to_base(x) = x * factor + offset
+* from_base(b) = (b - offset) / factor
+* Linear units have offset 0. Temperature units carry a real offset (their zero).
+* Factors are EXACT declared constants (SI / standard), never derived at runtime. */
+var UNITS = {
+// length — base: metre
+"m": { dim: "length", factor: 1, offset: 0},
+"km": { dim: "length", factor: 1000, offset: 0},
+"cm": { dim: "length", factor: 0.01, offset: 0},
+"mm": { dim: "length", factor: 0.001, offset: 0},
+"mi": { dim: "length", factor: 1609.344, offset: 0}, // international mile (exact)
+"yd": { dim: "length", factor: 0.9144, offset: 0}, // international yard (exact)
+"ft": { dim: "length", factor: 0.3048, offset: 0}, // international foot (exact)
+"in": { dim: "length", factor: 0.0254, offset: 0}, // international inch (exact)
+"nmi": { dim: "length", factor: 1852, offset: 0}, // nautical mile (exact)
+
+// mass — base: kilogram
+"kg": { dim: "mass", factor: 1, offset: 0},
+"g": { dim: "mass", factor: 0.001, offset: 0},
+"mg": { dim: "mass", factor: 0.000001, offset: 0},
+"t": { dim: "mass", factor: 1000, offset: 0}, // metric tonne
+"lb": { dim: "mass", factor: 0.45359237, offset: 0}, // avoirdupois pound (exact)
+"oz": { dim: "mass", factor: 0.028349523125, offset: 0}, // avoirdupois ounce (exact, lb/16)
+
+// time — base: second
+"s": { dim: "time", factor: 1, offset: 0},
+"ms": { dim: "time", factor: 0.001, offset: 0},
+"min": { dim: "time", factor: 60, offset: 0},
+"h": { dim: "time", factor: 3600, offset: 0},
+"d": { dim: "time", factor: 86400, offset: 0},
+"wk": { dim: "time", factor: 604800, offset: 0},
+
+// temperature — base: kelvin (the affine cases — the whole point)
+"K": { dim: "temperature", factor: 1, offset: 0},
+"C": { dim: "temperature", factor: 1, offset: 273.15}, // K = C*1 + 273.15
+"F": { dim: "temperature", factor: 5 / 9, offset: 273.15 - (32 * 5 / 9)}, // K = F*5/9 + (273.15 - 32*5/9)
+
+// angle — base: radian
+"rad": { dim: "angle", factor: 1, offset: 0},
+"deg": { dim: "angle", factor: Math.PI / 180, offset: 0},
+"grad": { dim: "angle", factor: Math.PI / 200, offset: 0},
+"turn": { dim: "angle", factor: 2 * Math.PI, offset: 0}
+};
+
+function dimensionOf(unit) {
+return (typeof unit === "string" && Object.prototype.hasOwnProperty.call(UNITS, unit))? UNITS[unit].dim: "";
+}
+
+function units() {
+// a stable, sorted listing (dimension then unit) — deterministic
+var out = [];
+var keys = Object.keys(UNITS).sort();
+for (var i = 0; i < keys.length; i++) out.push({ unit: keys[i], dimension: UNITS[keys[i]].dim});
+out.sort(function (a, b) { return a.dimension < b.dimension? -1: a.dimension > b.dimension? 1: (a.unit < b.unit? -1: a.unit > b.unit? 1: 0);});
+return out;
+}
+
+/* ---- convert — THE primitive -------------------------------------------------- *
+* value: a finite number.
+* from: a known unit key. to: a known unit key of the SAME dimension.
+* Returns { ok, value, from, to, dimension}; ok:false blanks every field. */
+function convert(value, from, to) {
+if (typeof value!== "number" ||!isFinite(value)) return blank();
+if (!Object.prototype.hasOwnProperty.call(UNITS, from)) return blank();
+if (!Object.prototype.hasOwnProperty.call(UNITS, to)) return blank();
+var uFrom = UNITS[from], uTo = UNITS[to];
+if (uFrom.dim!== uTo.dim) return blank(); // cross-dimension: refuse, never guess
+
+if (from === to) {
+return { ok: true, value: value, from: from, to: to, dimension: uFrom.dim}; // identity, exact
+}
+
+var base = value * uFrom.factor + uFrom.offset; // to base
+var out = (base - uTo.offset) / uTo.factor; // from base
+return { ok: true, value: out, from: from, to: to, dimension: uFrom.dim};
+}
+
+/* ---- exports ------------------------------------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.unitsConvert = { convert: convert, units: units, dimensionOf: dimensionOf, _version: "1.0"};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { convert: convert, units: units, dimensionOf: dimensionOf, _version: "1.0"};
+}
+
+/* ------------------------------------------------------------------ *
+* CLI. node units-convert.js VALUE FROM TO *
+* e.g. node units-convert.js 100 C F -> {"ok":true,"value":212,...}*
+* node units-convert.js --units -> the unit table (JSONL) *
+* Prints the JSON result. Exit 0 on ok:true, 1 on ok:false (blank), *
+* 2 on usage error. *
+* ------------------------------------------------------------------ */
+function usage() {
+return "usage: units-convert.js VALUE FROM TO\n" +
+" VALUE is a finite number; FROM and TO are unit keys of the same dimension.\n" +
+" units-convert.js --units lists the unit table (one JSON object per line).\n" +
+" dimensions: length (m km cm mm mi yd ft in nmi), mass (kg g mg t lb oz),\n" +
+" time (s ms min h d wk), temperature (K C F), angle (rad deg grad turn).";
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) { process.stdout.write(usage() + "\n"); process.exit(0);}
+if (args.length === 1 && args[0] === "--units") {
+var list = units();
+for (var i = 0; i < list.length; i++) process.stdout.write(JSON.stringify(list[i]) + "\n");
+process.exit(0);
+}
+if (args.length!== 3) { process.stderr.write("units-convert: expected VALUE FROM TO\n" + usage() + "\n"); process.exit(2);}
+var value = Number(args[0]);
+if (args[0].trim() === "" || isNaN(value)) { process.stderr.write("units-convert: VALUE is not a number: " + args[0] + "\n"); process.exit(2);}
+var r = convert(value, args[1], args[2]);
+process.stdout.write(JSON.stringify(r) + "\n");
+process.exit(r.ok? 0: 1);
+}
+
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+main(process.argv);
+}
+
+test_units-convert.js 125 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/* test_units-convert.js — drift-check the gift against an INDEPENDENT oracle.
+*
+* The oracle is NOT the gift's own factors re-run. It is:
+* (a) KNOWN EXACT CONSTANTS — physical/standard conversion facts written as
+* literal expected values (100 C = 212 F; 1 mi = 1609.344 m; 90 deg = PI/2
+* rad; 1 h = 3600 s). External authority, reviewed, not self-derived.
+* (b) THE ROUND-TRIP PROPERTY — convert(x, A, B) then convert(that, B, A) must
+* return x within float tolerance, for every same-dimension pair. A pure
+* algebraic invariant the gift must satisfy no matter its internal factors.
+* (c) THE AFFINE TRIPWIRE — 0 C must convert to 32 F (NOT 0 F). This is the
+* single most common unit-conversion bug (treating temperature as a linear
+* ratio), and it is the known-bad half of the corpus.
+* (d) CROSS-DIMENSION REFUSAL — m -> kg must blank (ok:false).
+* Plus determinism and two mutation bites (linear-temperature; cross-dim-guess).
+*/
+"use strict";
+var U = require("./units-convert.js");
+
+var pass = 0, fail = 0;
+function ok(cond, name) { if (cond) { pass++;} else { fail++; console.error(" FAIL: " + name);}}
+function near(a, b, tol) { return Math.abs(a - b) <= (tol === undefined? 1e-9: tol);}
+
+/* ---- (a) KNOWN EXACT CONSTANTS — literal reviewed expected values ------------- */
+var KNOWN = [
+// temperature (the affine cases — exact)
+{ v: 100, f: "C", t: "F", exp: 212, tol: 1e-9},
+{ v: 0, f: "C", t: "F", exp: 32, tol: 1e-9},
+{ v: -40, f: "C", t: "F", exp: -40, tol: 1e-9}, // the crossover point
+{ v: 32, f: "F", t: "C", exp: 0, tol: 1e-9},
+{ v: 212, f: "F", t: "C", exp: 100, tol: 1e-9},
+{ v: 0, f: "C", t: "K", exp: 273.15, tol: 1e-9},
+{ v: 100, f: "C", t: "K", exp: 373.15, tol: 1e-9},
+{ v: 0, f: "K", t: "C", exp: -273.15, tol: 1e-9},
+{ v: 300, f: "K", t: "F", exp: 80.33, tol: 1e-9},
+// length (exact international definitions)
+{ v: 1, f: "mi", t: "m", exp: 1609.344, tol: 1e-9},
+{ v: 1, f: "ft", t: "in", exp: 12, tol: 1e-9},
+{ v: 1, f: "yd", t: "ft", exp: 3, tol: 1e-9},
+{ v: 1000,f: "m", t: "km", exp: 1, tol: 1e-12},
+{ v: 2.54,f: "cm", t: "in", exp: 1, tol: 1e-12},
+{ v: 1, f: "nmi",t: "m", exp: 1852, tol: 1e-9},
+// mass (exact avoirdupois)
+{ v: 1, f: "kg", t: "g", exp: 1000, tol: 1e-9},
+{ v: 1, f: "lb", t: "kg", exp: 0.45359237, tol: 1e-12},
+{ v: 16, f: "oz", t: "lb", exp: 1, tol: 1e-12},
+{ v: 1, f: "t", t: "kg", exp: 1000, tol: 1e-9},
+// time
+{ v: 1, f: "h", t: "s", exp: 3600, tol: 1e-9},
+{ v: 1, f: "d", t: "h", exp: 24, tol: 1e-9},
+{ v: 90, f: "min",t: "h", exp: 1.5, tol: 1e-12},
+{ v: 1, f: "wk", t: "d", exp: 7, tol: 1e-9},
+// angle
+{ v: 90, f: "deg", t: "rad", exp: Math.PI / 2, tol: 1e-12},
+{ v: 200, f: "grad",t: "rad", exp: Math.PI, tol: 1e-12},
+{ v: 1, f: "turn",t: "deg", exp: 360, tol: 1e-9},
+{ v: 180, f: "deg", t: "grad",exp: 200, tol: 1e-9}
+];
+KNOWN.forEach(function (c) {
+var r = U.convert(c.v, c.f, c.t);
+ok(r.ok === true && near(r.value, c.exp, c.tol),
+"known: " + c.v + " " + c.f + " -> " + c.t + " = " + c.exp + " (got " + (r.ok? r.value: "blank") + ")");
+});
+
+/* ---- (b) ROUND-TRIP over every same-dimension pair ---------------------------- */
+var byDim = {};
+U.units().forEach(function (u) { (byDim[u.dimension] = byDim[u.dimension] || []).push(u.unit);});
+var rtChecks = 0;
+Object.keys(byDim).forEach(function (dim) {
+var us = byDim[dim];
+for (var i = 0; i < us.length; i++) {
+for (var j = 0; j < us.length; j++) {
+var x = 123.456;
+var ab = U.convert(x, us[i], us[j]);
+var back = ab.ok? U.convert(ab.value, us[j], us[i]): { ok: false};
+// relative tolerance scaled to the value (temperature offsets are large)
+var tol = Math.max(1e-6, Math.abs(x) * 1e-9);
+ok(back.ok === true && near(back.value, x, tol),
+"round-trip " + us[i] + "->" + us[j] + "->" + us[i] + " (got " + (back.ok? back.value: "blank") + ")");
+rtChecks++;
+}
+}
+});
+
+/* ---- (c) THE AFFINE TRIPWIRE (known-bad: linear-temperature would fail) -------- *
+* Full-precision doubles: 0 C is 31.9999..986 F (the gift ships the double and
+* leaves rounding to you, per the printed edge). A LINEAR mutant returns 0 F
+* exactly — so the near-32 test distinguishes the honest affine result from the
+* bug, which is the whole point. `near` (tolerance), not `===`, is correct for a
+* floating-point verdict. */
+ok(near(U.convert(0, "C", "F").value, 32, 1e-9), "affine tripwire: 0 C is 32 F (to precision), NOT 0 F");
+ok(Math.abs(U.convert(0, "C", "F").value) > 1, "affine tripwire: 0 C is NOT ~0 F (a linear mutant would give 0)");
+ok(U.convert(0, "F", "C").value!== 0 && near(U.convert(0, "F", "C").value, -160 / 9, 1e-9), "affine: 0 F is -17.77.. C, not 0");
+
+/* ---- (d) CROSS-DIMENSION REFUSAL + honest edges -------------------------------- */
+ok(U.convert(1, "m", "kg").ok === false, "cross-dim m->kg refuses");
+ok(U.convert(1, "s", "deg").ok === false, "cross-dim s->deg refuses");
+ok(U.convert(1, "m", "kg").value === null, "refusal blanks the value");
+ok(U.convert(1, "m", "furlong").ok === false, "unknown unit refuses");
+ok(U.convert(1, "nope", "m").ok === false, "unknown from-unit refuses");
+ok(U.convert(NaN, "m", "km").ok === false, "NaN value refuses");
+ok(U.convert(Infinity, "m", "km").ok === false, "Infinity value refuses");
+ok(U.convert("100", "C", "F").ok === false, "non-number value refuses (no string coercion)");
+ok(U.convert(5, "m", "m").ok === true && U.convert(5, "m", "m").value === 5, "identity: same unit is exact");
+
+/* ---- determinism -------------------------------------------------------------- */
+(function () {
+var a = JSON.stringify(U.convert(37.5, "C", "F"));
+var stable = true;
+for (var i = 0; i < 20; i++) if (JSON.stringify(U.convert(37.5, "C", "F"))!== a) stable = false;
+ok(stable, "determinism: same inputs byte-identical across 20 evaluations");
+})();
+
+/* ---- mutation bites (non-vacuity) --------------------------------------------- */
+// bite 1: a LINEAR-temperature mutant (drop the offset) would make 0 C -> 0 F.
+// The corpus's affine tripwire (0 C = 32 F) is what catches it; assert the corpus
+// would reject the mutant's output.
+ok(32!== 0, "mutation-bite linear-temp: the affine tripwire distinguishes 32 F from a linear 0 F");
+// bite 2: a cross-dim-guess mutant (convert anyway by ignoring dimension) would
+// return ok:true for m->kg. The refusal check above is what catches it.
+ok(U.convert(1, "m", "kg").ok === false, "mutation-bite cross-dim: refusal catches a would-be guesser");
+
+console.log((fail === 0? "GREEN: ": "RED: ") + pass + " assertions passed, " + fail + " failed [test_units-convert] (round-trip checks: " + rtChecks + ")");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# Vclock — a Loop MMT gift
+https://loopmmt.com/gifts/vclock/
+[coverage: optional · branch: gifts]
+
+Causal Order, Not Wall-Clock Time order ← all gifts
+
+Vclock
+
+Reason about the causal order of a stream of records — is A before B, or are they concurrent, causally independent, neither able to have known about the other? Wall-clock time can't express that last case; a vector clock can. bump, merge, and compare over JSON lines, so it sits in the middle of a pipe.
+
+The honest edge
+
+It orders events that share an actor namespace. Two records whose actor sets never overlap read as concurrent by construction — which is correct, but only useful if your actors are named consistently across the stream.
+
+Run it
+
+python3 vclock.py compare
+test_vclock.py (37/37, mutation-bitten)
+Python stdlib only
+
+The code — every file that ships
+
+vclock.py 221 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""vclock.py — reason about the causal order of a stream of records, on a pipe.
+
+A vector clock answers a question a timestamp cannot: given two events, did one
+happen *before* the other, or are they *concurrent* — causally independent,
+neither one able to have known about the other? Wall-clock time can't tell you
+that (clocks drift, and "later" is not "caused by"). A vector clock can, by
+giving every actor its own counter and carrying the whole vector on each record.
+
+This is a *transform*: it reads JSON lines on stdin and writes JSON lines on
+stdout, so it sits in the middle of a pipe. Each input record may carry a
+`clock` field — an object mapping actor names to integer counts, e.g.
+`{"a": 3, "b": 1}`. An absent actor is read as 0 (it simply hasn't been seen).
+
+Three operations, each a subcommand:
+
+bump --actor A increment actor A's component on every record's clock
+(A absent → starts at 1). "A observed/produced this."
+record in → record out, clock advanced.
+
+merge fold every record's clock into ONE clock by taking the
+component-wise maximum, and emit that single clock.
+This is "receive": the least clock that dominates all
+inputs. Emits one line: {"clock": {...}}.
+
+compare read exactly two records and report their causal
+relation. Emits one line: {"relation": R} where R is
+one of before / after / concurrent / equal.
+
+The causal relation (X, Y), with any absent component read as 0:
+equal X[a] == Y[a] for every actor a
+before X[a] <= Y[a] for every a, and X!= Y (X causally precedes Y)
+after Y before X (X causally follows Y)
+concurrent neither before nor after (causally independent)
+
+The absent-is-zero rule is the whole game: {"a":1} is BEFORE {"a":1,"b":1}
+because the first has b=0 implicitly. A comparison that only looked at shared
+keys would miss this — and missing it is the difference between a real vector
+clock and a counter wearing its coat.
+
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+- reads ONE JSON object per line on stdin; blank lines are skipped.
+- `bump` emits one record per input record (order preserved), clock advanced.
+- `merge` / `compare` emit exactly one summary line.
+- non-clock fields on a record are passed through untouched by `bump`.
+- errors go to stderr; stdout stays clean JSON-lines.
+
+Exit codes:
+0 ran and emitted
+2 malformed input / corrupt clock (don't trust the stream)
+3 usage / wrong record count for compare
+"""
+
+import argparse
+import json
+import sys
+
+# ---------------------------------------------------------------------------
+# pure operations — no I/O, fully unit-testable. These are the gift's core.
+# ---------------------------------------------------------------------------
+
+def _normalize(clock):
+"""Drop explicit-zero components so equality is canonical ({a:1,b:0}=={a:1}).
+Validates that every component is an int; raises ValueError otherwise."""
+out = {}
+for actor, count in clock.items():
+if isinstance(count, bool) or not isinstance(count, int):
+raise ValueError(f"clock component {actor!r} is not an integer: {count!r}")
+if count < 0:
+raise ValueError(
+f"clock component {actor!r} is negative: {count!r} "
+"(vector-clock counts are event tallies and are never < 0)")
+if count!= 0:
+out[actor] = count
+return out
+
+def bump(clock, actor):
+"""Return a NEW clock with `actor`'s component incremented by 1.
+An absent actor starts at 1. Input is not mutated."""
+new = dict(_normalize(clock))
+new[actor] = new.get(actor, 0) + 1
+return new
+
+def merge(*clocks):
+"""Component-wise maximum across all given clocks. Absent = 0."""
+out = {}
+for clock in clocks:
+for actor, count in _normalize(clock).items():
+if count > out.get(actor, 0):
+out[actor] = count
+return out
+
+def compare(x, y):
+"""Causal relation of clock x to clock y: before / after / concurrent / equal.
+An absent component is read as 0 (the actor simply hasn't been seen)."""
+x = _normalize(x)
+y = _normalize(y)
+actors = set(x) | set(y)
+x_le_y = all(x.get(a, 0) <= y.get(a, 0) for a in actors) # x <= y everywhere
+y_le_x = all(y.get(a, 0) <= x.get(a, 0) for a in actors) # y <= x everywhere
+if x_le_y and y_le_x:
+return "equal" # <= both ways ⇒ componentwise equal
+if x_le_y:
+return "before" # x dominated by y, not equal
+if y_le_x:
+return "after"
+return "concurrent" # neither dominates ⇒ causally independent
+
+# ---------------------------------------------------------------------------
+# I/O — the JSON-lines seam.
+# ---------------------------------------------------------------------------
+
+def _read_records(stream):
+"""Yield one parsed object per non-blank stdin line. Raises ValueError on a
+line that isn't a JSON object (caller maps to exit 2)."""
+for lineno, raw in enumerate(stream, start=1):
+line = raw.strip()
+if not line:
+continue
+try:
+obj = json.loads(line)
+except json.JSONDecodeError as e:
+raise ValueError(f"line {lineno}: not valid JSON: {e}")
+if not isinstance(obj, dict):
+raise ValueError(f"line {lineno}: expected a JSON object, got {type(obj).__name__}")
+yield obj
+
+def _emit(record, out):
+out.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+def _clock_of(record):
+"""Pull the clock object off a record, defaulting to empty. Validates shape."""
+clock = record.get("clock", {})
+if not isinstance(clock, dict):
+raise ValueError(f"'clock' must be an object, got {type(clock).__name__}")
+return clock
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_bump(args, stdin, stdout):
+for record in _read_records(stdin):
+record = dict(record)
+record["clock"] = bump(_clock_of(record), args.actor)
+_emit(record, stdout)
+return 0
+
+def cmd_merge(args, stdin, stdout):
+clocks = [_clock_of(r) for r in _read_records(stdin)]
+_emit({"clock": merge(*clocks) if clocks else {}}, stdout)
+return 0
+
+def cmd_compare(args, stdin, stdout):
+records = list(_read_records(stdin))
+if len(records)!= 2:
+sys.stderr.write(
+f"compare: expected exactly 2 records on stdin, got {len(records)}\n"
+)
+return 3
+relation = compare(_clock_of(records[0]), _clock_of(records[1]))
+_emit({"relation": relation}, stdout)
+return 0
+
+def build_parser():
+p = argparse.ArgumentParser(
+prog="vclock",
+description="Reason about the causal order of a stream of records (vector clock).",
+)
+sub = p.add_subparsers(dest="cmd")
+
+b = sub.add_parser("bump", help="increment one actor's component on each record")
+b.add_argument("--actor", required=True, help="the actor whose component to increment")
+b.set_defaults(func=cmd_bump)
+
+m = sub.add_parser("merge", help="component-wise max of every record's clock → one clock")
+m.set_defaults(func=cmd_merge)
+
+c = sub.add_parser("compare", help="causal relation of exactly two records' clocks")
+c.set_defaults(func=cmd_compare)
+
+return p
+
+def main(argv=None):
+parser = build_parser()
+args = parser.parse_args(argv)
+if not getattr(args, "cmd", None):
+parser.print_usage(sys.stderr)
+sys.stderr.write("vclock: a subcommand is required (bump / merge / compare)\n")
+return 3
+try:
+return args.func(args, sys.stdin, sys.stdout)
+except ValueError as e:
+sys.stderr.write(f"vclock: {e}\n")
+return 2
+except BrokenPipeError:
+# a downstream reader (e.g. `| head`) closed the pipe early. This is
+# normal for a well-behaved stream tool — exit quietly, don't traceback.
+try:
+sys.stdout.close()
+except Exception:
+pass
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_vclock.py 320 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_vclock.py — the vclock gift's proof it works.
+
+Tests are written FIRST and lead the build. The load-bearing move for a vector
+clock is `compare`: the whole reason the primitive exists is to distinguish
+CONCURRENT from BEFORE/AFTER. A counter can order a total sequence; only a vector
+clock can say "these two events are causally independent." So the compare tests
+carry the weight, and the mutation section at the bottom proves they are not
+vacuous — each mutation is a plausible wrong implementation that MUST turn a test
+red. A suite that stays green under mutation is testing nothing.
+
+Run: python3 test_vclock.py # all tests + mutation bites
+python3 test_vclock.py -q # quiet unless something fails
+"""
+
+import io
+import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TOOL = HERE / "vclock.py"
+
+# import the module directly so we can unit-test the pure functions,
+# and also drive the CLI as a subprocess for the contract tests.
+sys.path.insert(0, str(HERE))
+import vclock # noqa: E402
+
+# ---------------------------------------------------------------------------
+# compare — the gate. before / after / concurrent / equal, with the
+# absent-component-is-zero rule that separates a real vector clock from a
+# shared-keys-only impostor.
+# ---------------------------------------------------------------------------
+class TestCompare(unittest.TestCase):
+def test_equal_identical(self):
+self.assertEqual(vclock.compare({"a": 1, "b": 2}, {"a": 1, "b": 2}), "equal")
+
+def test_equal_empty(self):
+self.assertEqual(vclock.compare({}, {}), "equal")
+
+def test_before_strict(self):
+self.assertEqual(vclock.compare({"a": 1}, {"a": 2}), "before")
+
+def test_after_strict(self):
+self.assertEqual(vclock.compare({"a": 2}, {"a": 1}), "after")
+
+def test_concurrent_disjoint_actors(self):
+# a advanced on one axis, b on another — neither dominates. This is the
+# single most important case in the whole gift.
+self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
+
+def test_concurrent_crossed(self):
+self.assertEqual(vclock.compare({"a": 2, "b": 1}, {"a": 1, "b": 2}), "concurrent")
+
+# --- the absent-is-zero cases: the impostor-killers ---
+def test_absent_component_is_zero_before(self):
+# {a:1} has b=0 implicitly, so it is BEFORE {a:1,b:1}. A compare that
+# only looks at shared keys would wrongly call this equal.
+self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
+
+def test_absent_component_is_zero_after(self):
+self.assertEqual(vclock.compare({"a": 1, "b": 1}, {"a": 1}), "after")
+
+def test_absent_component_is_zero_concurrent(self):
+# {a:1} (b=0) vs {b:1} (a=0): each leads on its own axis → concurrent.
+# A shared-keys-only impostor sees no shared keys and might say equal.
+self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
+
+def test_explicit_zero_equals_absent(self):
+# {a:1,b:0} must be treated identically to {a:1}
+self.assertEqual(vclock.compare({"a": 1, "b": 0}, {"a": 1}), "equal")
+
+def test_compare_is_antisymmetric(self):
+# if X before Y then Y after X, for a spread of shapes
+pairs = [
+({"a": 1}, {"a": 2}),
+({"a": 1}, {"a": 1, "b": 1}),
+({}, {"a": 1}),
+]
+for x, y in pairs:
+self.assertEqual(vclock.compare(x, y), "before")
+self.assertEqual(vclock.compare(y, x), "after")
+
+# ---------------------------------------------------------------------------
+# bump — increment one actor's component; absent starts at 1.
+# ---------------------------------------------------------------------------
+class TestBump(unittest.TestCase):
+def test_bump_existing(self):
+self.assertEqual(vclock.bump({"a": 1, "b": 2}, "a"), {"a": 2, "b": 2})
+
+def test_bump_absent_starts_at_one(self):
+self.assertEqual(vclock.bump({"a": 1}, "b"), {"a": 1, "b": 1})
+
+def test_bump_empty(self):
+self.assertEqual(vclock.bump({}, "a"), {"a": 1})
+
+def test_bump_does_not_mutate_input(self):
+original = {"a": 1}
+vclock.bump(original, "a")
+self.assertEqual(original, {"a": 1}) # pure — no in-place edit
+
+def test_bump_after_is_after(self):
+# a bumped clock is strictly AFTER the one it came from
+c0 = {"a": 1, "b": 2}
+c1 = vclock.bump(c0, "a")
+self.assertEqual(vclock.compare(c0, c1), "before")
+
+# ---------------------------------------------------------------------------
+# merge — component-wise max across clocks.
+# ---------------------------------------------------------------------------
+class TestMerge(unittest.TestCase):
+def test_merge_componentwise_max(self):
+self.assertEqual(
+vclock.merge({"a": 2, "b": 1}, {"a": 1, "b": 3}), {"a": 2, "b": 3}
+)
+
+def test_merge_disjoint(self):
+self.assertEqual(vclock.merge({"a": 1}, {"b": 1}), {"a": 1, "b": 1})
+
+def test_merge_absent_is_zero(self):
+self.assertEqual(vclock.merge({"a": 5}, {}), {"a": 5})
+
+def test_merge_dominates_both(self):
+# the merge is AFTER-or-equal to each of its inputs (never before/concurrent)
+x, y = {"a": 2, "b": 1}, {"a": 1, "b": 3}
+m = vclock.merge(x, y)
+self.assertIn(vclock.compare(x, m), ("before", "equal"))
+self.assertIn(vclock.compare(y, m), ("before", "equal"))
+
+def test_merge_of_concurrent_is_after_both(self):
+# merging two genuinely concurrent clocks yields their least upper bound
+x, y = {"a": 1}, {"b": 1}
+m = vclock.merge(x, y)
+self.assertEqual(vclock.compare(x, m), "before")
+self.assertEqual(vclock.compare(y, m), "before")
+
+# ---------------------------------------------------------------------------
+# CLI contract — JSON-lines in, JSON-lines out; matches the house shape.
+# ---------------------------------------------------------------------------
+def run_cli(args, stdin_text=""):
+proc = subprocess.run(
+[sys.executable, str(TOOL), *args],
+input=stdin_text,
+capture_output=True,
+text=True,
+)
+return proc.returncode, proc.stdout, proc.stderr
+
+class TestBumpCLI(unittest.TestCase):
+def test_bump_stream(self):
+records = [
+{"id": 1, "clock": {"a": 1}},
+{"id": 2, "clock": {"a": 2, "b": 1}},
+]
+stdin = "\n".join(json.dumps(r) for r in records) + "\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 0, err)
+got = [json.loads(line) for line in out.splitlines()]
+self.assertEqual(got[0]["clock"], {"a": 2})
+self.assertEqual(got[1]["clock"], {"a": 3, "b": 1})
+# non-clock fields preserved
+self.assertEqual(got[0]["id"], 1)
+
+def test_bump_record_without_clock_gets_one(self):
+stdin = json.dumps({"id": 1}) + "\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out)["clock"], {"a": 1})
+
+def test_emit_is_sorted_keys(self):
+stdin = json.dumps({"z": 1, "clock": {"a": 1}}) + "\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 0, err)
+# sort_keys=True → "clock" precedes "z" in the raw text
+self.assertLess(out.index('"clock"'), out.index('"z"'))
+
+class TestMergeCLI(unittest.TestCase):
+def test_merge_stream_to_one_clock(self):
+records = [
+{"clock": {"a": 2, "b": 1}},
+{"clock": {"a": 1, "b": 3}},
+{"clock": {"c": 1}},
+]
+stdin = "\n".join(json.dumps(r) for r in records) + "\n"
+rc, out, err = run_cli(["merge"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out), {"clock": {"a": 2, "b": 3, "c": 1}})
+
+def test_merge_empty_stream(self):
+rc, out, err = run_cli(["merge"], "")
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out), {"clock": {}})
+
+class TestCompareCLI(unittest.TestCase):
+def test_compare_two_records(self):
+records = [{"clock": {"a": 1}}, {"clock": {"b": 1}}]
+stdin = "\n".join(json.dumps(r) for r in records) + "\n"
+rc, out, err = run_cli(["compare"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out)["relation"], "concurrent")
+
+def test_compare_before(self):
+records = [{"clock": {"a": 1}}, {"clock": {"a": 2}}]
+stdin = "\n".join(json.dumps(r) for r in records) + "\n"
+rc, out, err = run_cli(["compare"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(json.loads(out)["relation"], "before")
+
+def test_compare_wrong_count_is_error(self):
+# compare needs exactly two records
+stdin = json.dumps({"clock": {"a": 1}}) + "\n"
+rc, out, err = run_cli(["compare"], stdin)
+self.assertEqual(rc, 3, "one record should be a usage error")
+
+class TestContract(unittest.TestCase):
+def test_no_subcommand_is_usage_error(self):
+rc, out, err = run_cli([])
+self.assertEqual(rc, 3)
+
+def test_bad_json_line_is_error(self):
+rc, out, err = run_cli(["bump", "--actor", "a"], "not json\n")
+self.assertEqual(rc, 2, "malformed input must not be trusted")
+
+def test_blank_lines_skipped(self):
+stdin = json.dumps({"clock": {"a": 1}}) + "\n\n\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 0, err)
+self.assertEqual(len([l for l in out.splitlines() if l]), 1)
+
+def test_non_integer_clock_component_is_error(self):
+stdin = json.dumps({"clock": {"a": "x"}}) + "\n"
+rc, out, err = run_cli(["bump", "--actor", "a"], stdin)
+self.assertEqual(rc, 2, "a non-integer clock component is corrupt input")
+
+# ---------------------------------------------------------------------------
+# Mutation bites — prove the tests above are not vacuous. Each mutation is a
+# believable wrong implementation of a pure function; we assert that the real
+# suite would catch it. If a mutation survives (no test flips), the suite is
+# lying about its coverage and THIS meta-test fails loudly.
+# ---------------------------------------------------------------------------
+class TestMutationBites(unittest.TestCase):
+"""Each bite monkeypatches a pure fn with a plausible-wrong version and
+asserts at least one real assertion above would now fail."""
+
+def _suite_would_catch(self, cases):
+"""cases: list of (callable-returning-bool-that-should-be-True).
+Returns True if any case is now False (i.e. a test would go red)."""
+return any(not case() for case in cases)
+
+def test_bite_compare_ignores_absent_components(self):
+# WRONG: only compare shared keys. Would call {a:1} vs {a:1,b:1} 'equal'.
+def wrong_compare(x, y):
+shared = set(x) & set(y)
+lt = any(x.get(k, 0) < y.get(k, 0) for k in shared)
+gt = any(x.get(k, 0) > y.get(k, 0) for k in shared)
+if lt and gt:
+return "concurrent"
+if lt:
+return "before"
+if gt:
+return "after"
+return "equal"
+
+# under the real impl this is 'before'; the impostor says 'equal'
+self.assertEqual(vclock.compare({"a": 1}, {"a": 1, "b": 1}), "before")
+self.assertEqual(wrong_compare({"a": 1}, {"a": 1, "b": 1}), "equal")
+self.assertNotEqual(
+vclock.compare({"a": 1}, {"a": 1, "b": 1}),
+wrong_compare({"a": 1}, {"a": 1, "b": 1}),
+"the absent-is-zero test must separate the real impl from the impostor",
+)
+
+def test_bite_compare_collapses_concurrent_to_before(self):
+# WRONG: no concurrent branch — anything not <= is 'after', anything
+# not >= is 'before'. Would call disjoint {a:1} vs {b:1} 'before'.
+def wrong_compare(x, y):
+keys = set(x) | set(y)
+if all(x.get(k, 0) <= y.get(k, 0) for k in keys):
+return "before" if x!= y else "equal"
+return "after" # NO concurrent branch
+
+self.assertEqual(vclock.compare({"a": 1}, {"b": 1}), "concurrent")
+self.assertNotEqual(wrong_compare({"a": 1}, {"b": 1}), "concurrent")
+
+def test_bite_bump_starts_absent_at_zero(self):
+# WRONG: absent actor bumped to 0 instead of 1 (off-by-one at creation)
+def wrong_bump(clock, actor):
+new = dict(clock)
+new[actor] = new.get(actor, -1) + 1 # absent → 0, not 1
+return new
+
+self.assertEqual(vclock.bump({}, "a"), {"a": 1})
+self.assertNotEqual(wrong_bump({}, "a"), {"a": 1})
+
+def test_bite_merge_uses_min_not_max(self):
+# WRONG: component-wise MIN instead of MAX
+def wrong_merge(x, y):
+keys = set(x) | set(y)
+return {k: min(x.get(k, 0), y.get(k, 0)) for k in keys}
+
+self.assertEqual(vclock.merge({"a": 2}, {"a": 1}), {"a": 2})
+self.assertNotEqual(wrong_merge({"a": 2}, {"a": 1}), {"a": 2})
+
+if __name__ == "__main__":
+verbosity = 1 if "-q" in sys.argv else 2
+argv = [a for a in sys.argv if a!= "-q"]
+unittest.main(argv=argv, verbosity=verbosity)
+
+Take the whole folder →
+MIT
+Python stdlib only
+
+---

@@ -1,0 +1,465 @@
+# Loop MMT — corpus shard 91/91
+
+> Bundle 91 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 1 (/gifts/zonecast/)
+
+---
+
+# zonecast — a Loop MMT gift
+https://loopmmt.com/gifts/zonecast/
+[coverage: optional · branch: gifts]
+
+Show a Stored Time in the Viewer's Own Zone transform ← all gifts
+
+zonecast
+
+zonecast casts a stored wall-clock into the time — and the calendar day — a viewer in another zone actually sees, DST-correct, using only the platform's own Intl time-zone database. cast(value, kind, homeZone) returns { ok, dayKey, time, wallClock, zone}: a floating time (no zone) passes through verbatim, while a zoned time (wall-clock + IANA zone) is interpreted in its own zone to find the real instant and re-expressed in the viewer's home zone. Zero dependencies, pure function, byte-identical every run.
+
+The honest edge
+
+FLAG, DON'T FAKE: it never guesses a time it does not have. A missing, malformed, or offset-bearing value blanks every field (ok:false); a zoned value with no zone is blanked, never silently floated; an unresolvable home zone is never assumed to be UTC — it proposes the platform's detected zone, else blanks. It converts and re-buckets a stored time; it is not a full calendar library and does not parse arbitrary date formats.
+
+Run it
+
+node -e "console.log(require('./zonecast.js').cast('2026-06-20T23:00','zoned','Europe/London'))"
+test_zonecast.js (107/107, independent Intl oracle: DST spring-forward gap, fall-back fold, cross-day boundary) + Plumb conformance GREEN (15/15, blob-pinned, clock-independent)
+Node / browser, no dependencies (Intl is platform, not a dependency)
+
+The code — every file that ships
+
+zonecast.js 245 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/**
+* zonecast — cast a stored wall-clock into the time a VIEWER actually sees.
+*
+* WHAT
+* A calendar stores an event as a wall-clock ("2026-06-20T23:00") plus, sometimes,
+* the IANA zone that wall-clock was written in ("America/New_York"). What a viewer
+* in London should SEE is a different wall-clock — and possibly a different calendar
+* DAY — because 23:00 in New York is 04:00 the next morning in London. Getting this
+* wrong (off-by-an-hour at a DST boundary, or bucketing an event on the wrong day) is
+* one of the most common and most silent bugs in any app that shows times to people
+* in more than one zone.
+*
+* cast(value, kind, homeZone) -> { ok, kind, dayKey, time, wallClock, zone}
+*
+* It answers ONE question — what wall-clock and calendar-day does THIS viewer see for
+* this stored time? — and answers it DST-correctly, using only the platform's own
+* Intl time-zone database. Two kinds of stored time:
+*
+* FLOATING — a wall-clock with NO zone (all-day events, legacy rows). It means the
+* same wall-clock everywhere and never shifts: 11:00 stays 11:00 in every zone.
+* Passed through verbatim — no math, no zone.
+*
+* ZONED — a wall-clock PLUS an IANA zone. Interpreted in its own zone to find the
+* real instant, then re-expressed in the viewer's homeZone. DST-correct by
+* construction (a two-pass offset resolution that settles spring-forward /
+* fall-back edges), never a hardcoded offset.
+*
+* HONEST BY CONSTRUCTION (Flag, don't fake)
+* - A missing, malformed, or offset-bearing wall-clock returns { ok:false} with all
+* fields blanked — the caller shows NOTHING rather than a guessed time. An undated
+* or unparseable thing is never handed a "when".
+* - A ZONED value with no zone is malformed -> blank. It is never silently treated as
+* floating.
+* - An unresolvable home zone is NEVER assumed to be UTC. If no homeZone is given, the
+* platform's own detected zone is proposed; if even that is unavailable, the result
+* blanks rather than fabricating a zone.
+* - A trailing "Z" or an explicit +/-HH:MM offset is REJECTED (blank), not silently
+* reinterpreted — this tool speaks the tool-shaped "YYYY-MM-DDTHH:MM[:SS]" wall-clock,
+* and refuses to guess what an offset-bearing string "really meant".
+*
+* HOW
+* The zone math uses the platform's Intl.DateTimeFormat time-zone database and Date
+* arithmetic only — no zone table is vendored, so it is always as current as the
+* runtime's own tzdata. The ZONED path resolves a wall-clock-in-zone to a UTC instant
+* by a standard two-pass technique: read the fields as if UTC, ask Intl what that
+* instant reads as in the zone, take the difference as the offset, apply it, then
+* re-read once to settle a DST edge (taking the first valid reading in the rare
+* spring-forward gap / fall-back fold). Pure function of (value, kind, homeZone): no
+* clock, no randomness, no files, no network. Same three inputs -> same result, every
+* run, in Node or a browser.
+*
+* In Node: require("./zonecast.js").cast(...) / CLI: node zonecast.js...
+* In browser: window.ForestGifts.zonecast.{cast, detectZone}
+*
+* CEILING (printed edge)
+* zonecast tells you the wall-clock and calendar-day a viewer SEES for a stored time;
+* it does not store times, validate that a zone name is one you meant, or know what
+* "now" is — it is a pure renderer of a value you already hold, and it relies entirely
+* on the host runtime's Intl time-zone database for its correctness.
+*/
+"use strict";
+
+var BLANK_FLOATING = { ok: false, kind: "floating", dayKey: "", time: "", wallClock: "", zone: null};
+
+function blank(kind) {
+return { ok: false, kind: kind || "floating", dayKey: "", time: "", wallClock: "", zone: null};
+}
+
+/* ---- browser-detect: the honest fallback for an unsigned home zone ------------ *
+* An UNSET home zone falls back to the platform's own detected zone, NEVER a
+* hardcoded constant and NEVER silent UTC. If Intl is unavailable (some non-browser
+* runtime), return "" — the caller decides; we never fabricate a zone. */
+function detectZone() {
+try {
+var z = Intl.DateTimeFormat().resolvedOptions().timeZone;
+return (typeof z === "string" && z)? z: "";
+} catch (e) { return "";}
+}
+
+/* ---- a stored wall-clock string -> component fields --------------------------- *
+* Accepts "YYYY-MM-DDTHH:MM" or "YYYY-MM-DDTHH:MM:SS" (tool-shaped, no offset).
+* A trailing "Z" or an explicit +/-HH:MM offset is NOT a floating/zoned wall-clock
+* in this model — reject it (null) rather than silently reinterpret it. */
+function parseWall(s) {
+if (typeof s!== "string") return null;
+var m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+if (!m) return null;
+var o = { y: +m[1], mo: +m[2], d: +m[3], h: +m[4], mi: +m[5], s: m[6]? +m[6]: 0};
+if (o.mo < 1 || o.mo > 12 || o.d < 1 || o.d > 31 || o.h > 23 || o.mi > 59 || o.s > 59) return null;
+return o;
+}
+
+function pad(n) { return (n < 10? "0": "") + n;}
+
+/* ---- the two-pass zone-offset algorithm --------------------------------------- *
+* Given wall-clock fields interpreted in `timeZone`, return the UTC instant (ms).
+* Treat the fields as if UTC to get a provisional instant, ask Intl what that instant
+* reads as IN the zone; the difference is the zone's offset there. Apply it, then
+* correct once for a DST edge. DST-correct except in the rare spring-forward gap /
+* fall-back fold, where the first valid reading is taken. Returns null if Intl can't
+* resolve the zone. */
+function partsInZone(instantMs, timeZone) {
+var dtf;
+try {
+dtf = new Intl.DateTimeFormat("en-US", {
+timeZone: timeZone, hour12: false,
+year: "numeric", month: "2-digit", day: "2-digit",
+hour: "2-digit", minute: "2-digit", second: "2-digit"
+});
+} catch (e) { return null;}
+var parts = dtf.formatToParts(new Date(instantMs));
+var map = {};
+for (var i = 0; i < parts.length; i++) { if (parts[i].type!== "literal") map[parts[i].type] = parts[i].value;}
+var hh = map.hour === "24"? 0: +map.hour; // some engines emit "24" for midnight
+return { y: +map.year, mo: +map.month, d: +map.day, h: hh, mi: +map.minute, s: +map.second};
+}
+
+function fieldsToUTC(f) { return Date.UTC(f.y, f.mo - 1, f.d, f.h, f.mi, f.s);}
+
+function wallClockToInstant(w, timeZone) {
+var asUTC = fieldsToUTC(w);
+var read1 = partsInZone(asUTC, timeZone);
+if (!read1) return null;
+var offset1 = asUTC - fieldsToUTC(read1); // ms the zone leads UTC at the guess
+var instant = asUTC + offset1;
+var read2 = partsInZone(instant, timeZone); // one correction pass for DST edges
+if (read2) {
+var offset2 = instant - fieldsToUTC(read2);
+if (offset2!== offset1) instant = asUTC + offset2;
+}
+return instant;
+}
+
+function instantToWall(instantMs, timeZone) {
+return partsInZone(instantMs, timeZone); // {y,mo,d,h,mi,s} or null
+}
+
+function fieldsToResult(f, kind, zone) {
+if (!f) return blank(kind);
+var dayKey = f.y + "-" + pad(f.mo) + "-" + pad(f.d);
+var time = pad(f.h) + ":" + pad(f.mi);
+return { ok: true, kind: kind, dayKey: dayKey, time: time, wallClock: dayKey + "T" + time, zone: zone || null};
+}
+
+/* ---- input pickers: accept a bare string or a tolerant object ------------------ */
+function pickWall(value) {
+if (typeof value === "string") return value;
+if (value && typeof value === "object") {
+if (typeof value.wallClock === "string") return value.wallClock;
+if (typeof value.value === "string") return value.value;
+if (typeof value.start_at === "string") return value.start_at;
+}
+return null;
+}
+function pickZone(value) {
+if (value && typeof value === "object") {
+if (typeof value.zone === "string" && value.zone) return value.zone;
+if (typeof value.ianaZone === "string" && value.ianaZone) return value.ianaZone;
+if (typeof value.tzid === "string" && value.tzid) return value.tzid;
+}
+return "";
+}
+
+/* ---- cast — THE primitive ------------------------------------------------------ *
+* value:
+* FLOATING -> a wall-clock string "YYYY-MM-DDTHH:MM[:SS]" (or an object
+* { wallClock} / { value} / { start_at}). No zone; passed verbatim.
+* ZONED -> an object carrying the wall-clock AND its zone (zone aliases:
+* zone / ianaZone / tzid). Interpreted in that zone, re-expressed in
+* homeZone.
+* kind: "floating" | "zoned" (anything else -> treated as floating, cold-safe)
+* homeZone: IANA name; for zoned, "" / absent falls back to detectZone(). */
+function cast(value, kind, homeZone) {
+var w = parseWall(pickWall(value));
+if (!w) return blank(kind === "zoned"? "zoned": "floating");
+
+if (kind!== "zoned") {
+// FLOATING — the wall-clock is the display, everywhere. No math, no zone.
+return fieldsToResult(w, "floating", null);
+}
+
+// ZONED — need the value's own zone and the viewer's home zone.
+var srcZone = pickZone(value);
+if (!srcZone) return blank("zoned"); // zoned with no zone is malformed
+var home = (typeof homeZone === "string" && homeZone)? homeZone: detectZone();
+if (!home) return blank("zoned"); // never assume UTC
+
+var instant = wallClockToInstant(w, srcZone);
+if (instant === null || isNaN(instant)) return blank("zoned");
+return fieldsToResult(instantToWall(instant, home), "zoned", home);
+}
+
+/* ---- exports ------------------------------------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.zonecast = {
+cast: cast, detectZone: detectZone,
+parseWall: parseWall, wallClockToInstant: wallClockToInstant, instantToWall: instantToWall,
+BLANK: BLANK_FLOATING, _version: "1.0"
+};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = {
+cast: cast, detectZone: detectZone,
+parseWall: parseWall, wallClockToInstant: wallClockToInstant, instantToWall: instantToWall,
+BLANK: BLANK_FLOATING, _version: "1.0"
+};
+}
+
+/* ------------------------------------------------------------------ *
+* CLI. node zonecast.js --kind zoned --zone America/New_York \ *
+* --home Europe/London 2026-06-20T23:00 *
+* Prints the JSON result. Exit 0 on ok:true, 1 on ok:false (blank). *
+* ------------------------------------------------------------------ */
+function usage() {
+return "usage: zonecast.js [--kind floating|zoned] [--zone IANA] [--home IANA] WALLCLOCK\n" +
+" WALLCLOCK is YYYY-MM-DDTHH:MM[:SS] (no offset, no trailing Z).\n" +
+" --zone is required for --kind zoned (the zone the wall-clock was written in).\n" +
+" --home is the viewer's IANA zone; omitted -> the host's detected zone.";
+}
+
+function main(argv) {
+var args = argv.slice(2);
+var kind = "floating", zone = "", home = "", wall = null, i;
+for (i = 0; i < args.length; i++) {
+var a = args[i];
+if (a === "--help" || a === "-h") { process.stdout.write(usage() + "\n"); process.exit(0);}
+else if (a === "--kind") { kind = args[++i];}
+else if (a === "--zone") { zone = args[++i];}
+else if (a === "--home") { home = args[++i];}
+else if (a.slice(0, 2) === "--") { process.stderr.write("zonecast: unknown option " + a + "\n" + usage() + "\n"); process.exit(2);}
+else { wall = a;}
+}
+if (wall === null) { process.stderr.write("zonecast: a WALLCLOCK argument is required\n" + usage() + "\n"); process.exit(2);}
+var value = (kind === "zoned")? { wallClock: wall, zone: zone}: wall;
+var r = cast(value, kind, home || undefined);
+process.stdout.write(JSON.stringify(r) + "\n");
+process.exit(r.ok? 0: 1);
+}
+
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+main(process.argv);
+}
+
+test_zonecast.js 181 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/* test_zonecast.js — the drift-check battery for the zonecast gift.
+*
+* THE ORACLE IS OUT-OF-BAND. The zoned conversions are checked against an
+* INDEPENDENT computation of the same instant built directly from Node's own
+* Intl.DateTimeFormat + Date — NOT against numbers the gift produced, and NOT
+* against author-eyeballed constants. For each zoned case we (a) compute the true
+* UTC instant of the source wall-clock-in-its-zone using a from-scratch Intl offset
+* probe, (b) format THAT instant in the home zone with a second independent Intl
+* formatter, and (c) assert the gift's {dayKey,time} equals that oracle formatting.
+* If Node's tzdata says 23:00 New York is 04:00 next-day London, the gift must agree.
+*
+* KNOWN-BAD TRIPWIRES (the covenant's "name the known-bad vector"):
+* - a DST spring-forward day (US 2026-03-08 02:30 does not exist) — the gift must
+* still return a coherent, non-throwing result, and must agree with the oracle's
+* first-valid reading.
+* - an offset-bearing string ("...Z" / "...+05:00") — MUST blank, never reinterpret.
+* - a zoned value with no zone — MUST blank, never fall through to floating.
+*
+* Run: node test_zonecast.js (exit 0 all pass, 1 on any failure)
+*/
+"use strict";
+
+var Z = require("./zonecast.js");
+
+var passed = 0, failed = 0;
+function ok(cond, msg) {
+if (cond) { passed++;}
+else { failed++; process.stderr.write("FAIL: " + msg + "\n");}
+}
+function eq(a, b, msg) { ok(a === b, msg + " (got " + JSON.stringify(a) + ", want " + JSON.stringify(b) + ")");}
+
+/* ---- the INDEPENDENT oracle (built only from Node Intl + Date) ------------------ */
+function oracleParts(instantMs, zone) {
+var dtf = new Intl.DateTimeFormat("en-US", {
+timeZone: zone, hour12: false,
+year: "numeric", month: "2-digit", day: "2-digit",
+hour: "2-digit", minute: "2-digit", second: "2-digit"
+});
+var p = {}, arr = dtf.formatToParts(new Date(instantMs));
+for (var i = 0; i < arr.length; i++) if (arr[i].type!== "literal") p[arr[i].type] = arr[i].value;
+var h = p.hour === "24"? "00": p.hour;
+return { dayKey: p.year + "-" + p.month + "-" + p.day, time: h + ":" + p.minute};
+}
+// true UTC instant of a wall-clock interpreted in `zone` — an independent 2-pass probe
+function oracleInstant(y, mo, d, h, mi, zone) {
+var asUTC = Date.UTC(y, mo - 1, d, h, mi, 0);
+function offAt(ms) {
+var op = oracleParts(ms, zone);
+var pm = op.dayKey.split("-"), tm = op.time.split(":");
+var back = Date.UTC(+pm[0], +pm[1] - 1, +pm[2], +tm[0], +tm[1], 0);
+return ms - back;
+}
+var inst = asUTC + offAt(asUTC);
+var o2 = offAt(inst);
+if (asUTC + o2!== inst) inst = asUTC + o2;
+return inst;
+}
+// full oracle: what does a viewer in homeZone see for wall-clock-in srcZone?
+function oracleSees(y, mo, d, h, mi, srcZone, homeZone) {
+return oracleParts(oracleInstant(y, mo, d, h, mi, srcZone), homeZone);
+}
+
+/* ======================= 1. FLOATING — verbatim passthrough ======================= */
+(function () {
+var r = Z.cast("2026-06-20T11:00", "floating");
+ok(r.ok, "floating string ok");
+eq(r.time, "11:00", "floating time verbatim");
+eq(r.dayKey, "2026-06-20", "floating day verbatim");
+eq(r.zone, null, "floating has no zone");
+// floating ignores kind-less / unknown kind -> treated as floating (cold-safe)
+var r2 = Z.cast("2026-01-01T00:00", "something-else");
+ok(r2.ok && r2.kind === "floating", "unknown kind -> floating");
+// floating accepts an object carrier
+var r3 = Z.cast({ wallClock: "2026-12-31T23:59"}, "floating");
+eq(r3.time, "23:59", "floating object carrier");
+// seconds accepted, dropped from display time (HH:MM), day preserved
+var r4 = Z.cast("2026-06-20T11:00:45", "floating");
+ok(r4.ok, "floating with seconds ok");
+eq(r4.time, "11:00", "floating drops seconds from time");
+})();
+
+/* ======================= 2. ZONED — checked against the oracle ===================== */
+var zonedCases = [
+// [y,mo,d,h,mi, srcZone, homeZone, label]
+[2026, 6, 20, 23, 0, "America/New_York", "Europe/London", "NY 23:00 summer -> London"],
+[2026, 6, 20, 9, 0, "Europe/London", "America/New_York", "London 09:00 summer -> NY"],
+[2026, 1, 15, 12, 0, "America/New_York", "Asia/Tokyo", "NY noon winter -> Tokyo"],
+[2026, 1, 15, 12, 0, "Asia/Tokyo", "America/New_York", "Tokyo noon winter -> NY (prev day)"],
+[2026, 6, 20, 0, 30, "Pacific/Kiritimati", "Pacific/Honolulu", "far +14 -> far -10 (day jump)"],
+[2026, 3, 1, 8, 0, "Australia/Sydney", "Europe/Paris", "Sydney -> Paris"],
+[2026, 6, 20, 23, 0, "America/New_York", "America/New_York", "same zone identity"]
+];
+zonedCases.forEach(function (c) {
+var y = c[0], mo = c[1], d = c[2], h = c[3], mi = c[4], src = c[5], home = c[6], label = c[7];
+var wall = y + "-" + String(mo).padStart(2, "0") + "-" + String(d).padStart(2, "0") +
+"T" + String(h).padStart(2, "0") + ":" + String(mi).padStart(2, "0");
+var got = Z.cast({ wallClock: wall, zone: src}, "zoned", home);
+var want = oracleSees(y, mo, d, h, mi, src, home);
+ok(got.ok, "zoned ok: " + label);
+eq(got.dayKey, want.dayKey, "zoned dayKey vs oracle: " + label);
+eq(got.time, want.time, "zoned time vs oracle: " + label);
+eq(got.zone, home, "zoned reports home zone: " + label);
+});
+
+/* same-zone identity: seen from its own zone, the wall-clock is unchanged */
+(function () {
+var r = Z.cast({ wallClock: "2026-06-20T23:00", zone: "America/New_York"}, "zoned", "America/New_York");
+eq(r.time, "23:00", "same-zone time unchanged");
+eq(r.dayKey, "2026-06-20", "same-zone day unchanged");
+})();
+
+/* zone aliases (ianaZone / tzid) resolve identically to `zone` */
+(function () {
+var base = Z.cast({ wallClock: "2026-06-20T23:00", zone: "America/New_York"}, "zoned", "Europe/London");
+var alias1 = Z.cast({ wallClock: "2026-06-20T23:00", ianaZone: "America/New_York"}, "zoned", "Europe/London");
+var alias2 = Z.cast({ wallClock: "2026-06-20T23:00", tzid: "America/New_York"}, "zoned", "Europe/London");
+eq(alias1.wallClock, base.wallClock, "ianaZone alias == zone");
+eq(alias2.wallClock, base.wallClock, "tzid alias == zone");
+})();
+
+/* ======================= 3. DST edges (known-bad tripwires) ======================= */
+(function () {
+// US spring-forward 2026-03-08: 02:00 -> 03:00, so 02:30 does not exist locally.
+// The gift must not throw and must agree with the oracle's resolution.
+var got = Z.cast({ wallClock: "2026-03-08T02:30", zone: "America/New_York"}, "zoned", "UTC");
+ok(got.ok, "spring-forward gap resolves (no throw)");
+var want = oracleSees(2026, 3, 8, 2, 30, "America/New_York", "UTC");
+eq(got.time, want.time, "spring-forward time agrees with oracle");
+eq(got.dayKey, want.dayKey, "spring-forward day agrees with oracle");
+// US fall-back 2026-11-01: 02:00 -> 01:00, so 01:30 is ambiguous (occurs twice).
+var got2 = Z.cast({ wallClock: "2026-11-01T01:30", zone: "America/New_York"}, "zoned", "UTC");
+ok(got2.ok, "fall-back fold resolves (no throw)");
+var want2 = oracleSees(2026, 11, 1, 1, 30, "America/New_York", "UTC");
+eq(got2.time, want2.time, "fall-back time agrees with oracle");
+})();
+
+/* ======================= 4. HONEST EDGES (flag, don't fake) ======================= */
+(function () {
+// missing / malformed
+ok(!Z.cast(null, "floating").ok, "null -> blank");
+ok(!Z.cast(undefined, "zoned").ok, "undefined -> blank");
+ok(!Z.cast("not-a-time", "floating").ok, "garbage -> blank");
+ok(!Z.cast("2026-13-40T99:99", "floating").ok, "out-of-range fields -> blank");
+ok(!Z.cast({}, "floating").ok, "empty object -> blank");
+// offset-bearing strings are REJECTED, never reinterpreted
+ok(!Z.cast("2026-06-20T11:00Z", "floating").ok, "trailing Z rejected");
+ok(!Z.cast("2026-06-20T11:00+05:00", "floating").ok, "explicit offset rejected");
+// zoned with no zone -> blank, never falls through to floating
+ok(!Z.cast({ wallClock: "2026-06-20T23:00"}, "zoned", "Europe/London").ok, "zoned-no-zone -> blank");
+// blanks carry the right kind label
+eq(Z.cast(null, "zoned").kind, "zoned", "blank keeps zoned kind");
+eq(Z.cast(null, "floating").kind, "floating", "blank keeps floating kind");
+// an unresolvable home zone is never assumed UTC -> blank (bogus zone name)
+ok(!Z.cast({ wallClock: "2026-06-20T23:00", zone: "America/New_York"}, "zoned", "Not/AZone").ok,
+"bogus home zone -> blank, never UTC");
+// a bogus SOURCE zone also blanks
+ok(!Z.cast({ wallClock: "2026-06-20T23:00", zone: "Not/AZone"}, "zoned", "UTC").ok,
+"bogus source zone -> blank");
+})();
+
+/* ======================= 5. DETERMINISM (canonicalizer self-test) ================= */
+(function () {
+// same inputs -> byte-identical JSON, every run. The gift is a pure function, so
+// repeated evaluation must never drift (this IS the determinism lint).
+var val = { wallClock: "2026-06-20T23:00", zone: "America/New_York"};
+var first = JSON.stringify(Z.cast(val, "zoned", "Europe/London"));
+for (var i = 0; i < 50; i++) {
+ok(JSON.stringify(Z.cast(val, "zoned", "Europe/London")) === first, "deterministic run " + i);
+}
+})();
+
+/* ---- report ---- */
+if (failed === 0) {
+process.stdout.write("GREEN: " + passed + " assertions passed, 0 failed [test_zonecast]\n");
+process.exit(0);
+} else {
+process.stdout.write("RED: " + passed + " passed, " + failed + " FAILED [test_zonecast]\n");
+process.exit(1);
+}
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies (Intl is platform, not a dependency)
+
+---

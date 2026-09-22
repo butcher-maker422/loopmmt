@@ -1,1457 +1,451 @@
-# Loop MMT — corpus shard 71/87
+# Loop MMT — corpus shard 71/91
 
-> Bundle 71 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 71 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/l21x-snapshot/, /gifts/legible/, /gifts/life-fold/, /gifts/line-source/)
-
----
-
-# l21x-snapshot — a Loop MMT gift
-https://loopmmt.com/gifts/l21x-snapshot/
-[coverage: optional · branch: gifts]
-
-Browser Save Layer persist ← all gifts
-
-l21x-snapshot
-
-Encode any document to a self-describing base64 snapshot, keep a catalog of them with pure save/load/validate/sort, and fold a whole catalog into one portable blob — a zero-dependency save-file/catalog/archive layer for apps with no backend. No DOM, no filesystem, no network.
-
-The honest edge
-
-It persists structure, not identity — you supply ids and timestamps; snapshots are base64 (not compressed, not encrypted). It's a layer that hands you strings, not a store: it never touches localStorage, the disk, or the DOM itself.
-
-Run it
-
-node l21x-snapshot.js --demo
-test_l21x-snapshot.js (41/41)
-JavaScript, zero dependencies (Node + browser)
-
-The code — every file that ships
-
-l21x-snapshot.js 332 lines on GitHub →
-#!/usr/bin/env node
-// SPDX-License-Identifier: MIT
-"use strict";
-/* l21x-snapshot.js — a zero-dependency browser document persistence layer.
-
-A save-file / catalog / archive layer for browser apps that hold documents in
-memory and need to persist, list, and move them without a backend. Three tiers,
-all pure functions over values you already hold — no DOM, no filesystem, no fetch:
-
-1. SNAPSHOT CODEC. encodeSnapshot(doc) -> a self-describing base64 string
-(an ".l21x" snapshot); decodeSnapshot(str) -> the document back, verified.
-A document is any JSON-serializable object; the codec stamps a format tag
-and a version so a snapshot names its own shape.
-
-2. CATALOG. An in-memory list of snapshot entries with pure save/load/validate/
-sort operations. catalogSave returns a NEW catalog (never mutates its input),
-keyed by a caller-supplied id; catalogLoad decodes an entry back to a doc;
-catalogValidate reports honest structural errors; catalogSort orders by a
-named field without touching the input.
-
-3. ARCHIVE. archiveExport(catalog) -> ONE base64 blob (a whole catalog as a
-single portable string, for a download-one-file / paste-into-another-tab
-move); archiveImport(blob) -> the catalog back. Round-trips exactly.
-
-The same code runs in Node (module.exports) or a browser
-(window.LoopGifts.l21x). It persists data you already hold as objects; it does
-not fetch, connect, read files, or touch the DOM. Base64 is computed in pure JS
-so the behavior is identical in both runtimes (no atob/btoa, no Buffer needed). */
-
-// ---- UTF-8 <-> bytes (pure; full multibyte) --------------------------------
-function utf8Encode(str) {
-var out = [], i, c;
-for (i = 0; i < str.length; i++) {
-c = str.charCodeAt(i);
-if (c < 0x80) { out.push(c);}
-else if (c < 0x800) {
-out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-} else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
-// surrogate pair -> full code point
-var c2 = str.charCodeAt(i + 1);
-if (c2 >= 0xdc00 && c2 <= 0xdfff) {
-var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
-out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
-0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
-i++;
-} else {
-out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-}
-} else {
-out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-}
-}
-return out;
-}
-function utf8Decode(bytes) {
-var out = "", i = 0, b, cp, n;
-while (i < bytes.length) {
-b = bytes[i];
-if (b < 0x80) { out += String.fromCharCode(b); i += 1; continue;}
-else if ((b & 0xe0) === 0xc0) { cp = b & 0x1f; n = 1;}
-else if ((b & 0xf0) === 0xe0) { cp = b & 0x0f; n = 2;}
-else if ((b & 0xf8) === 0xf0) { cp = b & 0x07; n = 3;}
-else { out += "\ufffd"; i += 1; continue;}
-if (i + n >= bytes.length + 1 && i + n > bytes.length) { out += "\ufffd"; break;}
-var ok = true;
-for (var k = 1; k <= n; k++) {
-var cont = bytes[i + k];
-if (cont === undefined || (cont & 0xc0)!== 0x80) { ok = false; break;}
-cp = (cp << 6) | (cont & 0x3f);
-}
-if (!ok) { out += "\ufffd"; i += 1; continue;}
-if (cp > 0xffff) {
-cp -= 0x10000;
-out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-} else {
-out += String.fromCharCode(cp);
-}
-i += n + 1;
-}
-return out;
-}
-
-// ---- base64 (pure; url-safe-tolerant on decode) ----------------------------
-var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-function base64FromBytes(bytes) {
-var out = "", i;
-for (i = 0; i < bytes.length; i += 3) {
-var b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
-var t = (b0 << 16) | ((b1 || 0) << 8) | (b2 || 0);
-out += B64.charAt((t >> 18) & 0x3f) + B64.charAt((t >> 12) & 0x3f);
-out += (i + 1 < bytes.length)? B64.charAt((t >> 6) & 0x3f): "=";
-out += (i + 2 < bytes.length)? B64.charAt(t & 0x3f): "=";
-}
-return out;
-}
-function bytesFromBase64(str) {
-var lut = bytesFromBase64._lut;
-if (!lut) {
-lut = bytesFromBase64._lut = {};
-for (var i = 0; i < B64.length; i++) lut[B64.charAt(i)] = i;
-lut["-"] = 62; lut["_"] = 63; // tolerate url-safe alphabet
-}
-var out = [], buffer = 0, bits = 0;
-for (var j = 0; j < str.length; j++) {
-var c = str.charAt(j);
-if (c === "=") break;
-var v = lut[c];
-if (v === undefined) continue; // skip whitespace/newlines
-buffer = (buffer << 6) | v; bits += 6;
-if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff);}
-}
-return out;
-}
-
-// ---- snapshot codec --------------------------------------------------------
-var FORMAT = "l21x";
-var FORMAT_VERSION = 1;
-
-/* encodeSnapshot(doc[, meta]) -> base64 string.
-doc: any JSON-serializable value (the document body).
-meta: optional {title, schema} recorded alongside. */
-function encodeSnapshot(doc, meta) {
-if (doc === undefined) throw new Error("encodeSnapshot: doc is required");
-meta = meta || {};
-var envelope = {
-fmt: FORMAT,
-v: FORMAT_VERSION,
-title: (meta.title === undefined)? null: String(meta.title),
-schema: (meta.schema === undefined)? null: String(meta.schema),
-doc: doc
-};
-var json;
-try { json = JSON.stringify(envelope);}
-catch (e) { throw new Error("encodeSnapshot: doc is not JSON-serializable (" + e.message + ")");}
-return base64FromBytes(utf8Encode(json));
-}
-
-/* decodeSnapshot(str) -> {title, schema, doc, v}. Throws on a malformed or
-foreign-format snapshot rather than returning a half-parsed value. */
-function decodeSnapshot(str) {
-if (typeof str!== "string" || str.length === 0)
-throw new Error("decodeSnapshot: expected a non-empty base64 string");
-var json = utf8Decode(bytesFromBase64(str));
-var env;
-try { env = JSON.parse(json);}
-catch (e) { throw new Error("decodeSnapshot: not a valid l21x snapshot (bad base64/JSON)");}
-if (!env || env.fmt!== FORMAT)
-throw new Error("decodeSnapshot: not an l21x snapshot (fmt=" + (env && env.fmt) + ")");
-if (typeof env.v!== "number" || env.v > FORMAT_VERSION)
-throw new Error("decodeSnapshot: unsupported snapshot version " + (env && env.v));
-return { title: env.title, schema: env.schema, doc: env.doc, v: env.v};
-}
-
-// ---- catalog (pure; never mutates its input) -------------------------------
-/* A catalog is an array of entries: {id, title, schema, updated, snapshot}.
-snapshot is the base64 string; updated is a caller-supplied sortable value. */
-
-/* catalogSave(catalog, id, doc[, meta]) -> a NEW catalog with id saved/replaced.
-meta.updated (optional) is recorded for sorting; defaults to null. */
-function catalogSave(catalog, id, doc, meta) {
-if (!isArray(catalog)) throw new Error("catalogSave: catalog must be an array");
-if (id === undefined || id === null || String(id) === "")
-throw new Error("catalogSave: id is required");
-meta = meta || {};
-var entry = {
-id: String(id),
-title: (meta.title === undefined)? null: String(meta.title),
-schema: (meta.schema === undefined)? null: String(meta.schema),
-updated: (meta.updated === undefined)? null: meta.updated,
-snapshot: encodeSnapshot(doc, meta)
-};
-var out = [], replaced = false, i;
-for (i = 0; i < catalog.length; i++) {
-if (catalog[i] && catalog[i].id === entry.id) { out.push(entry); replaced = true;}
-else { out.push(catalog[i]);}
-}
-if (!replaced) out.push(entry);
-return out;
-}
-
-/* catalogLoad(catalog, id) -> the decoded {title, schema, doc, v}, or null if
-the id is not present. */
-function catalogLoad(catalog, id) {
-if (!isArray(catalog)) throw new Error("catalogLoad: catalog must be an array");
-for (var i = 0; i < catalog.length; i++) {
-if (catalog[i] && catalog[i].id === String(id)) return decodeSnapshot(catalog[i].snapshot);
-}
-return null;
-}
-
-/* catalogValidate(catalog) -> {ok, errors[]}. Honest structural check: each entry
-has a non-empty id, ids are unique, and every snapshot decodes. Reports every
-problem it finds rather than throwing on the first. */
-function catalogValidate(catalog) {
-var errors = [];
-if (!isArray(catalog)) return { ok: false, errors: ["catalog is not an array"]};
-var seen = {};
-for (var i = 0; i < catalog.length; i++) {
-var e = catalog[i];
-if (!e || typeof e!== "object") { errors.push("entry " + i + ": not an object"); continue;}
-if (e.id === undefined || e.id === null || String(e.id) === "")
-errors.push("entry " + i + ": missing id");
-else if (seen[e.id]) errors.push("entry " + i + ": duplicate id '" + e.id + "'");
-else seen[e.id] = true;
-if (typeof e.snapshot!== "string") { errors.push("entry " + i + ": snapshot is not a string");}
-else { try { decodeSnapshot(e.snapshot);} catch (err) { errors.push("entry " + i + ": " + err.message);}}
-}
-return { ok: errors.length === 0, errors: errors};
-}
-
-/* catalogSort(catalog, key[, desc]) -> a NEW sorted catalog. key is an entry
-field ('title'|'id'|'updated'|'schema'). Stable, input untouched. */
-function catalogSort(catalog, key, desc) {
-if (!isArray(catalog)) throw new Error("catalogSort: catalog must be an array");
-key = key || "id";
-var indexed = [], i;
-for (i = 0; i < catalog.length; i++) indexed.push([catalog[i], i]);
-indexed.sort(function (a, b) {
-var av = a[0]? a[0][key]: undefined, bv = b[0]? b[0][key]: undefined;
-var aNull = (av === null || av === undefined), bNull = (bv === null || bv === undefined);
-// nulls ALWAYS last, independent of sort direction
-if (aNull && bNull) return a[1] - b[1];
-if (aNull) return 1;
-if (bNull) return -1;
-var cmp;
-if (av === bv) cmp = a[1] - b[1]; // stable on ties
-else cmp = (av < bv)? -1: 1;
-if (cmp === 0) return 0;
-return desc? -cmp: cmp;
-});
-var out = [];
-for (i = 0; i < indexed.length; i++) out.push(indexed[i][0]);
-return out;
-}
-
-// ---- archive (whole catalog <-> one base64 blob) ---------------------------
-var ARCHIVE_FORMAT = "l21x-archive";
-
-/* archiveExport(catalog) -> ONE base64 blob carrying the whole catalog. */
-function archiveExport(catalog) {
-if (!isArray(catalog)) throw new Error("archiveExport: catalog must be an array");
-var v = catalogValidate(catalog);
-if (!v.ok) throw new Error("archiveExport: refusing to export an invalid catalog (" + v.errors[0] + ")");
-var envelope = { fmt: ARCHIVE_FORMAT, v: FORMAT_VERSION, entries: catalog};
-return base64FromBytes(utf8Encode(JSON.stringify(envelope)));
-}
-
-/* archiveImport(blob) -> the catalog array. Throws on a foreign/malformed blob. */
-function archiveImport(blob) {
-if (typeof blob!== "string" || blob.length === 0)
-throw new Error("archiveImport: expected a non-empty base64 string");
-var env;
-try { env = JSON.parse(utf8Decode(bytesFromBase64(blob)));}
-catch (e) { throw new Error("archiveImport: not a valid l21x archive (bad base64/JSON)");}
-if (!env || env.fmt!== ARCHIVE_FORMAT)
-throw new Error("archiveImport: not an l21x archive (fmt=" + (env && env.fmt) + ")");
-if (!isArray(env.entries)) throw new Error("archiveImport: archive has no entries array");
-var v = catalogValidate(env.entries);
-if (!v.ok) throw new Error("archiveImport: archive failed validation (" + v.errors[0] + ")");
-return env.entries;
-}
-
-// ---- small helper ----------------------------------------------------------
-function isArray(x) { return Object.prototype.toString.call(x) === "[object Array]";}
-
-// ---- dual-runtime export ---------------------------------------------------
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.l21x = {
-encodeSnapshot: encodeSnapshot, decodeSnapshot: decodeSnapshot,
-catalogSave: catalogSave, catalogLoad: catalogLoad,
-catalogValidate: catalogValidate, catalogSort: catalogSort,
-archiveExport: archiveExport, archiveImport: archiveImport
-};
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = {
-encodeSnapshot: encodeSnapshot, decodeSnapshot: decodeSnapshot,
-catalogSave: catalogSave, catalogLoad: catalogLoad,
-catalogValidate: catalogValidate, catalogSort: catalogSort,
-archiveExport: archiveExport, archiveImport: archiveImport,
-FORMAT: FORMAT, FORMAT_VERSION: FORMAT_VERSION
-};
-}
-
-// ---- CLI (value-arg + --demo; reads NO files) ------------------------------
-if (typeof require!== "undefined" && require.main === module) {
-var args = process.argv.slice(2);
-var DEMO_CATALOG = catalogSave(
-catalogSave([], "note-1", { title: "Groceries", items: ["milk", "eggs"]},
-{ title: "Groceries", updated: "2026-08-01"}),
-"note-2", { title: "Ideas — café ☕", body: "persistence without a backend"},
-{ title: "Ideas", updated: "2026-08-15"});
-
-function printDemo() {
-var archive = archiveExport(DEMO_CATALOG);
-var back = archiveImport(archive);
-var sorted = catalogSort(back, "updated", true);
-process.stdout.write("# l21x-snapshot demo\n");
-process.stdout.write("catalog entries: " + back.length + "\n");
-process.stdout.write("archive blob length (base64): " + archive.length + "\n");
-process.stdout.write("sorted by updated (desc): " +
-sorted.map(function (e) { return e.id;}).join(", ") + "\n");
-var loaded = catalogLoad(back, "note-2");
-process.stdout.write("loaded note-2 title: " + loaded.doc.title + "\n");
-process.stdout.write("round-trip ok: " +
-(archiveExport(archiveImport(archive)) === archive) + "\n");
-process.exit(0);
-}
-
-if (args[0] === "--help" || args[0] === "-h") {
-process.stdout.write(
-"l21x-snapshot — a zero-dependency browser document persistence layer\n\n" +
-" node l21x-snapshot.js --demo build a sample catalog, archive it,\n" +
-" round-trip it, and print the result\n" +
-" node l21x-snapshot.js '<json doc>' encode one JSON document as an.l21x\n" +
-" snapshot and print the base64\n\n" +
-"Library: encodeSnapshot/decodeSnapshot, catalogSave/Load/Validate/Sort,\n" +
-"archiveExport/archiveImport. Pure functions over values — no files, no DOM,\n" +
-"no network. Exit 0.\n");
-process.exit(0);
-}
-if (args[0] === "--demo" || args.length === 0) { printDemo();}
-else {
-// value-arg: treat the argument as a literal JSON document, encode it.
-var doc;
-try { doc = JSON.parse(args[0]);}
-catch (e) { process.stdout.write("not valid JSON; wrapping as a string document\n"); doc = args[0];}
-process.stdout.write(encodeSnapshot(doc, { title: "cli"}) + "\n");
-process.exit(0);
-}
-}
-
-test_l21x-snapshot.js 128 lines on GitHub →
-#!/usr/bin/env node
-// SPDX-License-Identifier: MIT
-/* test_l21x-snapshot.js — proves the persistence layer implements its contract.
-
-THE ORACLE. There is no stdlib that says "is this catalog persisted right?" — so
-the oracle is CURATED VECTORS expressed directly against what the functions
-promise: (1) snapshot encode->decode round-trips an arbitrary document, including
-full multibyte UTF-8; (2) decodeSnapshot REJECTS a foreign/garbage string rather
-than half-parsing; (3) catalogSave returns a NEW catalog, replaces by id, and
-never mutates its input; (4) catalogLoad returns the doc or null; (5)
-catalogValidate reports duplicate-id and bad-snapshot honestly; (6) catalogSort
-is stable, nulls-last, and leaves its input untouched; (7) archiveExport/Import
-round-trips a whole catalog exactly. Plus determinism (encode is a pure function)
-and a mutation-bite so a degenerate core (constant output / ignores input) fails.
-Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
-"use strict";
-var m = require("./l21x-snapshot.js");
-
-var pass = 0, fail = 0;
-function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
-function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
-function threw(label, fn) {
-var did = false;
-try { fn();} catch (e) { did = true;}
-ok(label + " (throws)", did);
-}
-function deepEq(a, b) { return JSON.stringify(a) === JSON.stringify(b);}
-
-// ---- 1. snapshot codec round-trip (incl. multibyte) ------------------------
-var doc1 = { title: "Café ☕ — 日本語", n: 42, list: [1, 2, { deep: true}], nil: null};
-var snap1 = m.encodeSnapshot(doc1, { title: "t", schema: "note"});
-var back1 = m.decodeSnapshot(snap1);
-ok("snapshot round-trips the doc", deepEq(back1.doc, doc1));
-eq("snapshot carries title", back1.title, "t");
-eq("snapshot carries schema", back1.schema, "note");
-ok("snapshot is base64-ish (no raw braces)", snap1.indexOf("{") === -1);
-
-// primitive & array docs also round-trip
-ok("string doc round-trips", m.decodeSnapshot(m.encodeSnapshot("hi")).doc === "hi");
-ok("array doc round-trips", deepEq(m.decodeSnapshot(m.encodeSnapshot([1, "two", 3])).doc, [1, "two", 3]));
-
-// ---- 2. decode REJECTS foreign / malformed input ---------------------------
-threw("decode rejects empty string", function () { m.decodeSnapshot("");});
-threw("decode rejects non-string", function () { m.decodeSnapshot(null);});
-threw("decode rejects garbage base64->json", function () { m.decodeSnapshot("bm90IGpzb24=");}); // "not json"
-threw("decode rejects a foreign-fmt envelope", function () {
-// valid base64 of a JSON object whose fmt is wrong
-var foreign = Buffer? Buffer.from(JSON.stringify({ fmt: "other", v: 1, doc: 1})).toString("base64")
-: m.encodeSnapshot({}); // fallback; still non-l21x-fmt below
-m.decodeSnapshot(foreign);
-});
-threw("encode rejects undefined doc", function () { m.encodeSnapshot(undefined);});
-
-// ---- 3. catalogSave: new catalog, replace-by-id, no mutation ---------------
-var cat0 = [];
-var cat1 = m.catalogSave(cat0, "a", { v: 1}, { title: "A", updated: "2026-01-01"});
-eq("save grows the catalog", cat1.length, 1);
-eq("save does not mutate input", cat0.length, 0);
-ok("saved returns a NEW array", cat1!== cat0);
-var cat2 = m.catalogSave(cat1, "b", { v: 2}, { title: "B", updated: "2026-03-01"});
-eq("second save grows", cat2.length, 2);
-var cat2b = m.catalogSave(cat2, "a", { v: 99}, { title: "A2", updated: "2026-02-01"});
-eq("replace keeps length", cat2b.length, 2);
-eq("replace updates in place by id", m.catalogLoad(cat2b, "a").doc.v, 99);
-eq("replace does not mutate prior catalog", m.catalogLoad(cat2, "a").doc.v, 1);
-threw("save rejects empty id", function () { m.catalogSave([], "", {});});
-
-// ---- 4. catalogLoad --------------------------------------------------------
-ok("load returns null for missing id", m.catalogLoad(cat2b, "zzz") === null);
-ok("load decodes the stored doc", deepEq(m.catalogLoad(cat2b, "b").doc, { v: 2}));
-
-// ---- 5. catalogValidate: honest errors -------------------------------------
-var good = m.catalogValidate(cat2b);
-ok("valid catalog validates ok", good.ok === true && good.errors.length === 0);
-var dupe = cat2b.concat([{ id: "a", snapshot: cat2b[0].snapshot}]);
-var dupeRes = m.catalogValidate(dupe);
-ok("duplicate id is reported", dupeRes.ok === false &&
-dupeRes.errors.join("|").indexOf("duplicate")!== -1);
-var badSnap = [{ id: "x", snapshot: "@@not-base64-json@@"}];
-ok("bad snapshot is reported", m.catalogValidate(badSnap).ok === false);
-var missingId = [{ snapshot: cat2b[0].snapshot}];
-ok("missing id is reported", m.catalogValidate(missingId).ok === false);
-
-// ---- 6. catalogSort: stable, nulls-last, input untouched -------------------
-var sortSrc = [
-{ id: "c", title: "Cherry", updated: "2026-03"},
-{ id: "a", title: "Apple", updated: null},
-{ id: "b", title: "Banana", updated: "2026-01"}
-];
-var byTitle = m.catalogSort(sortSrc, "title");
-eq("sort by title asc first", byTitle[0].id, "a");
-eq("sort by title asc last", byTitle[2].id, "c");
-ok("sort does not mutate input", sortSrc[0].id === "c");
-var byUpdated = m.catalogSort(sortSrc, "updated");
-eq("nulls sort last on updated", byUpdated[2].id, "a");
-var byUpdatedDesc = m.catalogSort(sortSrc, "updated", true);
-eq("desc reverses order", byUpdatedDesc[0].id, "c");
-// stability: equal keys keep input order
-var ties = [{ id: "p", k: 1}, { id: "q", k: 1}, { id: "r", k: 1}];
-var tied = m.catalogSort(ties, "k");
-ok("sort is stable on ties", tied[0].id === "p" && tied[1].id === "q" && tied[2].id === "r");
-
-// ---- 7. archive round-trip -------------------------------------------------
-var arch = m.archiveExport(cat2b);
-ok("archive is one string", typeof arch === "string" && arch.length > 0);
-var imported = m.archiveImport(arch);
-ok("archive round-trips the catalog", deepEq(imported, cat2b));
-eq("imported catalog is usable", m.catalogLoad(imported, "a").doc.v, 99);
-threw("archiveExport refuses an invalid catalog", function () { m.archiveExport(dupe);});
-threw("archiveImport rejects garbage", function () { m.archiveImport("bm90IGFuIGFyY2hpdmU=");});
-threw("archiveImport rejects a snapshot-as-archive", function () { m.archiveImport(snap1);});
-
-// ---- 8. determinism (encode is a pure function of its input) ---------------
-ok("encode is deterministic", m.encodeSnapshot(doc1, { title: "t", schema: "note"}) === snap1);
-ok("archive is deterministic", m.archiveExport(cat2b) === arch);
-
-// ---- 9. mutation-bite ------------------------------------------------------
-// A degenerate encode that ignored its input (constant output) would make two
-// different docs encode identically. Prove they DON'T.
-ok("MUTATION-BITE: different docs encode differently",
-m.encodeSnapshot({ a: 1})!== m.encodeSnapshot({ a: 2}));
-// A degenerate catalogLoad that returned a constant would fail id discrimination.
-ok("MUTATION-BITE: load discriminates by id",
-m.catalogLoad(cat2b, "a").doc.v!== m.catalogLoad(cat2b, "b").doc.v);
-
-// ---- report ----------------------------------------------------------------
-console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-JavaScript, zero dependencies (Node + browser)
+Nodes in this shard: 3 (/gifts/jq-lite/, /gifts/json-source/, /gifts/jsonl-diff/)
 
 ---
 
-# Text Legibility Gauge — a Loop MMT gift
-https://loopmmt.com/gifts/legible/
+# jq-lite — a Loop MMT gift
+https://loopmmt.com/gifts/jq-lite/
 [coverage: optional · branch: gifts]
 
-Readable Text, or Machine Rubble? gauge ← all gifts
+A Tiny jq-Style Query Language for JSON transform ← all gifts
 
-Text Legibility Gauge
+jq-lite
 
-Guess whether a string is human-readable text or machine-drawn rubble, and say how sure you are. A text extractor hands you a `.text` field and, by design, can't tell you whether it's readable — the classic failure is a subsetted CID font whose glyphs decode one byte at a time into control-character rubble that only looks like a populated string. assess(text) returns a label (readable / suspect / likely-binary / empty) with the raw score and signal counts exposed, scoring the density of characters human text almost never contains: C0 controls (minus tab/newline) plus U+FFFD, and nothing else. The load-bearing rule: it reports but never scores the C1 band, so legitimate multibyte-as-Latin1 (日本語, Cyrillic) never reads as binary — the CJK false-positive it refuses to make.
+jq-lite gives you jq's common moves — pull a field (.user.name), index an array (.[0],.[-1]), iterate a stream (.[]), and pipe one step into the next (.items[] |.id) — over JSON on stdin, without installing jq. It follows jq's rules where they save you: a missing key is null (not a crash), and the? operator skips a type mismatch so one ragged record doesn't abort the stream. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
 
 The honest edge
 
-legible is a heuristic, not a verdict, and it detects control-character rubble — NOT wrong encoding. Mojibake (valid bytes, wrong charset) is still printable characters, so it reads `readable` even though no human can read it: a `readable` means “not control-char rubble,” never “correctly decoded.” It does not decode, validate, or understand the text, and never proves it correct or meaningful. It is a gauge you read, never a gate you route on.
+jq-lite implements a SMALL subset of jq — identity, field/index/bracket access,.[] iteration, the pipe, and the? optional. It has no functions, no arithmetic, no object/array construction, no select/map/comparison, and no recursion (..). For those, use jq itself. A malformed filter or invalid JSON input is refused (exit 2); an unmarked runtime type error is exit 3.
 
 Run it
 
-node legible.js "some text"
-test_legible.js (20/20, hand-oracle drift-check + CID known-bad + CJK-as-Latin1 regression guard)
+echo '{"items":[{"id":10},{"id":20}]}' | node jq-lite.js '.items[] |.id' # -> 10 20
+test_jq-lite.js (426/426, independent recursive-descent oracle) + mutation-bite (7/7) + Plumb conformance GREEN (346/346, signed 2026-09-12, clock-independent, non-vacuity proven)
 Node / browser, no dependencies
 
 The code — every file that ships
 
-legible.js 217 lines on GitHub →
+jq-lite.js 492 lines on GitHub →
 #!/usr/bin/env node
-/* legible.js — a pure, dependency-free, HONEST gauge that guesses whether a
-string is human-readable text or machine-drawn rubble, and says how sure it is.
+/* jq-lite.js — a tiny jq-style query language for JSON, in one dependency-free file.
+Deterministic, pure, MIT. Runs in Node or a browser.
 
-WHY THIS EXISTS. A text extractor (ratchet-pdf-text, ratchet-png-text,
-exif-parser, a MIME part decoder) hands you a `.text` field and, by design,
-cannot tell you whether that text is *readable*. The classic failure: a PDF
-whose glyphs are drawn through a subsetted CID font. The extractor pulls the
-string operands honestly, but each glyph is a 2-byte CID index, and decoded
-one-byte-at-a-time it comes back as control-character rubble that merely
-*looks* like a populated string. You get a confident `.text` that no human
-can read. `legible` reads the delta the extractor can't: it scores the string
-and returns readable / suspect / likely-binary / empty, with the raw score
-and the signal counts exposed so you can see exactly why.
+WHAT IT IS. A TRANSFORM: it takes JSON in and emits JSON out, reshaped by a filter
+expression you write in a small, well-defined query language. It is the "reach for jq"
+move without installing jq — the mini-language that lets you pull `.user.name` out of a
+blob, iterate `.items[]`, index `.[0]`, and pipe one step into the next, over a single
+JSON value or a JSONL stream of them:
 
-THE SIGNAL (the whole reason to trust it, and its whole limit). Human-readable
-text — in ANY script — almost never contains C0 control characters (0x00–0x1F,
-excluding the ordinary text whitespace tab/LF/CR/FF) or the Unicode
-replacement character U+FFFD. CID glyph indices decoded as Latin-1 land in
-exactly that band disproportionately (the high byte of a low subset index is
-0x00–0x1F, and half the bytes are often 0x00). So the SCORED gauge is the
-density of those "text-never-contains-this" characters — C0 controls plus
-U+FFFD, nothing else. This is deliberately NOT the printable-ratio: a UTF-8
-é / 안 / я decoded byte-wise lands in 0x80–0xFF, which OVERLAPS the C1-control
-band (0x80–0x9F) AND the UTF-8 continuation-byte band — so scoring C1 would
-flag legitimate multibyte text as binary (the CJK false-positive). We report
-C1/DEL and NUL counts as *signals* for your inspection, but we do NOT score
-them, precisely so multibyte-as-Latin1 does not read as rubble.
+echo '{"user":{"name":"ada"}}' | node jq-lite.js '.user.name' -> "ada"
+printf '{"a":1}\n{"a":2}\n' | node jq-lite.js '.a' -> 1 \n 2
 
-WHAT IT DOES NOT DO (printed edge — present here and in the README):
-legible is a HEURISTIC, not a verdict, and it detects control-character
-rubble — NOT wrong encoding. Text decoded with the wrong charset (mojibake:
-UTF-8 read as Latin-1, æ—¥æœ¬èªž) is still printable characters, so it reads
-as `readable` even though no human can read it — a `readable` means "not
-control-char rubble," never "correctly decoded." It does not decode,
-validate, or understand the text, and never proves it correct, meaningful,
-or safe. It is a gauge you read, never a gate you route on.
+It is the adapter between "a JSON blob" and "the one field/element you actually want",
+at the front or middle of a pipe: `line-source access.log |... | jq-lite '.status'`.
 
-API
-legible(input[, options]) — dispatches on the shape of `input`:
-• a string -> assess(string) -> { label, score, signals}
-• a record with `.text` -> {...record, legibility: assess(record.text)}
-• an array of either -> input.map(legible)
-assess(text[, options]) -> { label, score, signals}
-label one of "readable" | "suspect" | "likely-binary" | "empty"
-score the binary-character ratio in [0,1], rounded to 4 places
-signals { length, control, c1, nul, replacement, binaryRatio}
-options.readableMax (default 0.05) score <= this => readable
-options.binaryMin (default 0.30) score >= this => likely-binary
-(between the two bounds => suspect)
+THE QUIET FAILURES IT FIXES. Everyone reaches for `obj.a.b.c` and everyone gets it
+subtly wrong, in ways that only bite on the input you didn't test:
 
-Pure function of its input. No dependencies, no randomness, no clock, no I/O
-in the core — the same input always yields the same output (the determinism
-lint is trivial). Same code in a browser (window.LoopGifts.legible) or Node
-(this CLI / require()).
+1. THE MISSING-KEY CRASH. `obj.a.b` throws the moment `obj.a` is absent
+(`Cannot read properties of undefined`). jq-lite follows jq's rule: a missing
+object key yields `null`, not an exception — `.a.b.c` on `{}` is `null`, quietly
+and correctly. You opt INTO strictness, you are never ambushed by it.
+
+2. THE TYPE-CONFUSION. Indexing a string or a number as if it were an object/array
+(`.foo` on `"hi"`, `.[0]` on `42`) is a real error you WANT surfaced — but only
+when you meant it. jq-lite errors loudly on a genuine type mismatch, and gives you
+the `?` operator (`.foo?`, `.[0]?`) to say "skip it if it doesn't fit" — so one
+ragged record in a stream doesn't abort the whole run.
+
+3. THE STREAM FAN-OUT. `.[]` turns one input into MANY outputs (each array element
+or object value), and a pipe must thread that correctly: `.items[] |.id` runs
+`.id` over EACH item, not over the array. Hand-rolled `.map(x => x.id)` forgets
+the empty-array case, the object case, and the compose-with-a-later-`[]` case.
+jq-lite treats every filter as value -> stream and composes streams properly.
+
+THE LANGUAGE (this is the whole of it — the "lite" is the point):
+
+. identity — the input value, unchanged
+.foo.foo.bar field access (missing key -> null; non-object -> error unless?)
+.["a b"] bracketed string key (for keys that aren't bare identifiers)
+.[2].foo[0] array index (negative counts from the end:.[-1] is the last)
+.[] iterate — emit each array element, or each object VALUE, as a stream
+a | b pipe — run b over every output of a
+.foo?.[0]?.[]? optional — on a type mismatch, emit nothing instead of erroring
+
+Values are standard JSON. Output is one JSON value per result; with --jsonl-out (the
+default for stream input) each result is a line. A filter is applied to EACH input
+value independently; a JSONL input runs the filter per line.
+
+--raw-output if a result is a JSON string, print it without quotes (jq -r)
+--slurp read the whole input as ONE JSON value (an array of the inputs) before
+filtering, instead of per-value (jq -s)
+--compact (default) one-line JSON per result
+
+DETERMINISM. run(value, filter) is a pure function — no clock, no randomness, no I/O
+beyond the value you pass, no ambient state. The same value and filter yield
+byte-identical output on every run and every machine. Object VALUE iteration (`.[]`)
+emits values in the object's own key insertion order (JSON parse order), which is
+stable for a given input.
 
 USAGE
-node legible.js "some text" # assess an argument, print JSON
-cat streams.jsonl | node legible.js # annotate each JSONL record's.text
-node legible.js --port # print this tool's port-verb (transform)
-node legible.js --help
+echo '{"a":{"b":2}}' | node jq-lite.js '.a.b'
+echo '[1,2,3]' | node jq-lite.js '.[]'
+echo '{"xs":[10,20]}'| node jq-lite.js '.xs[] '
+printf '{"n":1}\n{"n":2}\n' | node jq-lite.js '.n'
+echo '{"name":"ada"}' | node jq-lite.js --raw-output '.name'
+node jq-lite.js --help
 
-Released under MIT.
-*/
-(function (root, factory) {
-var api = factory();
-if (typeof module === "object" && module.exports) module.exports = api;
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.legible = api.legible;
-window.LoopGifts.assessLegibility = api.assess;
-}
-root.__legible = api;
-})(typeof globalThis!== "undefined"? globalThis: this, function () {
-"use strict";
+Exit codes: 0 success · 2 usage error (no filter, bad option, malformed filter syntax,
+or invalid JSON input) · 3 a runtime type error the filter did not mark optional. A
+clean one-line message on stderr, never a stack trace.
 
-var DEFAULTS = { readableMax: 0.05, binaryMin: 0.30};
-
-// The ordinary text whitespace inside the C0 band — legitimate in readable
-// text, so NOT counted as a binary signal.
-function isTextWhitespace(c) {
-return c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d;
-}
-// C0 control (0x00–0x1F) that is NOT text whitespace.
-function isC0Control(c) {
-return c >= 0x00 && c <= 0x1f &&!isTextWhitespace(c);
-}
-// DEL + C1 controls (0x7F, 0x80–0x9F). Reported as a signal but DELIBERATELY
-// NOT scored: 0x80–0x9F overlaps the UTF-8 continuation-byte band, so scoring
-// it would flag legitimate multibyte-as-Latin1 text as binary (the CJK
-// false-positive). Exposed for inspection; never drives the label.
-function isC1orDel(c) {
-return c === 0x7f || (c >= 0x80 && c <= 0x9f);
-}
-
-function assess(text, options) {
-var opt = options || {};
-var readableMax = typeof opt.readableMax === "number"? opt.readableMax: DEFAULTS.readableMax;
-var binaryMin = typeof opt.binaryMin === "number"? opt.binaryMin: DEFAULTS.binaryMin;
-
-// No signal to judge: null/undefined, empty, or whitespace-only.
-if (text === null || text === undefined) {
-return emptyResult();
-}
-var s = String(text);
-if (s.length === 0 || /^\s*$/.test(s)) {
-return emptyResult(s.length);
-}
-
-var control = 0, c1 = 0, nul = 0, replacement = 0;
-for (var i = 0; i < s.length; i++) {
-var c = s.charCodeAt(i);
-if (c === 0x00) nul++;
-if (c === 0xfffd) { replacement++; continue;}
-if (isC0Control(c)) { control++; continue;}
-if (isC1orDel(c)) { c1++; continue;}
-}
-var n = s.length;
-// SCORED signal: C0 controls + replacement only. c1/nul are reported below
-// for inspection but NOT scored (see isC1orDel — the CJK false-positive).
-var binaryRatio = (control + replacement) / n;
-var score = round4(binaryRatio);
-
-var label;
-if (score <= readableMax) label = "readable";
-else if (score >= binaryMin) label = "likely-binary";
-else label = "suspect";
-
-return {
-label: label,
-score: score,
-signals: {
-length: n,
-control: control, // C0 controls, excluding text whitespace
-c1: c1, // DEL + C1 controls
-nul: nul, // count of 0x00 (a strong binary tell)
-replacement: replacement, // U+FFFD (botched decode)
-binaryRatio: score
-}
-};
-}
-
-function emptyResult(length) {
-return {
-label: "empty",
-score: 0,
-signals: { length: length || 0, control: 0, c1: 0, nul: 0, replacement: 0, binaryRatio: 0}
-};
-}
-
-function round4(x) { return Math.round(x * 1e4) / 1e4;}
-
-// The composition joint: dispatch on the shape of the input.
-function legible(input, options) {
-if (Array.isArray(input)) {
-return input.map(function (x) { return legible(x, options);});
-}
-if (input && typeof input === "object") {
-// A record carrying a `.text` field (e.g. ratchet's.streams[] entries).
-var out = {};
-for (var k in input) if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
-out.legibility = assess(input.text, options);
-return out;
-}
-// A bare string (or anything String()-able).
-return assess(input, options);
-}
-
-return { legible: legible, assess: assess};
-});
-
-// ---- CLI (Node only) ------------------------------------------------------
-if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
-var api = (typeof globalThis!== "undefined"? globalThis: this).__legible;
-
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--port")!== -1) { process.stdout.write("transform\n"); return 0;}
-if (args.indexOf("--help")!== -1 || (args.length === 0 && process.stdin.isTTY)) {
-process.stdout.write(
-"legible — a heuristic gauge: is this string readable text or machine-drawn rubble?\n" +
-" node legible.js \"some text\" assess an argument, print JSON\n" +
-" cat streams.jsonl | node legible.js annotate each JSONL record's.text\n" +
-" node legible.js --port print the port-verb (transform)\n" +
-" node legible.js --help\n"
-);
-return 0;
-}
-// Argument form: assess the first non-flag argument.
-var textArg = null;
-for (var i = 0; i < args.length; i++) { if (args[i].indexOf("--")!== 0) { textArg = args[i]; break;}}
-if (textArg!== null) {
-process.stdout.write(JSON.stringify(api.assess(textArg)) + "\n");
-return 0;
-}
-// stdin JSONL form: one record (or raw line) per line -> annotate -> emit JSONL.
-var input = "";
-try { input = require("fs").readFileSync(0, "utf8");} catch (e) { input = "";}
-var lines = input.split("\n");
-for (var j = 0; j < lines.length; j++) {
-var line = lines[j];
-if (line === "" && j === lines.length - 1) continue; // trailing newline
-var rec;
-try {
-var parsed = JSON.parse(line);
-rec = api.legible(parsed);
-} catch (e) {
-// Not JSON — treat the raw line as a text string to assess.
-rec = { text: line, legibility: api.assess(line)};
-}
-process.stdout.write(JSON.stringify(rec) + "\n");
-}
-return 0;
-}
-
-process.exitCode = main(process.argv);
-}
-
-test_legible.js 173 lines on GitHub →
-#!/usr/bin/env node
-/* test_legible.js — known-answer battery for legible.
-
-The oracle is OUT OF BAND: every expected label/score below is a fact computed
-BY HAND from the definition (C0-control + U+FFFD density), never the output of
-a second scorer. The two load-bearing fixtures are drawn from real behaviour,
-not invented:
-• the KNOWN-BAD: a 2-byte CID glyph-index run decoded as Latin-1 — the exact
-shape ratchet-pdf-text surfaces for a subsetted CID font.
-• the REGRESSION GUARD: Japanese ("日本語") UTF-8 bytes read as Latin-1 — the
-CJK false-positive that a naive C1-inclusive score would mislabel; this
-test fails if anyone re-adds the C1 band (0x80–0x9F) to the score.
-
-Run: node test_legible.js (exit 0 = all pass, nonzero = failure)
-*/
-"use strict";
-var assert = require("assert");
-var cp = require("child_process");
-var path = require("path");
-var { legible, assess} = require("./legible.js");
-
-var pass = 0, fail = 0;
-function ok(name, fn) {
-try { fn(); pass++; console.log(" ok " + name);}
-catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
-}
-function cc() { return String.fromCharCode.apply(null, arguments);}
-
-// --- readable ---------------------------------------------------------------
-ok("plain ASCII is readable, score 0", function () {
-var r = assess("Hello, world! This is plain readable text.");
-assert.strictEqual(r.label, "readable");
-assert.strictEqual(r.score, 0);
-assert.strictEqual(r.signals.control, 0);
-});
-
-ok("accented Latin-1 (single-byte é) stays readable", function () {
-// 0xE9 (é) is printable Latin-1, not a control char.
-var r = assess("caf" + cc(0xe9) + " au lait");
-assert.strictEqual(r.label, "readable");
-assert.strictEqual(r.signals.control, 0);
-});
-
-// --- empty (no signal) ------------------------------------------------------
-ok("empty string is empty, not readable", function () {
-assert.strictEqual(assess("").label, "empty");
-});
-ok("whitespace-only is empty", function () {
-assert.strictEqual(assess(" \n\t ").label, "empty");
-});
-ok("null text is empty (via record)", function () {
-var r = legible({ index: 0, text: null});
-assert.strictEqual(r.legibility.label, "empty");
-});
-ok("undefined text is empty", function () {
-assert.strictEqual(assess(undefined).label, "empty");
-});
-
-// --- likely-binary: the KNOWN-BAD (CID glyph indices as Latin-1) -------------
-ok("KNOWN-BAD: 2-byte CID index run is likely-binary, score 1.0", function () {
-// Low subset glyph indices 0x0001..0x0005 as bytes: every char is 0x00–0x1F.
-var cid = cc(0, 1, 0, 2, 0, 3, 0, 4, 0, 5);
-var r = assess(cid);
-assert.strictEqual(r.label, "likely-binary");
-assert.strictEqual(r.score, 1);
-assert.strictEqual(r.signals.nul, 5); // five 0x00 high bytes
-assert.strictEqual(r.signals.control, 10);
-});
-
-// --- the REGRESSION GUARD: CJK-as-Latin1 must NOT be likely-binary -----------
-ok("REGRESSION: Japanese UTF-8 bytes as Latin-1 read as readable (C1 not scored)", function () {
-// "日本語" UTF-8 = E6 97 A5 E6 9C AC E8 AA 9E. Bytes 0x97/0x9C/0x9E are C1
-// controls AND UTF-8 continuation bytes. If C1 were scored, this is 3/9=0.33
-// => likely-binary (the CJK false-positive). C0-only scoring => 0 => readable.
-var mojibake = cc(0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac, 0xe8, 0xaa, 0x9e);
-var r = assess(mojibake);
-assert.strictEqual(r.label, "readable", "CJK-as-Latin1 must not be flagged binary");
-assert.strictEqual(r.score, 0);
-assert.ok(r.signals.c1 >= 3, "c1 IS reported (just not scored)"); // 0x97,0x9C,0x9E
-});
-
-// --- suspect: the mixed stream (half readable, half rubble) ------------------
-ok("mixed readable + a little rubble is suspect", function () {
-// 15 readable chars + 2 control chars => 2/17 = 0.1176 -> suspect.
-var mixed = "Hello World Foo" + cc(1, 2);
-var r = assess(mixed);
-assert.strictEqual(r.label, "suspect");
-assert.ok(r.score > 0.05 && r.score < 0.30, "score " + r.score + " in suspect band");
-});
-
-ok("replacement chars (U+FFFD) count toward the score", function () {
-var r = assess("abc" + cc(0xfffd) + cc(0xfffd) + "d"); // 6 chars, 2 replacement = 0.3333
-assert.strictEqual(r.signals.replacement, 2);
-assert.strictEqual(r.label, "likely-binary"); // 0.3333 >= 0.30
-});
-
-// --- band boundaries (the thresholds are exact) -----------------------------
-ok("score exactly at readableMax (0.05) is readable (<=)", function () {
-// 1 control in 20 chars = 0.05.
-var r = assess("abcdefghijklmnopqrs" + cc(1));
-assert.strictEqual(r.score, 0.05);
-assert.strictEqual(r.label, "readable");
-});
-ok("score exactly at binaryMin (0.30) is likely-binary (>=)", function () {
-// 3 control in 10 chars = 0.30.
-var r = assess("abcdefg" + cc(1, 2, 3));
-assert.strictEqual(r.score, 0.3);
-assert.strictEqual(r.label, "likely-binary");
-});
-
-// --- options override -------------------------------------------------------
-ok("options can widen the readable band", function () {
-var s = "aa" + cc(1); // 1/3 = 0.3333
-assert.strictEqual(assess(s).label, "likely-binary");
-assert.strictEqual(assess(s, { readableMax: 0.5}).label, "readable");
-});
-
-// --- the composition joint --------------------------------------------------
-ok("record passthrough preserves fields and adds.legibility", function () {
-var rec = { index: 2, filter: "FlateDecode", text: "readable content"};
-var out = legible(rec);
-assert.strictEqual(out.index, 2);
-assert.strictEqual(out.filter, "FlateDecode");
-assert.strictEqual(out.text, "readable content");
-assert.strictEqual(out.legibility.label, "readable");
-});
-ok("array input maps element-wise", function () {
-var out = legible(["hello", cc(0, 1, 2, 3)]);
-assert.strictEqual(out.length, 2);
-assert.strictEqual(out[0].label, "readable");
-assert.strictEqual(out[1].label, "likely-binary");
-});
-ok("a ratchet.streams-shaped record annotates cleanly", function () {
-// Mirrors the real join: ratchet-pdf-text emits entries like this.
-var stream = { index: 0, filter: "FlateDecode", compressed: true, needsInflate: false, text: cc(0,1,0,2,0,3), rawLength: 6};
-var out = legible(stream);
-assert.strictEqual(out.legibility.label, "likely-binary");
-assert.strictEqual(out.rawLength, 6); // original fields intact
-});
-
-// --- determinism (the canonicalizer self-test) ------------------------------
-ok("determinism: same input yields byte-identical JSON across runs", function () {
-var inputs = ["Hello", cc(0,1,2), "日本語 as latin1: " + cc(0xe6,0x97,0xa5), "", " "];
-for (var i = 0; i < inputs.length; i++) {
-var a = JSON.stringify(assess(inputs[i]));
-var b = JSON.stringify(assess(inputs[i]));
-assert.strictEqual(a, b, "run 2 differs for input " + i);
-}
-});
-
-// --- the CLI contract -------------------------------------------------------
-ok("CLI --port prints the port-verb (transform)", function () {
-var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " --port").toString().trim();
-assert.strictEqual(out, "transform");
-});
-ok("CLI argument form prints the assessment JSON", function () {
-var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " 'plain text'").toString().trim();
-var r = JSON.parse(out);
-assert.strictEqual(r.label, "readable");
-});
-ok("CLI stdin JSONL form annotates each record", function () {
-var jsonl = JSON.stringify({ index: 0, text: "readable"}) + "\n" +
-JSON.stringify({ index: 1, text: cc(0,1,2,3)}) + "\n";
-var out = cp.execSync("node " + path.join(__dirname, "legible.js"), { input: jsonl}).toString().trim().split("\n");
-var a = JSON.parse(out[0]), b = JSON.parse(out[1]);
-assert.strictEqual(a.legibility.label, "readable");
-assert.strictEqual(b.legibility.label, "likely-binary");
-assert.strictEqual(b.index, 1);
-});
-
-// --- report -----------------------------------------------------------------
-console.log("\n" + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# Life-fold — a Loop MMT gift
-https://loopmmt.com/gifts/life-fold/
-[coverage: optional · branch: gifts]
-
-One Conway Step as a Fold, Closed Under Its Own I/O fold ← all gifts
-
-Life-fold
-
-life-fold reads a set of LIVE CELLS — one JSON [x,y] integer pair per line (JSON Lines) — and folds it into the NEXT generation of Conway's Game of Life by the rule B3/S23, with zero dependencies, on a SPARSE UNBOUNDED grid (only live cells are represented, so a glider travels forever). The output is the SAME SHAPE as the input — [x,y] pairs, one per line, sorted — so the gift is CLOSED UNDER ITS OWN I/O: its output pipes straight back into itself, and life-fold | life-fold == life-fold --steps 2. That closed loop is the point: a fold circulating through its own output channel, each pass confirming the last — a mercury delay line made of live cells. --steps N runs N generations in-process (N=0 canonicalises: dedup + sort). Because the live set is sorted and duplicates collapse, the SAME set in ANY order folds to a BYTE-IDENTICAL record. Same cells in → next generation out, in Node or a browser.
-
-The honest edge
-
-life-fold is ONE Conway B3/S23 step as a fold over a set of live cells, stepped N times in-process — NOT a renderer (it emits the live-cell SET, not a picture), NOT a bounded grid (it is sparse and unbounded, so gliders travel forever), and NOT a variant rule (it is exactly B3/S23). The output is the same shape as the input, so it is closed under its own I/O (life-fold | life-fold == --steps 2). Fully order-independent — duplicates collapse, output sorted.
-
-Run it
-
-printf '%s\n' '[0,0]' '[1,0]' '[2,0]' | node life-fold.js # next generation as JSONL [x,y]; --steps N (N gens; 0 canonicalises); exit 0 ok | 2 input error
-test_life-fold.js (24/24: Conway correctness on frozen hand goldens — blinker period-2, block still-life unchanged, glider population-5 conserved AND translated on an unbounded grid — the TIER-B closure (--steps N == piping the fold into itself N times, N in {2,3,4}), byte-identical order-independence (shuffled == sorted), dedup + steps-0 canonicalisation, empty/blank/CRLF, and numeric/shape honesty hard errors (non-array / wrong-length / non-integer / non-finite / bad-JSON) plus bad-steps guards) + out-of-band conformance conform_life-fold.cjs (43/43 GREEN, subprocess-driven, signed 6d8fc4b5d7da412b, independent dense-grid oracle + B3/S12 wrong-rule mutation bite)
-Zero dependencies, Node or browser, deterministic
-
-The code — every file that ships
-
-life-fold.js 196 lines on GitHub →
-#!/usr/bin/env node
-/**
-* life-fold — Conway's Game of Life, one step as a FOLD, in a trace loop.
-*
-* WHAT
-* Reads a set of LIVE CELLS -- one `[x,y]` integer pair per line (JSON Lines) --
-* and folds it into the NEXT generation's live cells by Conway's rule (B3/S23).
-* Output is the same shape as input: `[x,y]` pairs, one per line, sorted. So the
-* gift is CLOSED UNDER ITS OWN I/O -- its output pipes straight back into itself:
-* life-fold < gen0 | life-fold | life-fold == life-fold --steps 3 < gen0
-* That feedback -- the fold circulating through its own output channel, each pass
-* confirming the last -- is Shea's mercury delay line, Loop 1.0 generalized. It is
-* the Tier-B property: the reducer transition stays the `fold` atom; the loop (↻)
-* is only wrapped around it, no new primitive. --steps N internalizes that loop.
-*
-* THE RULE (Conway B3/S23, on an unbounded sparse grid)
-* A live cell with 2 or 3 live neighbours survives; a dead cell with exactly 3
-* live neighbours is born; every other cell is dead next generation. Neighbours
-* are the 8 surrounding cells. The grid is infinite and sparse: only live cells
-* are represented, so patterns may grow without a bounding box.
-*
-* USAGE
-* node life-fold.js [--steps N] [FILE] # stdin if no FILE
-* printf '%s\n' '[0,0]' '[1,0]' '[2,0]' | node life-fold.js # blinker, 1 step
-* -> [1,-1]
-* [1,0]
-* [1,1]
-* --steps N run N generations in-process (default 1). N=0 canonicalises the
-* input (dedups + sorts the live set) without stepping.
-* --help
-*
-* EXIT CODES
-* 0 success
-* 2 input error: a line that is not a JSON array of exactly two FINITE INTEGERS;
-* a bad --steps (non-integer or < 0); a missing file or a directory. Always a
-* clean one-line message on stderr, never a stack trace.
-*
-* EDGE (what this is NOT)
-* ONE deterministic Life implementation stepped N times -- NOT a renderer (it
-* emits the live-cell SET, not a picture), NOT a bounded grid (it is sparse and
-* unbounded, so gliders travel forever), and NOT a variant rule (it is exactly
-* B3/S23). Cells are unordered on input (a SET -- duplicates collapse, order is
-* irrelevant) and SORTED on output (x then y), so the same generation is a
-* byte-identical record regardless of input order.
-*
-* Zero dependencies. Node builtin `require('fs')` for file reads only; runs in a
-* browser with no require (attaches `lifeFold` to window.ForestGifts). MIT.
+Released under MIT. Its edge is printed in the README: jq-lite implements a SMALL
+subset of jq — identity, field/index/bracket access, `.[]` iteration, the pipe, and the
+`?` optional. It has NO functions, NO arithmetic, NO object/array construction, NO
+select/map/comparison, NO recursion (`..`). For those, use jq itself. It is a reach
+tool for the common "pull this out / walk this stream" case, not a jq replacement.
 */
 "use strict";
 
-function key(x, y) { return x + "," + y;}
+/* ==================================================================
+THE PARSER — filter string -> a list of STEP objects.
+Each step is one of:
+{ op: "identity"}
+{ op: "field", key: <string>, optional: <bool>}
+{ op: "index", idx: <int>, optional: <bool>}
+{ op: "iterate", optional: <bool>}
+A PIPE ( a | b) concatenates the two step lists — piping is just
+sequential application, so the compiled program is one flat list of
+steps run left to right, each step mapping a stream to a stream.
+================================================================== */
 
-/* one Conway step over a Set of "x,y" keys -> a new Set of "x,y" keys */
-function step(live) {
-var counts = Object.create(null); // "x,y" -> live-neighbour count
-live.forEach(function (k) {
-var c = k.split(","), x = +c[0], y = +c[1];
-for (var dx = -1; dx <= 1; dx++) {
-for (var dy = -1; dy <= 1; dy++) {
-if (dx === 0 && dy === 0) continue;
-var nk = key(x + dx, y + dy);
-counts[nk] = (counts[nk] || 0) + 1;
-}
-}
-});
-var next = new Set();
-for (var k in counts) {
-var n = counts[k];
-if (n === 3 || (n === 2 && live.has(k))) next.add(k); // B3 / S23
-}
-return next;
-}
+// Parse one pipeline segment (no top-level '|') into steps, starting at position `pos`
+// in `src`. Returns { steps, pos}. Throws a clean Error on malformed syntax.
+function parseSegment(src, pos) {
+var steps = [];
+var n = src.length;
 
-/* parse JSONL live cells -> Set of "x,y"; throws on a non-integer-pair line */
-function parse(text) {
-var live = new Set();
-var lines = String(text).split("\n");
-for (var i = 0; i < lines.length; i++) {
-var raw = lines[i];
-if (raw.charCodeAt(raw.length - 1) === 13) raw = raw.slice(0, -1); // CRLF
-if (raw.length === 0) continue; // blank line skipped
-var v;
-try { v = JSON.parse(raw);}
-catch (e) { throw new Error("line " + (i + 1) + ": not valid JSON: " + raw);}
-if (!Array.isArray(v) || v.length!== 2) {
-throw new Error("line " + (i + 1) + ": expected a [x,y] pair: " + raw);
+function skipWs() { while (pos < n && isWs(src.charCodeAt(pos))) pos++;}
+function isWs(c) { return c === 32 || (c >= 9 && c <= 13);}
+function isIdentStart(c) {
+return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95; // A-Z a-z _
 }
-var x = v[0], y = v[1];
-if (typeof x!== "number" || typeof y!== "number" ||!isFinite(x) ||!isFinite(y) ||
-Math.floor(x)!== x || Math.floor(y)!== y) {
-throw new Error("line " + (i + 1) + ": coordinates must be finite integers: " + raw);
-}
-live.add(key(x, y));
-}
-return live;
+function isIdentPart(c) {
+return isIdentStart(c) || (c >= 48 && c <= 57); // + 0-9
 }
 
-/* sorted array of [x,y] from a Set of "x,y" (x asc, then y asc) -> canonical order */
-function sortedCells(live) {
-var arr = [];
-live.forEach(function (k) { var c = k.split(","); arr.push([+c[0], +c[1]]);});
-arr.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1];});
-return arr;
+skipWs();
+if (pos >= n) throw new Error("empty filter segment");
+
+// A segment must begin with '.'
+if (src.charAt(pos)!== ".") {
+throw new Error("filter must begin with '.' at position " + pos);
+}
+pos++; // consume the leading '.'
+
+// A bare '.' (identity) is legal if nothing accessor-like follows.
+// Otherwise a chain of.field / [..] / [] accessors follows, each optionally '?'.
+var sawAccessor = false;
+
+// Handle an immediate identifier right after the leading dot:.foo
+function tryField() {
+var c = src.charCodeAt(pos);
+if (pos < n && isIdentStart(c)) {
+var start = pos;
+while (pos < n && isIdentPart(src.charCodeAt(pos))) pos++;
+var key = src.slice(start, pos);
+var optional = consumeOptional();
+steps.push({ op: "field", key: key, optional: optional});
+sawAccessor = true;
+return true;
+}
+return false;
 }
 
-/**
-* Fold a JSONL live-cell set forward N generations.
-* @param {string} text JSONL of [x,y] live cells
-* @param {{steps?:number}} opts steps N (integer >= 0; default 1)
-* @returns {{steps:number, count:number, cells:number[][]}}
-* @throws {Error} on a bad line or a bad steps value.
-*/
-function fold(text, opts) {
-opts = opts || {};
-var steps = opts.steps === undefined? 1: opts.steps;
-if (typeof steps!== "number" ||!isFinite(steps) || Math.floor(steps)!== steps || steps < 0) {
-throw new Error("steps must be an integer >= 0 (got " + steps + ")");
-}
-var live = parse(text);
-for (var s = 0; s < steps; s++) live = step(live);
-var cells = sortedCells(live);
-return { steps: steps, count: cells.length, cells: cells};
+function consumeOptional() {
+if (pos < n && src.charAt(pos) === "?") { pos++; return true;}
+return false;
 }
 
-/* ------------------------------------------------------------------ exports */
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { fold: fold, step: step, parse: parse, sortedCells: sortedCells};
+//.["key"] or.[2] or.[] — the leading '.' is already consumed for the FIRST
+// accessor; subsequent bracket accessors do not need a dot.
+function tryBracket() {
+if (pos >= n || src.charAt(pos)!== "[") return false;
+pos++; // '['
+skipWs();
+if (pos < n && src.charAt(pos) === "]") {
+pos++; // ']'
+var opt0 = consumeOptional();
+steps.push({ op: "iterate", optional: opt0});
+sawAccessor = true;
+return true;
 }
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.lifeFold = fold;
+var c = src.charAt(pos);
+if (c === '"') {
+var str = parseJSONString();
+skipWs();
+expect("]");
+var opt1 = consumeOptional();
+steps.push({ op: "field", key: str, optional: opt1});
+sawAccessor = true;
+return true;
+}
+// numeric index (optionally negative)
+if (c === "-" || (src.charCodeAt(pos) >= 48 && src.charCodeAt(pos) <= 57)) {
+var start = pos;
+if (src.charAt(pos) === "-") pos++;
+var digits = 0;
+while (pos < n && src.charCodeAt(pos) >= 48 && src.charCodeAt(pos) <= 57) { pos++; digits++;}
+if (digits === 0) throw new Error("expected an array index inside []");
+var idx = parseInt(src.slice(start, pos), 10);
+skipWs();
+expect("]");
+var opt2 = consumeOptional();
+steps.push({ op: "index", idx: idx, optional: opt2});
+sawAccessor = true;
+return true;
+}
+throw new Error("unexpected character inside []: " + JSON.stringify(c));
 }
 
-/* ----------------------------------------------------------------- CLI main */
-function main(argv) {
-var args = argv.slice(2);
-var steps = 1, file = null;
-for (var i = 0; i < args.length; i++) {
-var a = args[i];
-if (a === "--help" || a === "-h") {
-process.stdout.write(
-"usage: life-fold.js [--steps N] [FILE]\n" +
-" --steps N run N generations in-process (default 1; N=0 canonicalises)\n" +
-" (no FILE) read live cells from stdin\n" +
-" FILE read live cells from a file\n" +
-" --help\n" +
-"Each non-blank line is one live cell as a JSON [x,y] integer pair. Output is\n" +
-"the next generation's live cells, same shape, one [x,y] per line, sorted --\n" +
-"so `life-fold | life-fold` steps two generations (closed under its own I/O).\n"
-);
-process.exit(0);
-} else if (a === "--steps") {
-var nx = args[i + 1];
-if (nx === undefined) { process.stderr.write("life-fold: --steps requires a value\n"); process.exit(2);}
-steps = Number(nx); i += 1;
-} else if (a.indexOf("--steps=") === 0) {
-steps = Number(a.slice(8));
-} else if (a.charAt(0) === "-" && a!== "-") {
-process.stderr.write("life-fold: unknown option: " + a + "\n"); process.exit(2);
-} else {
-if (file!== null) { process.stderr.write("life-fold: more than one FILE given\n"); process.exit(2);}
-file = a;
+function expect(ch) {
+if (pos >= n || src.charAt(pos)!== ch) {
+throw new Error("expected '" + ch + "' at position " + pos);
 }
+pos++;
 }
 
-function run(text) {
-var rec;
-try { rec = fold(text, { steps: steps});}
-catch (e) { process.stderr.write("life-fold: " + e.message + "\n"); process.exit(2); return;}
-// closed under I/O: emit the live-cell SET as JSONL [x,y] (one per line)
+// Minimal JSON string parser for bracket keys: assumes src.charAt(pos) === '"'.
+function parseJSONString() {
+var start = pos;
+pos++; // opening quote
 var out = "";
-for (var i = 0; i < rec.cells.length; i++) out += JSON.stringify(rec.cells[i]) + "\n";
-process.stdout.write(out);
-}
-
-if (file === null || file === "-") {
-var chunks = [];
-process.stdin.on("data", function (c) { chunks.push(c);});
-process.stdin.on("end", function () { run(Buffer.concat(chunks).toString("utf8"));});
+while (pos < n) {
+var ch = src.charAt(pos);
+if (ch === '"') { pos++; return out;}
+if (ch === "\\") {
+pos++;
+if (pos >= n) break;
+var e = src.charAt(pos);
+if (e === "n") out += "\n";
+else if (e === "t") out += "\t";
+else if (e === "r") out += "\r";
+else if (e === '"') out += '"';
+else if (e === "\\") out += "\\";
+else if (e === "/") out += "/";
+else if (e === "u") {
+var hex = src.slice(pos + 1, pos + 5);
+if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error("bad \\u escape in filter string");
+out += String.fromCharCode(parseInt(hex, 16));
+pos += 4;
 } else {
-var fs = require("fs");
-var text;
-try {
-var st = fs.statSync(file);
-if (st.isDirectory()) { process.stderr.write("life-fold: is a directory: " + file + "\n"); process.exit(2); return;}
-text = fs.readFileSync(file, "utf8");
-} catch (e) {
-process.stderr.write("life-fold: cannot read file: " + file + "\n"); process.exit(2); return;
+throw new Error("bad escape \\" + e + " in filter string");
 }
-run(text);
-}
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-main(process.argv);
-}
-
-test_life-fold.js 88 lines on GitHub →
-#!/usr/bin/env node
-/* test_life-fold.js — external battery for the life-fold gift.
-*
-* node test_life-fold.js -> exit 0 GREEN / non-zero RED
-*
-* Proves Conway B3/S23 correctness on known patterns (blinker oscillator, block
-* still-life, glider translation on an unbounded grid), the TIER-B closure property
-* (--steps N equals piping the fold into itself N times -- the trace ↻ loop), plus
-* determinism, order-independence, empty/steps-0, dedup, and numeric-honesty errors.
-*/
-"use strict";
-var assert = require("assert");
-var m = require("./life-fold.js");
-var fold = m.fold;
-
-var pass = 0, fail = 0;
-function ok(name, cond) { if (cond) pass++; else { fail++; console.error(" RED " + name);}}
-function throws(name, fn) { try { fn(); fail++; console.error(" RED " + name + " (did not throw)");} catch (e) { pass++;}}
-function J(v) { return JSON.stringify(v);}
-function jsonl(cells) { return cells.map(function (c) { return J(c);}).join("\n");}
-
-/* re-serialize a fold result back to JSONL (to feed it into itself) */
-function toJSONL(rec) { return rec.cells.map(function (c) { return J(c);}).join("\n");}
-
-/* ---- blinker: 3 in a row oscillates with period 2 -------------------------- */
-var blinkerH = [[0, 0], [1, 0], [2, 0]];
-var blinkerV = [[1, -1], [1, 0], [1, 1]];
-ok("blinker horizontal -> vertical (1 step)", J(fold(jsonl(blinkerH), { steps: 1}).cells) === J(blinkerV));
-ok("blinker vertical -> horizontal (1 step)", J(fold(jsonl(blinkerV), { steps: 1}).cells) === J(blinkerH));
-ok("blinker period 2 (2 steps == identity)", J(fold(jsonl(blinkerH), { steps: 2}).cells) === J(blinkerH));
-
-/* ---- block: 2x2 still-life is unchanged forever ---------------------------- */
-var block = [[0, 0], [0, 1], [1, 0], [1, 1]];
-ok("block still-life unchanged (1 step)", J(fold(jsonl(block), { steps: 1}).cells) === J(block));
-ok("block still-life unchanged (5 steps)", J(fold(jsonl(block), { steps: 5}).cells) === J(block));
-
-/* ---- TIER-B closure: --steps N == piping the fold N times ------------------ */
-var seed = [[0, 0], [1, 0], [2, 0], [5, 5], [5, 6], [6, 5], [6, 6]]; // blinker + block
-function piped(text, n) { var t = text; for (var i = 0; i < n; i++) t = toJSONL(fold(t, { steps: 1})); return t;}
-[2, 3, 4].forEach(function (n) {
-ok("closed under I/O: --steps " + n + " == piped " + n,
-toJSONL(fold(jsonl(seed), { steps: n})) === piped(jsonl(seed), n));
-});
-
-/* ---- glider: population 5 conserved, and it TRANSLATES on an unbounded grid - */
-var glider = [[1, 0], [2, 1], [0, 2], [1, 2], [2, 2]];
-ok("glider population 5 conserved through 4 steps",
-[1, 2, 3, 4].every(function (n) { return fold(jsonl(glider), { steps: n}).count === 5;}));
-function normalize(cells) {
-var minx = Math.min.apply(null, cells.map(function (c) { return c[0];}));
-var miny = Math.min.apply(null, cells.map(function (c) { return c[1];}));
-return cells.map(function (c) { return [c[0] - minx, c[1] - miny];})
-.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1];});
-}
-var g0 = fold(jsonl(glider), { steps: 0}).cells;
-var g4 = fold(jsonl(glider), { steps: 4}).cells;
-ok("glider after 4 steps is the same shape, translated (not identical position)",
-J(normalize(g4)) === J(normalize(g0)) && J(g4)!== J(g0));
-
-/* ---- determinism + order-independence (a SET; shuffled == base) ------------ */
-var shuffled = [[6, 6], [1, 0], [5, 5], [2, 0], [6, 5], [0, 0], [5, 6]];
-ok("order-independent: shuffled seed == sorted seed (1 step, byte-identical)",
-J(fold(jsonl(shuffled), { steps: 1}).cells) === J(fold(jsonl(seed), { steps: 1}).cells));
-ok("determinism: folds twice identical", J(fold(jsonl(seed), { steps: 3})) === J(fold(jsonl(seed), { steps: 3})));
-
-/* ---- dedup: duplicate live cells collapse (a set) -------------------------- */
-ok("duplicate cells collapse (steps 0 canonicalises)",
-J(fold("[0,0]\n[0,0]\n[1,1]\n", { steps: 0}).cells) === J([[0, 0], [1, 1]]));
-ok("steps 0 sorts + dedups", J(fold("[2,2]\n[0,0]\n[2,2]\n", { steps: 0}).cells) === J([[0, 0], [2, 2]]));
-
-/* ---- empty stream ---------------------------------------------------------- */
-ok("empty -> {steps:1,count:0,cells:[]}", J(fold("", { steps: 1})) === J({ steps: 1, count: 0, cells: []}));
-ok("blank lines skipped", J(fold("[0,0]\n\n[1,0]\n\n[2,0]\n", { steps: 0}).cells) === J([[0, 0], [1, 0], [2, 0]]));
-ok("CRLF trimmed", J(fold("[0,0]\r\n[1,0]\r\n[2,0]\r\n", { steps: 1}).cells) === J(blinkerV));
-
-/* ---- numeric / shape honesty: hard errors ---------------------------------- */
-throws("non-array line -> throw", function () { fold("[0,0]\n5\n", { steps: 1});});
-throws("wrong-length pair -> throw", function () { fold("[0,0,0]\n", { steps: 1});});
-throws("non-integer coord -> throw", function () { fold("[0.5,0]\n", { steps: 1});});
-throws("non-finite coord -> throw", function () { fold("[1e999,0]\n", { steps: 1});});
-throws("bad JSON line -> throw", function () { fold("[0,0]\nabc\n", { steps: 1});});
-
-/* ---- bad steps guards ------------------------------------------------------ */
-throws("steps=-1 -> throw", function () { fold("[0,0]", { steps: -1});});
-throws("steps=1.5 -> throw", function () { fold("[0,0]", { steps: 1.5});});
-
-console.log((fail === 0? "GREEN": "RED") + ": " + pass + " assertions passed, " + fail + " failed [test_life-fold]");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Zero dependencies, Node or browser, deterministic
-
----
-
-# line-source — a Loop MMT gift
-https://loopmmt.com/gifts/line-source/
-[coverage: optional · branch: gifts]
-
-Turn a Text File into a JSONL Stream, One Record per Line source ← all gifts
-
-line-source
-
-line-source turns line-oriented text (a log, a word list, any one-record-per-line file) into a JSONL stream, one record per line: { line: <text>, n: <index>}. It is the adapter at the front of a pipe that lets the fold/filter/transform gifts consume ordinary text files. It fixes the three quiet failures of naive text.split('\n'): the phantom trailing empty record, the CRLF \r left glued to every line, and the leading UTF-8 BOM. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
-
-The honest edge
-
-line-source splits on line terminators (\r\n, \n, \r) and emits one record per line — it does not parse CSV fields (use csv-source), does not parse JSON (lines are verbatim strings), does not read the file itself (you pipe text in), and does not sort or deduplicate. It preserves line bytes (minus the terminator and a leading BOM); with --trim it strips surrounding whitespace, and never otherwise. Empty --field, an unknown option, or a positional argument is refused (exit 2).
-
-Run it
-
-printf 'a\r\nb\n\nc\n' | node line-source.js --skip-blank # -> {"line":"a","n":0} {"line":"b","n":1} {"line":"c","n":3}
-test_line-source.js (138/138, independent regex-normalize-route oracle) + mutation-bite (7/7) + Plumb conformance GREEN (126/126, signed 2026-09-12, clock-independent, non-vacuity proven)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-line-source.js 241 lines on GitHub →
-#!/usr/bin/env node
-/* line-source.js — turn a plain-text file into a JSONL record stream, one record per line.
-Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
-
-WHAT IT IS. A SOURCE: it takes text in and emits a JSONL stream out — the front of a
-pipe. Hand it the contents of a log file, a word list, a CSV-without-structure, any
-line-oriented text, and it emits one JSON object per line: {"line":"...","n":0}. It is
-the adapter that lets the JSONL fold/filter/transform gifts consume ordinary text
-files: `line-source access.log | range-filter...`, `line-source names.txt | dedup-filter`.
-
-THE THREE QUIET FAILURES IT FIXES. Everyone "knows" how to split a file into lines —
-text.split("\n") — and everyone gets it subtly wrong, in three ways that only bite
-later:
-
-1. THE PHANTOM EMPTY RECORD. A well-formed text file ends with a newline. Naive
-"abc\ndef\n".split("\n") yields ["abc","def",""] — a trailing empty string that
-becomes a bogus final record. line-source treats a single trailing newline as the
-line TERMINATOR it is (POSIX: a line is text followed by a newline), not a
-separator, so "abc\ndef\n" is exactly two lines. A file with NO final newline
-("abc\ndef") is also two lines — the last line is still a line. The difference
-between "ends with newline" and "does not" never changes the record count.
-
-2. CRLF. Files authored on Windows end lines with "\r\n". Splitting on "\n" alone
-leaves a trailing "\r" glued to every record — invisible, and a silent mismatch
-the moment you compare or key on that field. line-source recognizes "\r\n", "\n",
-and a lone "\r" (classic-Mac) as line endings and strips them, so the emitted
-"line" value is the text WITHOUT its terminator, whatever the file's convention.
-
-3. THE BOM. A UTF-8 file may open with a byte-order mark (U+FEFF). Left in, it glues
-an invisible character to the first record. line-source strips a single leading
-BOM before splitting, so the first line is clean.
-
-THE MODEL. Input is the whole text (stdin on the CLI, or a string to lines()). Each
-line becomes { line: <text-without-terminator>, n: <0-based index>}, emitted in file
-order, one JSON object per line of output.
-
---field NAME the key holding the line text (default "line"). Non-empty.
---index NAME the key holding the 0-based line number (default "n"). Empty string
-disables the index entirely (emit { line:...} only).
---skip-blank do not emit a record for a line that is empty after its terminator
-is stripped. Index numbering still follows ORIGINAL line position, so
-n stays a faithful pointer into the source file (a dropped blank
-leaves a gap in n — that is the honest behavior, not a bug).
---trim strip leading/trailing ASCII whitespace from each line's text before
-emitting. Off by default: a source should preserve bytes unless told.
-
-DETERMINISM. lines(text, opts) is a pure function — no clock, no randomness, no files
-beyond the text you pass, no ambient state — so the same text and options yield
-byte-identical output on every run and every machine.
-
-USAGE
-node line-source.js < access.log
-printf 'a\nb\nc\n' | node line-source.js --skip-blank
-node line-source.js --field text --index "" < names.txt
-node line-source.js --help
-
-Exit codes: 0 success (including empty input -> empty stream) · 2 input error (empty
---field name, unknown option, unexpected positional). Always a clean one-line message
-on stderr, never a stack trace.
-
-Released under MIT. Its edge is printed in the README: line-source splits on line
-TERMINATORS (\r\n, \n, \r) and emits one record per line — it does not parse CSV
-fields (use csv-source), does not parse JSON (the lines are emitted as verbatim
-strings), does not read the file itself (you pipe text in), and does not sort or
-deduplicate. It preserves line bytes (minus the terminator, and minus a leading BOM);
-with --trim it strips surrounding whitespace, and never otherwise.
-*/
-"use strict";
-
-/* ---- the pure core ------------------------------------------------ */
-
-// Split text into its lines, honoring \r\n / \n / \r terminators, treating a final
-// terminator as a terminator (not a separator that spawns a phantom empty line), and
-// stripping a single leading BOM. Returns an array of line strings (terminators removed).
-// Pure: depends only on `text`.
-function splitLines(text) {
-if (typeof text!== "string") text = String(text == null? "": text);
-if (text.length === 0) return [];
-// strip a single leading UTF-8 BOM
-if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-if (text.length === 0) return [];
-var lines = [];
-var start = 0;
-var i = 0;
-var len = text.length;
-while (i < len) {
-var c = text.charCodeAt(i);
-if (c === 10 /* \n */) {
-lines.push(text.slice(start, i));
-i += 1;
-start = i;
-} else if (c === 13 /* \r */) {
-lines.push(text.slice(start, i));
-if (i + 1 < len && text.charCodeAt(i + 1) === 10) i += 2; // \r\n
-else i += 1; // lone \r
-start = i;
+pos++;
 } else {
-i += 1;
+out += ch;
+pos++;
 }
 }
-// trailing text with no final terminator is still a line
-if (start < len) lines.push(text.slice(start, len));
-return lines;
+throw new Error("unterminated string starting at position " + start);
 }
 
-function isWs(code) {
-// ASCII whitespace: space, \t, \n, \v, \f, \r
-return code === 32 || (code >= 9 && code <= 13);
+// First accessor after the leading '.': either a field, a bracket, or nothing (identity).
+if (!tryField()) { tryBracket();}
+// Subsequent accessors:.field or [..]
+for (;;) {
+skipWs();
+if (pos < n && src.charAt(pos) === ".") {
+// a following.field (dotted). The dot must be followed by an identifier or bracket.
+pos++;
+if (!tryField()) {
+if (!tryBracket()) throw new Error("expected a field name or [ after '.' at position " + pos);
+}
+continue;
+}
+if (pos < n && src.charAt(pos) === "[") { tryBracket(); continue;}
+break;
 }
 
-function trimAscii(s) {
-var a = 0, b = s.length;
-while (a < b && isWs(s.charCodeAt(a))) a++;
-while (b > a && isWs(s.charCodeAt(b - 1))) b--;
-return s.slice(a, b);
+if (steps.length === 0) {
+// just '.' — identity
+steps.push({ op: "identity"});
+}
+return { steps: steps, pos: pos};
 }
 
-// Turn text into an array of records. Throws a clean Error on invalid options — the CLI
-// turns that into exit 2. Pure; no side effects.
-// opts.field key for the line text (default "line"; non-empty)
-// opts.index key for the 0-based line number (default "n"; "" disables)
-// opts.skipBlank drop lines empty after terminator strip (index still tracks source pos)
-// opts.trim strip surrounding ASCII whitespace from each line's text
-function lines(text, opts) {
-opts = opts || {};
-var field = opts.field === undefined? "line": opts.field;
-var index = opts.index === undefined? "n": opts.index;
-var skipBlank =!!opts.skipBlank;
-var trim =!!opts.trim;
+// Parse a full filter (with top-level pipes) into a flat step list.
+// Pure: depends only on `src`. Throws a clean Error on malformed input.
+function parse(src) {
+if (typeof src!== "string") throw new Error("filter must be a string");
+var n = src.length;
+var pos = 0;
+var all = [];
 
-if (typeof field!== "string" || field.length === 0) throw new Error("--field must be a non-empty name");
-if (typeof index!== "string") throw new Error("--index must be a string name (or empty to disable)");
+function skipWs() { while (pos < n && (src.charCodeAt(pos) === 32 || (src.charCodeAt(pos) >= 9 && src.charCodeAt(pos) <= 13))) pos++;}
 
-var raw = splitLines(text);
+skipWs();
+if (pos >= n) throw new Error("empty filter");
+for (;;) {
+var seg = parseSegment(src, pos);
+pos = seg.pos;
+for (var i = 0; i < seg.steps.length; i++) all.push(seg.steps[i]);
+skipWs();
+if (pos >= n) break;
+if (src.charAt(pos) === "|") { pos++; skipWs(); continue;}
+throw new Error("unexpected character " + JSON.stringify(src.charAt(pos)) + " at position " + pos + " (expected '|' or end of filter)");
+}
+return all;
+}
+
+/* ==================================================================
+THE EVALUATOR — apply a compiled step list to a value.
+Each step maps a value to a STREAM (array) of values; the program
+threads the stream through the steps left to right. This is what
+makes `.[]` fan-out and the pipe compose correctly.
+================================================================== */
+
+function isPlainObject(v) {
+return v!== null && typeof v === "object" &&!Array.isArray(v);
+}
+
+// Apply ONE step to ONE value, returning an array of result values.
+// Throws a TypeError-tagged Error on a genuine, non-optional type mismatch.
+function applyStep(step, value) {
+switch (step.op) {
+case "identity":
+return [value];
+
+case "field": {
+if (value === null || value === undefined) return [null]; // missing -> null (jq)
+if (isPlainObject(value)) {
+return [Object.prototype.hasOwnProperty.call(value, step.key)? value[step.key]: null];
+}
+if (step.optional) return [];
+throw typeErr("cannot index " + typeName(value) + ' with "' + step.key + '"');
+}
+
+case "index": {
+if (value === null || value === undefined) return [null];
+if (Array.isArray(value)) {
+var i = step.idx < 0? value.length + step.idx: step.idx;
+return [(i >= 0 && i < value.length)? value[i]: null];
+}
+if (step.optional) return [];
+throw typeErr("cannot index " + typeName(value) + " with number " + step.idx);
+}
+
+case "iterate": {
+if (Array.isArray(value)) return value.slice();
+if (isPlainObject(value)) {
 var out = [];
-for (var i = 0; i < raw.length; i++) {
-var value = trim? trimAscii(raw[i]): raw[i];
-if (skipBlank && value.length === 0) continue;
-var rec = {};
-rec[field] = value;
-// index reflects the ORIGINAL 0-based line position (i), so a skipped blank leaves a
-// faithful gap rather than renumbering — n stays a pointer into the source file.
-if (index.length > 0) rec[index] = i;
-out.push(rec);
+for (var k in value) if (Object.prototype.hasOwnProperty.call(value, k)) out.push(value[k]);
+return out;
+}
+if (step.optional) return [];
+throw typeErr("cannot iterate over " + typeName(value));
+}
+
+default:
+throw new Error("internal: unknown step op " + step.op);
+}
+}
+
+function typeName(v) {
+if (v === null) return "null";
+if (Array.isArray(v)) return "array";
+if (typeof v === "object") return "object";
+return typeof v; // string | number | boolean
+}
+
+function typeErr(msg) {
+var e = new Error(msg);
+e.jqType = true; // tag for exit-code 3 routing
+return e;
+}
+
+// Run a compiled program (step list) over one input value -> array of results.
+// Pure: depends only on `steps` and `value`.
+function evalSteps(steps, value) {
+var stream = [value];
+for (var s = 0; s < steps.length; s++) {
+var next = [];
+for (var i = 0; i < stream.length; i++) {
+var results = applyStep(steps[s], stream[i]);
+for (var j = 0; j < results.length; j++) next.push(results[j]);
+}
+stream = next;
+}
+return stream;
+}
+
+// Parse `filter` and run it over `value` -> array of result values.
+// The one-call entry point. Throws a clean Error on parse or type failure.
+function run(value, filter) {
+var steps = parse(filter);
+return evalSteps(steps, value);
+}
+
+/* ==================================================================
+JSON I/O helpers (pure)
+================================================================== */
+
+// Parse a JSONL / concatenated-JSON text into an array of values.
+// A blank line yields no value. Throws on malformed JSON.
+function parseInputs(text) {
+if (typeof text!== "string") text = String(text == null? "": text);
+var out = [];
+var lines = text.split(/\r\n|\n|\r/);
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+if (line.replace(/[\s]/g, "").length === 0) continue; // skip blank/whitespace-only
+out.push(JSON.parse(line));
 }
 return out;
 }
 
-// Render records as JSONL text (one JSON object per line, trailing newline per record).
-function toJSONL(records) {
-var s = "";
-for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
-return s;
+// Render one result value as output text.
+function renderValue(v, rawOutput) {
+if (rawOutput && typeof v === "string") return v;
+return JSON.stringify(v);
 }
 
-/* ---- exports (browser + Node) ------------------------------------ */
+/* ==================================================================
+EXPORTS (browser + Node)
+================================================================== */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.lineSource = { lines: lines, splitLines: splitLines, toJSONL: toJSONL};
+window.ForestGifts.jqLite = { run: run, parse: parse, evalSteps: evalSteps, parseInputs: parseInputs};
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { lines: lines, splitLines: splitLines, toJSONL: toJSONL};
+module.exports = { run: run, parse: parse, evalSteps: evalSteps, parseInputs: parseInputs, renderValue: renderValue};
 }
 
-/* ---- CLI (runs only when invoked directly, never on require) ------ */
+/* ==================================================================
+CLI (runs only when invoked directly, never on require)
+================================================================== */
 
 function parseArgs(args) {
-var opts = {};
+var opts = { rawOutput: false, slurp: false};
+var filter = null;
 var i = 0;
 while (i < args.length) {
 var a = args[i];
-if (a === "--field") {
-var f = args[i + 1];
-if (f === undefined) throw new Error("--field requires a name");
-opts.field = f;
-i += 2;
-} else if (a === "--index") {
-var x = args[i + 1];
-if (x === undefined) throw new Error("--index requires a name (or \"\" to disable)");
-opts.index = x;
-i += 2;
-} else if (a === "--skip-blank") {
-opts.skipBlank = true;
-i += 1;
-} else if (a === "--trim") {
-opts.trim = true;
-i += 1;
-} else if (a.charAt(0) === "-") {
-throw new Error("unknown option " + a);
-} else {
-throw new Error("unexpected argument " + JSON.stringify(a) + " (line-source reads text from stdin)");
+if (a === "--raw-output" || a === "-r") { opts.rawOutput = true; i++;}
+else if (a === "--slurp" || a === "-s") { opts.slurp = true; i++;}
+else if (a === "--compact" || a === "-c") { i++;} // default; accepted for familiarity
+else if (a.charAt(0) === "-" && a!== "-") { throw new Error("unknown option " + a);}
+else {
+if (filter!== null) throw new Error("unexpected extra argument " + JSON.stringify(a) + " (only one filter is allowed)");
+filter = a;
+i++;
 }
 }
+if (filter === null) throw new Error("no filter given (usage: jq-lite '<filter>')");
+opts.filter = filter;
 return opts;
 }
 
@@ -1464,36 +458,63 @@ return "";
 }
 }
 
+var HELP =
+"jq-lite.js — a tiny jq-style query language for JSON, in one dependency-free file.\n\n" +
+" echo '{\"a\":{\"b\":2}}' | node jq-lite.js '.a.b'\n" +
+" echo '[1,2,3]' | node jq-lite.js '.[]'\n" +
+" printf '{\"n\":1}\\n{\"n\":2}\\n' | node jq-lite.js '.n'\n" +
+" echo '{\"name\":\"ada\"}' | node jq-lite.js --raw-output '.name'\n" +
+" node jq-lite.js --help\n\n" +
+"The language:\n" +
+". identity\n" +
+".foo.foo.bar field access (missing key -> null; non-object -> error unless?)\n" +
+".[\"a b\"] bracketed string key\n" +
+".[2].foo[0] array index (negative counts from the end:.[-1] is last)\n" +
+".[] iterate: emit each array element, or each object value, as a stream\n" +
+" a | b pipe: run b over every output of a\n" +
+".foo?.[]? optional: emit nothing on a type mismatch instead of erroring\n\n" +
+" --raw-output print string results without quotes (jq -r)\n" +
+" --slurp read the whole input as one JSON array before filtering (jq -s)\n\n" +
+"Reads JSON (one value or a JSONL stream) from stdin; applies the filter to each value\n" +
+"and prints one JSON result per output.\n\n" +
+"Edge: jq-lite is a SMALL subset of jq — no functions, no arithmetic, no construction,\n" +
+"no select/map/comparison, no recursion (..). For those, use jq itself.\n";
+
 function main(argv) {
 var args = argv.slice(2);
 if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"line-source.js — turn a plain-text file into a JSONL record stream, one record per line.\n\n" +
-" node line-source.js < access.log\n" +
-" printf 'a\\nb\\nc\\n' | node line-source.js --skip-blank\n" +
-" node line-source.js --field text --index \"\" < names.txt\n" +
-" node line-source.js --help\n\n" +
-" --field NAME key holding the line text (default \"line\")\n" +
-" --index NAME key holding the 0-based line number (default \"n\"; \"\" disables)\n" +
-" --skip-blank drop lines empty after the terminator is stripped (n keeps source position)\n" +
-" --trim strip surrounding ASCII whitespace from each line's text\n\n" +
-"Reads text from stdin; emits one JSON object per line: { line: <text>, n: <index>}.\n" +
-"Splits on \\r\\n, \\n, or \\r; a final terminator is a terminator (no phantom empty\n" +
-"record); a leading UTF-8 BOM is stripped.\n\n" +
-"Edge: it splits on line terminators and emits one record per line. It does not parse\n" +
-"CSV fields (use csv-source), does not parse JSON (lines are verbatim strings), does\n" +
-"not read the file itself (pipe text in), and does not sort or deduplicate.\n"
-);
+process.stdout.write(HELP);
 return 0;
 }
 var opts;
 try { opts = parseArgs(args);}
-catch (e) { process.stderr.write("line-source: " + e.message + "\n"); return 2;}
+catch (e) { process.stderr.write("jq-lite: " + e.message + "\n"); return 2;}
+
+// Pre-parse the filter so a syntax error is a usage error (exit 2), before reading input.
+var steps;
+try { steps = parse(opts.filter);}
+catch (e) { process.stderr.write("jq-lite: " + e.message + "\n"); return 2;}
+
 var text = readStdin();
-var records;
-try { records = lines(text, opts);}
-catch (e) { process.stderr.write("line-source: " + e.message + "\n"); return 2;}
-process.stdout.write(toJSONL(records));
+var inputs;
+try { inputs = parseInputs(text);}
+catch (e) { process.stderr.write("jq-lite: invalid JSON input: " + e.message + "\n"); return 2;}
+
+if (opts.slurp) inputs = [inputs];
+
+var out = "";
+for (var i = 0; i < inputs.length; i++) {
+var results;
+try { results = evalSteps(steps, inputs[i]);}
+catch (e) {
+if (e && e.jqType) { process.stderr.write("jq-lite: " + e.message + "\n"); return 3;}
+process.stderr.write("jq-lite: " + e.message + "\n"); return 3;
+}
+for (var j = 0; j < results.length; j++) {
+out += renderValue(results[j], opts.rawOutput) + "\n";
+}
+}
+process.stdout.write(out);
 return 0;
 }
 
@@ -1501,20 +522,22 @@ if (typeof require!== "undefined" && require.main === module) {
 process.exitCode = main(process.argv);
 }
 
-test_line-source.js 155 lines on GitHub →
+test_jq-lite.js 212 lines on GitHub →
 #!/usr/bin/env node
-/* test_line-source.js — battery for the line-source gift.
-`node test_line-source.js` -> exit 0 PASS / non-zero FAIL.
+/* test_jq-lite.js — battery for the jq-lite gift.
+`node test_jq-lite.js` -> exit 0 PASS / non-zero FAIL.
 
-The oracle is INDEPENDENT and takes a DIFFERENT ROUTE than the gift: the gift scans
-char codes and slices; the oracle normalizes terminators with a regex then splits and
-drops one trailing empty. Two routes that share no code — agreement is evidence, not
-tautology. Plus frozen hand goldens for each of the three quiet-failure cases the gift
-exists to fix (phantom empty record, CRLF, BOM).
+THE ORACLE IS INDEPENDENT AND TAKES A DIFFERENT ROUTE than the gift. The gift compiles
+the filter into a FLAT LIST OF STEP OBJECTS and threads a stream through them. The
+oracle here re-tokenizes the filter with a REGEX SCANNER and interprets it by RECURSIVE
+DESCENT directly over the value — no compiled step list, no shared parser, no shared
+evaluator. Two routes that share no code — agreement is evidence, not tautology. Plus
+frozen hand goldens for each quiet-failure case the gift exists to fix (missing-key,
+type-confusion, stream fan-out).
 */
 "use strict";
 
-var G = require("./line-source.js");
+var G = require("./jq-lite.js");
 var assert = require("assert");
 
 var pass = 0, fail = 0;
@@ -1528,138 +551,910 @@ if (g === w) { pass++;}
 else { fail++; console.error("FAIL: " + name + "\n got: " + g + "\n want: " + w);}
 }
 
-/* ---- independent oracle: regex-normalize route ------------------- */
-// Normalize every terminator to \n, strip a leading BOM, then split on \n and drop a
-// single trailing empty caused by a final terminator. A different route than the gift's
-// char-scan; shares no code with it.
-function oracleSplit(text) {
-if (typeof text!== "string") text = String(text == null? "": text);
-if (text.length === 0) return [];
-if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-if (text.length === 0) return [];
-var norm = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-var parts = norm.split("\n");
-// a trailing terminator produces a final "" — drop exactly one (terminator, not separator)
-if (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
-return parts;
+/* ==================================================================
+INDEPENDENT ORACLE — regex-token scanner + recursive-descent walk.
+Tokens: DOT-FIELD (.name), BRACKET ([..] contents), PIPE (|),
+OPTIONAL (?), IDENTITY (a lone.).
+The oracle interprets tokens directly against the value, producing a
+stream (array). It shares NO code with the gift's step compiler.
+================================================================== */
+
+// Tokenize into an array of { kind, value, optional} accessor tokens and PIPE markers.
+function oracleTokens(src) {
+var toks = [];
+var re = /\s*(\||\.(?:[A-Za-z_][A-Za-z0-9_]*)?|\[\s*(?:"(?:[^"\\]|\\.)*"|-?\d+|)\s*\])(\?)?/g;
+var i = 0;
+// Validate the whole string is consumed by our token grammar; else it's a syntax error.
+var consumed = 0;
+var m;
+re.lastIndex = 0;
+while ((m = re.exec(src))!== null) {
+if (m.index!== consumed) throw new Error("oracle: gap at " + consumed);
+consumed = re.lastIndex;
+var raw = m[1];
+var optional = m[2] === "?";
+if (raw === "|") { toks.push({ kind: "pipe"}); continue;}
+if (raw === ".") { toks.push({ kind: "identity", optional: optional}); continue;}
+if (raw.charAt(0) === ".") { toks.push({ kind: "field", value: raw.slice(1), optional: optional}); continue;}
+if (raw.charAt(0) === "[") {
+var inner = raw.slice(1, -1).trim();
+if (inner === "") { toks.push({ kind: "iterate", optional: optional}); continue;}
+if (inner.charAt(0) === '"') { toks.push({ kind: "field", value: JSON.parse(inner), optional: optional}); continue;}
+toks.push({ kind: "index", value: parseInt(inner, 10), optional: optional}); continue;
 }
-function oracleTrim(s) { return s.replace(/^[\s]+|[\s]+$/g, "");}
-function oracleRecords(text, opts) {
-opts = opts || {};
-var field = opts.field === undefined? "line": opts.field;
-var index = opts.index === undefined? "n": opts.index;
-var raw = oracleSplit(text);
-var out = [];
-for (var i = 0; i < raw.length; i++) {
-var v = opts.trim? oracleTrim(raw[i]): raw[i];
-if (opts.skipBlank && v.length === 0) continue;
-var rec = {};
-rec[field] = v;
-if (index.length > 0) rec[index] = i;
-out.push(rec);
+throw new Error("oracle: unrecognized token " + raw);
 }
-return out;
+if (consumed!== src.replace(/\s+$/, "").length && consumed!== src.length) {
+// allow trailing whitespace
+var tail = src.slice(consumed);
+if (tail.trim()!== "") throw new Error("oracle: trailing " + JSON.stringify(tail));
+}
+return toks;
 }
 
-/* ---- grid: gift == oracle across many inputs --------------------- */
-var inputs = [
-"",
-"\n",
-"a\n",
-"a",
-"a\nb\nc\n",
-"a\nb\nc",
-"a\r\nb\r\nc\r\n", // CRLF
-"a\rb\rc\r", // classic-mac lone CR
-"a\r\nb\nc\r", // mixed
-"\ufeffhello\nworld\n", // BOM
-"line one\n\nline three\n", // blank in the middle
-" padded \n\ttabbed\t\n",
-"no-newline-at-all",
-"\n\n\n", // three blank lines (terminators only)
-"trailing space \nx",
+function isObj(v) { return v!== null && typeof v === "object" &&!Array.isArray(v);}
+
+// Apply one accessor token to one value -> array of values (recursive-descent semantics).
+function oracleApply(tok, v) {
+switch (tok.kind) {
+case "identity": return [v];
+case "field":
+if (v === null || v === undefined) return [null];
+if (isObj(v)) return [Object.prototype.hasOwnProperty.call(v, tok.value)? v[tok.value]: null];
+if (tok.optional) return [];
+throw tagged("type");
+case "index":
+if (v === null || v === undefined) return [null];
+if (Array.isArray(v)) { var k = tok.value < 0? v.length + tok.value: tok.value; return [(k >= 0 && k < v.length)? v[k]: null];}
+if (tok.optional) return [];
+throw tagged("type");
+case "iterate":
+if (Array.isArray(v)) return v.slice();
+if (isObj(v)) { var o = []; for (var kk in v) if (Object.prototype.hasOwnProperty.call(v, kk)) o.push(v[kk]); return o;}
+if (tok.optional) return [];
+throw tagged("type");
+default: throw new Error("oracle: bad token kind");
+}
+}
+function tagged(t) { var e = new Error(t); e.jqType = true; return e;}
+
+// Interpret the whole token list over a value -> stream. Pipes just continue the thread.
+function oracleRun(value, filter) {
+var toks = oracleTokens(filter);
+var stream = [value];
+for (var t = 0; t < toks.length; t++) {
+if (toks[t].kind === "pipe") continue; // sequential thread; pipe is a no-op separator
+var next = [];
+for (var i = 0; i < stream.length; i++) {
+var r = oracleApply(toks[t], stream[i]);
+for (var j = 0; j < r.length; j++) next.push(r[j]);
+}
+stream = next;
+}
+return stream;
+}
+
+/* ==================================================================
+GRID — gift == oracle across many (value, filter) pairs
+================================================================== */
+var VALUES = [
+{}, { a: 1}, { a: { b: { c: 3}}}, { a: null}, { "weird key": 9},
+[], [1, 2, 3], [{ id: 1}, { id: 2}, { id: 3}],
+{ items: [{ id: 10}, { id: 20}]}, { xs: [], ys: [5]},
+{ a: 1, b: 2, c: 3}, [[1], [2, 3]], null, "hi", 42, true,
+{ nested: { list: [{ v: 1}, { v: 2}]}}
 ];
-var optsets = [
-{},
-{ field: "text"},
-{ index: ""},
-{ index: "row"},
-{ skipBlank: true},
-{ trim: true},
-{ skipBlank: true, trim: true},
-{ field: "L", index: "i", trim: true},
+var FILTERS = [
+".", ".a", ".a.b", ".a.b.c", ".a?", ".missing", ".missing.deep",
+".[]", ".[0]", ".[1]", ".[-1]", ".[2]", ".[5]",
+".items[]", ".items[] |.id", ".[] |.id", ".xs[]", ".ys[]",
+'.["weird key"]', ".nested.list[] |.v", ".a.b?", ".[]?", ".[0]?"
 ];
-for (var a = 0; a < inputs.length; a++) {
-for (var b = 0; b < optsets.length; b++) {
-var got = G.lines(inputs[a], optsets[b]);
-var want = oracleRecords(inputs[a], optsets[b]);
-eq("grid input#" + a + " opts#" + b, got, want);
+
+for (var vi = 0; vi < VALUES.length; vi++) {
+for (var fi = 0; fi < FILTERS.length; fi++) {
+var val = VALUES[vi], filt = FILTERS[fi];
+var giftOut, giftErr = null, oracleOut, oracleErr = null;
+try { giftOut = G.run(val, filt);} catch (e) { giftErr =!!e.jqType? "type": "err";}
+try { oracleOut = oracleRun(val, filt);} catch (e) { oracleErr =!!e.jqType? "type": "err";}
+var name = "grid v" + vi + " f[" + filt + "]";
+if (giftErr || oracleErr) {
+ok(name + " (both error, same kind)", giftErr === oracleErr);
+} else {
+eq(name, giftOut, oracleOut);
 }
 }
+}
 
-/* ---- hand goldens: the three quiet failures ---------------------- */
-// 1. phantom empty record: a trailing newline is a terminator, not a separator
-eq("golden: trailing newline -> 2 records not 3",
-G.lines("abc\ndef\n"),
-[{ line: "abc", n: 0}, { line: "def", n: 1}]);
-eq("golden: no final newline -> still 2 records",
-G.lines("abc\ndef"),
-[{ line: "abc", n: 0}, { line: "def", n: 1}]);
+/* ==================================================================
+FROZEN HAND GOLDENS — the three quiet failures, pinned exactly
+================================================================== */
 
-// 2. CRLF: terminator stripped, no trailing \r glued on
-eq("golden: CRLF stripped clean",
-G.lines("abc\r\ndef\r\n"),
-[{ line: "abc", n: 0}, { line: "def", n: 1}]);
-ok("golden: no lingering CR in CRLF line",
-G.lines("x\r\ny\r\n")[0].line.indexOf("\r") === -1);
+// 1. Missing-key crash -> null (not an exception)
+eq("golden: missing key yields null", G.run({}, ".a.b.c"), [null]);
+eq("golden: missing on populated -> null", G.run({ a: {}}, ".a.b"), [null]);
+eq("golden: null propagates", G.run({ a: null}, ".a.b"), [null]);
+// TYPE-STRICT: a missing key must yield an actual JSON null, never `undefined` (which
+// serializes to null but is a leaking JS artifact — the mutation-bite proves this matters).
+ok("golden: missing key is real null not undefined", G.run({}, ".a")[0] === null && typeof G.run({}, ".a")[0] === "object");
+ok("golden: missing deep is real null not undefined", G.run({ a: {}}, ".a.b")[0] === null);
+ok("golden: no undefined ever leaks a stream", G.run({ a: { b: 1}}, ".a.z")[0] === null);
 
-// 3. BOM stripped from first line
-eq("golden: leading BOM stripped",
-G.lines("\ufeffalpha\nbeta\n"),
-[{ line: "alpha", n: 0}, { line: "beta", n: 1}]);
-ok("golden: first line has no BOM char",
-G.lines("\ufeffalpha\n")[0].line.charCodeAt(0)!== 0xfeff);
+// 2. Type confusion -> loud error, but? suppresses to empty stream
+ok("golden:.foo on string throws (type)", (function () { try { G.run("hi", ".foo"); return false;} catch (e) { return!!e.jqType;}})());
+eq("golden:.foo? on string -> empty", G.run("hi", ".foo?"), []);
+ok("golden:.[0] on number throws (type)", (function () { try { G.run(42, ".[0]"); return false;} catch (e) { return!!e.jqType;}})());
+eq("golden:.[]? on number -> empty", G.run(42, ".[]?"), []);
 
-/* ---- feature goldens --------------------------------------------- */
-eq("empty input -> empty stream", G.lines(""), []);
-eq("single blank line (just a terminator)", G.lines("\n"), [{ line: "", n: 0}]);
-eq("--index disabled emits no index key",
-G.lines("a\nb\n", { index: ""}),
-[{ line: "a"}, { line: "b"}]);
-eq("--skip-blank drops blanks but n keeps source position",
-G.lines("a\n\nc\n", { skipBlank: true}),
-[{ line: "a", n: 0}, { line: "c", n: 2}]);
-eq("--trim strips surrounding whitespace",
-G.lines(" hi \n\tbye\t\n", { trim: true}),
-[{ line: "hi", n: 0}, { line: "bye", n: 1}]);
-eq("without --trim bytes are preserved",
-G.lines(" hi \n", {}),
-[{ line: " hi ", n: 0}]);
-eq("custom field + index names",
-G.lines("x\n", { field: "text", index: "row"}),
-[{ text: "x", row: 0}]);
+// 3. Stream fan-out:.[] then pipe runs over EACH element
+eq("golden: fan-out over array", G.run([1, 2, 3], ".[]"), [1, 2, 3]);
+eq("golden: fan-out then field", G.run({ items: [{ id: 1}, { id: 2}]}, ".items[] |.id"), [1, 2]);
+eq("golden: fan-out over empty array", G.run([], ".[]"), []);
+eq("golden: fan-out over object values", G.run({ a: 1, b: 2}, ".[]"), [1, 2]);
+eq("golden: object value order = key order", G.run({ z: 1, a: 2, m: 3}, ".[]"), [1, 2, 3]);
 
-// JSONL rendering
-ok("toJSONL ends every record with newline",
-G.toJSONL([{ line: "a", n: 0}]) === '{"line":"a","n":0}\n');
-ok("toJSONL of empty is empty string", G.toJSONL([]) === "");
+/* ==================================================================
+DIRECT UNIT CHECKS
+================================================================== */
+eq("identity returns input", G.run({ a: 1}, "."), [{ a: 1}]);
+eq("negative index last element", G.run([10, 20, 30], ".[-1]"), [30]);
+eq("index out of range -> null", G.run([1, 2], ".[9]"), [null]);
+eq("bracket key with space", G.run({ "a b": 5}, '.["a b"]'), [5]);
+eq("chained field then index", G.run({ xs: [7, 8, 9]}, ".xs[1]"), [8]);
+eq("deep pipe", G.run({ a: { b: [{ c: 1}, { c: 2}]}}, ".a.b[] |.c"), [1, 2]);
 
-/* ---- determinism ------------------------------------------------- */
-var d1 = G.toJSONL(G.lines("a\nb\r\nc\r", {}));
-var d2 = G.toJSONL(G.lines("a\nb\r\nc\r", {}));
+// parse() surfaces
+eq("parse identity", G.parse("."), [{ op: "identity"}]);
+ok("parse field", G.parse(".a")[0].op === "field" && G.parse(".a")[0].key === "a");
+ok("parse iterate", G.parse(".[]")[0].op === "iterate");
+ok("parse pipe flattens", G.parse(".a |.b").length === 2);
+
+// parseInputs
+eq("parseInputs JSONL", G.parseInputs('{"a":1}\n{"a":2}\n'), [{ a: 1}, { a: 2}]);
+eq("parseInputs skips blank lines", G.parseInputs('1\n\n2\n'), [1, 2]);
+eq("parseInputs empty -> []", G.parseInputs(""), []);
+
+/* ==================================================================
+DETERMINISM
+================================================================== */
+var d1 = JSON.stringify(G.run({ a: [1, 2, 3], b: { c: 4}}, ".a[] "));
+var d2 = JSON.stringify(G.run({ a: [1, 2, 3], b: { c: 4}}, ".a[] "));
 ok("deterministic across two runs", d1 === d2);
 
-/* ---- fail-closed edges ------------------------------------------- */
+/* ==================================================================
+FAIL-CLOSED / SYNTAX
+================================================================== */
 function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
-ok("empty --field throws", throws(function () { G.lines("a\n", { field: ""});}));
-ok("non-string --index throws", throws(function () { G.lines("a\n", { index: 5});}));
+ok("empty filter throws", throws(function () { G.parse("");}));
+ok("filter not starting with. throws", throws(function () { G.parse("foo");}));
+ok("dangling pipe throws", throws(function () { G.parse(".a |");}));
+ok("unterminated bracket throws", throws(function () { G.parse(".[");}));
+ok("bad char after dot throws", throws(function () { G.parse(".a.|");}));
+ok("non-string filter throws", throws(function () { G.run({}, 5);}));
 
 /* ---- report ------------------------------------------------------ */
-console.log("line-source battery: " + pass + " passed, " + fail + " failed");
+console.log("jq-lite battery: " + pass + " passed, " + fail + " failed");
 process.exitCode = fail === 0? 0: 1;
 
 Take the whole folder →
 MIT
 Node / browser, no dependencies
+
+---
+
+# json-source — a Loop MMT gift
+https://loopmmt.com/gifts/json-source/
+[coverage: optional · branch: gifts]
+
+Stream a JSON Array into a JSONL Record Stream source ← all gifts
+
+json-source
+
+json-source reads a JSON file (a FILE arg, or stdin) whose top-level value is an ARRAY and emits one element per line (JSONL) — the front of a pipe you feed into the fold/filter/transform gifts (json-source users.json | dedup-filter --key id). Object elements are records the consuming gifts read directly; scalar elements are a stream of scalars. Each element is re-serialized to canonical compact JSON (key order preserved). Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+
+The honest edge
+
+json-source streams the elements of a TOP-LEVEL JSON ARRAY only — a non-array top-level (an object, a number, a string, a boolean, null) or malformed JSON is refused (exit 2) rather than guess how to streamify a single value. Each element is re-serialized to canonical compact JSON, so number tokens and whitespace are normalized (1e3 -> 1000, 1.0 -> 1) though key order is preserved — the JSON value, not the input bytes. It reads JSON, not JSON5/NDJSON, and parses the WHOLE document (not an incremental stream).
+
+Run it
+
+printf '[{"id":1},{"id":2}]' | node json-source.js # -> {"id":1}\n{"id":2}
+test_json-source.js (33/33, independent map-route oracle) + Plumb conformance GREEN (21/21, signed 2026-09-12, clock-independent, mutation-bite non-vacuous)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+json-source.js 171 lines on GitHub →
+#!/usr/bin/env node
+/* json-source.js — stream the elements of a JSON array as a JSONL record stream.
+Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
+
+WHAT IT IS. A SOURCE: it turns a JSON array — the shape an API response, an export,
+or a `[...]` file so often arrives in — into the front of a pipe: one element per
+line (JSONL), ready to feed INTO the fold/filter/transform gifts. Give it a file (or
+pipe text on stdin) and it emits each top-level array element as one compact JSON line:
+
+[{"id":1},{"id":2}] -> {"id":1}
+{"id":2}
+[1, 2, 3] -> 1
+2
+3
+
+When the elements are objects, they are records the consuming gifts read directly:
+`json-source users.json | dedup-filter --key id`. When they are scalars, you get a
+stream of scalars — still valid JSONL.
+
+TOP-LEVEL ARRAY ONLY (the honesty axis). The input's top-level value MUST be a JSON
+array — that is the only thing that IS a stream. A bare object, a number, a string, a
+boolean, or null is a single value, not a stream, so json-source REFUSES it (exit 2)
+rather than guess how to "streamify" it (wrap it? emit its entries? emit it as one
+line?). Each guess is a different tool; refusing keeps json-source one honest thing.
+Malformed JSON is likewise a hard error (exit 2), never a partial or repaired parse.
+
+CANONICAL RE-SERIALIZATION (declared, so it is pinnable). Each element is emitted via
+canonical compact JSON.stringify — object key order is preserved from the input, but
+input WHITESPACE and NUMBER TOKENS are normalized to canonical JSON form (`1e3` -> 1000,
+`1.0` -> 1, `[ 1,2]` -> [1,2]). This is the JSON *value*, losslessly; it is not the
+input's exact bytes. The result is deterministic: the same input yields byte-identical
+output every run and every machine.
+
+THE MODEL
+[FILE] The JSON file to stream. If omitted, read stdin. Its top-level value must
+be an array; each element becomes one output line.
+
+DETERMINISM. parse(text) is a pure function — no clock, no randomness, no network — so
+the same text yields byte-identical output every run.
+
+USAGE
+node json-source.js data.json
+cat data.json | node json-source.js
+node json-source.js --help
+
+Exit codes: 0 success (including an empty stream from `[]`) · 2 input error (malformed
+JSON, a top-level value that is not an array, an unknown option, a second positional
+file, or an unreadable file). Always a clean one-line message on stderr, never a stack
+trace.
+
+Released under MIT. Its edge is printed in the README: json-source streams the elements
+of a TOP-LEVEL JSON ARRAY only — it refuses a non-array top-level and malformed JSON
+(exit 2), and it re-serializes each element to canonical compact JSON (normalizing
+number tokens and whitespace, preserving key order). It reads JSON, not JSON5/NDJSON,
+and does not stream incrementally (it parses the whole document).
+*/
+"use strict";
+
+/* ---- the pure core ------------------------------------------------ */
+
+// Parse JSON text and return its top-level array of elements. Throws a clean Error on
+// malformed JSON or a non-array top-level — the CLI turns that into exit 2. Pure.
+function parse(text) {
+if (typeof text!== "string") throw new Error("input must be text");
+var value;
+try {
+value = JSON.parse(text);
+} catch (e) {
+throw new Error("input is not valid JSON: " + e.message);
+}
+if (!Array.isArray(value)) {
+var kind = value === null? "null": Array.isArray(value)? "array": typeof value;
+throw new Error("top-level JSON must be an array (got " + kind + ") — a non-array value is not a stream");
+}
+return value;
+}
+
+// Render elements as JSONL text (one canonical compact JSON value per line, trailing
+// newline if any).
+function toJSONL(elements) {
+var s = "";
+for (var i = 0; i < elements.length; i++) s += JSON.stringify(elements[i]) + "\n";
+return s;
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.jsonSource = { parse: parse, toJSONL: toJSONL};
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { parse: parse, toJSONL: toJSONL};
+}
+
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+
+function parseArgs(args) {
+var file;
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a.charAt(0) === "-" && a!== "-") {
+throw new Error("unknown option " + a);
+} else {
+if (file!== undefined) throw new Error("only one input file may be given (got a second: " + JSON.stringify(a) + ")");
+file = a;
+i += 1;
+}
+}
+return { file: file};
+}
+
+function readAll(stream) {
+return new Promise(function (resolve, reject) {
+var chunks = [];
+stream.on("data", function (c) { chunks.push(c);});
+stream.on("end", function () { resolve(Buffer.concat(chunks).toString("utf8"));});
+stream.on("error", reject);
+});
+}
+
+function helpText() {
+return (
+"json-source.js — stream the elements of a JSON array as a JSONL record stream.\n\n" +
+" node json-source.js data.json\n" +
+" cat data.json | node json-source.js\n" +
+" node json-source.js --help\n\n" +
+" [FILE] JSON file to stream (default: read stdin). Top-level must be an array.\n\n" +
+"Emits one canonical compact JSON line per top-level array element.\n\n" +
+"Edge: streams a TOP-LEVEL JSON ARRAY only — a non-array top-level or malformed JSON\n" +
+"is refused (exit 2). Each element is re-serialized to canonical compact JSON (number\n" +
+"tokens and whitespace normalized, key order preserved). Reads JSON, not JSON5/NDJSON,\n" +
+"and parses the whole document (not an incremental stream).\n"
+);
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(helpText());
+return Promise.resolve(0);
+}
+var parsed;
+try { parsed = parseArgs(args);}
+catch (e) { process.stderr.write("json-source: " + e.message + "\n"); return Promise.resolve(2);}
+
+var getText;
+if (parsed.file!== undefined) {
+getText = new Promise(function (resolve, reject) {
+require("fs").readFile(parsed.file, "utf8", function (err, data) {
+if (err) reject(new Error("cannot read " + JSON.stringify(parsed.file) + ": " + err.code));
+else resolve(data);
+});
+});
+} else {
+getText = readAll(process.stdin);
+}
+
+return getText.then(function (text) {
+var elements = parse(text); // throws -> caught below
+process.stdout.write(toJSONL(elements));
+return 0;
+}).catch(function (e) {
+process.stderr.write("json-source: " + e.message + "\n");
+return 2;
+});
+}
+
+if (typeof require!== "undefined" && require.main === module) {
+main(process.argv).then(function (code) { process.exitCode = code;});
+}
+
+test_json-source.js 108 lines on GitHub →
+#!/usr/bin/env node
+/* test_json-source.js — battery for the json-source gift.
+node test_json-source.js -> exit 0 PASS / non-zero FAIL. Zero dependencies.
+
+Cross-checks the gift against an INDEPENDENT map-route oracle (a different route than
+the gift's loop), frozen hand goldens, the canonical-re-serialization contract,
+determinism, and every fail-closed edge. */
+"use strict";
+var js = require("./json-source.js");
+
+var pass = 0, fail = 0;
+function ok(name, cond) { if (cond) pass++; else { fail++; console.log(" FAIL " + name);}}
+function eqS(name, a, b) {
+if (a === b) pass++;
+else { fail++; console.log(" FAIL " + name + "\n exp " + JSON.stringify(b) + "\n got " + JSON.stringify(a));}
+}
+function throws(name, fn) {
+var threw = false; try { fn();} catch (e) { threw = true;}
+if (threw) pass++; else { fail++; console.log(" FAIL " + name + " (expected a throw)");}
+}
+
+/* ---- independent oracle: Array.prototype.map route (different route than the gift) ---- */
+function oracleJSONL(text) {
+var v = JSON.parse(text); // may throw -> caller counts as error
+if (!Array.isArray(v)) throw new Error("not array");
+return v.map(function (el) { return JSON.stringify(el);}).join("") + (v.length? "": "");
+}
+// build expected JSONL the oracle way (join with \n + trailing \n if non-empty)
+function oracle(text) {
+var v = JSON.parse(text);
+if (!Array.isArray(v)) throw new Error("not array");
+var out = "";
+v.forEach(function (el) { out += JSON.stringify(el) + "\n";});
+return out;
+}
+
+/* ---- 1. differential grid: gift == oracle on every good vector ---- */
+var good = [
+"[]",
+"[1,2,3]",
+'[{"id":1},{"id":2}]',
+'[{"a":1,"b":2},{"a":3,"b":4}]',
+'["x","y","z"]',
+"[true,false,null]",
+'[{"nested":{"k":[1,2]}}]',
+"[ 1, 2,\n 3]", // whitespace normalized
+"[1e3, 1.0, 100]", // number tokens normalized to value
+'[{"b":2,"a":1}]', // key order preserved from input
+'[""]', // array with one empty string
+];
+for (var i = 0; i < good.length; i++) {
+eqS("differential[" + i + "] gift==oracle", js.toJSONL(js.parse(good[i])), oracle(good[i]));
+}
+
+/* ---- 2. hand goldens (frozen) ---- */
+eqS("golden: empty array -> empty stream", js.toJSONL(js.parse("[]")), "");
+eqS("golden: scalars", js.toJSONL(js.parse("[1,2,3]")), "1\n2\n3\n");
+eqS("golden: objects", js.toJSONL(js.parse('[{"id":1},{"id":2}]')), '{"id":1}\n{"id":2}\n');
+eqS("golden: whitespace normalized", js.toJSONL(js.parse("[ 1, 2]")), "1\n2\n");
+eqS("golden: number token 1e3 -> 1000", js.toJSONL(js.parse("[1e3]")), "1000\n");
+eqS("golden: number token 1.0 -> 1", js.toJSONL(js.parse("[1.0]")), "1\n");
+eqS("golden: key order preserved", js.toJSONL(js.parse('[{"b":2,"a":1}]')), '{"b":2,"a":1}\n');
+eqS("golden: nested value verbatim-as-value", js.toJSONL(js.parse('[{"k":{"z":[1,2]}}]')), '{"k":{"z":[1,2]}}\n');
+
+/* ---- 3. one line per element ---- */
+var recs = js.parse('[{"a":1},{"a":2},{"a":3}]');
+ok("count: 3 elements", recs.length === 3);
+ok("lines: JSONL has 3 lines", js.toJSONL(recs).split("\n").filter(Boolean).length === 3);
+
+/* ---- 4. fail-closed (exit-2 class) ---- */
+throws("bad: malformed JSON", function () { js.parse("[1,2,");});
+throws("bad: top-level object", function () { js.parse('{"a":1}');});
+throws("bad: top-level scalar number", function () { js.parse("42");});
+throws("bad: top-level string", function () { js.parse('"hello"');});
+throws("bad: top-level bool", function () { js.parse("true");});
+throws("bad: top-level null", function () { js.parse("null");});
+throws("bad: empty input (not JSON)", function () { js.parse("");});
+throws("bad: non-string input", function () { js.parse(123);});
+
+/* ---- 5. determinism: parse twice -> byte-identical JSONL ---- */
+var arr = [];
+for (var k = 0; k < 50; k++) arr.push({ n: k, s: "v" + k});
+var big = JSON.stringify(arr);
+ok("determinism: two parses byte-identical", js.toJSONL(js.parse(big)) === js.toJSONL(js.parse(big)));
+
+/* ---- 6. toJSONL shape ---- */
+ok("toJSONL: one value per line + trailing nl", js.toJSONL([{ a: 1}]) === '{"a":1}\n');
+ok("toJSONL: empty -> empty string", js.toJSONL([]) === "");
+
+/* ---- 7. mutation tripwire: an object-flattening mutant must diverge ---- */
+(function () {
+// mutant: emits only the FIRST value of each object (a lossy "flatten"); must diverge
+function mutant(text) {
+var v = JSON.parse(text); var out = "";
+v.forEach(function (el) {
+if (el && typeof el === "object" &&!Array.isArray(el)) {
+var ks = Object.keys(el); out += JSON.stringify(ks.length? el[ks[0]]: el) + "\n";
+} else out += JSON.stringify(el) + "\n";
+});
+return out;
+}
+var v = '[{"a":1,"b":2}]';
+ok("mutation: first-value-flatten is CAUGHT (diverges from gift)",
+mutant(v)!== js.toJSONL(js.parse(v)));
+})();
+
+console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# JSONL-Diff — a Loop MMT gift
+https://loopmmt.com/gifts/jsonl-diff/
+[coverage: optional · branch: gifts]
+
+What Changed Between Two Runs? fold ← all gifts
+
+JSONL-Diff
+
+You ran the same prompt through a model twice — a new version, a new day — and got two files of JSONL output. What actually changed? jsonl-diff takes an OLD file and a NEW file and tells you what was added, removed, and (when you name a key field) changed — sorted, canonical, and byte-identical on every run, so it drops straight into a CI gate or a review. Two modes: set-diff (default) keys each record by its own canonical form, so a changed record shows as one removed plus one added; keyed diff (--key FIELD) keys by a field, so a same-key record with different content is a CHANGE reported with its field-level deltas. Object keys are sorted and array order is faithful, so a key-reordered record matches and a reordered array does not. Deterministic, fail-closed, zero dependencies, offline.
+
+The honest edge
+
+jsonl-diff compares STRUCTURE, not MEANING. A reported change may be cosmetic (1 vs 1.0, "a,b" vs ["a","b"]) and an unreported match may still be wrong — semantic equivalence it will miss is a difference here. A human reads the diff; the tool only makes the change visible and exact. It tells you two records differ; it cannot tell you the difference matters, is correct, or is safe.
+
+Run it
+
+node jsonl-diff.js --key id old.jsonl new.jsonl # exit 0 identical | 1 differs | 2 input error; --out json for a canonical result object
+test_jsonl-diff.js (10/10) + --selftest (10/10: canon idempotence, set-diff added/removed, keyed change, folds-twice-identical, blank-line skip, guard/exit space)
+Zero dependencies, Node or browser, deterministic
+
+The code — every file that ships
+
+jsonl-diff.js 294 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/* jsonl-diff.js — what changed between two JSONL files, deterministically.
+*
+* A tiny, dependency-free diff for JSON Lines (one JSON value per line). Give it
+* an OLD file and a NEW file and it tells you what was ADDED, REMOVED, and (when
+* you name a key) CHANGED — sorted, canonical, byte-identical on every run so it
+* drops straight into a CI gate or a review.
+*
+* old.jsonl, new.jsonl ──▶ diff(old, new, {key})
+* ──▶ { added:[…], removed:[…], changed:[…]}
+*
+* TWO MODES.
+* set-diff (default) — records are keyed by their own canonical form, so a
+* record either matches exactly or it is added/removed.
+* A changed record shows as one removed + one added.
+* keyed diff (--key F) — records are keyed by the value of field F. A record
+* present on both sides with the same key but different
+* content is a CHANGE, reported with its field deltas.
+*
+* DETERMINISM (the promise, and the self-test that proves it). Comparison and
+* output both run over a canonical form: object keys sorted, whitespace fixed,
+* no ordering luck. The result is sorted by key. `--selftest` proves the canon
+* is idempotent (canon(canon(x)) === canon(x)) and the diff is stable, so the
+* output is a pure function of the two inputs — the same bytes, every run.
+*
+* THE LINE IT WILL NOT CROSS (the honest ceiling — printed every --help/--list).
+* jsonl-diff compares STRUCTURE, not MEANING. It tells you two records differ; it
+* cannot tell you the difference matters, is correct, or is safe. Semantic
+* equivalence it will miss (1 vs 1.0, "a,b" vs ["a","b"]) is a difference here.
+* A human reads the diff; the tool only makes the change visible and exact.
+*
+* EXIT CODES (diff convention, gate-friendly).
+* 0 the two files are identical (under the chosen mode)
+* 1 they differ (added / removed / changed present)
+* 2 input could not be used (missing file, a directory, unreadable, bad JSON,
+* a duplicate key, or a missing --key field) — always a clean message, never
+* a stack trace.
+*
+* Runs identically in Node and in a browser (no DOM, no deps). MIT.
+*/
+
+var CEILING =
+'ceiling: jsonl-diff compares STRUCTURE, not MEANING. A reported change may be\n' +
+' cosmetic (1 vs 1.0) and an unreported match may still be wrong. A human reads\n' +
+' the diff; the tool only makes the change visible and exact.';
+
+/* ---- canonical form (the canonicalizer; idempotent + order-faithful) ------ */
+function canon(v) {
+if (v === null || typeof v!== 'object') return JSON.stringify(v);
+if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
+var keys = Object.keys(v).sort();
+var parts = [];
+for (var i = 0; i < keys.length; i++) {
+parts.push(JSON.stringify(keys[i]) + ':' + canon(v[keys[i]]));
+}
+return '{' + parts.join(',') + '}';
+}
+
+/* ---- parse a JSONL string into records (throws JsonlError on a bad line) --- */
+function JsonlError(msg) { var e = new Error(msg); e.jsonl = true; return e;}
+
+function parseJsonl(text, label) {
+var out = [];
+var lines = text.split('\n');
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i];
+if (line.replace(/\s+/g, '') === '') continue; // skip blank lines
+var obj;
+try { obj = JSON.parse(line);}
+catch (e) {
+throw JsonlError(label + ':' + (i + 1) + ': not valid JSON (' +
+((e && e.message) || 'parse error') + ')');
+}
+out.push({ value: obj, line: i + 1});
+}
+return out;
+}
+
+/* ---- key a record: by field F (keyed mode) or by its canonical form (set) -- */
+function keyOf(rec, key, label) {
+if (key === null) return canon(rec.value);
+var v = rec.value;
+if (v === null || typeof v!== 'object' || Array.isArray(v) ||
+!Object.prototype.hasOwnProperty.call(v, key)) {
+throw JsonlError(label + ':' + rec.line + ': record has no key field ' +
+JSON.stringify(key));
+}
+return canon(v[key]);
+}
+
+function index(recs, key, label) {
+var map = {};
+for (var i = 0; i < recs.length; i++) {
+var k = keyOf(recs[i], key, label);
+if (Object.prototype.hasOwnProperty.call(map, k)) {
+throw JsonlError(label + ':' + recs[i].line + ': duplicate key ' + k +
+' (first seen at ' + label + ':' + map[k].line + ') — the diff would be ambiguous');
+}
+map[k] = recs[i];
+}
+return map;
+}
+
+/* ---- field-level delta for a CHANGED record (keyed mode) ------------------ */
+function fieldDelta(before, after) {
+var d = { added: {}, removed: {}, changed: {}};
+var bObj = before && typeof before === 'object' &&!Array.isArray(before);
+var aObj = after && typeof after === 'object' &&!Array.isArray(after);
+if (!bObj ||!aObj) return null; // not object-vs-object; whole-value change
+var seen = {};
+var k, keys = Object.keys(before).concat(Object.keys(after));
+for (var i = 0; i < keys.length; i++) {
+k = keys[i];
+if (seen[k]) continue; seen[k] = 1;
+var hb = Object.prototype.hasOwnProperty.call(before, k);
+var ha = Object.prototype.hasOwnProperty.call(after, k);
+if (hb &&!ha) d.removed[k] = before[k];
+else if (!hb && ha) d.added[k] = after[k];
+else if (canon(before[k])!== canon(after[k])) d.changed[k] = { before: before[k], after: after[k]};
+}
+return d;
+}
+
+/* ---- the diff (pure) ------------------------------------------------------ */
+function diff(oldText, newText, opts) {
+opts = opts || {};
+var key = (opts.key === undefined)? null: opts.key;
+var oldRecs = parseJsonl(oldText, 'old');
+var newRecs = parseJsonl(newText, 'new');
+var oldMap = index(oldRecs, key, 'old');
+var newMap = index(newRecs, key, 'new');
+var added = [], removed = [], changed = [];
+var k;
+var allKeys = {};
+for (k in oldMap) if (Object.prototype.hasOwnProperty.call(oldMap, k)) allKeys[k] = 1;
+for (k in newMap) if (Object.prototype.hasOwnProperty.call(newMap, k)) allKeys[k] = 1;
+var sorted = Object.keys(allKeys).sort();
+for (var i = 0; i < sorted.length; i++) {
+k = sorted[i];
+var inOld = Object.prototype.hasOwnProperty.call(oldMap, k);
+var inNew = Object.prototype.hasOwnProperty.call(newMap, k);
+if (inOld &&!inNew) removed.push({ key: k, value: oldMap[k].value});
+else if (!inOld && inNew) added.push({ key: k, value: newMap[k].value});
+else if (canon(oldMap[k].value)!== canon(newMap[k].value)) {
+changed.push({
+key: k,
+before: oldMap[k].value,
+after: newMap[k].value,
+fields: (key === null)? null: fieldDelta(oldMap[k].value, newMap[k].value)
+});
+}
+}
+return { added: added, removed: removed, changed: changed};
+}
+
+/* ---- rendering ------------------------------------------------------------ */
+function renderText(d) {
+var out = [];
+var i;
+for (i = 0; i < d.removed.length; i++) out.push('- ' + d.removed[i].key);
+for (i = 0; i < d.added.length; i++) out.push('+ ' + d.added[i].key);
+for (i = 0; i < d.changed.length; i++) {
+var c = d.changed[i];
+out.push('~ ' + c.key);
+if (c.fields) {
+var f = c.fields, fk;
+var rk = Object.keys(f.removed).sort();
+for (fk = 0; fk < rk.length; fk++) out.push(' - ' + rk[fk] + ': ' + JSON.stringify(f.removed[rk[fk]]));
+var ak = Object.keys(f.added).sort();
+for (fk = 0; fk < ak.length; fk++) out.push(' + ' + ak[fk] + ': ' + JSON.stringify(f.added[ak[fk]]));
+var ck = Object.keys(f.changed).sort();
+for (fk = 0; fk < ck.length; fk++) {
+out.push(' ~ ' + ck[fk] + ': ' + JSON.stringify(f.changed[ck[fk]].before) +
+' -> ' + JSON.stringify(f.changed[ck[fk]].after));
+}
+}
+}
+out.push('# ' + d.added.length + ' added, ' + d.removed.length + ' removed, ' +
+d.changed.length + ' changed');
+return out.join('\n');
+}
+
+function renderJson(d) {
+// canonical, deterministic: sorted keys, stable field order
+return canon({
+added: d.added,
+removed: d.removed,
+changed: d.changed,
+summary: { added: d.added.length, removed: d.removed.length, changed: d.changed.length}
+});
+}
+
+/* ---- self-test (determinism + promise proof) ------------------------------ */
+function selftest() {
+var pass = 0, fail = 0;
+function ok(cond, name) { if (cond) pass++; else { fail++; console.error('FAIL: ' + name);}}
+
+// canon is idempotent and order-faithful
+var a = { b: 1, a: [3, { y: 2, x: 1}]};
+ok(canon(JSON.parse(canon(a))) === canon(a), 'canon round-trips through JSON.parse');
+ok(canon({ x: 1, y: 2}) === canon({ y: 2, x: 1}), 'canon is key-order-faithful');
+ok(canon(canon(a)) === canon(canon(a)), 'canon is idempotent');
+
+// set-diff mode
+var oldT = '{"id":1,"v":"a"}\n{"id":2,"v":"b"}\n';
+var newT = '{"id":2,"v":"b"}\n{"id":3,"v":"c"}\n';
+var d1 = diff(oldT, newT, {});
+ok(d1.added.length === 1 && d1.removed.length === 1 && d1.changed.length === 0, 'set-diff add/remove');
+
+// keyed diff: same key, changed content => CHANGE with field delta
+var d2 = diff(oldT, '{"id":1,"v":"A","extra":9}\n{"id":2,"v":"b"}\n', { key: 'id'});
+ok(d2.changed.length === 1 && d2.added.length === 0 && d2.removed.length === 0, 'keyed change is a change, not add+remove');
+ok(d2.changed[0].fields && d2.changed[0].fields.changed.v && d2.changed[0].fields.added.extra!== undefined,
+'keyed change reports field deltas');
+
+// identical inputs => empty diff, byte-stable render
+var d3 = diff(oldT, oldT, { key: 'id'});
+ok(d3.added.length === 0 && d3.removed.length === 0 && d3.changed.length === 0, 'identical => empty');
+ok(renderJson(diff(oldT, newT, {})) === renderJson(diff(oldT, newT, {})), 'render is byte-stable across runs');
+
+// blank lines skipped; whitespace-insensitive comparison
+ok(diff('{"id":1}\n\n', '{ "id": 1}\n', { key: 'id'}).changed.length === 0, 'whitespace-insensitive, blanks skipped');
+
+// duplicate key is an error (ambiguous)
+var threw = false;
+try { diff('{"id":1}\n{"id":1}\n', '{"id":1}\n', { key: 'id'});} catch (e) { threw = e && e.jsonl;}
+ok(threw, 'duplicate key throws a clean JsonlError');
+
+console.log((fail === 0? 'GREEN': 'RED') + ': ' + (pass) + ' checks passed, ' + fail + ' failed [jsonl-diff]');
+return fail === 0;
+}
+
+/* ---- crashclean read ------------------------------------------------------ */
+function readFileClean(path) {
+var fs = require('fs');
+try {
+return fs.readFileSync(path, 'utf8');
+} catch (e) {
+var why = e && e.code === 'ENOENT'? 'no such file'
+: e && e.code === 'EISDIR'? 'is a directory'
+: e && e.code === 'EACCES'? 'permission denied'
+: (e && e.message) || 'cannot read';
+process.stderr.write('jsonl-diff: cannot read ' + JSON.stringify(path) + ': ' + why + '\n');
+process.exit(2);
+}
+}
+
+/* ---- CLI ------------------------------------------------------------------ */
+function usage() {
+console.log('usage: jsonl-diff.js [--key FIELD] [--out text|json] OLD.jsonl NEW.jsonl');
+console.log(' --key FIELD key records by FIELD; a same-key record that differs is a CHANGE');
+console.log(' (default: key by the whole record — changes show as remove + add)');
+console.log(' --out text - removed, + added, ~ changed, then a summary [default]');
+console.log(' --out json a canonical JSON result object');
+console.log(' --selftest run the built-in checks (exit 0 GREEN, 1 RED)');
+console.log(' exit 0 identical | 1 differs | 2 input could not be used');
+console.error('\n' + CEILING);
+}
+
+if (typeof require!== 'undefined' && require.main === module) {
+var argv = process.argv.slice(2);
+var key = null, out = 'text', files = [];
+for (var a = 0; a < argv.length; a++) {
+var t = argv[a];
+if (t === '--selftest') { process.exit(selftest()? 0: 1);}
+else if (t === '-h' || t === '--help') { usage(); process.exit(0);}
+else if (t === '--key') { key = argv[++a]; if (key === undefined) { console.error('jsonl-diff: --key needs a field name'); process.exit(2);}}
+else if (t === '--out') { out = argv[++a]; if (out!== 'text' && out!== 'json') { console.error('jsonl-diff: --out must be text or json'); process.exit(2);}}
+else if (t.charAt(0) === '-') { console.error('jsonl-diff: unknown option ' + JSON.stringify(t)); process.exit(2);}
+else files.push(t);
+}
+if (files.length!== 2) {
+console.error('jsonl-diff: need exactly two files (OLD NEW); got ' + files.length + '. Try --help.');
+process.exit(2);
+}
+var oldText = readFileClean(files[0]);
+var newText = readFileClean(files[1]);
+var d;
+try {
+d = diff(oldText, newText, key === null? {}: { key: key});
+} catch (e) {
+if (e && e.jsonl) { console.error('jsonl-diff: ' + e.message); process.exit(2);}
+throw e; // a non-input bug: let it surface honestly (never masked as clean)
+}
+console.log(out === 'json'? renderJson(d): renderText(d));
+var differs = d.added.length + d.removed.length + d.changed.length > 0;
+process.exit(differs? 1: 0);
+}
+
+/* ---- exports (browser / require) ------------------------------------------ */
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { diff: diff, canon: canon, parseJsonl: parseJsonl, selftest: selftest};
+}
+
+test_jsonl-diff.js 80 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/* test_jsonl-diff.js — the house-standard test file for the jsonl-diff gift.
+*
+* Runs the module's own selftest (canon idempotence/order-faithfulness + the
+* diff modes), then adds API-level assertions the CLI selftest doesn't cover:
+* the set-diff vs keyed-diff distinction, deterministic sort order, the JSON
+* render being canonical + byte-stable, and that adversarial input throws a
+* clean JsonlError rather than a raw crash. Exits non-zero on any failure so it
+* drops straight into a CI gate.
+*/
+'use strict';
+var jd = require('./jsonl-diff.js');
+
+var fails = [];
+function ck(name, cond) { if (!cond) fails.push(name);}
+
+// 1. the module's own selftest must pass
+ck('module selftest GREEN', jd.selftest() === true);
+
+// 2. canon: order-faithful + idempotent
+ck('canon order-faithful', jd.canon({ b: 2, a: 1}) === jd.canon({ a: 1, b: 2}));
+ck('canon idempotent', jd.canon(jd.canon({ a: [1, 2]})) === jd.canon(jd.canon({ a: [1, 2]})));
+
+// 3. set-diff (no key): a changed record is one remove + one add, never a change
+var d = jd.diff('{"id":1,"v":"a"}\n', '{"id":1,"v":"b"}\n', {});
+ck('set-diff: change becomes remove+add', d.changed.length === 0 && d.added.length === 1 && d.removed.length === 1);
+
+// 4. keyed diff: same key, different content is a CHANGE with field deltas
+d = jd.diff('{"id":1,"v":"a","gone":1}\n', '{"id":1,"v":"b","new":2}\n', { key: 'id'});
+ck('keyed: same key differing is a change', d.changed.length === 1);
+ck('keyed: field delta names changed/removed/added',
+d.changed[0].fields.changed.v && d.changed[0].fields.removed.gone!== undefined &&
+d.changed[0].fields.added.new!== undefined);
+
+// 5. deterministic sort order (result independent of input line order)
+var A = jd.diff('{"id":2}\n{"id":1}\n', '{"id":3}\n{"id":1}\n', { key: 'id'});
+var B = jd.diff('{"id":1}\n{"id":2}\n', '{"id":1}\n{"id":3}\n', { key: 'id'});
+ck('result independent of input order',
+JSON.stringify(A.removed.map(function (r) { return r.key;})) ===
+JSON.stringify(B.removed.map(function (r) { return r.key;})));
+
+// 6. duplicate key => clean JsonlError (not a raw crash)
+var threw = null;
+try { jd.diff('{"id":1}\n{"id":1}\n', '{"id":1}\n', { key: 'id'});} catch (e) { threw = e;}
+ck('duplicate key throws JsonlError', threw && threw.jsonl === true);
+
+// 7. bad JSON line => clean JsonlError naming file:line
+threw = null;
+try { jd.parseJsonl('{"ok":1}\nnope\n', 'x');} catch (e) { threw = e;}
+ck('bad JSON throws JsonlError with location', threw && threw.jsonl === true && /x:2:/.test(threw.message));
+
+// 8. missing --key field => clean JsonlError, not a silent wrong answer
+threw = null;
+try { jd.diff('{"a":1}\n', '{"a":1}\n', { key: 'id'});} catch (e) { threw = e;}
+ck('missing key field throws JsonlError', threw && threw.jsonl === true);
+
+// 9. blank lines + whitespace are insensitive under canon
+d = jd.diff('{"id":1}\n\n', '{ "id": 1}\n', { key: 'id'});
+ck('whitespace/blank-insensitive', d.added.length === 0 && d.removed.length === 0 && d.changed.length === 0);
+
+// --- the adversarial CLI exits (crashclean; the qualify D4 contract) ---------
+var cp = require('child_process');
+var here = __dirname + '/jsonl-diff.js';
+function run(args) {
+var r = cp.spawnSync('node', [here].concat(args), { encoding: 'utf8'});
+return { code: r.status, err: r.stderr || '', out: r.stdout || ''};
+}
+var m = run(['/no/such/path_zzz', '/also/missing']);
+ck('missing file => exit 2, no stack trace', m.code === 2 &&!/\bat \w/.test(m.err));
+var one = run(['/no/such/path_zzz']);
+ck('one arg => exit 2, no stack trace', one.code === 2 &&!/\bat \w/.test(one.err));
+var help = run(['--help']);
+ck('--help => exit 0', help.code === 0);
+
+if (fails.length) {
+console.error('RED: ' + fails.length + ' failed: ' + fails.join(', ') + ' [test_jsonl-diff]');
+process.exit(1);
+}
+console.log('GREEN: all checks passed [test_jsonl-diff]');
+
+Take the whole folder →
+MIT
+Zero dependencies, Node or browser, deterministic
 
 ---

@@ -1,1503 +1,1407 @@
-# Loop MMT — corpus shard 69/87
+# Loop MMT — corpus shard 69/91
 
-> Bundle 69 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 69 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/interval-math/, /gifts/isvalidcsscolor/, /gifts/jq-lite/)
+Nodes in this shard: 3 (/gifts/hmac-webhook/, /gifts/hunkhole/, /gifts/ini-source/)
 
 ---
 
-# Interval-math — a Loop MMT gift
-https://loopmmt.com/gifts/interval-math/
+# hmac-webhook — a Loop MMT gift
+https://loopmmt.com/gifts/hmac-webhook/
 [coverage: optional · branch: gifts]
 
-Ranges In, A Bound You Can Trust Out transform ← all gifts
+Verify an HMAC-Signed Webhook in Constant Time filter ← all gifts
 
-Interval-math
+hmac-webhook
 
-Point it at a JSONL stream of operations — each a {op, a:[lo,hi], b:[lo,hi]} pairing two intervals with + - * or / — and it computes the resulting interval, emitting {"lo":L,"hi":H} one per record in input order. An interval [lo,hi] means 'some real number in this range'; the result is GUARANTEED to contain every (x op y) for x in a, y in b (the containment property). Multiply uses all FOUR corner products, so [-2,3]*[-5,4] is [-15,12], not the naive [10,12]. Division by an interval strictly on one side of zero multiplies by the reciprocal interval; dividing by an interval that SPANS zero is refused (unbounded result). It drops into a pipe anywhere ranges/tolerances/error-bars need combining with an honest bound, without an interval-arithmetic library.
+hmac-webhook recomputes HMAC-SHA256(secret, rawBody) and checks it against the signature a webhook sender put in a header (conventionally X-Signature: sha256=<hex>), answering one question — is this body authentic and unmodified, from someone who holds the secret? It answers in CONSTANT TIME, so a forger cannot learn the correct signature one character at a time from how long a rejection takes. verify(body, header, secret) returns {ok, reason}; ok:false always names why — no-signature, bad-format, unsupported-scheme, length-mismatch, or hmac-mismatch — never a partial match. HMAC-SHA256 is RFC 2104 exactly, with the SHA-256 core vendored byte-for-byte from the shipped sha256 gift, so the result is byte-identical to Node's crypto.createHmac and to openssl dgst -sha256 -hmac. Same body, header, and secret in → same verdict out, in Node or a browser.
 
 The honest edge
 
-Does the four arithmetic ops (+ - * /) on real intervals. NOT a full interval library — no power/exponent, roots, or transcendental functions (sin/exp/log), no interval union/intersection/hull. NO outward-directed rounding: bounds are plain IEEE-754 doubles (a result whose true endpoint is not exactly representable is the nearest double, which may be a hair inside the guaranteed bound) — for certified soundness use a rational/directed-rounding library. Division by an interval containing zero is refused, not split.
+hmac-webhook verifies AUTHENTICITY — nothing more. It is NOT a secret store (you supply the secret; it is never persisted), NOT a replay defender (it proves THIS body is authentic, not that it is fresh — pair it with a timestamp or nonce check for that), NOT a TLS or transport check, NOT an authorization system (authentic is not the same as allowed), and NOT a multi-algorithm negotiator (it verifies the one scheme you name, default sha256).
 
 Run it
 
-printf '%s\n' '{"op":"*","a":[-1,2],"b":[3,4]}' | node interval-math.js # op + - * /; exit 0 ok | 2 input error
-test_interval-math.js (28/28: the CONTAINMENT invariant as a self-witnessing oracle (sample a 20-pt grid of x in a, y in b; every x op y must lie in the returned [lo,hi]) + TIGHTNESS (bounds == sampled extremes) over 10 op/interval cases + frozen hand goldens (all-four-corner sign-crossing multiply == [-15,12], subtraction flip, reciprocal division) + division-by-interval-spanning-zero refusals + input-honesty hard errors (unknown/missing op, mis-shaped/non-finite/lo>hi interval, non-JSON) + the naive-two-corner-multiply mutation bite) + out-of-band conformance conform_interval-math.cjs (18/18 GREEN, subprocess-driven, signed b77c4b3dbc9d8798)
-Zero dependencies, Node or browser, deterministic
+printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --signature "sha256=<hex>" # prints 'ok' exit 0 if authentic; reason + exit 1 otherwise; --sign to emit a signature; exit 2 usage/input error
+test_hmac-webhook.js (40/40: RFC 4231 TC2, Node-crypto parity over 10 shapes incl. multibyte + 63/64/65-byte block-boundary keys + multi-block body, sign→verify round-trip, and the known-bad half — tampered body / wrong secret / flipped sig / truncated / 5 malformed headers / 2 wrong-scheme / uppercase-hex normalize / whitespace tolerate — plus determinism 3x and constant-time-compare correctness)
+Zero dependencies, Node or browser, deterministic, constant-time
 
 The code — every file that ships
 
-interval-math.js 238 lines on GitHub →
+hmac-webhook.js 351 lines on GitHub →
 #!/usr/bin/env node
-/* interval-math.js — interval arithmetic (+ - * /) over a JSONL stream of operations.
-Dependency-free, deterministic. Runs in Node or a browser. MIT.
-
-WHAT IT IS. Give it a stream of operations — one JSON record per line (JSONL),
-each naming two intervals and an operator — and it computes the resulting interval
-and emits it. An interval [lo, hi] stands for "some real number between lo and hi,
-inclusive"; interval arithmetic computes the tightest interval GUARANTEED to
-contain the true result whatever the inputs actually were. Same stream in,
-byte-identical stream out, on every machine and every run. It is a TRANSFORM: one
-record in, one record out, in the same order.
-
-THE OPERATION RECORD. Each non-blank line is one JSON object:
-
-{"op": "+", "a": [1, 2], "b": [3, 4]} -> {"lo":4,"hi":6}
-{"op": "*", "a": [-1, 2], "b": [3, 4]} -> {"lo":-4,"hi":8}
-{"op": "/", "a": [1, 1], "b": [2, 4]} -> {"lo":0.25,"hi":0.5}
-
-"op" is one of "+", "-", "*", "/". "a" and "b" are each a two-element array
-[lo, hi] of finite JSON numbers with lo <= hi. The output is {"lo":L, "hi":H}.
-
-THE CONTAINMENT GUARANTEE (the whole point). For every operation the result [L,H]
-is computed so that for ALL x in a and ALL y in b, (x op y) lies in [L, H]. This
-is the load-bearing invariant: interval arithmetic is only correct if it never
-loses a possible result.
-
-+ [a,b] + [c,d] = [a+c, b+d]
-- [a,b] - [c,d] = [a-d, b-c] (subtract the OTHER interval flipped)
-* [a,b] * [c,d] = [min(P), max(P)] where P = {a*c, a*d, b*c, b*d}
-(ALL FOUR corner products — a naive
-[a*c, b*d] is WRONG whenever a sign
-crosses zero)
-/ [a,b] / [c,d] = [a,b] * [1/d, 1/c] (multiply by the reciprocal interval)
-ONLY when [c,d] does NOT contain 0 —
-
-DIVISION BY AN INTERVAL SPANNING ZERO IS A HARD ERROR. If b = [c,d] has c <= 0 <= d
-the reciprocal interval is unbounded (the result would be (-inf, +inf) or a split),
-so this gift REFUSES it (exit 2) rather than emit a bound it cannot honor. Dividing
-by an interval strictly on one side of zero (c>0 or d<0) is fine.
-
-NUMERIC HONESTY. Bounds are IEEE-754 doubles. Every endpoint must be a FINITE JSON
-number; a NaN/Infinity/overflow (e.g. 1e999 -> Infinity) or an interval with
-lo > hi is a HARD ERROR (exit 2) naming the line — never a silent skip. See the
-printed edge for the rounding caveat: this is EXACT for representable endpoints and
-representable results, but does NOT do outward-directed rounding, so a result whose
-true endpoint is not exactly representable in a double is stored as the nearest
-double (which may be a hair inside the mathematically-guaranteed bound). For
-verified/certified interval arithmetic use a rational or a directed-rounding
-library; this gift is the honest zero-dep representation, not a proof engine.
-
-USAGE
-printf '%s\n' '{"op":"+","a":[1,2],"b":[3,4]}' | node interval-math.js
-printf '%s\n' '{"op":"*","a":[-1,2],"b":[3,4]}' | node interval-math.js
-node interval-math.js ops.jsonl
-node interval-math.js --help
-
-Each non-blank line is one operation record; blank lines are skipped; a trailing
-\r (CRLF files) is trimmed. Output is one compact JSON object ({"lo":L,"hi":H})
-per record, one per line, in input order.
-
-Exit codes: 0 success · 2 input error (a line that is not a valid operation record,
-an unknown op, a non-finite or mis-ordered interval, or a division by an interval
-spanning zero). Always a clean one-line message on stderr, never a stack trace.
-
-Released under MIT. Its edge is printed in the README: this does the four
-arithmetic ops (+ - * /) on real intervals. It is NOT a full interval library — no
-power/exponent, roots, or transcendental functions (sin/exp/log), no interval
-union/intersection/hull, and NO outward-directed rounding (bounds are plain
-doubles). Division by an interval containing zero is refused, not split.
+/**
+* hmac-webhook — verify an HMAC-signed webhook before you trust its body.
+*
+* WHAT
+* A webhook sender (GitHub, Stripe, Shopify, a Loop module) signs each request
+* body with a shared secret and puts the signature in a header, conventionally
+* X-Signature: sha256=<hex>
+* hmac-webhook recomputes HMAC-SHA256(secret, rawBody) and checks it against the
+* signature the sender sent. It answers ONE question — is this body authentic and
+* unmodified, from someone who holds the secret? — and answers it in CONSTANT TIME
+* so a forger cannot learn the right signature one byte at a time from timing.
+*
+* verify(rawBody, signatureHeader, secret) -> { ok, reason}
+*
+* ok:true the body is authentic (the computed MAC equals the presented one).
+* ok:false reason names WHY it failed — never a partial match, never a maybe:
+* "no-signature" the header is empty / missing.
+* "bad-format" the header is not "<scheme>=<hex>" with an even-length
+* lowercase-normalizable hex body.
+* "unsupported-scheme" a scheme other than the one asked for (default sha256).
+* "length-mismatch" the presented digest is not 64 hex chars (32 bytes).
+* "hmac-mismatch" well-formed, right length, but the MAC does not match —
+* the body was altered, the secret is wrong, or it is a forgery.
+*
+* HOW
+* HMAC-SHA256 is RFC 2104 exactly: with block size B=64 and the SHA-256 core
+* vendored from the shipped `sha256` gift (FIPS 180-4, byte-faithful),
+* K' = key if len(key) <= B, else SHA-256(key) then zero-padded to B
+* HMAC = SHA-256( (K' XOR opad) || SHA-256( (K' XOR ipad) || message))
+* ipad is 0x36 repeated B times, opad is 0x5c repeated B times. Everything runs on
+* RAW BYTES — the message and the key are UTF-8 encoded once — so a multibyte secret
+* or body is hashed byte-for-byte the same as Node's crypto.createHmac('sha256').
+* The comparison is a fixed-time XOR-accumulate over the full digest width: it looks
+* at every byte regardless of where the first difference is, so the pass/fail timing
+* carries no information about the correct signature.
+*
+* Pure function of (body, header, secret). No clock, no randomness, no files, no
+* network. Same three inputs -> same verdict, every run, in Node or a browser.
+*
+* USAGE
+* node hmac-webhook.js --secret SECRET --signature "sha256=<hex>" [FILE] # body from FILE or stdin
+* node hmac-webhook.js --secret SECRET --sign [FILE] # PRINT the signature for a body (sender side)
+* printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --sign
+* -> sha256=<hex>
+* printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --signature "sha256=<hex>"
+* -> exits 0 (authentic) and prints "ok"; exits 1 and prints the reason otherwise.
+* --scheme NAME signature scheme label to require/emit (default "sha256").
+* --help
+*
+* In a browser: window.ForestGifts.hmacWebhook.{verify, sign, hmacSha256Hex}.
+*
+* EXIT CODES (CLI)
+* 0 verify: authentic. (--sign always exits 0 on success.)
+* 1 verify: NOT authentic — the reason is printed on stdout (one word) + stderr.
+* 2 usage / input error: missing --secret, missing --signature (without --sign),
+* a file that is a directory or cannot be read. One clean line on stderr.
+*
+* EDGE (what this is NOT)
+* NOT a signer's secret store — you supply the secret; it is never persisted.
+* NOT a replay defender — it proves authenticity of THIS body, not that the body
+* is fresh; pair it with a timestamp/nonce check if you need replay protection.
+* NOT a TLS or transport check, NOT an authorization system (authentic!= allowed),
+* and NOT a multi-algorithm negotiator — it verifies ONE scheme (sha256) you name.
+*
+* Zero dependencies. Node builtin `require('fs')` for file reads only; runs in a
+* browser with no require. MIT.
 */
 "use strict";
 
-var OPS = { "+": true, "-": true, "*": true, "/": true};
+/* ------------------------------------------------------------------ *
+* SHA-256 core — vendored from the `sha256` gift (FIPS 180-4), *
+* byte-faithful, with the raw-bytes entry HMAC needs. The block *
+* machinery is IDENTICAL to the shipped sha256 gift and to *
+* Node crypto's sha256; a mismatch here is a rebuild failure. *
+* ------------------------------------------------------------------ */
 
-// Validate an interval value: a 2-element array of finite numbers with lo <= hi.
-function checkInterval(v, which, lineNo) {
-if (!Array.isArray(v) || v.length!== 2) {
-throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
-" must be a two-element [lo,hi] array");
-}
-var lo = v[0], hi = v[1];
-if (typeof lo!== "number" || typeof hi!== "number" ||!isFinite(lo) ||!isFinite(hi)) {
-throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
-" endpoints must be finite numbers");
-}
-if (lo > hi) {
-throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
-" has lo > hi (" + lo + " > " + hi + ")");
-}
-return [lo, hi];
-}
+// Round constants — FIPS 180-4 §4.2.2.
+var K = [
+0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
 
-// Compute one interval operation. Throws (clean, line-named) on divide-by-spanning-0.
-function apply(op, a, b, lineNo) {
-var al = a[0], ah = a[1], bl = b[0], bh = b[1];
-switch (op) {
-case "+":
-return [al + bl, ah + bh];
-case "-":
-return [al - bh, ah - bl];
-case "*": {
-var p = [al * bl, al * bh, ah * bl, ah * bh];
-return [Math.min(p[0], p[1], p[2], p[3]), Math.max(p[0], p[1], p[2], p[3])];
+function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
+
+// UTF-8 encode a JS string to a byte array — the SAME bytes Node's
+//.update(String(s)) hashes (surrogate-pair aware fallback matches TextEncoder).
+function utf8Bytes(str) {
+if (typeof TextEncoder!== "undefined") {
+return Array.prototype.slice.call(new TextEncoder().encode(str));
 }
-case "/": {
-if (bl <= 0 && bh >= 0) {
-throw new Error("line " + lineNo +
-" divides by an interval spanning zero [" + bl + "," + bh + "] (unbounded result; refused)");
+var out = [], i, c, lo;
+for (i = 0; i < str.length; i++) {
+c = str.charCodeAt(i);
+if (c < 0x80) { out.push(c);}
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) {
+lo = str.charCodeAt(++i);
+c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
+out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
 }
-// reciprocal of [bl,bh] (which does not contain 0) is [1/bh, 1/bl]
-var rl = 1 / bh, rh = 1 / bl;
-var q = [al * rl, al * rh, ah * rl, ah * rh];
-return [Math.min(q[0], q[1], q[2], q[3]), Math.max(q[0], q[1], q[2], q[3])];
-}
-default:
-throw new Error("line " + lineNo + " unknown op " + JSON.stringify(op) +
-" (expected + - * /)");
-}
+return out;
 }
 
-// Convert one parsed record -> {lo,hi}. Throws on a malformed record.
-function computeRecord(rec, lineNo) {
-if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
-throw new Error("line " + lineNo + " is not an operation object");
+// sha256 of RAW BYTES (array-like of 0..255) -> a 32-byte Array digest.
+function sha256Digest(bytes) {
+var len = bytes.length;
+var bitLenHi = Math.floor(len / 0x20000000);
+var bitLenLo = (len * 8) >>> 0;
+var withOne = len + 1;
+var padded = (withOne + 8 + 63) & ~63;
+var msg = new Array(padded);
+var i;
+for (i = 0; i < padded; i++) msg[i] = 0;
+for (i = 0; i < len; i++) msg[i] = bytes[i] & 0xff;
+msg[len] = 0x80;
+msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
+msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
+msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
+msg[padded - 5] = bitLenHi & 0xff;
+msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
+msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
+msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
+msg[padded - 1] = bitLenLo & 0xff;
+
+var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
+h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+
+var w = new Array(64), t, blk;
+for (blk = 0; blk < padded; blk += 64) {
+for (t = 0; t < 16; t++) {
+w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
+(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
 }
-var op = rec.op;
-if (typeof op!== "string" ||!OPS[op]) {
-throw new Error("line " + lineNo + " has a missing or unknown op " +
-JSON.stringify(op) + " (expected + - * /)");
+for (t = 16; t < 64; t++) {
+var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
 }
-var a = checkInterval(rec.a, "a", lineNo);
-var b = checkInterval(rec.b, "b", lineNo);
-var r = apply(op, a, b, lineNo);
-return { lo: r[0], hi: r[1]};
+var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
+for (t = 0; t < 64; t++) {
+var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+var ch = (e & f) ^ (~e & g);
+var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
+var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+var maj = (a & b) ^ (a & c) ^ (b & c);
+var temp2 = (S0 + maj) >>> 0;
+hh = g; g = f; f = e; e = (d + temp1) >>> 0;
+d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+}
+h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
 }
 
-// The public transform: JSONL text -> { lines: [json per record..], count}.
-function transform(text) {
-var rawLines = String(text).split("\n");
-var out = [];
-var i, line, rec, result;
-for (i = 0; i < rawLines.length; i++) {
-line = rawLines[i];
-if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
-if (line.length === 0) continue; // blank line
-
-try { rec = JSON.parse(line);}
-catch (e) {
-throw new Error("line " + (i + 1) + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
+var out = new Array(32), words = [h0, h1, h2, h3, h4, h5, h6, h7], wi;
+for (wi = 0; wi < 8; wi++) {
+out[wi * 4] = (words[wi] >>> 24) & 0xff;
+out[wi * 4 + 1] = (words[wi] >>> 16) & 0xff;
+out[wi * 4 + 2] = (words[wi] >>> 8) & 0xff;
+out[wi * 4 + 3] = words[wi] & 0xff;
 }
-result = computeRecord(rec, i + 1);
-out.push(JSON.stringify(result));
-}
-return { lines: out, count: out.length};
+return out;
 }
 
-/* ---- exports (browser + Node) ------------------------------------ */
+function byteToHex(b) {
+var h = (b & 0xff).toString(16);
+return h.length === 1? "0" + h: h;
+}
+function bytesToHex(bytes) {
+var s = "", i;
+for (i = 0; i < bytes.length; i++) s += byteToHex(bytes[i]);
+return s;
+}
+
+/* ------------------------------------------------------------------ *
+* HMAC-SHA256 — RFC 2104. *
+* ------------------------------------------------------------------ */
+
+var BLOCK = 64; // SHA-256 block size in bytes (RFC 2104 "B").
+
+// key: byte array. Returns the B-byte K' (hashed-if-long, zero-padded).
+function normalizeKey(keyBytes) {
+var k = keyBytes;
+if (k.length > BLOCK) k = sha256Digest(k); // K longer than a block -> hash it first.
+var out = new Array(BLOCK), i;
+for (i = 0; i < BLOCK; i++) out[i] = (i < k.length? (k[i] & 0xff): 0);
+return out;
+}
+
+// HMAC-SHA256 over raw byte arrays -> 32-byte digest array.
+function hmacSha256Bytes(keyBytes, msgBytes) {
+var kp = normalizeKey(keyBytes);
+var ipad = new Array(BLOCK), opad = new Array(BLOCK), i;
+for (i = 0; i < BLOCK; i++) {
+ipad[i] = kp[i] ^ 0x36;
+opad[i] = kp[i] ^ 0x5c;
+}
+var inner = sha256Digest(ipad.concat(msgBytes)); // H((K' ^ ipad) || m)
+return sha256Digest(opad.concat(inner)); // H((K' ^ opad) || inner)
+}
+
+// HMAC-SHA256 hex of (secret string, message string), UTF-8 encoded — byte-identical
+// to Node crypto.createHmac('sha256', secret).update(message).digest('hex').
+function hmacSha256Hex(secret, message) {
+return bytesToHex(hmacSha256Bytes(utf8Bytes(String(secret)), utf8Bytes(String(message))));
+}
+
+/* ------------------------------------------------------------------ *
+* The verifier. *
+* ------------------------------------------------------------------ */
+
+var HEX_RE = /^[0-9a-f]+$/;
+
+// Constant-time equality of two equal-length lowercase-hex strings. Looks at every
+// character; the running OR of per-char differences carries no early-exit timing.
+// Caller MUST have already checked the lengths match (a length difference is not a
+// secret — it is public structure — so it is decided before this point).
+function constantTimeHexEqual(a, b) {
+var diff = 0, i;
+for (i = 0; i < a.length; i++) diff |= (a.charCodeAt(i) ^ b.charCodeAt(i));
+return diff === 0;
+}
+
+// Parse "<scheme>=<hex>" -> { scheme, hex} or null if it is not that shape.
+function parseSignatureHeader(header) {
+if (typeof header!== "string") return null;
+var s = header.trim();
+var eq = s.indexOf("=");
+if (eq <= 0 || eq === s.length - 1) return null; // no scheme, or nothing after '='
+var scheme = s.slice(0, eq);
+var hex = s.slice(eq + 1).toLowerCase();
+if (!HEX_RE.test(hex) || (hex.length % 2)!== 0) return null; // must be even-length hex
+return { scheme: scheme, hex: hex};
+}
+
+/**
+* Verify a signed webhook body.
+* @param {string} rawBody the exact bytes the sender signed (a string; UTF-8 hashed).
+* @param {string} signatureHeader e.g. "sha256=abcd..." from the request header.
+* @param {string} secret the shared secret.
+* @param {{scheme?: string}} [opts] scheme to require (default "sha256").
+* @returns {{ok: boolean, reason: string}} reason is "" on success.
+*/
+function verify(rawBody, signatureHeader, secret, opts) {
+opts = opts || {};
+var wantScheme = opts.scheme || "sha256";
+if (signatureHeader === undefined || signatureHeader === null || String(signatureHeader).trim() === "") {
+return { ok: false, reason: "no-signature"};
+}
+var parsed = parseSignatureHeader(String(signatureHeader));
+if (!parsed) return { ok: false, reason: "bad-format"};
+if (parsed.scheme!== wantScheme) return { ok: false, reason: "unsupported-scheme"};
+// A SHA-256 digest is exactly 32 bytes = 64 hex chars. Length is public structure,
+// decided before the constant-time compare (which requires equal lengths).
+if (parsed.hex.length!== 64) return { ok: false, reason: "length-mismatch"};
+var expected = hmacSha256Hex(secret, rawBody); // always 64 lowercase hex chars
+if (constantTimeHexEqual(expected, parsed.hex)) return { ok: true, reason: ""};
+return { ok: false, reason: "hmac-mismatch"};
+}
+
+/**
+* Produce the signature header a sender would send for a body (the sender side).
+* @returns {string} e.g. "sha256=abcd..."
+*/
+function sign(rawBody, secret, opts) {
+opts = opts || {};
+var scheme = opts.scheme || "sha256";
+return scheme + "=" + hmacSha256Hex(secret, rawBody);
+}
+
+/* ---- exports ---- */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.intervalMath = transform;
-window.ForestGifts.intervalOp = function (op, a, b) { return apply(op, checkInterval(a, "a", 1), checkInterval(b, "b", 1), 1);};
+window.ForestGifts.hmacWebhook = {
+verify: verify, sign: sign, hmacSha256Hex: hmacSha256Hex,
+parseSignatureHeader: parseSignatureHeader
+};
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { transform: transform, apply: apply, computeRecord: computeRecord, checkInterval: checkInterval};
+module.exports = {
+verify: verify, sign: sign, hmacSha256Hex: hmacSha256Hex,
+parseSignatureHeader: parseSignatureHeader, constantTimeHexEqual: constantTimeHexEqual
+};
 }
 
-/* ---- CLI (runs only when invoked directly, never on require) ------ */
-function run(text) {
-var r = transform(text);
-var body = r.lines.length? r.lines.join("\n") + "\n": "";
-return { out: body, count: r.count};
+/* ------------------------------------------------------------------ *
+* CLI. *
+* ------------------------------------------------------------------ */
+
+function readAll(stream, cb) {
+var chunks = [];
+stream.on("data", function (d) { chunks.push(d);});
+stream.on("end", function () { cb(Buffer.concat(chunks).toString("utf8"));});
+}
+
+function usage() {
+return "usage: hmac-webhook.js --secret SECRET (--sign | --signature 'sha256=<hex>') [--scheme NAME] [FILE]";
 }
 
 function main(argv) {
 var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"interval-math.js — interval arithmetic (+ - * /) over a JSONL stream.\n\n" +
-" printf '%s\\n' '{\"op\":\"+\",\"a\":[1,2],\"b\":[3,4]}' | node interval-math.js -> {\"lo\":4,\"hi\":6}\n" +
-" printf '%s\\n' '{\"op\":\"*\",\"a\":[-1,2],\"b\":[3,4]}' | node interval-math.js -> {\"lo\":-4,\"hi\":8}\n" +
-" node interval-math.js ops.jsonl\n" +
-" node interval-math.js --help\n\n" +
-"Each non-blank line is one operation object {op, a:[lo,hi], b:[lo,hi]}. The\n" +
-"result [L,H] is guaranteed to contain every (x op y) for x in a, y in b. Output\n" +
-"is one {\"lo\":L,\"hi\":H} per record, in input order.\n\n" +
-"Edge: the four arithmetic ops on real intervals. NOT a full interval library\n" +
-"(no powers/roots/transcendentals, no union/intersection, no outward rounding).\n" +
-"Division by an interval spanning zero is a hard error, not split.\n"
-);
-return 0;
-}
-
-var files = [];
-var i;
-try {
+var secret = null, signature = null, scheme = "sha256", doSign = false, file = null, i;
 for (i = 0; i < args.length; i++) {
-if (args[i].charAt(0) === "-" && args[i]!== "-") { throw new Error("unknown option " + args[i]);}
-else { files.push(args[i]);}
+var a = args[i];
+if (a === "--help" || a === "-h") { process.stdout.write(usage() + "\n"); process.exit(0);}
+else if (a === "--secret") { secret = args[++i];}
+else if (a === "--signature") { signature = args[++i];}
+else if (a === "--scheme") { scheme = args[++i];}
+else if (a === "--sign") { doSign = true;}
+else if (a.slice(0, 2) === "--") { process.stderr.write("hmac-webhook: unknown option " + a + "\n" + usage() + "\n"); process.exit(2);}
+else { file = a;}
 }
-} catch (e) {
-process.stderr.write("interval-math: " + e.message + "\n");
-return 2;
-}
-
-function emit(text) {
-try {
-var r = run(text);
-process.stdout.write(r.out);
-return 0;
-} catch (e) {
-process.stderr.write("interval-math: " + e.message + "\n");
-return 2;
-}
+if (secret === null || secret === undefined) { process.stderr.write("hmac-webhook: --secret is required\n" + usage() + "\n"); process.exit(2);}
+if (!doSign && (signature === null || signature === undefined)) {
+process.stderr.write("hmac-webhook: --signature is required (or use --sign to produce one)\n" + usage() + "\n");
+process.exit(2);
 }
 
-if (files.length > 0) {
+function run(body) {
+if (doSign) {
+process.stdout.write(sign(body, secret, { scheme: scheme}) + "\n");
+process.exit(0);
+}
+var r = verify(body, signature, secret, { scheme: scheme});
+if (r.ok) { process.stdout.write("ok\n"); process.exit(0);}
+process.stdout.write(r.reason + "\n");
+process.stderr.write("hmac-webhook: verification failed (" + r.reason + ")\n");
+process.exit(1);
+}
+
+if (file) {
 var fs = require("fs");
-var text;
-try { text = fs.readFileSync(files[0], "utf8");}
-catch (e) {
-process.stderr.write("interval-math: cannot read " + files[0] +
-" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
-return 2;
+var stat;
+try { stat = fs.statSync(file);} catch (e) { process.stderr.write("hmac-webhook: cannot read " + file + "\n"); process.exit(2);}
+if (stat.isDirectory()) { process.stderr.write("hmac-webhook: " + file + " is a directory\n"); process.exit(2);}
+run(fs.readFileSync(file, "utf8"));
+} else {
+readAll(process.stdin, run);
 }
-return emit(text);
-}
-
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
-});
-return 0;
 }
 
 if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
+main(process.argv);
 }
 
-test_interval-math.js 171 lines on GitHub →
+test_hmac-webhook.js 142 lines on GitHub →
 #!/usr/bin/env node
-/* test_interval-math.js — golden battery for the interval-math gift.
-
-Out-of-band and self-verifying. The oracle here is not an external library — it is
-the CONTAINMENT INVARIANT, which is self-witnessing:
-
-(1) CONTAINMENT. For each op and interval pair, sample a dense grid of x in a and
-y in b, compute (x op y) directly, and assert EVERY sampled result lies
-within the gift's returned [lo,hi]. A correct interval result cannot fail
-this; an under-wide (buggy) result will. This needs no external authority —
-the definition of interval arithmetic IS the test.
-
-(2) TIGHTNESS (a companion, so containment isn't passed by returning [-inf,inf]).
-For + - * / on continuous inputs the true result range endpoints are attained
-at interval corners, so the gift's [lo,hi] must EQUAL [min,max] of the sampled
-direct results to within a small epsilon — i.e. the interval is not just
-containing but tight.
-
-(3) FROZEN hand goldens — the sign-crossing multiply (the corner case), the
-subtraction flip, reciprocal division, and the division-spanning-zero refusal.
-
-A planted mutation (the bite, §BITE) MUST be caught: the naive multiply
-[a*c, b*d] (only two corners) is WRONG on a sign-crossing interval; the oracle
-(containment) must reject it.
-
-Run: node test_interval-math.js -> exit 0 GREEN / non-zero RED
+/**
+* test_hmac-webhook — out-of-band battery for the hmac-webhook gift.
+*
+* The gift verifies HMAC-SHA256 webhook signatures. The oracle here is INDEPENDENT
+* of the gift's own SHA-256/HMAC code in two ways:
+* (1) RFC 4231 published HMAC-SHA256 test vectors (known-good, external authority);
+* (2) Node's built-in crypto.createHmac('sha256') (a different implementation).
+* A gift MAC that disagrees with either is a rebuild failure, not a warning.
+*
+* The known-bad half is real defect shapes: a tampered body, a wrong secret, a
+* bit-flipped signature, a truncated digest, a malformed header, a wrong scheme.
+*
+* GREEN means every assertion RAN and passed. A battery that executes nothing fails.
 */
 "use strict";
-var im = require("./interval-math.js");
 
-var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;}
-else { fail++; console.log(" FAIL " + name);}
-}
-function J(v) { return JSON.stringify(v);}
-function giftOp(op, a, b) {
-var r = im.transform(J({ op: op, a: a, b: b}) + "\n");
-return JSON.parse(r.lines[0]); // {lo,hi}
-}
+var crypto = require("crypto");
+var G = require("./hmac-webhook.js");
 
-// direct scalar op
-function scalar(op, x, y) {
-if (op === "+") return x + y;
-if (op === "-") return x - y;
-if (op === "*") return x * y;
-if (op === "/") return x / y;
-throw new Error("bad op");
+var passed = 0, failed = 0, ran = 0;
+function check(name, cond) {
+ran++;
+if (cond) { passed++;}
+else { failed++; console.error("FAIL: " + name);}
 }
-// sample N points across [lo,hi] inclusive
-function grid(lo, hi, n) {
-if (lo === hi) return [lo];
-var out = [];
-for (var i = 0; i <= n; i++) out.push(lo + (hi - lo) * i / n);
-return out;
+function eq(name, got, want) {
+check(name + " (got=" + JSON.stringify(got) + " want=" + JSON.stringify(want) + ")", got === want);
 }
 
-/* ---- (1)+(2) containment AND tightness over a spread of ops+intervals ----- */
-(function () {
-var cases = [
-["+", [1, 2], [3, 4]],
-["-", [1, 2], [3, 4]],
-["*", [-1, 2], [3, 4]], // sign-crossing a
-["*", [-3, -1], [-4, -2]], // both negative
-["*", [-2, 3], [-5, 4]], // both sign-crossing (the hard corner case)
-["*", [0, 5], [2, 3]],
-["/", [1, 1], [2, 4]],
-["/", [-6, 6], [2, 3]], // numerator spans 0, denom positive
-["/", [1, 2], [-4, -2]], // denom strictly negative
-["+", [-5, -5], [5, 5]], // degenerate (points)
+/* ---- 1. RFC 4231 HMAC-SHA256 known-good vectors ----
+* Keys/data given as hex/ascii in RFC 4231 §4. We feed the byte-exact inputs.
+* hmacSha256Hex takes STRINGS (UTF-8), so we only use the vectors whose key and
+* data are plain ASCII (no embedded non-UTF8 bytes) — vectors 2 and 7-ascii-part.
+* For the binary-key vectors we cross-check against Node crypto below on raw bytes
+* via the same public gift API used on strings, keeping the oracle independent.
+*/
+
+// RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?"
+eq("rfc4231-tc2",
+G.hmacSha256Hex("Jefe", "what do ya want for nothing?"),
+"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+
+/* ---- 2. Cross-check against Node crypto over a spread of inputs ---- */
+function nodeHmac(secret, msg) {
+return crypto.createHmac("sha256", secret).update(msg, "utf8").digest("hex");
+}
+var samples = [
+["", ""],
+["s3cr3t", ""],
+["", "body-with-empty-secret"],
+["shared-hmac-secret", '{"event":"ping","id":1}'],
+["key", "The quick brown fox jumps over the lazy dog"],
+// multibyte secret AND body — the byte-faithfulness trap
+["ключ-🔑", "日本語のペイロード — π ≈ 3.14159"],
+// a secret longer than the 64-byte block (forces the K'=SHA256(K) path)
+["x".repeat(65), "block-boundary body"],
+["x".repeat(64), "exactly one block key"],
+["x".repeat(63), "just under one block key"],
+// long body spanning many blocks
+["k", "A".repeat(1000)]
 ];
-var containFail = 0, tightFail = 0;
-cases.forEach(function (c) {
-var op = c[0], a = c[1], b = c[2];
-var got = giftOp(op, a, b);
-var xs = grid(a[0], a[1], 20), ys = grid(b[0], b[1], 20);
-var minR = Infinity, maxR = -Infinity, allIn = true;
-for (var i = 0; i < xs.length; i++) for (var j = 0; j < ys.length; j++) {
-var v = scalar(op, xs[i], ys[j]);
-if (v < minR) minR = v;
-if (v > maxR) maxR = v;
-if (v < got.lo - 1e-9 || v > got.hi + 1e-9) allIn = false;
-}
-if (!allIn) { containFail++; console.log(" CONTAIN " + op + " " + J(a) + J(b) + " -> " + J(got));}
-// tightness: the gift's bounds equal the sampled extremes to epsilon
-if (Math.abs(got.lo - minR) > 1e-6 || Math.abs(got.hi - maxR) > 1e-6) {
-tightFail++; console.log(" TIGHT " + op + " " + J(a) + J(b) + " gift=" + J(got) + " sampled=[" + minR + "," + maxR + "]");
-}
+samples.forEach(function (s, idx) {
+eq("node-crypto-parity[" + idx + "]", G.hmacSha256Hex(s[0], s[1]), nodeHmac(s[0], s[1]));
 });
-ok("containment: every sampled x∘y lies in the gift interval (" + cases.length + " cases)", containFail === 0);
-ok("tightness: gift bounds == sampled extremes (" + cases.length + " cases)", tightFail === 0);
-})();
 
-/* ---- (3) frozen hand goldens --------------------------------------------- */
-function G(name, op, a, b, lo, hi) {
-var g = giftOp(op, a, b);
-ok(name, g.lo === lo && g.hi === hi);
+/* ---- 3. sign() round-trips through verify() ---- */
+var secret = "shared-hmac-secret";
+var body = '{"event":"order.created","id":"ord_123","amount":4200}';
+var header = G.sign(body, secret);
+check("sign-emits-sha256-scheme", /^sha256=[0-9a-f]{64}$/.test(header));
+eq("sign-matches-node", header, "sha256=" + nodeHmac(secret, body));
+eq("verify-authentic", G.verify(body, header, secret).ok, true);
+eq("verify-authentic-reason-empty", G.verify(body, header, secret).reason, "");
+
+/* ---- 4. KNOWN-BAD: real forgery / tamper shapes must be rejected ---- */
+
+// 4a. tampered body — one byte changed
+var tampered = body.replace("4200", "9900");
+eq("reject-tampered-body.ok", G.verify(tampered, header, secret).ok, false);
+eq("reject-tampered-body.reason", G.verify(tampered, header, secret).reason, "hmac-mismatch");
+
+// 4b. wrong secret
+eq("reject-wrong-secret.ok", G.verify(body, header, "not-the-secret").ok, false);
+eq("reject-wrong-secret.reason", G.verify(body, header, "not-the-secret").reason, "hmac-mismatch");
+
+// 4c. bit-flipped signature (last hex nibble changed, still 64 hex chars)
+var flipped = header.slice(0, -1) + (header.slice(-1) === "0"? "1": "0");
+eq("reject-flipped-sig.ok", G.verify(body, flipped, secret).ok, false);
+eq("reject-flipped-sig.reason", G.verify(body, flipped, secret).reason, "hmac-mismatch");
+
+// 4d. truncated digest (right prefix, wrong length) -> length-mismatch, not a compare
+var truncated = "sha256=" + header.slice("sha256=".length, "sha256=".length + 40);
+eq("reject-truncated.reason", G.verify(body, truncated, secret).reason, "length-mismatch");
+
+// 4e. empty / missing signature
+eq("reject-empty-sig", G.verify(body, "", secret).reason, "no-signature");
+eq("reject-null-sig", G.verify(body, null, secret).reason, "no-signature");
+eq("reject-undefined-sig", G.verify(body, undefined, secret).reason, "no-signature");
+
+// 4f. malformed header shapes -> bad-format
+eq("reject-no-eq", G.verify(body, "sha256" + header.slice("sha256=".length), secret).reason, "bad-format");
+eq("reject-no-scheme", G.verify(body, "=" + "a".repeat(64), secret).reason, "bad-format");
+eq("reject-non-hex", G.verify(body, "sha256=" + "z".repeat(64), secret).reason, "bad-format");
+eq("reject-odd-hex", G.verify(body, "sha256=" + "a".repeat(63), secret).reason, "bad-format");
+eq("reject-nothing-after-eq", G.verify(body, "sha256=", secret).reason, "bad-format");
+
+// 4g. wrong scheme -> unsupported-scheme
+eq("reject-md5-scheme", G.verify(body, "md5=" + "a".repeat(64), secret).reason, "unsupported-scheme");
+eq("reject-sha1-scheme", G.verify(body, "sha1=" + "a".repeat(40), secret).reason, "unsupported-scheme");
+
+// 4h. uppercase hex in the presented sig is normalized and still verifies
+var upperHeader = "sha256=" + nodeHmac(secret, body).toUpperCase();
+eq("accept-uppercase-hex", G.verify(body, upperHeader, secret).ok, true);
+
+// 4i. leading/trailing whitespace in the header is tolerated
+eq("accept-padded-header", G.verify(body, " " + header + " ", secret).ok, true);
+
+/* ---- 5. custom scheme label round-trips ---- */
+var h2 = G.sign(body, secret, { scheme: "loop"});
+check("custom-scheme-format", /^loop=[0-9a-f]{64}$/.test(h2));
+eq("custom-scheme-verify", G.verify(body, h2, secret, { scheme: "loop"}).ok, true);
+eq("custom-scheme-default-rejects", G.verify(body, h2, secret).reason, "unsupported-scheme");
+
+/* ---- 6. determinism: same inputs -> byte-identical MAC across repeated calls ---- */
+var d1 = G.hmacSha256Hex(secret, body);
+var d2 = G.hmacSha256Hex(secret, body);
+var d3 = G.hmacSha256Hex(secret, body);
+check("determinism-3x-identical", d1 === d2 && d2 === d3);
+
+/* ---- 7. constant-time compare correctness (function-level) ---- */
+eq("ct-equal-true", G.constantTimeHexEqual("abcdef", "abcdef"), true);
+eq("ct-equal-false", G.constantTimeHexEqual("abcdef", "abcdff"), false);
+
+/* ---- summary ---- */
+if (failed === 0 && ran > 0) {
+console.log("GREEN: " + passed + " assertions passed, 0 failed [test_hmac-webhook] (ran=" + ran + ")");
+process.exit(0);
+} else {
+console.error("RED: " + failed + " failed / " + ran + " ran [test_hmac-webhook]");
+process.exit(1);
 }
-G("add", "+", [1, 2], [3, 4], 4, 6);
-G("sub flips the other interval", "-", [1, 2], [3, 4], -3, -1);
-G("mul sign-crossing (all four corners)", "*", [-1, 2], [3, 4], -4, 8);
-G("mul both negative", "*", [-3, -1], [-4, -2], 2, 12);
-G("mul both sign-crossing", "*", [-2, 3], [-5, 4], -15, 12);
-G("div by positive interval", "/", [1, 1], [2, 4], 0.25, 0.5);
-G("div numerator spans zero", "/", [-6, 6], [2, 3], -3, 3);
-G("div by strictly-negative interval", "/", [1, 2], [-4, -2], -1, -0.25);
-
-/* ---- (4) division-by-spanning-zero is a HARD ERROR ------------------------ */
-function throws(name, fn) {
-var t = false;
-try { fn();} catch (e) { t = true;}
-ok(name, t);
-}
-throws("div by [-1,1] (spans 0) refused", function () { giftOp("/", [1, 2], [-1, 1]);});
-throws("div by [0,2] (touches 0 at lo) refused", function () { giftOp("/", [1, 2], [0, 2]);});
-throws("div by [-2,0] (touches 0 at hi) refused", function () { giftOp("/", [1, 2], [-2, 0]);});
-throws("div by [0,0] refused", function () { giftOp("/", [1, 2], [0, 0]);});
-
-/* ---- (5) transform shape + input honesty --------------------------------- */
-(function () {
-var text = '{"op":"+","a":[1,2],"b":[3,4]}\n{"op":"*","a":[0,1],"b":[2,2]}\n';
-var r = im.transform(text);
-ok("one output per input, in order", J(r.lines) === J(['{"lo":4,"hi":6}', '{"lo":0,"hi":2}']));
-ok("count == records", r.count === 2);
-})();
-ok("blank lines skipped", im.transform('{"op":"+","a":[1,1],"b":[1,1]}\n\n').count === 1);
-ok("CRLF trimmed", J(im.transform('{"op":"+","a":[1,1],"b":[2,2]}\r\n').lines) === J(['{"lo":3,"hi":3}']));
-(function () {
-var t = '{"op":"*","a":[-2,3],"b":[-5,4]}\n';
-ok("determinism: two runs identical", im.transform(t).lines.join() === im.transform(t).lines.join());
-})();
-
-throws("unknown op is a hard error", function () { giftOp("^", [1, 2], [3, 4]);});
-throws("missing op is a hard error", function () { im.transform('{"a":[1,2],"b":[3,4]}\n');});
-throws("interval not a 2-array", function () { im.transform('{"op":"+","a":[1,2,3],"b":[3,4]}\n');});
-throws("interval lo>hi is a hard error", function () { im.transform('{"op":"+","a":[2,1],"b":[3,4]}\n');});
-throws("non-finite endpoint (1e999->Infinity) is a hard error", function () { im.transform('{"op":"+","a":[1e999,1e999],"b":[3,4]}\n');});
-throws("non-object record is a hard error", function () { im.transform('[1,2]\n');});
-throws("non-JSON line is a hard error", function () { im.transform('not json\n');});
-ok("hard error names the line", (function () {
-try { im.transform('{"op":"+","a":[1,1],"b":[2,2]}\n{"op":"?","a":[1,1],"b":[2,2]}\n'); return false;}
-catch (e) { return /line 2/.test(e.message);}
-})());
-
-/* ---- §BITE — the naive-multiply mutation must be caught ------------------- */
-/* The classic wrong build is mul = [a*c, b*d] (only 2 corners). It agrees with the
-correct gift when signs don't cross, but is WRONG on a sign-crossing interval. We
-build that mutant and assert containment (the oracle) rejects it on a crossing
-case — so a regression to naive-corners fails test (1). */
-(function () {
-function naiveMul(a, b) { return { lo: a[0] * b[0], hi: a[1] * b[1]};}
-var a = [-2, 3], b = [-5, 4];
-var gift = giftOp("*", a, b); // correct: [-15, 12]
-var mutant = naiveMul(a, b); // naive: [10, 12] (WRONG, misses -15 and lower)
-// containment check on the mutant: does a sampled product escape it?
-var xs = grid(a[0], a[1], 20), ys = grid(b[0], b[1], 20);
-var mutantEscapes = false, giftContains = true;
-for (var i = 0; i < xs.length; i++) for (var j = 0; j < ys.length; j++) {
-var v = xs[i] * ys[j];
-if (v < mutant.lo - 1e-9 || v > mutant.hi + 1e-9) mutantEscapes = true;
-if (v < gift.lo - 1e-9 || v > gift.hi + 1e-9) giftContains = false;
-}
-ok("BITE: naive-corners mutant fails containment where the gift holds",
-mutantEscapes === true && giftContains === true &&
-gift.lo === -15 && gift.hi === 12);
-})();
-
-/* ---- report --------------------------------------------------------------- */
-console.log("");
-console.log("interval-math battery: " + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Zero dependencies, Node or browser, deterministic
+Zero dependencies, Node or browser, deterministic, constant-time
 
 ---
 
-# Isvalidcsscolor — a Loop MMT gift
-https://loopmmt.com/gifts/isvalidcsscolor/
+# Hunkhole — a Loop MMT gift
+https://loopmmt.com/gifts/hunkhole/
 [coverage: optional · branch: gifts]
 
-Is This String A CSS Color? validate ← all gifts
+The Change Git Hides filter ← all gifts
 
-Isvalidcsscolor
+Hunkhole
 
-A pure, dependency-free isValidCSSColor(str) that runs identically in a browser and in Node (no DOM) and decides whether a string is a valid CSS color across a documented subset of the spec — named colors, transparent/currentColor, hex 3/4/6/8, and rgb()/rgba()/hsl()/hsla() in both legacy comma and modern space syntax, including angle hues and out-of-range channels that CSS clamps.
+Git tells you which FILES changed. It does not tell you when a stale working tree, a bad merge, or a clumsy restore quietly REVERTED part of a file while leaving the file itself in place — a file-presence check reads that as a clean recovery. Hunkhole is the one command that catches it: it diffs the set of named top-level definitions (function / const / exports / def) between two git revisions and reports the ones that vanished. A symbol present before and gone after, with nothing renamed to take its place, is the reverted-hunk shape. Read-only, deterministic, stdlib-only.
 
 The honest edge
 
-It validates a DEFINED subset — the colors people actually type. It deliberately does not accept hwb()/lab()/lch()/oklab()/oklch()/color()/color-mix()/relative-color syntax/system colors, and it rejects the CSS-wide keywords inherit/initial/unset/revert (which are not colors). In a browser, CSS.supports('color', str) is the full ground truth; this trades that breadth for a tiny DOM-free core you can read in one sitting.
+Every hit is a QUESTION, not a verdict — a symbol you renamed or retired reads exactly like one that was reverted away, so hunkhole hands you the finite list and you rule on each. And a clean run is NOT a clean bill: it sees NAMED TOP-LEVEL definitions only, so a hunk reverted inside a surviving function body is invisible to it. Visibility, not immunity.
 
 Run it
 
-node isvalidcsscolor.js "rebeccapurple"
-test_isvalidcsscolor.js (83/83: 38 valid + 34 invalid spec vectors, coercion, determinism, mutation-bite)
-Node, no dependencies
+python3 hunkhole.py --help
+test_hunkhole.py (30 checks / 8 tests, mutation-bitten, pinned golden vanished-set + throwaway-repo end-to-end)
+Python standard library only, read-only, deterministic
 
 The code — every file that ships
 
-isvalidcsscolor.js 195 lines on GitHub →
-#!/usr/bin/env node
-/* isvalidcsscolor.js — a pure, dependency-free "is this string a valid CSS color?"
-checker that returns a boolean and runs identically in a browser and in Node.
+hunkhole.py 177 lines on GitHub →
+#!/usr/bin/env python3
+"""hunkhole — find the change that git's own tools hide: a reverted hunk.
 
-WHY THIS EXISTS. You take a color from a human — a theme field, a config file,
-a query param — and before you write it into a stylesheet or a canvas you want
-to know: is this actually a color? The browser's honest oracle,
-CSS.supports('color', str), only exists in a browser and needs the DOM. On a
-Node server, in a build step, or in a test, there is no built-in answer. This
-is a small, pure function of its input — no DOM, no dependencies — that decides
-the question against a DEFINED, DOCUMENTED SUBSET of the CSS Color spec: the
-colors people actually type.
+THE HOLE THIS FILLS
 
-WHAT IT ACCEPTS (the whole contract — a validator that hides its scope lies):
-• named colors — the 148 CSS Color Module Level 4 names, plus `transparent`
-and the `currentColor` keyword (case-insensitive).
-• hex — #RGB, #RGBA, #RRGGBB, #RRGGBBAA (3/4/6/8 hex digits).
-• rgb() / rgba() — both the legacy comma form `rgb(255, 0, 0)` /
-`rgba(255,0,0,.5)` (all-number OR all-percent, no mixing; optional alpha)
-AND the modern space form `rgb(255 0 0 / 50%)` (number|percent|none per
-channel, mixing allowed, optional `/ alpha`).
-• hsl() / hsla() — legacy `hsl(120, 50%, 50%)` (hue then two percentages,
-optional alpha) AND modern `hsl(120deg 50% 50% /.5)`. Hue may be a bare
-number (degrees) or an <angle> (deg/grad/rad/turn).
-Out-of-range numeric channels are ACCEPTED, because CSS accepts and clamps them
-(`rgb(300 -10 0)` is a valid color that renders as red) — validity is about
-grammar, not range.
+Git tells you which *files* changed. It does not tell you when a stale working
+tree, a bad merge, or a clumsy restore quietly *reverted* part of a file while
+leaving the file itself in place. A file-presence check reads that as a clean
+recovery — the file is there, so nothing looks wrong — while a load-bearing
+definition that used to live inside it is simply gone.
 
-WHAT IT DOES NOT ACCEPT (stated on purpose — see the README's "edge"):
-hwb(), lab(), lch(), oklab(), oklch(), color(), color-mix(), the relative-
-color syntax (`rgb(from …)`), and system colors (Canvas, ButtonText, …). The
-CSS-wide keywords `inherit`, `initial`, `unset`, `revert` are NOT colors and
-are rejected. If you need the newer color functions, use a browser's
-CSS.supports — this gift trades breadth for a tiny, dependency-free core you
-can read in one sitting.
+That failure is real and it hides well: a stale tree can revert tens of
+thousands of lines across dozens of files, a later restore returns every *file*,
+and because every file is present, no one notices the definitions that never
+came back. hunkhole is the one command that would have found it.
 
-Pure function of its input. Same code in a browser (window.LoopGifts.isValidCSSColor)
-or Node (this CLI / require()).
+THE PROBE
+
+Not "did this file change" (forward work changes files constantly) but "is a
+named, top-level definition that existed at BEFORE absent at AFTER." A symbol
+present in the old revision and gone in the new one, with nothing renamed to
+take its place, is the reverted-hunk shape. hunkhole diffs the *set of defined
+names* between two git revisions and reports the ones that vanished.
+
+WHY IT'S HONEST — read this before trusting a clean run
+
+- **Every hit is a QUESTION, not a verdict.** A symbol you deliberately renamed
+or retired reads exactly like one that was reverted away. hunkhole hands you
+the finite list of vanished names; you rule on each. It never claims a symbol
+"should" still be there.
+
+- **A clean run is NOT a clean bill.** hunkhole sees *named top-level*
+definitions (function / const / exports / def). A hunk reverted *inside* a
+surviving function body is invisible to it — the function name is still there.
+Absence of a finding is not proof of a clean restore, and the tool says so in
+its own output.
+
+- **It is read-only.** It writes nothing, changes nothing, fixes nothing. It
+reads two revisions out of git and compares symbol sets.
+
+Visibility, not immunity. You are the witness.
 
 USAGE
-node isvalidcsscolor.js "rebeccapurple" # prints "true" or "false", exits 0/1
-node isvalidcsscolor.js "#0f0" "not-a-color" # one verdict per argument
-node isvalidcsscolor.js --help
+python3 hunkhole.py <BEFORE> [AFTER]
+BEFORE a git revision (sha, tag, branch) — the "known-good" side
+AFTER a git revision to compare against (default: HEAD)
+
+python3 hunkhole.py <BEFORE> <AFTER> --against <CLOBBER>
+--against limit the sweep to files touched by one suspect commit,
+instead of every file that differs between BEFORE and AFTER
+
+EXIT 0 = no vanished symbols · 3 = findings (the alarm) · 2 = error/usage
+
+MIT licensed. Python standard library only. Read-only. Deterministic.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+
+# Named top-level definitions across the common scripting languages.
+# JS: function foo / const foo = / foo: function / exports.foo · Python: def foo
+_DEF_PATTERN = re.compile(
+r"^\s*(?:"
+r"function\s+(\w+)"
+r"|const\s+(\w+)\s*="
+r"|(\w+)\s*:\s*function"
+r"|exports\.(\w+)"
+r"|def\s+(\w+)"
+r")",
+re.M,
+)
+_CODE_SUFFIXES = (".js", ".py", ".sh", ".mjs", ".cjs")
+
+def git(*args: str) -> str | None:
+"""Run a git command; return stdout on success, None on failure."""
+r = subprocess.run(["git", *args], capture_output=True, text=True)
+return r.stdout if r.returncode == 0 else None
+
+def symbols(text: str) -> set[str]:
+"""The set of named top-level definitions found in a blob of source text."""
+return {name for groups in _DEF_PATTERN.findall(text) for name in groups if name}
+
+def vanished_symbols(before_text: str, after_text: str) -> list[str]:
+"""Names defined in `before_text` but not in `after_text`, sorted."""
+return sorted(symbols(before_text) - symbols(after_text))
+
+def is_code(path: str) -> bool:
+"""True iff the path has a suffix hunkhole probes for symbols."""
+return path.endswith(_CODE_SUFFIXES)
+
+def scan(before: str, after: str = "HEAD", against: str | None = None):
+"""Compare two revisions; return (files_swept, holes, absent).
+
+holes — list of (path, [vanished names]) for surviving code files.
+absent — list of paths present at `before` and absent at `after`
+(a whole-file drop; reported alongside hunk holes).
+Returns (None, None, None) if the underlying diff can't be produced.
+"""
+listing = git("diff", "--name-only", before, against or after)
+if listing is None:
+return None, None, None
+files = sorted(listing.split())
+
+holes: list[tuple[str, list[str]]] = []
+absent: list[str] = []
+for f in files:
+a = git("show", f"{before}:{f}")
+if a is None:
+continue # born after BEFORE — not hunkhole's business
+b = git("show", f"{after}:{f}")
+if b is None:
+absent.append(f) # whole-file drop — reported, not hunkhole's core probe
+continue
+if not is_code(f):
+continue # symbols are a code probe; data files need a different lens
+gone = vanished_symbols(a, b)
+if gone:
+holes.append((f, gone))
+return files, holes, absent
+
+def render(before: str, after: str, against: str | None, files, holes, absent) -> str:
+"""Render a scan result as the human-readable report text."""
+header = f"hunkhole: {before[:9]} -> {after}"
+if against:
+header += f" (files touched by {against[:9]})"
+header += f" · {len(files)} file(s) swept"
+lines = [header, "-" * 78]
+for f in absent:
+lines.append(f"FILE ABSENT {f}")
+for f, gone in holes:
+lines.append(f"HOLE {f}")
+for s in gone:
+lines.append(f" gone: {s}()")
+if not holes and not absent:
+lines.append("no named definition present at BEFORE is missing at AFTER.")
+lines.append("(NOT a clean bill — a hunk inside a surviving function body is invisible here.)")
+lines.append("-" * 78)
+n = len(holes) + len(absent)
+lines.append(
+f"{n} finding(s). Each is a QUESTION, not a verdict — a rename reads the same as a revert."
+)
+return "\n".join(lines)
+
+def main(argv: list[str]) -> int:
+if not argv or argv[0] in ("-h", "--help"):
+sys.stdout.write(__doc__)
+return 2
+before = argv[0]
+after = argv[1] if len(argv) > 1 and not argv[1].startswith("--") else "HEAD"
+against = None
+if "--against" in argv:
+i = argv.index("--against")
+if i + 1 >= len(argv):
+sys.stderr.write("hunkhole: --against needs a revision\n")
+return 2
+against = argv[i + 1]
+
+files, holes, absent = scan(before, after, against)
+if files is None:
+sys.stderr.write(f"hunkhole: cannot diff {before}..{against or after}\n")
+return 2
+
+sys.stdout.write(render(before, after, against, files, holes, absent) + "\n")
+return 3 if (holes or absent) else 0
+
+if __name__ == "__main__":
+raise SystemExit(main(sys.argv[1:]))
+
+test_hunkhole.py 185 lines on GitHub →
+#!/usr/bin/env python3
+"""test_hunkhole.py — the certifying properties of the hunkhole gift.
+
+Run: python3 test_hunkhole.py (exit 0 = all pass, 1 = a failure)
+
+hunkhole's git-facing shell is exercised end-to-end in a throwaway repo; its
+symbol-diff CORE (symbols / vanished_symbols / is_code / render) is pure and is
+tested directly on fixtures. Each test is MUTATION-BITTEN: it is here because a
+plausible mutation of hunkhole.py makes it fail loud. The core-diff test pins a
+GOLDEN sorted vanished-set — a rename reading identically to a revert is the
+exact property that must hold, and a golden proves the set, not just its size.
+"""
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+
+import hunkhole as h
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+# ---- fixtures: before/after source blobs -----------------------------------
+BEFORE_JS = """\
+function alpha() { return 1;}
+const beta = () => 2;
+gamma: function () { return 3;}
+exports.delta = function () {};
+function survivor() {
+let innerReverted = 9; // a hunk inside a surviving body (not def-shaped)
+return innerReverted;
+}
+"""
+AFTER_JS = """\
+const beta = () => 2;
+exports.delta = function () {};
+function survivor() {
+return 0; // innerReverted hunk reverted, name survives
+}
+"""
+
+BEFORE_PY = """\
+def one(): pass
+def two(): pass
+def three(): pass
+"""
+AFTER_PY = """\
+def one(): pass
+def three(): pass
+"""
+
+# ---- 1. the core diff: vanished top-level names, pinned golden --------------
+def test_vanished_golden():
+gone_js = h.vanished_symbols(BEFORE_JS, AFTER_JS)
+# alpha (function) and gamma (obj-method) vanished; beta/delta/survivor stayed.
+check(gone_js == ["alpha", "gamma"], f"JS vanished set wrong: {gone_js}")
+# the hunk INSIDE survivor() is invisible — survivor is not reported gone
+check("survivor" not in gone_js, "survivor should NOT be flagged (in-body hunk is invisible)")
+# pin a golden signature over a combined fixture run
+gone_py = h.vanished_symbols(BEFORE_PY, AFTER_PY)
+check(gone_py == ["two"], f"PY vanished set wrong: {gone_py}")
+sig = hashlib.sha256(("|".join(gone_js) + "#" + "|".join(gone_py)).encode()).hexdigest()
+golden = "72e9237f911294dc57a66b67e296fb888a0d43373cbb485118d4f73a4df09f8b"
+check(sig == golden, f"golden vanished-set signature drifted: got {sig[:16]}...")
+
+# ---- 2. a rename reads the same as a revert (the honest-edge property) ------
+def test_rename_reads_as_revert():
+before = "def compute(): pass\n"
+after = "def calculate(): pass\n" # renamed
+gone = h.vanished_symbols(before, after)
+check(gone == ["compute"], f"rename should surface old name as gone: {gone}")
+# kills a mutation that tried to be 'smart' and suppress renames
+
+# ---- 3. no false hole when nothing vanished --------------------------------
+def test_no_false_hole():
+same = "def a(): pass\ndef b(): pass\n"
+check(h.vanished_symbols(same, same) == [], "identical source must yield no vanished names")
+# a purely ADDED symbol is not a hole
+added = "def a(): pass\ndef b(): pass\ndef c(): pass\n"
+check(h.vanished_symbols(same, added) == [], "an added symbol must not read as vanished")
+
+# ---- 4. symbols() sees each definition form; kills a dropped alternative ----
+def test_symbol_forms():
+src = "function f(){}\nconst g=1\nh: function(){}\nexports.i=1\ndef j(): pass\n"
+got = h.symbols(src)
+for name in ("f", "g", "h", "i", "j"):
+check(name in got, f"symbol form not detected: {name} (pattern lost an alternative)")
+
+# ---- 5. is_code gate: symbols probed only on code suffixes -----------------
+def test_is_code():
+for ok in ("x.js", "y.py", "z.sh", "a.mjs", "b.cjs"):
+check(h.is_code(ok), f"{ok} should be code")
+for no in ("data.json", "notes.md", "image.png", "LICENSE"):
+check(not h.is_code(no), f"{no} should NOT be treated as code")
+
+# ---- 6. render marks a clean run as NOT a clean bill ------------------------
+def test_render_clean_caveat():
+out = h.render("abc123def", "HEAD", None, files=["a.py"], holes=[], absent=[])
+check("NOT a clean bill" in out, "clean render must carry the not-a-clean-bill caveat")
+check("0 finding(s)" in out, "clean render must report 0 findings")
+
+# ---- 7. render shows holes and absent files distinctly ---------------------
+def test_render_findings():
+out = h.render(
+"abc123def", "HEAD", None,
+files=["a.py", "b.py"],
+holes=[("a.py", ["gone_one", "gone_two"])],
+absent=["b.py"],
+)
+check("HOLE a.py" in out, "hole line missing")
+check("gone: gone_one()" in out, "vanished symbol not rendered")
+check("FILE ABSENT b.py" in out, "absent-file line missing")
+check("2 finding(s)" in out, "finding count wrong (1 hole + 1 absent = 2)")
+check("QUESTION, not a verdict" in out, "the question-not-verdict disclaimer must render")
+
+# ---- 8. END-TO-END against a real throwaway git repo -----------------------
+def _run_git(cwd, *args):
+subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+
+def test_end_to_end_reverted_hunk():
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+p = os.path.join(repo, "mod.py")
+with open(p, "w") as fh:
+fh.write("def keeper(): pass\ndef doomed(): pass\n")
+_run_git(repo, "add", "mod.py")
+_run_git(repo, "commit", "-qm", "before")
+before_sha = subprocess.run(
+["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+).stdout.strip()
+# revert the 'doomed' definition, keep the file
+with open(p, "w") as fh:
+fh.write("def keeper(): pass\n")
+_run_git(repo, "commit", "-aqm", "after (doomed reverted)")
+
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+files, holes, absent = h.scan(before_sha, "HEAD")
+finally:
+os.chdir(cwd0)
+check(holes == [("mod.py", ["doomed"])], f"end-to-end hole not found: {holes}")
+check(absent == [], f"nothing should be absent: {absent}")
+
+def run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+try:
+t()
+except Exception as exc:
+_FAILURES.append(f"{t.__name__} raised: {exc!r}")
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
+return 0
+
+if __name__ == "__main__":
+sys.exit(run())
+
+Take the whole folder →
+MIT
+Python standard library only, read-only, deterministic
+
+---
+
+# ini-source — a Loop MMT gift
+https://loopmmt.com/gifts/ini-source/
+[coverage: optional · branch: gifts]
+
+Parse Sectioned INI Config into a JSONL Record Stream source ← all gifts
+
+ini-source
+
+ini-source reads sectioned INI /.gitconfig-style config text (a FILE arg, or stdin) and emits one uniform JSON object per assignment — {"section":S,"key":K,"value":V}, all strings — tagged with the section it lives under, the front of a pipe you feed into the fold/filter/transform gifts (ini-source app.ini | pluck --fields key,value). Lines split on the FIRST '=', full-line; and # comments and blank lines skipped, section headers set the tag, outer quotes stripped, CRLF==LF, BOM stripped. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+
+The honest edge
+
+ini-source parses sectioned INI text into uniform string records only — it does not coerce types ("8080" stays a string), does not interpolate ${VAR}, does not honor inline comments, and does not process escapes inside quotes. Its own honesty axis: a DUPLICATE key within a section, or a REPEATED [section] header, is REFUSED (exit 2, line-numbered) — never a silent overwrite (the common INI-parser behaviour that changes your data without telling you). A malformed line, an illegal/empty key, or a field-name collision is exit 2. An honest, pinnable parse — not a full INI runtime.
+
+Run it
+
+printf '[s]\nk=v\n' | node ini-source.js # -> {"section":"s","key":"k","value":"v"}
+test_ini-source.js (43/43, independent regex-route oracle) + Plumb conformance GREEN (28/28, signed 2026-09-12, clock-independent, 2 mutation-bites non-vacuous)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+ini-source.js 301 lines on GitHub →
+#!/usr/bin/env node
+/* ini-source.js — parse INI /.gitconfig-style sectioned config text into a uniform
+JSONL record stream. Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
+
+WHAT IT IS. A SOURCE: it turns non-JSONL sectioned config text (an.ini, a
+.gitconfig-style file, an editorconfig-shaped file) into the front of a pipe — one JSON
+object per line (JSONL) that the fold/filter/transform gifts consume. Give it a file (or
+pipe text on stdin) and it emits one uniform record per assignment, tagged with the
+section it lives under:
+
+[server] -> (sets the current section)
+host = localhost -> {"section":"server","key":"host","value":"localhost"}
+port = 8080 -> {"section":"server","key":"port","value":"8080"}
+; a comment -> (skipped)
+[client]
+host = 10.0.0.1 -> {"section":"client","key":"host","value":"10.0.0.1"}
+
+Every record has the same three string fields, so it drops straight into a generic
+filter or fold: ini-source app.ini | range-filter... / ini-source app.ini | pluck...
+
+THE SHAPE (the design decision that makes it compose). One record per key-assignment,
+the FLAT uniform triple {section, key, value} — NOT one nested record per section. A
+nested {section, entries:{...}} record would carry the section's structure but would not
+compose with the flat fold/filter/transform gifts (they cannot reach into a per-record
+sub-object with a generic --field). The flat triple lets a downstream gift filter by
+section, pluck the key/value, or fold across sections without knowing the file's shape.
+Keys that appear BEFORE any [section] header (a global preamble, as in.gitconfig) are
+emitted with section "" — the honest "no section" marker, never an invented default name.
+
+STRINGS ONLY (inherited honesty axis). Values are emitted as LITERAL STRINGS —
+ini-source does not guess types. "8080" stays the string "8080"; "true" stays "true".
+The moment a parser coerces (is 08 octal? is 1e3 a number? is TRUE a boolean?) the SAME
+file parses to different bytes under different tools, and a source you cannot pin is not
+a source. For the same reason it does NOT interpolate ${VAR}/%VAR%, does NOT honor inline
+(trailing) comments, and does NOT process backslash escapes inside a quoted value — each
+is a context-dependent guess that would break byte determinism. It parses the grammar it
+was given and REFUSES the rest, loudly.
+
+THE HONESTY AXIS THAT IS ITS OWN (fail-closed on a duplicated key). A key that appears
+TWICE within the same section is a HARD ERROR (exit 2), naming the line, the key, and the
+section. This is the whole reason ini-source exists as its own gift rather than a flag on
+kv-source: the common INI-parser behaviour is to silently keep the last (or the first) of
+a duplicated key — which changes the caller's data without telling them. ini-source
+refuses. The same key in DIFFERENT sections is fine (that is what sections are for); a
+key repeated in the global preamble (section "") is a duplicate. A repeated [section]
+HEADER is likewise refused (exit 2): merging or overriding two blocks of the same name is
+the same silent guess one level up.
+
+THE GRAMMAR (declared, so it is pinnable)
+* A leading UTF-8 BOM on the first line is stripped (Windows INI files often carry one).
+* Lines split on newline; a trailing CR (CRLF files) is stripped, so a file parses
+identically whether it uses LF or CRLF.
+* A whitespace-only line emits nothing.
+* A line whose first non-whitespace character is ';' or '#' is a full-line COMMENT and
+emits nothing. (There are no inline/trailing comments — a ';' inside a value is part
+of the value.)
+* A line that, trimmed, is [ NAME] — begins with '[' and ends with ']' — is a SECTION
+HEADER. NAME is the inner text trimmed; it must be non-empty and contain no '[' or
+']'. An empty [] or a malformed header is a hard error (exit 2). The section it names
+becomes the current section. A section name may appear only once.
+* Any other non-blank line MUST be KEY=VALUE. It is split on the FIRST '='; everything
+before is the key, everything after is the value.
+- KEY is trimmed and MUST match [A-Za-z_][A-Za-z0-9_.-]* — a non-empty name. An
+empty key, or a key with spaces/illegal characters, is a hard error (exit 2).
+- VALUE is trimmed. If, after trimming, it both begins and ends with a matching
+'"' or "'" (length >= 2), those OUTER quotes are stripped and the inner text is
+the literal value (no escape processing). Otherwise the trimmed remainder is the
+literal value.
+* A non-blank, non-comment, non-header line with no '=' is a MALFORMED line (exit 2).
+
+THE MODEL
+[FILE] The INI file to parse. If omitted, read stdin.
+--section-field NAME The object key the SECTION is emitted under. Default "section".
+--key-field NAME The object key the parsed KEY is emitted under. Default "key".
+--value-field NAME The object key the parsed VALUE is emitted under. Default "value".
+The three field names must be pairwise distinct (else the record
+would collapse) — a collision is exit 2.
+--global NAME The section name given to keys that appear before any header.
+Default "" (empty string).
+
+DETERMINISM. parse(text, opts) is a pure function — no clock, no randomness, no network —
+so the same text yields byte-identical output every run and every machine.
+
+USAGE
+node ini-source.js app.ini
+cat app.ini | node ini-source.js
+node ini-source.js app.ini --section-field s --key-field k --value-field v
+node ini-source.js --help
+
+Exit codes: 0 success (including an empty stream from empty input) · 2 input error
+(malformed line, illegal/empty key, empty/malformed header, DUPLICATE key in a section,
+REPEATED section header, field-name collision, empty field name, unknown option,
+unreadable file). Always a clean one-line message on stderr, never a stack trace.
 
 Released under MIT.
 */
 "use strict";
 
-// The 148 CSS Color Module Level 4 named colors, plus `transparent` and the
-// `currentcolor` keyword. All lowercase; input is lowercased before lookup.
-var NAMED = ("aliceblue antiquewhite aqua aquamarine azure beige bisque black " +
-"blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate " +
-"coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod " +
-"darkgray darkgreen darkgrey darkkhaki darkmagenta darkolivegreen darkorange " +
-"darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray " +
-"darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey " +
-"dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite gold " +
-"goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory " +
-"khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral " +
-"lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey lightpink " +
-"lightsalmon lightseagreen lightskyblue lightslategray lightslategrey " +
-"lightsteelblue lightyellow lime limegreen linen magenta maroon mediumaquamarine " +
-"mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue " +
-"mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream " +
-"mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered " +
-"orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff " +
-"peru pink plum powderblue purple rebeccapurple red rosybrown royalblue " +
-"saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue " +
-"slategray slategrey snow springgreen steelblue tan teal thistle tomato " +
-"turquoise violet wheat white whitesmoke yellow yellowgreen " +
-"transparent currentcolor").split(/\s+/);
+/* ---- the pure core ------------------------------------------------ */
 
-var NAMED_SET = Object.create(null);
-for (var n = 0; n < NAMED.length; n++) { NAMED_SET[NAMED[n]] = true;}
+var KEY_RE = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
 
-// A CSS <number>: optional sign, digits with an optional fractional part, or a
-// leading-dot fraction, with optional scientific notation. Rejects a trailing
-// bare dot ("5." is NOT a valid CSS number).
-var NUMBER = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
-var PERCENT = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?%$/;
-var ANGLE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?(?:deg|grad|rad|turn)$/;
-var HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/;
-
-function isNumber(t) { return NUMBER.test(t);}
-function isPercent(t) { return PERCENT.test(t);}
-function isHue(t) { return NUMBER.test(t) || ANGLE.test(t);} // bare number = degrees
-function isAlphaLegacy(t) { return NUMBER.test(t) || PERCENT.test(t);}
-function isAlphaModern(t) { return NUMBER.test(t) || PERCENT.test(t) || t === "none";}
-
-// Validate an rgb()/rgba()/hsl()/hsla() body. `fn` is one of rgb|rgba|hsl|hsla,
-// `inner` is the text between the parentheses (already lowercased).
-function validFunction(fn, inner) {
-inner = inner.trim();
-if (inner === "") { return false;}
-var isRgb = (fn === "rgb" || fn === "rgba");
-
-if (inner.indexOf(",")!== -1) {
-// ---- Legacy comma syntax: no `none`, no `/`, exactly 3 or 4 parts --------
-if (inner.indexOf("/")!== -1) { return false;}
-var parts = inner.split(",");
-for (var i = 0; i < parts.length; i++) { parts[i] = parts[i].trim();}
-if (parts.length!== 3 && parts.length!== 4) { return false;}
-var c = [parts[0], parts[1], parts[2]];
-if (c[0] === "none" || c[1] === "none" || c[2] === "none") { return false;}
-if (isRgb) {
-var allNum = isNumber(c[0]) && isNumber(c[1]) && isNumber(c[2]);
-var allPct = isPercent(c[0]) && isPercent(c[1]) && isPercent(c[2]);
-if (!(allNum || allPct)) { return false;}
-} else {
-if (!isHue(c[0])) { return false;}
-if (!(isPercent(c[1]) && isPercent(c[2]))) { return false;}
-}
-if (parts.length === 4) {
-if (parts[3] === "none" ||!isAlphaLegacy(parts[3])) { return false;}
-}
-return true;
-}
-
-// ---- Modern space syntax: `none` allowed, optional `/ alpha`, mixing ok -----
-var slash = inner.split("/");
-if (slash.length > 2) { return false;}
-var comps = slash[0].trim().split(/\s+/).filter(Boolean);
-var alpha = slash.length === 2? slash[1].trim(): null;
-if (comps.length!== 3) { return false;}
-if (isRgb) {
-for (var j = 0; j < 3; j++) {
-var v = comps[j];
-if (!(isNumber(v) || isPercent(v) || v === "none")) { return false;}
-}
-} else {
-if (!(isHue(comps[0]) || comps[0] === "none")) { return false;}
-for (var k = 1; k < 3; k++) {
-var w = comps[k];
-if (!(isPercent(w) || isNumber(w) || w === "none")) { return false;}
+// Strip one pair of matching outer quotes from an already-trimmed value, if present.
+function stripQuotes(v) {
+if (v.length >= 2) {
+var a = v.charAt(0), b = v.charAt(v.length - 1);
+if ((a === '"' && b === '"') || (a === "'" && b === "'")) {
+return v.slice(1, v.length - 1);
 }
 }
-if (alpha!== null) {
-if (alpha === "" ||!isAlphaModern(alpha)) { return false;}
-}
-return true;
+return v;
 }
 
-/**
-* isValidCSSColor(input) -> boolean
-* True iff `input` is a string naming a color in this gift's supported subset of
-* the CSS Color spec (see the file header for the exact contract). Non-strings
-* return false — a color is a string token, not a number or object. Surrounding
-* whitespace is trimmed before checking.
-*/
-function isValidCSSColor(input) {
-if (typeof input!== "string") { return false;}
-var s = input.trim();
-if (s === "") { return false;}
-var lower = s.toLowerCase();
+function trim(s) { return s.replace(/^\s+/, "").replace(/\s+$/, "");}
 
-if (NAMED_SET[lower] === true) { return true;}
-if (HEX.test(lower)) { return true;}
+// Parse INI text into an array of uniform three-field records. Throws a clean Error on any
+// malformed input — the CLI turns that into exit 2. Pure; no side effects.
+function parse(text, opts) {
+opts = opts || {};
+var sectionField = opts.sectionField === undefined? "section": opts.sectionField;
+var keyField = opts.keyField === undefined? "key": opts.keyField;
+var valueField = opts.valueField === undefined? "value": opts.valueField;
+var globalName = opts.global === undefined? "": opts.global;
 
-var m = /^(rgba?|hsla?)\((.*)\)$/.exec(lower);
-if (m) { return validFunction(m[1], m[2]);}
-
-return false;
+if (typeof sectionField!== "string" || sectionField.length === 0) throw new Error("--section-field must be a non-empty name");
+if (typeof keyField!== "string" || keyField.length === 0) throw new Error("--key-field must be a non-empty name");
+if (typeof valueField!== "string" || valueField.length === 0) throw new Error("--value-field must be a non-empty name");
+if (sectionField === keyField || sectionField === valueField || keyField === valueField) {
+throw new Error("--section-field, --key-field and --value-field must be pairwise distinct");
 }
+if (typeof globalName!== "string") throw new Error("--global must be a string");
+if (typeof text!== "string") throw new Error("input must be text");
 
-// ---- Dual-runtime export: browser namespace + Node module ------------------
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.isValidCSSColor = isValidCSSColor;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { isValidCSSColor: isValidCSSColor};
-}
+// strip a leading UTF-8 BOM on the whole document
+if (text.charAt(0) === "\uFEFF") text = text.slice(1);
 
-// ---- CLI: one verdict per argument; exit 0 iff every argument is valid -------
-if (typeof require!== "undefined" && require.main === module) {
-var args = process.argv.slice(2);
-if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
-process.stdout.write(
-"isvalidcsscolor — is a string a valid CSS color? (defined subset)\n\n" +
-" node isvalidcsscolor.js \"rebeccapurple\" one verdict, exit 0 if valid\n" +
-" node isvalidcsscolor.js \"#0f0\" \"nope\" one line per argument\n\n" +
-"Accepts: named colors, transparent, currentColor, hex 3/4/6/8,\n" +
-"rgb()/rgba() and hsl()/hsla() in legacy and modern syntax.\n" +
-"Does NOT accept hwb()/lab()/lch()/oklab()/oklch()/color()/color-mix()/\n" +
-"relative-color syntax/system colors. See the README for the full edge.\n");
-process.exit(args.length === 0? 1: 0);
-}
-var allValid = true;
-for (var a = 0; a < args.length; a++) {
-var ok = isValidCSSColor(args[a]);
-if (!ok) { allValid = false;}
-process.stdout.write((args.length > 1? args[a] + "\t": "") + (ok? "true": "false") + "\n");
-}
-process.exit(allValid? 0: 1);
-}
-
-test_isvalidcsscolor.js 95 lines on GitHub →
-#!/usr/bin/env node
-/* test_isvalidcsscolor.js — proves the validator implements its stated CSS-color
-subset correctly.
-
-THE ORACLE. sha256 could check itself against Node's crypto — a live reference
-implementation. CSS-color validity has no Node stdlib oracle (CSS.supports is
-browser-only and needs the DOM). So the oracle here is the CSS Color spec
-expressed as CURATED VECTORS: a VALID set (every one must pass) and an INVALID
-set (every one must fail), chosen to exercise every branch of the grammar —
-named / hex(3,4,6,8) / rgb legacy+modern / hsl legacy+modern / angles /
-out-of-range-clamps / the documented exclusions. Plus determinism, non-string
-coercion, and a mutation-bite so a degenerate core (constant true/false) can't
-pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
-"use strict";
-var isValidCSSColor = require("./isvalidcsscolor.js").isValidCSSColor;
-
-var pass = 0, fail = 0;
-function expect(input, want) {
-var got = isValidCSSColor(input);
-if (got === want) { pass++;}
-else {
-fail++;
-console.error("FAIL isValidCSSColor(" + JSON.stringify(input) + ")\n" +
-" got: " + got + "\n want: " + want);
-}
-}
-
-// ---- VALID: every one must return true --------------------------------------
-var VALID = [
-// named + keywords (case-insensitive, trimmed)
-"red", "RebeccaPurple", "AliceBlue", "transparent", "currentColor", " teal ",
-// hex 3/4/6/8
-"#000", "#0f0", "#ABCDEF", "#00ff00", "#0f08", "#00ff0080",
-// rgb legacy — numbers, percents, out-of-range (clamps), optional alpha
-"rgb(255, 0, 0)", "rgb(0,0,0)", "rgb( 12, 34, 56)", "rgb(100%, 0%, 50%)",
-"rgb(300, -10, 0)", "rgba(0,0,0,0.5)", "rgba(0,0,0,50%)", "rgb(0,0,0,0.5)",
-// rgb modern — space form, mixing, none, /alpha with and without spaces
-"rgb(255 0 0)", "rgb(255 0 0 / 0.5)", "rgb(255 0 0 / 50%)",
-"rgb(100% 0% 0% / none)", "rgb(none 0 0)", "rgb(255 0 0/.5)",
-// hsl legacy — number hue, angle hue, negative hue, optional alpha
-"hsl(120, 50%, 50%)", "hsla(120, 50%, 50%, 0.3)", "hsl(120deg, 50%, 50%)",
-"hsl(-30, 100%, 50%)",
-// hsl modern — angles, number S/L, none, /alpha
-"hsl(120 50% 50%)", "hsl(120deg 50% 50% /.5)", "hsl(0.5turn 50% 50%)",
-"hsl(200grad 50% 50%)", "hsl(3.14rad 50% 50%)", "hsl(120 50 50)",
-"hsl(none 50% 50%)", "hsl(120 50% 50% / none)"
-];
-
-// ---- INVALID: every one must return false -----------------------------------
-var INVALID = [
-// empties & nonsense
-"", " ", "notacolor", "reddish",
-// CSS-wide keywords are NOT colors
-"inherit", "initial", "unset", "revert",
-// malformed hex
-"#12", "#12345", "#1234567", "#gggggg", "#",
-// arity / structure
-"rgb()", "rgb(1,2)", "rgb(1,2,3,4,5)", "rgb(1 2)", "rgb(1 2 3 4)",
-// legacy channel-type mixing (number + percent) is illegal
-"rgb(1, 2, 50%)",
-// comma + slash mixed, none in legacy, empty/missing alpha
-"rgb(1,2,3 /.5)", "rgb(none, 0, 0)", "rgb(1,2,3,)", "rgb(1 2 3 /)",
-"rgb(1 2 3 / /.5)",
-// hsl: hue can't be a percent; legacy S/L must be percent
-"hsl(50%, 50%, 50%)", "hsl(120, 50, 50)",
-// spacing / number-shape faults
-"rgb (1,2,3)", "rgb(5., 0, 0)",
-// documented exclusions (out of this gift's scope, on purpose)
-"hwb(0 0% 0%)", "lab(50% 40 59)", "oklch(0.7 0.15 30)",
-"color(display-p3 1 0 0)", "rgb(from red r g b)", "Canvas"
-];
-
-for (var i = 0; i < VALID.length; i++) { expect(VALID[i], true);}
-for (var j = 0; j < INVALID.length; j++) { expect(INVALID[j], false);}
-
-// ---- Non-string coercion: a color is a string; nothing else is --------------
-var NON_STRINGS = [42, 0, true, false, null, undefined, {}, ["red"], NaN];
-for (var k = 0; k < NON_STRINGS.length; k++) { expect(NON_STRINGS[k], false);}
-
-// ---- Determinism: same input, same verdict, twice ---------------------------
-if (isValidCSSColor("rgb(1 2 3 /.5)") === isValidCSSColor("rgb(1 2 3 /.5)")) { pass++;}
-else { fail++; console.error("FAIL determinism: same input gave two verdicts");}
-
-// ---- Mutation-bite: the core must actually discriminate ---------------------
-// A degenerate `return true` fails every INVALID case above; a degenerate
-// `return false` fails every VALID case. This explicit bite additionally catches
-// a core that ignores its input entirely: a valid and an invalid string must not
-// share a verdict.
-if (isValidCSSColor("red")!== isValidCSSColor("zzz-not-a-color")) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: core did not distinguish valid from invalid");}
-
-console.log("\nisvalidcsscolor: " + pass + " passed, " + fail + " failed" +
-" (" + VALID.length + " valid + " + INVALID.length + " invalid vectors, " +
-"plus coercion, determinism, mutation-bite)");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node, no dependencies
-
----
-
-# jq-lite — a Loop MMT gift
-https://loopmmt.com/gifts/jq-lite/
-[coverage: optional · branch: gifts]
-
-A Tiny jq-Style Query Language for JSON transform ← all gifts
-
-jq-lite
-
-jq-lite gives you jq's common moves — pull a field (.user.name), index an array (.[0],.[-1]), iterate a stream (.[]), and pipe one step into the next (.items[] |.id) — over JSON on stdin, without installing jq. It follows jq's rules where they save you: a missing key is null (not a crash), and the? operator skips a type mismatch so one ragged record doesn't abort the stream. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
-
-The honest edge
-
-jq-lite implements a SMALL subset of jq — identity, field/index/bracket access,.[] iteration, the pipe, and the? optional. It has no functions, no arithmetic, no object/array construction, no select/map/comparison, and no recursion (..). For those, use jq itself. A malformed filter or invalid JSON input is refused (exit 2); an unmarked runtime type error is exit 3.
-
-Run it
-
-echo '{"items":[{"id":10},{"id":20}]}' | node jq-lite.js '.items[] |.id' # -> 10 20
-test_jq-lite.js (426/426, independent recursive-descent oracle) + mutation-bite (7/7) + Plumb conformance GREEN (346/346, signed 2026-09-12, clock-independent, non-vacuity proven)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-jq-lite.js 492 lines on GitHub →
-#!/usr/bin/env node
-/* jq-lite.js — a tiny jq-style query language for JSON, in one dependency-free file.
-Deterministic, pure, MIT. Runs in Node or a browser.
-
-WHAT IT IS. A TRANSFORM: it takes JSON in and emits JSON out, reshaped by a filter
-expression you write in a small, well-defined query language. It is the "reach for jq"
-move without installing jq — the mini-language that lets you pull `.user.name` out of a
-blob, iterate `.items[]`, index `.[0]`, and pipe one step into the next, over a single
-JSON value or a JSONL stream of them:
-
-echo '{"user":{"name":"ada"}}' | node jq-lite.js '.user.name' -> "ada"
-printf '{"a":1}\n{"a":2}\n' | node jq-lite.js '.a' -> 1 \n 2
-
-It is the adapter between "a JSON blob" and "the one field/element you actually want",
-at the front or middle of a pipe: `line-source access.log |... | jq-lite '.status'`.
-
-THE QUIET FAILURES IT FIXES. Everyone reaches for `obj.a.b.c` and everyone gets it
-subtly wrong, in ways that only bite on the input you didn't test:
-
-1. THE MISSING-KEY CRASH. `obj.a.b` throws the moment `obj.a` is absent
-(`Cannot read properties of undefined`). jq-lite follows jq's rule: a missing
-object key yields `null`, not an exception — `.a.b.c` on `{}` is `null`, quietly
-and correctly. You opt INTO strictness, you are never ambushed by it.
-
-2. THE TYPE-CONFUSION. Indexing a string or a number as if it were an object/array
-(`.foo` on `"hi"`, `.[0]` on `42`) is a real error you WANT surfaced — but only
-when you meant it. jq-lite errors loudly on a genuine type mismatch, and gives you
-the `?` operator (`.foo?`, `.[0]?`) to say "skip it if it doesn't fit" — so one
-ragged record in a stream doesn't abort the whole run.
-
-3. THE STREAM FAN-OUT. `.[]` turns one input into MANY outputs (each array element
-or object value), and a pipe must thread that correctly: `.items[] |.id` runs
-`.id` over EACH item, not over the array. Hand-rolled `.map(x => x.id)` forgets
-the empty-array case, the object case, and the compose-with-a-later-`[]` case.
-jq-lite treats every filter as value -> stream and composes streams properly.
-
-THE LANGUAGE (this is the whole of it — the "lite" is the point):
-
-. identity — the input value, unchanged
-.foo.foo.bar field access (missing key -> null; non-object -> error unless?)
-.["a b"] bracketed string key (for keys that aren't bare identifiers)
-.[2].foo[0] array index (negative counts from the end:.[-1] is the last)
-.[] iterate — emit each array element, or each object VALUE, as a stream
-a | b pipe — run b over every output of a
-.foo?.[0]?.[]? optional — on a type mismatch, emit nothing instead of erroring
-
-Values are standard JSON. Output is one JSON value per result; with --jsonl-out (the
-default for stream input) each result is a line. A filter is applied to EACH input
-value independently; a JSONL input runs the filter per line.
-
---raw-output if a result is a JSON string, print it without quotes (jq -r)
---slurp read the whole input as ONE JSON value (an array of the inputs) before
-filtering, instead of per-value (jq -s)
---compact (default) one-line JSON per result
-
-DETERMINISM. run(value, filter) is a pure function — no clock, no randomness, no I/O
-beyond the value you pass, no ambient state. The same value and filter yield
-byte-identical output on every run and every machine. Object VALUE iteration (`.[]`)
-emits values in the object's own key insertion order (JSON parse order), which is
-stable for a given input.
-
-USAGE
-echo '{"a":{"b":2}}' | node jq-lite.js '.a.b'
-echo '[1,2,3]' | node jq-lite.js '.[]'
-echo '{"xs":[10,20]}'| node jq-lite.js '.xs[] '
-printf '{"n":1}\n{"n":2}\n' | node jq-lite.js '.n'
-echo '{"name":"ada"}' | node jq-lite.js --raw-output '.name'
-node jq-lite.js --help
-
-Exit codes: 0 success · 2 usage error (no filter, bad option, malformed filter syntax,
-or invalid JSON input) · 3 a runtime type error the filter did not mark optional. A
-clean one-line message on stderr, never a stack trace.
-
-Released under MIT. Its edge is printed in the README: jq-lite implements a SMALL
-subset of jq — identity, field/index/bracket access, `.[]` iteration, the pipe, and the
-`?` optional. It has NO functions, NO arithmetic, NO object/array construction, NO
-select/map/comparison, NO recursion (`..`). For those, use jq itself. It is a reach
-tool for the common "pull this out / walk this stream" case, not a jq replacement.
-*/
-"use strict";
-
-/* ==================================================================
-THE PARSER — filter string -> a list of STEP objects.
-Each step is one of:
-{ op: "identity"}
-{ op: "field", key: <string>, optional: <bool>}
-{ op: "index", idx: <int>, optional: <bool>}
-{ op: "iterate", optional: <bool>}
-A PIPE ( a | b) concatenates the two step lists — piping is just
-sequential application, so the compiled program is one flat list of
-steps run left to right, each step mapping a stream to a stream.
-================================================================== */
-
-// Parse one pipeline segment (no top-level '|') into steps, starting at position `pos`
-// in `src`. Returns { steps, pos}. Throws a clean Error on malformed syntax.
-function parseSegment(src, pos) {
-var steps = [];
-var n = src.length;
-
-function skipWs() { while (pos < n && isWs(src.charCodeAt(pos))) pos++;}
-function isWs(c) { return c === 32 || (c >= 9 && c <= 13);}
-function isIdentStart(c) {
-return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95; // A-Z a-z _
-}
-function isIdentPart(c) {
-return isIdentStart(c) || (c >= 48 && c <= 57); // + 0-9
-}
-
-skipWs();
-if (pos >= n) throw new Error("empty filter segment");
-
-// A segment must begin with '.'
-if (src.charAt(pos)!== ".") {
-throw new Error("filter must begin with '.' at position " + pos);
-}
-pos++; // consume the leading '.'
-
-// A bare '.' (identity) is legal if nothing accessor-like follows.
-// Otherwise a chain of.field / [..] / [] accessors follows, each optionally '?'.
-var sawAccessor = false;
-
-// Handle an immediate identifier right after the leading dot:.foo
-function tryField() {
-var c = src.charCodeAt(pos);
-if (pos < n && isIdentStart(c)) {
-var start = pos;
-while (pos < n && isIdentPart(src.charCodeAt(pos))) pos++;
-var key = src.slice(start, pos);
-var optional = consumeOptional();
-steps.push({ op: "field", key: key, optional: optional});
-sawAccessor = true;
-return true;
-}
-return false;
-}
-
-function consumeOptional() {
-if (pos < n && src.charAt(pos) === "?") { pos++; return true;}
-return false;
-}
-
-//.["key"] or.[2] or.[] — the leading '.' is already consumed for the FIRST
-// accessor; subsequent bracket accessors do not need a dot.
-function tryBracket() {
-if (pos >= n || src.charAt(pos)!== "[") return false;
-pos++; // '['
-skipWs();
-if (pos < n && src.charAt(pos) === "]") {
-pos++; // ']'
-var opt0 = consumeOptional();
-steps.push({ op: "iterate", optional: opt0});
-sawAccessor = true;
-return true;
-}
-var c = src.charAt(pos);
-if (c === '"') {
-var str = parseJSONString();
-skipWs();
-expect("]");
-var opt1 = consumeOptional();
-steps.push({ op: "field", key: str, optional: opt1});
-sawAccessor = true;
-return true;
-}
-// numeric index (optionally negative)
-if (c === "-" || (src.charCodeAt(pos) >= 48 && src.charCodeAt(pos) <= 57)) {
-var start = pos;
-if (src.charAt(pos) === "-") pos++;
-var digits = 0;
-while (pos < n && src.charCodeAt(pos) >= 48 && src.charCodeAt(pos) <= 57) { pos++; digits++;}
-if (digits === 0) throw new Error("expected an array index inside []");
-var idx = parseInt(src.slice(start, pos), 10);
-skipWs();
-expect("]");
-var opt2 = consumeOptional();
-steps.push({ op: "index", idx: idx, optional: opt2});
-sawAccessor = true;
-return true;
-}
-throw new Error("unexpected character inside []: " + JSON.stringify(c));
-}
-
-function expect(ch) {
-if (pos >= n || src.charAt(pos)!== ch) {
-throw new Error("expected '" + ch + "' at position " + pos);
-}
-pos++;
-}
-
-// Minimal JSON string parser for bracket keys: assumes src.charAt(pos) === '"'.
-function parseJSONString() {
-var start = pos;
-pos++; // opening quote
-var out = "";
-while (pos < n) {
-var ch = src.charAt(pos);
-if (ch === '"') { pos++; return out;}
-if (ch === "\\") {
-pos++;
-if (pos >= n) break;
-var e = src.charAt(pos);
-if (e === "n") out += "\n";
-else if (e === "t") out += "\t";
-else if (e === "r") out += "\r";
-else if (e === '"') out += '"';
-else if (e === "\\") out += "\\";
-else if (e === "/") out += "/";
-else if (e === "u") {
-var hex = src.slice(pos + 1, pos + 5);
-if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error("bad \\u escape in filter string");
-out += String.fromCharCode(parseInt(hex, 16));
-pos += 4;
-} else {
-throw new Error("bad escape \\" + e + " in filter string");
-}
-pos++;
-} else {
-out += ch;
-pos++;
-}
-}
-throw new Error("unterminated string starting at position " + start);
-}
-
-// First accessor after the leading '.': either a field, a bracket, or nothing (identity).
-if (!tryField()) { tryBracket();}
-// Subsequent accessors:.field or [..]
-for (;;) {
-skipWs();
-if (pos < n && src.charAt(pos) === ".") {
-// a following.field (dotted). The dot must be followed by an identifier or bracket.
-pos++;
-if (!tryField()) {
-if (!tryBracket()) throw new Error("expected a field name or [ after '.' at position " + pos);
-}
-continue;
-}
-if (pos < n && src.charAt(pos) === "[") { tryBracket(); continue;}
-break;
-}
-
-if (steps.length === 0) {
-// just '.' — identity
-steps.push({ op: "identity"});
-}
-return { steps: steps, pos: pos};
-}
-
-// Parse a full filter (with top-level pipes) into a flat step list.
-// Pure: depends only on `src`. Throws a clean Error on malformed input.
-function parse(src) {
-if (typeof src!== "string") throw new Error("filter must be a string");
-var n = src.length;
-var pos = 0;
-var all = [];
-
-function skipWs() { while (pos < n && (src.charCodeAt(pos) === 32 || (src.charCodeAt(pos) >= 9 && src.charCodeAt(pos) <= 13))) pos++;}
-
-skipWs();
-if (pos >= n) throw new Error("empty filter");
-for (;;) {
-var seg = parseSegment(src, pos);
-pos = seg.pos;
-for (var i = 0; i < seg.steps.length; i++) all.push(seg.steps[i]);
-skipWs();
-if (pos >= n) break;
-if (src.charAt(pos) === "|") { pos++; skipWs(); continue;}
-throw new Error("unexpected character " + JSON.stringify(src.charAt(pos)) + " at position " + pos + " (expected '|' or end of filter)");
-}
-return all;
-}
-
-/* ==================================================================
-THE EVALUATOR — apply a compiled step list to a value.
-Each step maps a value to a STREAM (array) of values; the program
-threads the stream through the steps left to right. This is what
-makes `.[]` fan-out and the pipe compose correctly.
-================================================================== */
-
-function isPlainObject(v) {
-return v!== null && typeof v === "object" &&!Array.isArray(v);
-}
-
-// Apply ONE step to ONE value, returning an array of result values.
-// Throws a TypeError-tagged Error on a genuine, non-optional type mismatch.
-function applyStep(step, value) {
-switch (step.op) {
-case "identity":
-return [value];
-
-case "field": {
-if (value === null || value === undefined) return [null]; // missing -> null (jq)
-if (isPlainObject(value)) {
-return [Object.prototype.hasOwnProperty.call(value, step.key)? value[step.key]: null];
-}
-if (step.optional) return [];
-throw typeErr("cannot index " + typeName(value) + ' with "' + step.key + '"');
-}
-
-case "index": {
-if (value === null || value === undefined) return [null];
-if (Array.isArray(value)) {
-var i = step.idx < 0? value.length + step.idx: step.idx;
-return [(i >= 0 && i < value.length)? value[i]: null];
-}
-if (step.optional) return [];
-throw typeErr("cannot index " + typeName(value) + " with number " + step.idx);
-}
-
-case "iterate": {
-if (Array.isArray(value)) return value.slice();
-if (isPlainObject(value)) {
 var out = [];
-for (var k in value) if (Object.prototype.hasOwnProperty.call(value, k)) out.push(value[k]);
-return out;
-}
-if (step.optional) return [];
-throw typeErr("cannot iterate over " + typeName(value));
-}
+var current = globalName;
+var seenSections = {}; // section name -> true (a section may appear once)
+var seenKeys = {}; // section name -> { key -> true} (dup key in a section)
+seenKeys[current] = {};
 
-default:
-throw new Error("internal: unknown step op " + step.op);
-}
-}
-
-function typeName(v) {
-if (v === null) return "null";
-if (Array.isArray(v)) return "array";
-if (typeof v === "object") return "object";
-return typeof v; // string | number | boolean
-}
-
-function typeErr(msg) {
-var e = new Error(msg);
-e.jqType = true; // tag for exit-code 3 routing
-return e;
-}
-
-// Run a compiled program (step list) over one input value -> array of results.
-// Pure: depends only on `steps` and `value`.
-function evalSteps(steps, value) {
-var stream = [value];
-for (var s = 0; s < steps.length; s++) {
-var next = [];
-for (var i = 0; i < stream.length; i++) {
-var results = applyStep(steps[s], stream[i]);
-for (var j = 0; j < results.length; j++) next.push(results[j]);
-}
-stream = next;
-}
-return stream;
-}
-
-// Parse `filter` and run it over `value` -> array of result values.
-// The one-call entry point. Throws a clean Error on parse or type failure.
-function run(value, filter) {
-var steps = parse(filter);
-return evalSteps(steps, value);
-}
-
-/* ==================================================================
-JSON I/O helpers (pure)
-================================================================== */
-
-// Parse a JSONL / concatenated-JSON text into an array of values.
-// A blank line yields no value. Throws on malformed JSON.
-function parseInputs(text) {
-if (typeof text!== "string") text = String(text == null? "": text);
-var out = [];
-var lines = text.split(/\r\n|\n|\r/);
+var lines = text.split("\n");
 for (var i = 0; i < lines.length; i++) {
 var line = lines[i];
-if (line.replace(/[\s]/g, "").length === 0) continue; // skip blank/whitespace-only
-out.push(JSON.parse(line));
+if (line.charAt(line.length - 1) === "\r") line = line.slice(0, line.length - 1); // CRLF==LF
+
+var t = trim(line);
+if (t.length === 0) continue; // blank line
+var c0 = t.charAt(0);
+if (c0 === ";" || c0 === "#") continue; // full-line comment
+
+// section header?
+if (c0 === "[" && t.charAt(t.length - 1) === "]") {
+var name = trim(t.slice(1, t.length - 1));
+if (name.length === 0) throw new Error("empty section header on line " + (i + 1) + ": " + JSON.stringify(line));
+if (name.indexOf("[")!== -1 || name.indexOf("]")!== -1) {
+throw new Error("malformed section header on line " + (i + 1) + " (name contains '[' or ']'): " + JSON.stringify(line));
+}
+if (seenSections[name]) throw new Error("repeated section header [" + name + "] on line " + (i + 1) + " (a section may appear only once)");
+seenSections[name] = true;
+current = name;
+if (seenKeys[current] === undefined) seenKeys[current] = {};
+continue;
+}
+
+// key = value
+var eq = line.indexOf("=");
+if (eq === -1) throw new Error("malformed line " + (i + 1) + " (not a comment, section header, or KEY=VALUE): " + JSON.stringify(line));
+
+var key = trim(line.slice(0, eq));
+var value = trim(line.slice(eq + 1));
+
+if (!KEY_RE.test(key)) throw new Error("illegal key on line " + (i + 1) + ": " + JSON.stringify(key) + " (keys must match [A-Za-z_][A-Za-z0-9_.-]*)");
+
+if (seenKeys[current][key]) {
+throw new Error("duplicate key " + JSON.stringify(key) + " in section [" + current + "] on line " + (i + 1) + " (a key may appear once per section; refusing to silently overwrite)");
+}
+seenKeys[current][key] = true;
+
+value = stripQuotes(value);
+
+var rec = {};
+rec[sectionField] = current;
+rec[keyField] = key;
+rec[valueField] = value;
+out.push(rec);
 }
 return out;
 }
 
-// Render one result value as output text.
-function renderValue(v, rawOutput) {
-if (rawOutput && typeof v === "string") return v;
-return JSON.stringify(v);
+// Render records as JSONL text (one JSON object per line, trailing newline if any).
+function toJSONL(records) {
+var s = "";
+for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
+return s;
 }
 
-/* ==================================================================
-EXPORTS (browser + Node)
-================================================================== */
+/* ---- exports (browser + Node) ------------------------------------ */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.jqLite = { run: run, parse: parse, evalSteps: evalSteps, parseInputs: parseInputs};
+window.ForestGifts.iniSource = { parse: parse, toJSONL: toJSONL};
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { run: run, parse: parse, evalSteps: evalSteps, parseInputs: parseInputs, renderValue: renderValue};
+module.exports = { parse: parse, toJSONL: toJSONL};
 }
 
-/* ==================================================================
-CLI (runs only when invoked directly, never on require)
-================================================================== */
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
 
 function parseArgs(args) {
-var opts = { rawOutput: false, slurp: false};
-var filter = null;
+var opts = {};
+var file;
 var i = 0;
 while (i < args.length) {
 var a = args[i];
-if (a === "--raw-output" || a === "-r") { opts.rawOutput = true; i++;}
-else if (a === "--slurp" || a === "-s") { opts.slurp = true; i++;}
-else if (a === "--compact" || a === "-c") { i++;} // default; accepted for familiarity
-else if (a.charAt(0) === "-" && a!== "-") { throw new Error("unknown option " + a);}
-else {
-if (filter!== null) throw new Error("unexpected extra argument " + JSON.stringify(a) + " (only one filter is allowed)");
-filter = a;
-i++;
+if (a === "--section-field") {
+if (args[i + 1] === undefined) throw new Error("--section-field requires a name");
+opts.sectionField = args[i + 1]; i += 2;
+} else if (a === "--key-field") {
+if (args[i + 1] === undefined) throw new Error("--key-field requires a name");
+opts.keyField = args[i + 1]; i += 2;
+} else if (a === "--value-field") {
+if (args[i + 1] === undefined) throw new Error("--value-field requires a name");
+opts.valueField = args[i + 1]; i += 2;
+} else if (a === "--global") {
+if (args[i + 1] === undefined) throw new Error("--global requires a name");
+opts.global = args[i + 1]; i += 2;
+} else if (a.charAt(0) === "-" && a!== "-") {
+throw new Error("unknown option " + a);
+} else {
+if (file!== undefined) throw new Error("only one input file may be given (got a second: " + JSON.stringify(a) + ")");
+file = a; i += 1;
 }
 }
-if (filter === null) throw new Error("no filter given (usage: jq-lite '<filter>')");
-opts.filter = filter;
-return opts;
-}
-
-function readStdin() {
-try {
-var fs = require("fs");
-return fs.readFileSync(0, "utf8");
-} catch (e) {
-return "";
-}
+return { file: file, opts: opts};
 }
 
-var HELP =
-"jq-lite.js — a tiny jq-style query language for JSON, in one dependency-free file.\n\n" +
-" echo '{\"a\":{\"b\":2}}' | node jq-lite.js '.a.b'\n" +
-" echo '[1,2,3]' | node jq-lite.js '.[]'\n" +
-" printf '{\"n\":1}\\n{\"n\":2}\\n' | node jq-lite.js '.n'\n" +
-" echo '{\"name\":\"ada\"}' | node jq-lite.js --raw-output '.name'\n" +
-" node jq-lite.js --help\n\n" +
-"The language:\n" +
-". identity\n" +
-".foo.foo.bar field access (missing key -> null; non-object -> error unless?)\n" +
-".[\"a b\"] bracketed string key\n" +
-".[2].foo[0] array index (negative counts from the end:.[-1] is last)\n" +
-".[] iterate: emit each array element, or each object value, as a stream\n" +
-" a | b pipe: run b over every output of a\n" +
-".foo?.[]? optional: emit nothing on a type mismatch instead of erroring\n\n" +
-" --raw-output print string results without quotes (jq -r)\n" +
-" --slurp read the whole input as one JSON array before filtering (jq -s)\n\n" +
-"Reads JSON (one value or a JSONL stream) from stdin; applies the filter to each value\n" +
-"and prints one JSON result per output.\n\n" +
-"Edge: jq-lite is a SMALL subset of jq — no functions, no arithmetic, no construction,\n" +
-"no select/map/comparison, no recursion (..). For those, use jq itself.\n";
+function readAll(stream) {
+return new Promise(function (resolve, reject) {
+var chunks = [];
+stream.on("data", function (c) { chunks.push(c);});
+stream.on("end", function () { resolve(Buffer.concat(chunks).toString("utf8"));});
+stream.on("error", reject);
+});
+}
+
+function helpText() {
+return (
+"ini-source.js — parse INI /.gitconfig-style sectioned config into a uniform JSONL stream.\n\n" +
+" node ini-source.js app.ini\n" +
+" cat app.ini | node ini-source.js\n" +
+" node ini-source.js app.ini --section-field s --key-field k --value-field v\n" +
+" node ini-source.js --help\n\n" +
+" [FILE] INI file to parse (default: read stdin)\n" +
+" --section-field NAME field the SECTION is emitted under (default \"section\")\n" +
+" --key-field NAME field the parsed KEY is emitted under (default \"key\")\n" +
+" --value-field NAME field the parsed VALUE is emitted under (default \"value\")\n" +
+" --global NAME section name for keys before any header (default \"\")\n\n" +
+"Emits one JSON object per assignment: { section: S, key: K, value: V}, one per line.\n" +
+"Full-line; and # comments and blank lines are skipped; lines split on the first '='.\n\n" +
+"Edge: STRINGS ONLY — no type coercion, no ${VAR} interpolation, no inline comments, no\n" +
+"escapes. A duplicate key within a section, or a repeated [section], is REFUSED (exit 2) —\n" +
+"ini-source never silently overwrites. An honest, pinnable parse.\n"
+);
+}
 
 function main(argv) {
 var args = argv.slice(2);
 if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(HELP);
+process.stdout.write(helpText());
+return Promise.resolve(0);
+}
+var parsed;
+try { parsed = parseArgs(args);}
+catch (e) { process.stderr.write("ini-source: " + e.message + "\n"); return Promise.resolve(2);}
+
+var getText;
+if (parsed.file!== undefined) {
+getText = new Promise(function (resolve, reject) {
+require("fs").readFile(parsed.file, "utf8", function (err, data) {
+if (err) reject(new Error("cannot read " + JSON.stringify(parsed.file) + ": " + err.code));
+else resolve(data);
+});
+});
+} else {
+getText = readAll(process.stdin);
+}
+
+return getText.then(function (text) {
+var records = parse(text, parsed.opts); // throws -> caught below
+process.stdout.write(toJSONL(records));
 return 0;
-}
-var opts;
-try { opts = parseArgs(args);}
-catch (e) { process.stderr.write("jq-lite: " + e.message + "\n"); return 2;}
-
-// Pre-parse the filter so a syntax error is a usage error (exit 2), before reading input.
-var steps;
-try { steps = parse(opts.filter);}
-catch (e) { process.stderr.write("jq-lite: " + e.message + "\n"); return 2;}
-
-var text = readStdin();
-var inputs;
-try { inputs = parseInputs(text);}
-catch (e) { process.stderr.write("jq-lite: invalid JSON input: " + e.message + "\n"); return 2;}
-
-if (opts.slurp) inputs = [inputs];
-
-var out = "";
-for (var i = 0; i < inputs.length; i++) {
-var results;
-try { results = evalSteps(steps, inputs[i]);}
-catch (e) {
-if (e && e.jqType) { process.stderr.write("jq-lite: " + e.message + "\n"); return 3;}
-process.stderr.write("jq-lite: " + e.message + "\n"); return 3;
-}
-for (var j = 0; j < results.length; j++) {
-out += renderValue(results[j], opts.rawOutput) + "\n";
-}
-}
-process.stdout.write(out);
-return 0;
+}).catch(function (e) {
+process.stderr.write("ini-source: " + e.message + "\n");
+return 2;
+});
 }
 
 if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
+main(process.argv).then(function (code) { process.exitCode = code;});
 }
 
-test_jq-lite.js 212 lines on GitHub →
+test_ini-source.js 172 lines on GitHub →
 #!/usr/bin/env node
-/* test_jq-lite.js — battery for the jq-lite gift.
-`node test_jq-lite.js` -> exit 0 PASS / non-zero FAIL.
+/* test_ini-source.js — executable battery for ini-source. `node test_ini-source.js` ->
+exit 0 PASS / non-zero FAIL. Zero dependencies.
 
-THE ORACLE IS INDEPENDENT AND TAKES A DIFFERENT ROUTE than the gift. The gift compiles
-the filter into a FLAT LIST OF STEP OBJECTS and threads a stream through them. The
-oracle here re-tokenizes the filter with a REGEX SCANNER and interprets it by RECURSIVE
-DESCENT directly over the value — no compiled step list, no shared parser, no shared
-evaluator. Two routes that share no code — agreement is evidence, not tautology. Plus
-frozen hand goldens for each quiet-failure case the gift exists to fix (missing-key,
-type-confusion, stream fan-out).
+Coverage: frozen hand goldens; a differential grid cross-checked against an
+INDEPENDENT regex-route oracle (a different parse route than the gift's indexOf-split);
+the {section,key,value} uniform + strings-only contract; custom field names + --global;
+every fail-closed throw (malformed line, illegal key, empty/malformed header, DUP key in
+a section, REPEATED section, field collision, empty field, non-string input); CRLF==LF,
+BOM strip, quote strip, first-'=' split, '#'/';' inside a value literal; determinism
+across two parses; toJSONL shape; and in-battery MUTATION TRIPWIRES (a sabotaged parse
+must go RED, so a green run is non-vacuous).
 */
 "use strict";
-
-var G = require("./jq-lite.js");
-var assert = require("assert");
+var G = require("./ini-source.js");
 
 var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;}
-else { fail++; console.error("FAIL: " + name);}
-}
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL: " + name + "\n got: " + g + "\n want: " + w);}
+function ok(name, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL: " + name);}}
+function eq(name, a, b) { ok(name, JSON.stringify(a) === JSON.stringify(b));}
+function throws(name, fn) {
+var threw = false;
+try { fn();} catch (e) { threw = true;}
+ok(name, threw);
 }
 
-/* ==================================================================
-INDEPENDENT ORACLE — regex-token scanner + recursive-descent walk.
-Tokens: DOT-FIELD (.name), BRACKET ([..] contents), PIPE (|),
-OPTIONAL (?), IDENTITY (a lone.).
-The oracle interprets tokens directly against the value, producing a
-stream (array). It shares NO code with the gift's step compiler.
-================================================================== */
-
-// Tokenize into an array of { kind, value, optional} accessor tokens and PIPE markers.
-function oracleTokens(src) {
-var toks = [];
-var re = /\s*(\||\.(?:[A-Za-z_][A-Za-z0-9_]*)?|\[\s*(?:"(?:[^"\\]|\\.)*"|-?\d+|)\s*\])(\?)?/g;
-var i = 0;
-// Validate the whole string is consumed by our token grammar; else it's a syntax error.
-var consumed = 0;
-var m;
-re.lastIndex = 0;
-while ((m = re.exec(src))!== null) {
-if (m.index!== consumed) throw new Error("oracle: gap at " + consumed);
-consumed = re.lastIndex;
-var raw = m[1];
-var optional = m[2] === "?";
-if (raw === "|") { toks.push({ kind: "pipe"}); continue;}
-if (raw === ".") { toks.push({ kind: "identity", optional: optional}); continue;}
-if (raw.charAt(0) === ".") { toks.push({ kind: "field", value: raw.slice(1), optional: optional}); continue;}
-if (raw.charAt(0) === "[") {
-var inner = raw.slice(1, -1).trim();
-if (inner === "") { toks.push({ kind: "iterate", optional: optional}); continue;}
-if (inner.charAt(0) === '"') { toks.push({ kind: "field", value: JSON.parse(inner), optional: optional}); continue;}
-toks.push({ kind: "index", value: parseInt(inner, 10), optional: optional}); continue;
+/* ---- INDEPENDENT ORACLE (regex-route, from spec, shares no code with the gift) ---- */
+function oracle(text, opts) {
+opts = opts || {};
+var sf = opts.sectionField || "section", kf = opts.keyField || "key", vf = opts.valueField || "value";
+var gl = opts.global === undefined? "": opts.global;
+if (sf === kf || sf === vf || kf === vf) throw new Error("field collision");
+if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+var HDR = /^\[([^\[\]]+)\]$/, KV = /^([^=]*)=([\s\S]*)$/, KEY = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
+var out = [], cur = gl, secs = {}, keys = {}; keys[cur] = {};
+var ls = text.split("\n");
+for (var i = 0; i < ls.length; i++) {
+var line = ls[i].replace(/\r$/, "");
+var t = line.replace(/^\s+|\s+$/g, "");
+if (!t) continue;
+if (t[0] === ";" || t[0] === "#") continue;
+var hm = t.match(HDR);
+if (t[0] === "[" && t[t.length - 1] === "]") {
+if (!hm) throw new Error("bad header");
+var nm = hm[1].replace(/^\s+|\s+$/g, "");
+if (!nm) throw new Error("empty header");
+if (secs[nm]) throw new Error("repeat section");
+secs[nm] = 1; cur = nm; if (!keys[cur]) keys[cur] = {}; continue;
 }
-throw new Error("oracle: unrecognized token " + raw);
+var m = line.match(KV);
+if (!m) throw new Error("no =");
+var k = m[1].replace(/^\s+|\s+$/g, ""), v = m[2].replace(/^\s+|\s+$/g, "");
+if (!KEY.test(k)) throw new Error("bad key");
+if (keys[cur][k]) throw new Error("dup key");
+keys[cur][k] = 1;
+if (v.length >= 2) { var a = v[0], b = v[v.length - 1]; if ((a === '"' && b === '"') || (a === "'" && b === "'")) v = v.slice(1, -1);}
+var r = {}; r[sf] = cur; r[kf] = k; r[vf] = v; out.push(r);
 }
-if (consumed!== src.replace(/\s+$/, "").length && consumed!== src.length) {
-// allow trailing whitespace
-var tail = src.slice(consumed);
-if (tail.trim()!== "") throw new Error("oracle: trailing " + JSON.stringify(tail));
-}
-return toks;
+return out;
 }
 
-function isObj(v) { return v!== null && typeof v === "object" &&!Array.isArray(v);}
+/* ---- frozen hand goldens ---- */
+eq("basic section", G.parse("[s]\na=1\nb=2\n"),
+[{section:"s",key:"a",value:"1"},{section:"s",key:"b",value:"2"}]);
+eq("two sections, same key ok",
+G.parse("[server]\nhost=a\n[client]\nhost=b\n"),
+[{section:"server",key:"host",value:"a"},{section:"client",key:"host",value:"b"}]);
+eq("global preamble -> section ''",
+G.parse("x=1\n[s]\ny=2\n"),
+[{section:"",key:"x",value:"1"},{section:"s",key:"y",value:"2"}]);
+eq("comments (; and #) + blank lines skipped",
+G.parse("; a comment\n[s]\n# another\n\nk=v\n"),
+[{section:"s",key:"k",value:"v"}]);
+eq("first-'=' split (value contains '=')",
+G.parse("[s]\nurl=a=b=c\n"), [{section:"s",key:"url",value:"a=b=c"}]);
+eq("value trim + double-quote strip",
+G.parse('[s]\nk = " hi there " \n'), [{section:"s",key:"k",value:" hi there "}]);
+eq("single-quote strip", G.parse("[s]\nk='x'\n"), [{section:"s",key:"k",value:"x"}]);
+eq("empty value", G.parse("[s]\nk=\n"), [{section:"s",key:"k",value:""}]);
+eq("'#'/';' inside a value are literal",
+G.parse("[s]\nk=a#b;c\n"), [{section:"s",key:"k",value:"a#b;c"}]);
+eq("CRLF == LF", G.parse("[s]\r\nk=v\r\n"), G.parse("[s]\nk=v\n"));
+eq("leading BOM stripped", G.parse("\uFEFF[s]\nk=v\n"), [{section:"s",key:"k",value:"v"}]);
+eq("empty input -> empty stream", G.parse(""), []);
+eq("section name trimmed", G.parse("[ srv]\nk=v\n"), [{section:"srv",key:"k",value:"v"}]);
+eq("custom fields + --global",
+G.parse("g=1\n[s]\nk=v\n", {sectionField:"S",keyField:"K",valueField:"V",global:"root"}),
+[{S:"root",K:"g",V:"1"},{S:"s",K:"k",V:"v"}]);
 
-// Apply one accessor token to one value -> array of values (recursive-descent semantics).
-function oracleApply(tok, v) {
-switch (tok.kind) {
-case "identity": return [v];
-case "field":
-if (v === null || v === undefined) return [null];
-if (isObj(v)) return [Object.prototype.hasOwnProperty.call(v, tok.value)? v[tok.value]: null];
-if (tok.optional) return [];
-throw tagged("type");
-case "index":
-if (v === null || v === undefined) return [null];
-if (Array.isArray(v)) { var k = tok.value < 0? v.length + tok.value: tok.value; return [(k >= 0 && k < v.length)? v[k]: null];}
-if (tok.optional) return [];
-throw tagged("type");
-case "iterate":
-if (Array.isArray(v)) return v.slice();
-if (isObj(v)) { var o = []; for (var kk in v) if (Object.prototype.hasOwnProperty.call(v, kk)) o.push(v[kk]); return o;}
-if (tok.optional) return [];
-throw tagged("type");
-default: throw new Error("oracle: bad token kind");
-}
-}
-function tagged(t) { var e = new Error(t); e.jqType = true; return e;}
+/* ---- the honesty axis: fail-closed edges ---- */
+throws("DUP key in a section -> throw", function(){ G.parse("[s]\nk=1\nk=2\n");});
+throws("DUP key in global -> throw", function(){ G.parse("k=1\nk=2\n");});
+throws("REPEATED section header -> throw", function(){ G.parse("[s]\na=1\n[s]\nb=2\n");});
+throws("malformed line (no '=') -> throw", function(){ G.parse("[s]\nnope\n");});
+throws("unclosed header is a no-'=' line -> throw", function(){ G.parse("[s\nk=v\n");});
+throws("empty section [] -> throw", function(){ G.parse("[]\nk=v\n");});
+throws("illegal key (space) -> throw", function(){ G.parse("[s]\nbad key=v\n");});
+throws("illegal key (digit lead) -> throw", function(){ G.parse("[s]\n1k=v\n");});
+throws("empty key -> throw", function(){ G.parse("[s]\n=v\n");});
+throws("field collision -> throw", function(){ G.parse("[s]\nk=v\n", {keyField:"section"});});
+throws("empty field name -> throw", function(){ G.parse("[s]\nk=v\n", {keyField:""});});
+throws("non-string input -> throw", function(){ G.parse(42);});
 
-// Interpret the whole token list over a value -> stream. Pipes just continue the thread.
-function oracleRun(value, filter) {
-var toks = oracleTokens(filter);
-var stream = [value];
-for (var t = 0; t < toks.length; t++) {
-if (toks[t].kind === "pipe") continue; // sequential thread; pipe is a no-op separator
-var next = [];
-for (var i = 0; i < stream.length; i++) {
-var r = oracleApply(toks[t], stream[i]);
-for (var j = 0; j < r.length; j++) next.push(r[j]);
-}
-stream = next;
-}
-return stream;
-}
+/* ---- strings-only contract (no coercion) ---- */
+eq("numbers stay strings", G.parse("[s]\nn=8080\nf=1e3\nb=true\n"),
+[{section:"s",key:"n",value:"8080"},{section:"s",key:"f",value:"1e3"},{section:"s",key:"b",value:"true"}]);
+eq("no ${VAR} interpolation", G.parse("[s]\nk=${HOME}\n"), [{section:"s",key:"k",value:"${HOME}"}]);
+(function(){
+var recs = G.parse("[s]\nk=v\n");
+ok("record has exactly the 3 declared fields", Object.keys(recs[0]).length === 3 &&
+"section" in recs[0] && "key" in recs[0] && "value" in recs[0]);
+})();
 
-/* ==================================================================
-GRID — gift == oracle across many (value, filter) pairs
-================================================================== */
-var VALUES = [
-{}, { a: 1}, { a: { b: { c: 3}}}, { a: null}, { "weird key": 9},
-[], [1, 2, 3], [{ id: 1}, { id: 2}, { id: 3}],
-{ items: [{ id: 10}, { id: 20}]}, { xs: [], ys: [5]},
-{ a: 1, b: 2, c: 3}, [[1], [2, 3]], null, "hi", 42, true,
-{ nested: { list: [{ v: 1}, { v: 2}]}}
+/* ---- differential grid vs the independent oracle ---- */
+var grid = [
+"[s]\nk=v\n",
+"a=1\n[x]\nb=2\n[y]\nb=3\n",
+"[s]\nurl=http://a=b\n",
+'[s]\nk="quoted"\n',
+"; c\n[s]\nk = v \n\n",
+"\uFEFF[s]\nk=v\n",
+"[s]\r\nk=v\r\n",
+"",
 ];
-var FILTERS = [
-".", ".a", ".a.b", ".a.b.c", ".a?", ".missing", ".missing.deep",
-".[]", ".[0]", ".[1]", ".[-1]", ".[2]", ".[5]",
-".items[]", ".items[] |.id", ".[] |.id", ".xs[]", ".ys[]",
-'.["weird key"]', ".nested.list[] |.v", ".a.b?", ".[]?", ".[0]?"
-];
-
-for (var vi = 0; vi < VALUES.length; vi++) {
-for (var fi = 0; fi < FILTERS.length; fi++) {
-var val = VALUES[vi], filt = FILTERS[fi];
-var giftOut, giftErr = null, oracleOut, oracleErr = null;
-try { giftOut = G.run(val, filt);} catch (e) { giftErr =!!e.jqType? "type": "err";}
-try { oracleOut = oracleRun(val, filt);} catch (e) { oracleErr =!!e.jqType? "type": "err";}
-var name = "grid v" + vi + " f[" + filt + "]";
-if (giftErr || oracleErr) {
-ok(name + " (both error, same kind)", giftErr === oracleErr);
-} else {
-eq(name, giftOut, oracleOut);
+for (var gi = 0; gi < grid.length; gi++) {
+eq("grid[" + gi + "] gift==oracle", G.parse(grid[gi]), oracle(grid[gi]));
 }
+// grid with custom opts
+var o2 = {sectionField:"S",keyField:"K",valueField:"V",global:"root"};
+eq("grid custom-opts gift==oracle", G.parse("g=1\n[s]\nk=v\n", o2), oracle("g=1\n[s]\nk=v\n", o2));
+
+/* ---- determinism ---- */
+eq("two parses byte-identical",
+G.toJSONL(G.parse("[a]\nk=1\n[b]\nk=2\n")), G.toJSONL(G.parse("[a]\nk=1\n[b]\nk=2\n")));
+
+/* ---- toJSONL shape ---- */
+eq("toJSONL one object per line + trailing NL",
+G.toJSONL([{section:"s",key:"k",value:"v"}]), '{"section":"s","key":"k","value":"v"}\n');
+eq("toJSONL empty -> empty", G.toJSONL([]), "");
+
+/* ---- MUTATION TRIPWIRES: a sabotaged parse must diverge from the honest oracle ---- */
+// Mutant A: dup-key check removed (silent last-wins). Must NOT match oracle on a dup vector.
+function mutantA(text) {
+var out = [], cur = "", secs = {};
+var ls = text.split("\n");
+for (var i = 0; i < ls.length; i++) {
+var line = ls[i].replace(/\r$/, ""), t = line.replace(/^\s+|\s+$/g, "");
+if (!t || t[0] === ";" || t[0] === "#") continue;
+if (t[0] === "[" && t[t.length - 1] === "]") { cur = t.slice(1, -1).replace(/^\s+|\s+$/g, ""); continue;}
+var eq2 = line.indexOf("="); if (eq2 === -1) throw new Error("no =");
+out.push({section:cur,key:line.slice(0,eq2).replace(/^\s+|\s+$/g,""),value:line.slice(eq2+1).replace(/^\s+|\s+$/g,"")});
 }
+return out; // NO dup check
 }
+(function(){
+var dupText = "[s]\nk=1\nk=2\n";
+var honestThrew = false; try { oracle(dupText);} catch(e){ honestThrew = true;}
+var mutantDidNot = false; try { mutantA(dupText); mutantDidNot = true;} catch(e){}
+ok("mutation bite: dropping the dup-key check diverges from the honest oracle", honestThrew && mutantDidNot);
+})();
+// Mutant B: split on LAST '=' instead of first. Must diverge on a value containing '='.
+function mutantB(text) {
+var line = "k=a=b", last = line.lastIndexOf("=");
+return line.slice(last + 1); // "b" — wrong; honest first-split value is "a=b"
+}
+(function(){
+var honest = G.parse("[s]\nk=a=b\n")[0].value; // "a=b"
+ok("mutation bite: last-'=' split diverges from first-'=' honest value", honest === "a=b" && mutantB()!== honest);
+})();
 
-/* ==================================================================
-FROZEN HAND GOLDENS — the three quiet failures, pinned exactly
-================================================================== */
-
-// 1. Missing-key crash -> null (not an exception)
-eq("golden: missing key yields null", G.run({}, ".a.b.c"), [null]);
-eq("golden: missing on populated -> null", G.run({ a: {}}, ".a.b"), [null]);
-eq("golden: null propagates", G.run({ a: null}, ".a.b"), [null]);
-// TYPE-STRICT: a missing key must yield an actual JSON null, never `undefined` (which
-// serializes to null but is a leaking JS artifact — the mutation-bite proves this matters).
-ok("golden: missing key is real null not undefined", G.run({}, ".a")[0] === null && typeof G.run({}, ".a")[0] === "object");
-ok("golden: missing deep is real null not undefined", G.run({ a: {}}, ".a.b")[0] === null);
-ok("golden: no undefined ever leaks a stream", G.run({ a: { b: 1}}, ".a.z")[0] === null);
-
-// 2. Type confusion -> loud error, but? suppresses to empty stream
-ok("golden:.foo on string throws (type)", (function () { try { G.run("hi", ".foo"); return false;} catch (e) { return!!e.jqType;}})());
-eq("golden:.foo? on string -> empty", G.run("hi", ".foo?"), []);
-ok("golden:.[0] on number throws (type)", (function () { try { G.run(42, ".[0]"); return false;} catch (e) { return!!e.jqType;}})());
-eq("golden:.[]? on number -> empty", G.run(42, ".[]?"), []);
-
-// 3. Stream fan-out:.[] then pipe runs over EACH element
-eq("golden: fan-out over array", G.run([1, 2, 3], ".[]"), [1, 2, 3]);
-eq("golden: fan-out then field", G.run({ items: [{ id: 1}, { id: 2}]}, ".items[] |.id"), [1, 2]);
-eq("golden: fan-out over empty array", G.run([], ".[]"), []);
-eq("golden: fan-out over object values", G.run({ a: 1, b: 2}, ".[]"), [1, 2]);
-eq("golden: object value order = key order", G.run({ z: 1, a: 2, m: 3}, ".[]"), [1, 2, 3]);
-
-/* ==================================================================
-DIRECT UNIT CHECKS
-================================================================== */
-eq("identity returns input", G.run({ a: 1}, "."), [{ a: 1}]);
-eq("negative index last element", G.run([10, 20, 30], ".[-1]"), [30]);
-eq("index out of range -> null", G.run([1, 2], ".[9]"), [null]);
-eq("bracket key with space", G.run({ "a b": 5}, '.["a b"]'), [5]);
-eq("chained field then index", G.run({ xs: [7, 8, 9]}, ".xs[1]"), [8]);
-eq("deep pipe", G.run({ a: { b: [{ c: 1}, { c: 2}]}}, ".a.b[] |.c"), [1, 2]);
-
-// parse() surfaces
-eq("parse identity", G.parse("."), [{ op: "identity"}]);
-ok("parse field", G.parse(".a")[0].op === "field" && G.parse(".a")[0].key === "a");
-ok("parse iterate", G.parse(".[]")[0].op === "iterate");
-ok("parse pipe flattens", G.parse(".a |.b").length === 2);
-
-// parseInputs
-eq("parseInputs JSONL", G.parseInputs('{"a":1}\n{"a":2}\n'), [{ a: 1}, { a: 2}]);
-eq("parseInputs skips blank lines", G.parseInputs('1\n\n2\n'), [1, 2]);
-eq("parseInputs empty -> []", G.parseInputs(""), []);
-
-/* ==================================================================
-DETERMINISM
-================================================================== */
-var d1 = JSON.stringify(G.run({ a: [1, 2, 3], b: { c: 4}}, ".a[] "));
-var d2 = JSON.stringify(G.run({ a: [1, 2, 3], b: { c: 4}}, ".a[] "));
-ok("deterministic across two runs", d1 === d2);
-
-/* ==================================================================
-FAIL-CLOSED / SYNTAX
-================================================================== */
-function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
-ok("empty filter throws", throws(function () { G.parse("");}));
-ok("filter not starting with. throws", throws(function () { G.parse("foo");}));
-ok("dangling pipe throws", throws(function () { G.parse(".a |");}));
-ok("unterminated bracket throws", throws(function () { G.parse(".[");}));
-ok("bad char after dot throws", throws(function () { G.parse(".a.|");}));
-ok("non-string filter throws", throws(function () { G.run({}, 5);}));
-
-/* ---- report ------------------------------------------------------ */
-console.log("jq-lite battery: " + pass + " passed, " + fail + " failed");
-process.exitCode = fail === 0? 0: 1;
+/* ---- summary ---- */
+console.log((fail === 0? "PASS": "FAIL") + " — " + pass + "/" + (pass + fail));
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT

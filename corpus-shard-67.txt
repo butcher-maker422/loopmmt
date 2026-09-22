@@ -1,8 +1,1266 @@
-# Loop MMT — corpus shard 67/87
+# Loop MMT — corpus shard 67/91
 
-> Bundle 67 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 67 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/grid-source/, /gifts/heatmap-sink/, /gifts/histogram-fold/)
+Nodes in this shard: 4 (/gifts/gitlog/, /gifts/grain/, /gifts/grid-sink/, /gifts/grid-source/)
+
+---
+
+# Gitlog — a Loop MMT gift
+https://loopmmt.com/gifts/gitlog/
+[coverage: optional · branch: gifts]
+
+Git History On A Pipe read ← all gifts
+
+Gitlog
+
+Turn a git history into one JSON object per commit on stdout, so the questions you actually have — how many commits touched this file, who authored what last week, churn per day — become one pipe away instead of re-parsing git's text yourself. Field names match what git-log folds already read.
+
+The honest edge
+
+It reports exactly what git reports — it's only as complete as the history you point it at. A shallow clone gives you a shallow answer, faithfully.
+
+Run it
+
+python3 gitlog.py --repo.
+test_gitlog.py (19/19)
+Python stdlib only
+
+The code — every file that ships
+
+gitlog.py 269 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""gitlog.py — turn a git history into one JSON object per commit, on stdout.
+
+A git repository already holds the truth about what happened and when: every
+commit is a dated, authored, immutable record. But that truth is trapped behind
+`git log`'s human-facing format. This reads the log and emits it as **JSON
+lines** — one object per commit, newest first by default — so the next tool in a
+pipe can fold, filter, count, or chart it without re-parsing git's output itself.
+
+It is a *source*: it emits records and consumes no stdin. Point it at a repo, get
+a clean stream of commits you can reason about. The whole point is to stop
+eyeballing `git log` and start folding it: "how many commits touched this file",
+"who authored what in this range", "what was the churn per day" all become one
+pipe away once the history is on the rail as records.
+
+Each commit becomes one object with these fields (always present):
+hash full 40-char commit SHA (git %H)
+short abbreviated SHA (git %h)
+committed committer date, ISO-8601 strict (git %cI)
+authored author date, ISO-8601 strict (git %aI)
+author author name (git %an)
+email author email (git %ae)
+subject first line of the message (git %s)
+
+With --churn, three more fields are added per commit (one extra git call each):
+files number of files changed in the commit (int)
+added total inserted lines across those files (int, None if binary-only)
+deleted total deleted lines (int, None if binary-only)
+
+The field names match what the existing git-log folds already read (%H, %h, %cI,
+%aI, %s), so a fold written against those consumes this source's output directly.
+
+------------------------------------------------------------------------------
+The JSON-lines contract (so this composes in a pipe):
+- emits ONE JSON object per line on stdout — a commit record.
+- order is git's default (reverse-chronological) unless --reverse is given.
+- --path P restricts to commits that touched P (repeatable).
+- --since / --until / --author / --max-count are passed through to git log.
+- errors go to stderr; stdout stays clean JSON-lines.
+
+Exit codes:
+0 the log was read and emitted (including the empty-history case)
+2 git failed / not a repository / git not found (don't trust the reading)
+3 usage / bad input
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+# GIFT-013: field/record framing must use a byte that CANNOT occur in commit
+# text. The old 0x1f/0x1e (ASCII unit/record separators) were assumed "safe
+# inside commit text" but are not — git permits those control bytes inside a
+# subject or author name, so a crafted commit split one record into many
+# ("malformed log record: expected 7 fields, got 8"). NUL is the only byte git
+# guarantees absent from commit content (its objects are NUL-terminated
+# C-strings): fields are joined with %x00 and each record is terminated by
+# `git log -z`, so no field value can ever break the frame.
+NUL = "\x00"
+
+# The per-commit fields, in emit order. (placeholder, json_key) pairs.
+FIELDS = [
+("%H", "hash"),
+("%h", "short"),
+("%cI", "committed"),
+("%aI", "authored"),
+("%an", "author"),
+("%ae", "email"),
+("%s", "subject"),
+]
+
+class GitLogError(Exception):
+"""A git fault or usage error, carrying an exit code."""
+
+def __init__(self, message, code):
+super().__init__(message)
+self.code = code
+
+def _run_git(args, repo):
+"""Run a git command in repo, return stdout text. Raise GitLogError on failure."""
+try:
+proc = subprocess.run(
+["git", "-C", repo] + args,
+stdout=subprocess.PIPE,
+stderr=subprocess.PIPE,
+encoding="utf-8",
+)
+except FileNotFoundError:
+raise GitLogError("git executable not found on PATH", 2)
+if proc.returncode!= 0:
+detail = proc.stderr.strip() or "git exited %d" % proc.returncode
+raise GitLogError(detail, 2)
+return proc.stdout
+
+def read_commits(repo, ref="HEAD", paths=None, since=None, until=None,
+author=None, max_count=None, reverse=False):
+"""Read commits from repo and return a list of record dicts (no churn).
+
+The list is git's default order (reverse-chronological) unless reverse=True.
+An empty history returns [] and is NOT an error.
+"""
+# GIFT-014: an unborn repository (git init, zero commits) has no valid HEAD,
+# so `git log HEAD` fatals. The contract says an empty history returns [] and
+# is not an error. When the ref is the DEFAULT HEAD, detect the unborn case
+# with a quiet verify and honor that contract. An invalid EXPLICIT ref
+# (ref!= "HEAD") still errors, and stays distinguishable from an unborn HEAD.
+if ref == "HEAD":
+probe = subprocess.run(
+["git", "-C", repo, "rev-parse", "--verify", "--quiet", "HEAD"],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+)
+if probe.returncode!= 0:
+inside = subprocess.run(
+["git", "-C", repo, "rev-parse", "--git-dir"],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+)
+if inside.returncode == 0:
+return [] # unborn default HEAD -> empty history, per contract
+# not a git repo / unreadable -> fall through; _run_git raises properly.
+
+# Fields joined by a literal NUL (%x00); `-z` NUL-terminates each record.
+fmt = "%x00".join(p for p, _ in FIELDS)
+args = ["log", ref, "-z", "--format=%s" % fmt]
+if reverse:
+args.append("--reverse")
+if since:
+args.append("--since=%s" % since)
+if until:
+args.append("--until=%s" % until)
+if author:
+args.append("--author=%s" % author)
+if max_count is not None:
+args.append("--max-count=%d" % max_count)
+if paths:
+args.append("--")
+args.extend(paths)
+
+raw = _run_git(args, repo)
+# -z terminates every record (including the last) with a NUL, and fields are
+# NUL-joined, so the whole stream is NUL-separated tokens: every len(FIELDS)
+# tokens is one record. Drop the single trailing empty left by the final
+# terminator; interior empty tokens (e.g. an empty subject) are preserved.
+tokens = raw.split(NUL)
+if tokens and tokens[-1] == "":
+tokens.pop()
+if not tokens:
+return []
+n = len(FIELDS)
+if len(tokens) % n!= 0:
+# A malformed stream is a fault, not a silent drop.
+raise GitLogError(
+"malformed log stream: %d field tokens is not a multiple of %d"
+% (len(tokens), n),
+2,
+)
+records = []
+for i in range(0, len(tokens), n):
+group = tokens[i:i + n]
+rec = {key: group[j] for j, (_, key) in enumerate(FIELDS)}
+records.append(rec)
+return records
+
+def add_churn(repo, record):
+"""Add files/added/deleted to one record via `git show --numstat`.
+
+added/deleted are None when the commit is binary-only (git prints '-').
+Mutates and returns the record.
+"""
+out = _run_git(
+["show", "--numstat", "--format=", record["hash"]], repo
+)
+files = 0
+added = 0
+deleted = 0
+saw_binary = False
+for line in out.splitlines():
+line = line.strip()
+if not line:
+continue
+cols = line.split("\t")
+if len(cols) < 3:
+continue
+files += 1
+a, d = cols[0], cols[1]
+if a == "-" or d == "-":
+saw_binary = True
+continue
+try:
+added += int(a)
+deleted += int(d)
+except ValueError:
+saw_binary = True
+record["files"] = files
+# If every changed file was binary, added/deleted are not meaningful.
+if saw_binary and added == 0 and deleted == 0:
+record["added"] = None
+record["deleted"] = None
+else:
+record["added"] = added
+record["deleted"] = deleted
+return record
+
+def _emit(record, out=None):
+"""Write one JSON object as a single line to stdout (or the given stream)."""
+stream = out if out is not None else sys.stdout
+stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+def build_parser():
+p = argparse.ArgumentParser(
+prog="gitlog",
+description="Emit a git history as JSON lines, one object per commit.",
+)
+p.add_argument("--repo", default=".", help="path to the git repo (default:.)")
+p.add_argument("--ref", default="HEAD",
+help="ref/range to log (default: HEAD; e.g. main, v1..v2)")
+p.add_argument("--path", action="append", dest="paths", metavar="P",
+help="restrict to commits touching P (repeatable)")
+p.add_argument("--since", help="git --since passthrough (e.g. '2 weeks ago')")
+p.add_argument("--until", help="git --until passthrough")
+p.add_argument("--author", help="git --author filter passthrough")
+p.add_argument("-n", "--max-count", type=int, default=None,
+help="limit to the most recent N commits")
+p.add_argument("--reverse", action="store_true",
+help="oldest first (default is newest first)")
+p.add_argument("--churn", action="store_true",
+help="add files/added/deleted per commit (one extra git call each)")
+return p
+
+def main(argv=None):
+parser = build_parser()
+args = parser.parse_args(argv)
+
+if args.max_count is not None and args.max_count < 1:
+sys.stderr.write("gitlog: -n must be >= 1\n")
+return 3
+
+try:
+records = read_commits(
+args.repo,
+ref=args.ref,
+paths=args.paths,
+since=args.since,
+until=args.until,
+author=args.author,
+max_count=args.max_count,
+reverse=args.reverse,
+)
+for rec in records:
+if args.churn:
+add_churn(args.repo, rec)
+_emit(rec)
+return 0
+except GitLogError as exc:
+sys.stderr.write("gitlog: %s\n" % exc)
+return exc.code
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_gitlog.py 168 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Tests for gitlog.py — run against a REAL throwaway git repo, not a mock.
+
+The point of a source gift is that it reads a real git log correctly, so the
+tests build an actual repository in a temp dir and assert on the emitted records.
+Each test is written to BITE: it asserts specific values a broken implementation
+would get wrong (field mapping, ordering, churn arithmetic, path filtering),
+not merely that "some output appeared".
+
+Run: python3 test_gitlog.py (exits non-zero if any assertion fails)
+"""
+
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import gitlog
+
+def _git(repo, *args, env=None):
+subprocess.run(["git", "-C", repo] + list(args), check=True,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+def _commit(repo, path, content, message, when):
+"""Write a file and commit it with a fixed author/committer date."""
+full = os.path.join(repo, path)
+os.makedirs(os.path.dirname(full), exist_ok=True) if os.path.dirname(full) else None
+with open(full, "w", encoding="utf-8") as fh:
+fh.write(content)
+_git(repo, "add", path)
+env = dict(os.environ)
+env["GIT_AUTHOR_DATE"] = when
+env["GIT_COMMITTER_DATE"] = when
+env["GIT_AUTHOR_NAME"] = "Ada Lovelace"
+env["GIT_AUTHOR_EMAIL"] = "ada@example.com"
+env["GIT_COMMITTER_NAME"] = "Ada Lovelace"
+env["GIT_COMMITTER_EMAIL"] = "ada@example.com"
+subprocess.run(["git", "-C", repo, "commit", "-m", message],
+check=True, stdout=subprocess.DEVNULL,
+stderr=subprocess.DEVNULL, env=env)
+
+def _make_repo(tmp):
+repo = os.path.join(tmp, "r")
+os.makedirs(repo)
+_git(repo, "init")
+_git(repo, "config", "user.name", "Ada Lovelace")
+_git(repo, "config", "user.email", "ada@example.com")
+# three commits, oldest first
+_commit(repo, "a.txt", "one\ntwo\nthree\n", "first: add a.txt",
+"2026-01-01T09:00:00")
+_commit(repo, "b.txt", "x\n", "second: add b.txt",
+"2026-01-02T09:00:00")
+_commit(repo, "a.txt", "one\ntwo\nthree\nfour\n", "third: extend a.txt",
+"2026-01-03T09:00:00")
+return repo
+
+def _run(argv):
+"""Run main() capturing stdout; return (exit_code, [parsed records])."""
+buf = io.StringIO()
+old = sys.stdout
+sys.stdout = buf
+try:
+code = gitlog.main(argv)
+finally:
+sys.stdout = old
+records = [json.loads(l) for l in buf.getvalue().splitlines() if l.strip()]
+return code, records
+
+RESULTS = []
+
+def check(name, cond):
+RESULTS.append((name, bool(cond)))
+print(("PASS" if cond else "FAIL") + " " + name)
+
+def main():
+tmp = tempfile.mkdtemp(prefix="gitlog-test-")
+repo = _make_repo(tmp)
+
+# 1. count: three commits in, three records out.
+code, recs = _run(["--repo", repo])
+check("emits one record per commit (3)", code == 0 and len(recs) == 3)
+
+# 2. default order is newest-first — the third commit leads.
+check("default order newest-first",
+recs[0]["subject"] == "third: extend a.txt"
+and recs[2]["subject"] == "first: add a.txt")
+
+# 3. --reverse flips to oldest-first. (Bites an ignored --reverse.)
+code, rrecs = _run(["--repo", repo, "--reverse"])
+check("--reverse gives oldest-first",
+rrecs[0]["subject"] == "first: add a.txt"
+and rrecs[2]["subject"] == "third: extend a.txt")
+
+# 4. field mapping: author/email/dates land in the right keys.
+# (Bites a transposed field map — the classic %an/%ae swap.)
+top = recs[0]
+check("author name mapped correctly", top["author"] == "Ada Lovelace")
+check("email mapped correctly", top["email"] == "ada@example.com")
+check("committed date is the fixed ISO date",
+top["committed"].startswith("2026-01-03T09:00:00"))
+check("hash is 40 hex chars", len(top["hash"]) == 40
+and all(c in "0123456789abcdef" for c in top["hash"]))
+check("short is a prefix of hash", top["hash"].startswith(top["short"]))
+
+# 5. no churn fields unless asked. (Bites churn leaking in by default.)
+check("no churn fields by default", "added" not in top and "files" not in top)
+
+# 6. --churn arithmetic: the first commit added 3 lines to a.txt, 0 deleted.
+code, crecs = _run(["--repo", repo, "--reverse", "--churn"])
+first = crecs[0]
+check("churn: files counted", first.get("files") == 1)
+check("churn: added lines correct (3)", first.get("added") == 3)
+check("churn: deleted lines correct (0)", first.get("deleted") == 0)
+# third commit: +1 line, -0 on a.txt
+third = crecs[2]
+check("churn: extend commit added 1", third.get("added") == 1
+and third.get("deleted") == 0)
+
+# 7. --path filters to commits touching that path.
+# a.txt was touched by commits 1 and 3 only (not 2). Bites a broken filter.
+code, precs = _run(["--repo", repo, "--path", "a.txt"])
+subjects = {r["subject"] for r in precs}
+check("--path a.txt selects only its 2 commits",
+len(precs) == 2 and "second: add b.txt" not in subjects)
+
+# 8. -n limits count. Bites an ignored max-count.
+code, nrecs = _run(["--repo", repo, "-n", "1"])
+check("-n 1 yields exactly one record", code == 0 and len(nrecs) == 1)
+
+# 9. not-a-repo is exit 2, not a crash and not exit 0.
+code, _ = _run(["--repo", tmp]) # tmp itself is not a git repo
+check("non-repo path exits 2", code == 2)
+
+# 10. -n 0 is a usage error (exit 3).
+code, _ = _run(["--repo", repo, "-n", "0"])
+check("-n 0 is usage error (exit 3)", code == 3)
+
+# 11. stdout is clean JSON-lines: every emitted line parses as a JSON object.
+code, recs = _run(["--repo", repo])
+check("every line is a JSON object",
+all(isinstance(r, dict) for r in recs) and len(recs) == 3)
+
+# 12. empty range is exit 0 with zero records (not an error).
+code, erecs = _run(["--repo", repo, "--since", "2030-01-01"])
+check("empty result is exit 0, zero records", code == 0 and erecs == [])
+
+# --- meta: the suite must not be vacuous ---
+ran = len(RESULTS)
+passed = sum(1 for _, ok in RESULTS if ok)
+print("\n%d/%d checks passed (%d ran)" % (passed, ran, ran))
+if ran < 12:
+print("VACUITY GUARD FAILED: too few checks ran")
+return 1
+return 0 if passed == ran else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only
+
+---
+
+# Grain — a Loop MMT gift
+https://loopmmt.com/gifts/grain/
+[coverage: optional · branch: gifts]
+
+Structure Smell Test smell ← all gifts
+
+Grain
+
+Compress your data, compare the ratio against a size-matched random null model drawn live, and get a self-calibrating reading of how much structure vs. noise — no hand-set threshold. Snapshot it over time and it becomes a cheap drift alarm.
+
+The honest edge
+
+It's a smell, not a proof — a smoke alarm, not an arson investigator. Great for staleness and homogenization drift; not a data-rot or dead-link checker.
+
+Run it
+
+python3 grain.py --help
+test_grain.py (5/5)
+Python stdlib only
+
+The code — every file that ships
+
+grain.py 315 lines on GitHub →
+#!/usr/bin/env python3
+"""
+grain.py — a self-calibrating structure & drift smell test for any corpus.
+
+Does this text/relation have *grain* — real structure — or is it slurry?
+
+WHAT IT DOES
+It compresses your data with zlib (a Kolmogorov UPPER bound: DEFLATE finds
+repeated substructure) and compares the compression ratio against a
+size-matched, deterministically-seeded RANDOM NULL MODEL built from your own
+data's own symbols. If your data compresses clearly *more* than random
+arrangements of the same symbols, it carries structure a random baseline does
+not — a rule, a template, a hub, a repetition. The threshold is drawn LIVE
+from the null model, so there is no magic number to hand-tune as your data
+grows. That self-calibration is the whole trick.
+
+WHAT IT IS GOOD FOR (graded honestly)
+* Corpus staleness / homogenization drift — its BEST fit. Snapshot the grain
+signature over time; a drift is a near-free staleness/homogenization alarm.
+No labels, no model, no training. (see: --drift)
+* "AI slop" smell — YES, as a SMELL, not a classifier.
+Machine-generated text trends more templated/redundant; rising structure
+against the null is a cheap smoke alarm. A smoke alarm, not an investigator.
+* Detecting a generating rule leaking into a published relation (hub / label
+reuse) — the original use this was extracted from. (see: --relation)
+
+WHAT IT IS *NOT* GOOD FOR
+* Data rot (dead links, broken references, bit-decay). Wrong tool — that is a
+reference-integrity problem; this measures structure, not reachability.
+* A proof of anything. It is a lower-bound SMELL. zlib is an upper bound on
+complexity, so a low ratio proves compressibility, not a specific cause; and
+it is WEAK on chain-shaped rules (a chain reuses each symbol ~twice, like a
+sparse random graph), so a clean reading is not a certificate of "no rule."
+
+Stdlib only. Deterministic (seeded). No dependencies. MIT licensed.
+
+Origin: extracted and generalized from the "non-compressibility gate" in the
+Loop MMT corpus-map builder. The specific application (generator-leak detection
+in a published edge graph) stayed home; this is the general kernel, given away.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import statistics
+import sys
+import zlib
+
+class GrainInputError(Exception):
+"""A clean, user-facing input error (bad path, unreadable baseline).
+
+Raised instead of letting an OSError traceback escape, so adversarial I/O
+fails with a one-line message and a nonzero exit (exit 2) rather than a
+stack trace."""
+
+# --- the one documented knob ------------------------------------------------
+Z_CUT = 2.0 # flag STRUCTURED when the real ratio is > Z sd below the
+# null MEAN — more compressible than random arrangements of
+# its own symbols, beyond normal variation. Self-calibrating
+# (mean+sd drawn live); no absolute number to drift.
+NULL_TRIALS = 64 # deterministic sample size of the random baseline
+NULL_SEED = 0xC0DE # fixed seed => folds-twice-identical (reproducible)
+MIN_SD = 1e-6 # sd-floor: below this the baseline is degenerate and the
+# z-cut is meaningless, so fall back to a coarse fraction.
+DEGENERATE_FRACTION = 0.5 # backstop only when the null baseline has ~no spread
+
+def _zlib_ratio(raw: bytes) -> float:
+"""rho = compressed_len / raw_len at max level. LOW rho => compressible => structure."""
+if not raw:
+return 1.0
+return len(zlib.compress(raw, 9)) / len(raw)
+
+def _serialize(tokens) -> bytes:
+"""
+Canonical bytes for a token sequence: newline-joined, real symbols kept.
+We keep the REAL tokens (never remap to a dense integer alphabet): structure
+manifests as repeated real tokens, and that reuse is exactly the compressible
+signal to catch. The null is serialized identically, so any per-token length
+effect cancels between actual and null.
+"""
+return "\n".join(tokens).encode("utf-8")
+
+def _null_stats(n_tokens, null_draw):
+"""
+zlib-ratio DISTRIBUTION of `NULL_TRIALS` size-matched RANDOM draws from the
+data's own alphabet — NOT a permutation of the same multiset. Drawing fresh
+from the alphabet is what lets a real rule stand out: the actual reuses a hub
+label (`x -> glossary` many times) far more than a uniform draw over the
+alphabet does, so the actual compresses more and its z_score drops. (A
+same-multiset permutation would hold that reuse INSIDE the null and detect
+nothing — the exact bug this replaced.) Deterministic (seeded). Returns
+(mean, population_sd) over the draws.
+
+`null_draw(rng, n)` returns one random size-n token list from the alphabet.
+"""
+if n_tokens < 2:
+return 1.0, 0.0
+rng = random.Random(NULL_SEED)
+ratios = [_zlib_ratio(_serialize(null_draw(rng, n_tokens)))
+for _ in range(NULL_TRIALS)]
+return statistics.mean(ratios), statistics.pstdev(ratios)
+
+def _alphabet_draw(alphabet):
+"""Default null: draw n symbols uniformly (with replacement) from `alphabet`.
+
+The pool is `sorted`, not a bare `list(alphabet)`: a set's iteration order is
+randomized per process (PYTHONHASHSEED), so an unsorted pool made the fixed
+PRNG seed index a differently-ordered pool in every process — same input, two
+processes, different z-score (GIFT-006). Determinism is a whole-pipeline
+property; the seed alone is not enough if upstream ordering is not canonical.
+The relation path already sorts its node pool; this brings the token path to
+the same footing.
+"""
+pool = sorted(alphabet)
+return lambda rng, n: [rng.choice(pool) for _ in range(n)]
+
+def signature(tokens, null_draw=None):
+"""
+The grain signature of a token sequence, self-calibrated against a size-matched
+uniform draw from its own alphabet. `z_score` is sigma below (negative) / above
+the null mean: strongly negative => structured (compresses more than a random
+draw of its size does). Pass `null_draw` to supply a domain-specific null (see
+the relation path); default is a uniform draw over the distinct tokens.
+"""
+tokens = list(tokens)
+if null_draw is None:
+null_draw = _alphabet_draw(set(tokens) or {""})
+rho_actual = _zlib_ratio(_serialize(tokens))
+mean_null, sd_null = _null_stats(len(tokens), null_draw)
+rel = (rho_actual / mean_null) if mean_null else 1.0
+z = ((rho_actual - mean_null) / sd_null) if sd_null > MIN_SD else 0.0
+degenerate = sd_null <= MIN_SD
+if not tokens:
+structured = False
+elif degenerate:
+structured = rho_actual < DEGENERATE_FRACTION * mean_null
+else:
+structured = z < -Z_CUT
+return {
+"tokens": len(tokens),
+"rho_actual": round(rho_actual, 4),
+"mean_null": round(mean_null, 4),
+"sd_null": round(sd_null, 4),
+"rel_to_null": round(rel, 4),
+"z_score": round(z, 3),
+"z_cut": Z_CUT,
+"null_trials": NULL_TRIALS,
+"degenerate_baseline": degenerate,
+"verdict": "STRUCTURED" if structured else "IDIOSYNCRATIC",
+}
+
+# --- input modes ------------------------------------------------------------
+
+def tokens_from_text(text, mode="lines"):
+if mode == "lines":
+return [ln for ln in text.splitlines() if ln.strip()]
+if mode == "words":
+return text.split()
+raise ValueError(f"unknown text mode: {mode}")
+
+def tokens_from_relation(text):
+"""Each non-empty line is an edge `a->b` or `a<TAB>b`; kept as a real token."""
+out = []
+for ln in text.splitlines():
+ln = ln.strip()
+if not ln:
+continue
+if "->" in ln:
+a, b = ln.split("->", 1)
+elif "\t" in ln:
+a, b = ln.split("\t", 1)
+else:
+a, b = ln, ""
+out.append(f"{a.strip()}->{b.strip()}")
+return sorted(out) # canonical order, like the original relation serializer
+
+def relation_null_draw(edge_tokens):
+"""
+Faithful relation null (from the original gate): the alphabet is the NODE set,
+and each null draw is `n` random DISTINCT directed pairs from it. A rule-leak
+(a hub reusing one target node across many edges) sits far below this uniform-
+pair baseline; a genuinely idiosyncratic dependency graph sits inside it.
+"""
+nodes = set()
+for tok in edge_tokens:
+if "->" in tok:
+a, b = tok.split("->", 1)
+nodes.add(a.strip())
+nodes.add(b.strip())
+nodes = sorted(nodes)
+all_pairs = [(a, b) for a in nodes for b in nodes if a!= b]
+
+def draw(rng, n):
+k = min(n, len(all_pairs))
+return [f"{a}->{b}" for a, b in sorted(rng.sample(all_pairs, k))] if k > 0 else []
+
+return draw
+
+def _read(path):
+if path == "-":
+return sys.stdin.read()
+try:
+with open(path, "r", encoding="utf-8", errors="replace") as fh:
+return fh.read()
+except (OSError, IOError) as exc:
+# A clean one-line refusal instead of a traceback: missing file,
+# a directory given as a file, permission denied, etc.
+raise GrainInputError("cannot read %r: %s" % (path, exc.strerror or exc))
+
+HONEST_CEILING = (
+"note: a lower-bound SMELL, never a proof. zlib is an upper bound on "
+"complexity, so a low ratio proves compressibility, not a specific cause; "
+"it is weak on chain-shaped rules; and it says nothing about data rot "
+"(broken references) — that is a different tool."
+)
+
+def main(argv=None):
+p = argparse.ArgumentParser(
+description="Self-calibrating structure & drift smell test for any corpus.",
+epilog=HONEST_CEILING,
+)
+p.add_argument("path", help="file to read, or '-' for stdin")
+p.add_argument("--relation", action="store_true",
+help="treat each line as an edge (a->b) instead of prose")
+p.add_argument("--words", action="store_true",
+help="tokenize prose by words instead of lines")
+p.add_argument("--drift", metavar="BASELINE.json",
+help="compare this input's signature against a saved baseline "
+"and report the change (the staleness alarm)")
+p.add_argument("--save", metavar="OUT.json",
+help="write this input's signature to OUT.json as a baseline")
+p.add_argument("--json", action="store_true", help="machine-readable output")
+args = p.parse_args(argv)
+
+try:
+return _run(args)
+except GrainInputError as exc:
+sys.stderr.write("grain: %s\n" % exc)
+return 2
+
+def _run(args):
+text = _read(args.path)
+if args.relation:
+toks = tokens_from_relation(text)
+sig = signature(toks, null_draw=relation_null_draw(toks))
+else:
+toks = tokens_from_text(text, "words" if args.words else "lines")
+sig = signature(toks)
+
+if args.save:
+try:
+with open(args.save, "w", encoding="utf-8") as fh:
+json.dump(sig, fh, indent=2, sort_keys=True)
+except (OSError, IOError) as exc:
+raise GrainInputError("cannot write %r: %s"
+% (args.save, exc.strerror or exc))
+
+if args.drift:
+try:
+with open(args.drift, "r", encoding="utf-8") as fh:
+base = json.load(fh)
+except (OSError, IOError) as exc:
+raise GrainInputError("cannot read baseline %r: %s"
+% (args.drift, exc.strerror or exc))
+except ValueError as exc:
+raise GrainInputError("baseline %r is not valid JSON: %s"
+% (args.drift, exc))
+delta_z = round(sig["z_score"] - base.get("z_score", 0.0), 3)
+delta_rel = round(sig["rel_to_null"] - base.get("rel_to_null", 1.0), 4)
+drift = {
+"baseline_z": base.get("z_score"),
+"current_z": sig["z_score"],
+"delta_z": delta_z,
+"delta_rel_to_null": delta_rel,
+# more structure than before => drift toward homogenization/staleness
+"reading": ("MORE STRUCTURED than baseline (homogenizing/staling)"
+if delta_z < -0.5 else
+"LESS STRUCTURED than baseline (diversifying)"
+if delta_z > 0.5 else
+"stable (within noise)"),
+}
+if args.json:
+print(json.dumps({"signature": sig, "drift": drift}, indent=2, sort_keys=True))
+else:
+print(f"grain drift: {drift['reading']} (delta_z={delta_z})")
+print(HONEST_CEILING)
+return 0
+
+if args.json:
+print(json.dumps(sig, indent=2, sort_keys=True))
+else:
+print(f"grain: {sig['verdict']} "
+f"(z={sig['z_score']} vs cut -{sig['z_cut']}; "
+f"{sig['tokens']} tokens; rho={sig['rho_actual']} vs null {sig['mean_null']})")
+print(HONEST_CEILING)
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_grain.py 71 lines on GitHub →
+#!/usr/bin/env python3
+"""Tests for grain.py — the discrimination must be real, not a no-op."""
+import json
+import subprocess
+import sys
+import tempfile
+import os
+
+import grain
+
+def test_structured_vs_idiosyncratic():
+# A hub/template: every line reuses the same target token — a generator leak.
+structured = [f"class_{i}->glossary" for i in range(60)]
+# Idiosyncratic: distinct random-ish pairs, little reuse.
+import random
+rng = random.Random(1)
+nodes = [f"n{i}" for i in range(60)]
+idio = sorted({f"{rng.choice(nodes)}->{rng.choice(nodes)}" for _ in range(60)})
+s_struct = grain.signature(structured, null_draw=grain.relation_null_draw(structured))
+s_idio = grain.signature(idio, null_draw=grain.relation_null_draw(idio))
+# The structured set must read more compressible (lower z) than the idiosyncratic.
+assert s_struct["z_score"] < s_idio["z_score"], (s_struct, s_idio)
+assert s_struct["verdict"] == "STRUCTURED", s_struct
+
+def test_determinism():
+toks = [f"a{i}->b{i%7}" for i in range(50)]
+a = grain.signature(toks)
+b = grain.signature(toks)
+assert a == b, "signature must fold-twice-identical (seeded)"
+
+def test_empty_is_not_structured():
+s = grain.signature([])
+assert s["verdict"] == "IDIOSYNCRATIC", s
+
+def test_drift_detects_homogenization():
+diverse = [f"n{i}->m{i}" for i in range(60)] # low structure
+homogd = [f"n{i}->glossary" for i in range(60)] # high structure (hub)
+base = grain.signature(diverse, null_draw=grain.relation_null_draw(diverse))
+now = grain.signature(homogd, null_draw=grain.relation_null_draw(homogd))
+# Homogenized corpus is MORE structured => z drops.
+assert now["z_score"] < base["z_score"]
+
+def test_cli_json_and_honest_ceiling():
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+fh.write("\n".join(f"class_{i}->glossary" for i in range(40)))
+path = fh.name
+try:
+out = subprocess.run(
+[sys.executable, "grain.py", path, "--relation", "--json"],
+capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+)
+assert out.returncode == 0, out.stderr
+data = json.loads(out.stdout)
+assert "verdict" in data and "z_score" in data
+finally:
+os.unlink(path)
+
+if __name__ == "__main__":
+n = 0
+for name, fn in sorted(globals().items()):
+if name.startswith("test_") and callable(fn):
+fn()
+print(f"ok {name}")
+n += 1
+print(f"\n{n}/{n} passed")
+
+Take the whole folder →
+MIT
+Python stdlib only
+
+---
+
+# Grid-sink — a Loop MMT gift
+https://loopmmt.com/gifts/grid-sink/
+[coverage: optional · branch: gifts]
+
+Placed Blocks In, One Grid SVG Out render ← all gifts
+
+Grid-sink
+
+grid-sink places a stream of blocks {row,col,w,h} into a fixed grid and renders it as one standalone, deterministic SVG with zero dependencies — one <rect> per block, painted from a fixed palette by index. It renders no axes, labels, gridlines, or legend, and no text at all — numbers only. Its one distinguishing decision is the DECLARED overflow policy: when the grid is pinned and a block does not fit, the caller declares up front how it is handled — error (refuse the layout), clip (draw the in-grid portion), or skip (omit it) — so overflow is never handled silently by accident. Same blocks + grid + policy in -> byte-identical SVG out.
+
+The honest edge
+
+grid-sink is a grid-placement primitive, not a layout engine: one <rect> per block at integer (row,col) spanning (w,h) cells, painted from a fixed named palette by index, NUMBERS ONLY (no text-escaping surface), no axes/labels/gridlines/legend, no fonts/script. Its ONE distinguishing decision is the DECLARED OVERFLOW POLICY — a block that exceeds a pinned grid is handled the way the caller declared: error (default, Fit-by-Construction), clip, or skip; never silently. Blocks draw in input order (painter’s order). Bad coord/span, unknown palette, or unknown overflow policy -> hard error. Same blocks + grid + policy in -> byte-identical SVG out.
+
+Run it
+
+printf "[0,0,1,1]
+[1,1,2,1]
+" | node grid-sink.js # a grid SVG (--cols/--rows to pin · --overflow error|clip|skip · --cell N · --palette loop|mono|warm|cool)
+test_grid-sink.js (12/12, out-of-band hand-computed SVG oracle across all 3 overflow branches) + Plumb conformance GREEN (I1-I5, I3=closed-palette+no-text, signed, clock-independent)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+grid-sink.js 257 lines on GitHub →
+#!/usr/bin/env node
+/*
+* grid-sink — place blocks into a FIXED grid and render it as a deterministic SVG, no deps.
+* MIT · zero-dependency · standalone gift · lane: sink (consumes placed blocks, emits an SVG).
+*
+* THE PRINTED EDGE (read before trusting the output):
+* This is a grid-placement primitive, not a layout engine. Each input is a block placed at an
+* integer (row,col) spanning (w,h) cells; the gift draws one <rect> per block into a fixed grid,
+* painting from a fixed named palette by block index. It renders NO axes, labels, gridlines,
+* legend, or text — NUMBERS ONLY, so there is no text-escaping surface. Its ONE distinguishing
+* decision is the DECLARED OVERFLOW POLICY: when the grid is pinned (fixed cols/rows) and a block
+* would extend past it, the caller declares up front how that is handled — "error" (the default:
+* refuse the layout, Fit-by-Construction), "clip" (draw only the in-grid portion), or "skip"
+* (omit the block). Overflow is never handled silently by accident; it is always the policy the
+* caller named. Blocks draw in INPUT ORDER (painter's order — a later block overlaps an earlier
+* one). A non-finite/negative/non-integer coordinate, a non-positive span, an unknown palette, or
+* an unknown overflow policy is a HARD ERROR. Same blocks + same grid + same policy in →
+* byte-identical SVG out.
+*
+* USAGE:
+* printf '[0,0,1,1]\n[1,1,2,1]\n' | node grid-sink.js # auto-fit grid
+* echo '{"blocks":[[0,0,3,1]],"cols":2,"rows":2,"overflow":"clip"}' | node grid-sink.js
+* node grid-sink.js --help
+*
+* INPUT (stdin): either
+* - JSONL — one block per line, each [row,col,w,h] or {"row":R,"col":C,"w":W,"h":H}
+* - a single JSON spec object { blocks, cols, rows, cell, pad, palette, overflow}
+* row,col are non-negative integers; w,h are positive integers.
+* CLI flags (--cols --rows --cell --pad --palette --overflow) OVERRIDE object fields.
+*
+* OUTPUT (stdout): one SVG document string (UTF-8), trailing newline. No blocks → an empty frame.
+*
+* DETERMINISM: integer cell coordinates (no float in the output), stable attribute order, blocks in
+* input order, fixed palette by index. Same blocks + grid + policy → same bytes, Node or browser.
+*/
+'use strict';
+
+// ---- palettes (the ONLY source of block color; no free-form color input) --------
+var PALETTES = {
+loop: ['#2f6f8f', '#c25b3a', '#4a8a52', '#8a6d3b', '#6d4a8a', '#3b6d8a'],
+mono: ['#111111', '#555555', '#999999', '#bbbbbb'],
+warm: ['#c25b3a', '#d98a3a', '#b23b3b', '#8a5a2b'],
+cool: ['#2f6f8f', '#4a8a8a', '#3b5a8a', '#5a6d8a']
+};
+var OVERFLOW = ['error', 'clip', 'skip']; // the DECLARED policy set (closed)
+var DEFAULTS = { cell: 20, pad: 2, palette: 'loop', overflow: 'error'};
+
+// ---- validation helpers --------------------------------------------------------
+function nonNegInt(v, i, name) {
+if (typeof v!== 'number' ||!isFinite(v) || Math.floor(v)!== v || v < 0) {
+throw new Error('block[' + i + '] ' + name + ' must be a non-negative integer, got ' + JSON.stringify(v));
+}
+return v;
+}
+function posInt(v, i, name) {
+if (typeof v!== 'number' ||!isFinite(v) || Math.floor(v)!== v || v <= 0) {
+throw new Error('block[' + i + '] ' + name + ' must be a positive integer, got ' + JSON.stringify(v));
+}
+return v;
+}
+function posIntOpt(v, dflt, name) {
+if (v == null) return dflt;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n <= 0) throw new Error(name + ' must be a positive integer, got ' + JSON.stringify(v));
+return n;
+}
+function nonNegIntOpt(v, name) {
+if (v == null) return null;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n < 0) throw new Error(name + ' must be a non-negative integer, got ' + JSON.stringify(v));
+return n;
+}
+
+// ---- one block -> {row,col,w,h} (accepts [row,col,w,h] or {row,col,w,h}) --------
+function asBlock(raw, i) {
+var row, col, w, h;
+if (Array.isArray(raw)) {
+if (raw.length!== 4) throw new Error('block[' + i + '] array must be [row,col,w,h] (4 fields), got ' + JSON.stringify(raw));
+row = raw[0]; col = raw[1]; w = raw[2]; h = raw[3];
+} else if (raw && typeof raw === 'object') {
+if (!('row' in raw) ||!('col' in raw) ||!('w' in raw) ||!('h' in raw)) {
+throw new Error('block[' + i + '] object must have row,col,w,h, got ' + JSON.stringify(raw));
+}
+row = raw.row; col = raw.col; w = raw.w; h = raw.h;
+} else {
+throw new Error('block[' + i + '] must be [row,col,w,h] or {row,col,w,h}, got ' + JSON.stringify(raw));
+}
+nonNegInt(row, i, 'row'); nonNegInt(col, i, 'col'); posInt(w, i, 'w'); posInt(h, i, 'h');
+return { row: row, col: col, w: w, h: h};
+}
+
+// ---- input normalization -------------------------------------------------------
+function normalize(input, flags) {
+var spec = {};
+var blocksRaw;
+if (input &&!Array.isArray(input) && typeof input === 'object') {
+blocksRaw = input.blocks;
+if (input.cols!= null) spec.cols = input.cols;
+if (input.rows!= null) spec.rows = input.rows;
+if (input.cell!= null) spec.cell = input.cell;
+if (input.pad!= null) spec.pad = input.pad;
+if (input.palette!= null) spec.palette = input.palette;
+if (input.overflow!= null) spec.overflow = input.overflow;
+} else {
+blocksRaw = input;
+}
+flags = flags || {};
+for (var k in flags) if (flags[k]!= null) spec[k] = flags[k];
+
+if (blocksRaw == null) blocksRaw = [];
+if (!Array.isArray(blocksRaw)) throw new Error('input has no blocks (expected [[row,col,w,h],...] or a {blocks:...} object)');
+spec.blocks = blocksRaw.map(asBlock);
+spec.cell = posIntOpt(spec.cell, DEFAULTS.cell, 'cell');
+spec.pad = (spec.pad!= null)? nonNegIntOpt(spec.pad, 'pad'): DEFAULTS.pad;
+spec.palette = (spec.palette!= null)? String(spec.palette): DEFAULTS.palette;
+spec.overflow = (spec.overflow!= null)? String(spec.overflow): DEFAULTS.overflow;
+spec.cols = nonNegIntOpt(spec.cols, 'cols'); // null => auto-fit
+spec.rows = nonNegIntOpt(spec.rows, 'rows');
+if (!PALETTES[spec.palette]) throw new Error('unknown palette "' + spec.palette + '" (expected ' + Object.keys(PALETTES).join(' | ') + ')');
+if (OVERFLOW.indexOf(spec.overflow) === -1) throw new Error('unknown overflow policy "' + spec.overflow + '" (expected ' + OVERFLOW.join(' | ') + ')');
+return spec;
+}
+
+// ---- grid dimensions: pinned (declared) or auto-fit to the blocks ---------------
+function gridDims(spec) {
+var cols = spec.cols, rows = spec.rows;
+if (cols == null || rows == null) {
+var mc = 0, mr = 0;
+for (var i = 0; i < spec.blocks.length; i++) {
+var b = spec.blocks[i];
+if (b.col + b.w > mc) mc = b.col + b.w;
+if (b.row + b.h > mr) mr = b.row + b.h;
+}
+if (cols == null) cols = mc;
+if (rows == null) rows = mr;
+}
+return { cols: cols, rows: rows};
+}
+
+// ---- apply the DECLARED overflow policy to one block ----------------------------
+// returns a {row,col,w,h} to draw, or null to omit — or throws (policy "error").
+function fit(b, i, cols, rows, policy) {
+var overRight = b.col + b.w > cols;
+var overBottom = b.row + b.h > rows;
+var outside = b.col >= cols || b.row >= rows;
+if (!overRight &&!overBottom) return b; // fits — nothing to decide
+if (policy === 'error') {
+throw new Error('block[' + i + '] at (row ' + b.row + ', col ' + b.col + ') size ' + b.w + 'x' + b.h +
+' exceeds the fixed ' + cols + 'x' + rows + ' grid (overflow policy "error")');
+}
+if (policy === 'skip') return null; // omit the whole block
+// policy === 'clip': draw only the in-grid portion.
+if (outside) return null; // entirely outside -> nothing to draw
+var w = Math.min(b.w, cols - b.col);
+var h = Math.min(b.h, rows - b.row);
+if (w <= 0 || h <= 0) return null;
+return { row: b.row, col: b.col, w: w, h: h};
+}
+
+// ---- core: grid(input, flags) -> string (pure, the whole gift) -----------------
+function grid(input, flags) {
+var spec = normalize(input, flags);
+var cell = spec.cell, pad = spec.pad, pal = PALETTES[spec.palette];
+var dims = gridDims(spec);
+var W = 2 * pad + dims.cols * cell;
+var H = 2 * pad + dims.rows * cell;
+
+var body = [];
+for (var i = 0; i < spec.blocks.length; i++) { // painter's order = input order
+var drawn = fit(spec.blocks[i], i, dims.cols, dims.rows, spec.overflow);
+if (drawn == null) continue;
+var x = pad + drawn.col * cell, y = pad + drawn.row * cell;
+var w = drawn.w * cell, h = drawn.h * cell;
+var color = pal[i % pal.length];
+body.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" fill="' + color + '" />');
+}
+
+var open = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '">';
+return open + '\n' + (body.length? body.join('\n') + '\n': '') + '</svg>\n';
+}
+
+// ---- exports -------------------------------------------------------------------
+if (typeof window!== 'undefined') {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts['grid-sink'] = { grid: grid, PALETTES: PALETTES, OVERFLOW: OVERFLOW};
+}
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { grid: grid, normalize: normalize, gridDims: gridDims, fit: fit, PALETTES: PALETTES, OVERFLOW: OVERFLOW};
+}
+
+// ---- cli -----------------------------------------------------------------------
+var HELP =
+'grid-sink — place blocks into a FIXED grid -> a standalone, deterministic SVG, zero deps.\n\n' +
+" printf '[0,0,1,1]\\n[1,1,2,1]\\n' | node grid-sink.js\n" +
+" echo '{\"blocks\":[[0,0,3,1]],\"cols\":2,\"rows\":2,\"overflow\":\"clip\"}' | node grid-sink.js\n\n" +
+'INPUT (stdin): JSONL of [row,col,w,h] or {row,col,w,h} blocks (one per line), OR a {blocks,...}\n' +
+'spec object. Flags (override object fields): --cols N --rows N --cell N --pad N\n' +
+' --palette loop|mono|warm|cool --overflow error|clip|skip\n\n' +
+'One <rect> per block, painted from a fixed palette by index; NUMBERS ONLY (no text surface). With a\n' +
+'PINNED grid, a block that exceeds it is handled by the DECLARED overflow policy: error (default) |\n' +
+'clip | skip. Auto-fit grid (no --cols/--rows) never overflows. Bad coord/span, unknown palette, or\n' +
+'unknown overflow policy -> hard error.\n';
+
+function parseFlags(argv) {
+var f = {};
+for (var i = 0; i < argv.length; i++) {
+var a = argv[i];
+if (a === '--cols') f.cols = Number(argv[++i]);
+else if (a === '--rows') f.rows = Number(argv[++i]);
+else if (a === '--cell') f.cell = Number(argv[++i]);
+else if (a === '--pad') f.pad = Number(argv[++i]);
+else if (a === '--palette') f.palette = argv[++i];
+else if (a === '--overflow') f.overflow = argv[++i];
+}
+return f;
+}
+
+function parseStdin(raw) {
+var trimmed = raw.trim();
+if (trimmed === '') return { blocks: []};
+if (trimmed.charAt(0) === '{') {
+try {
+var obj = JSON.parse(trimmed);
+if (obj &&!Array.isArray(obj) && typeof obj === 'object' && 'blocks' in obj) return obj;
+} catch (e) { /* fall through to JSONL */}
+}
+var blocks = [];
+var lines = trimmed.split('\n');
+for (var i = 0; i < lines.length; i++) {
+var ln = lines[i].trim();
+if (ln === '') continue;
+var b;
+try { b = JSON.parse(ln);}
+catch (e) { throw new Error('line ' + (i + 1) + ' is not valid JSON: ' + e.message);}
+blocks.push(b);
+}
+return { blocks: blocks};
+}
+
+function main() {
+var argv = process.argv.slice(2);
+if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) { process.stdout.write(HELP); return;}
+var flags = parseFlags(argv);
+var chunks = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (d) { chunks += d;});
+process.stdin.on('end', function () {
+var input;
+try { input = parseStdin(chunks);}
+catch (e) { process.stderr.write('grid-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+var svg;
+try { svg = grid(input, flags);}
+catch (e) { process.stderr.write('grid-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+process.stdout.write(svg);
+});
+}
+if (typeof require!== 'undefined' && require.main === module) { main();}
+
+test_grid-sink.js 118 lines on GitHub →
+#!/usr/bin/env node
+/*
+* test_grid-sink.js — drift-check battery for the grid-sink gift.
+*
+* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The expected SVG documents below are hand-computed from
+* the documented geometry — a block at (row,col) spanning (w,h) draws a <rect> at (pad+col*cell,
+* pad+row*cell) sized (w*cell,h*cell); grid W=2*pad+cols*cell, H=2*pad+rows*cell (cell=20,pad=2);
+* fill = PALETTES.loop[blockIndex]; the DECLARED overflow policy (error|clip|skip) decides a block
+* that exceeds a pinned grid — written independently of the emitter. A build cannot certify itself.
+* The char-of-this-gift is the overflow policy, so the battery pins all three branches explicitly.
+*
+* Run: node test_grid-sink.js (exit 0 = all pass; nonzero = a named failure)
+*/
+'use strict';
+const assert = require('assert');
+const { grid, PALETTES} = require('./grid-sink.js');
+
+let n = 0, passed = 0;
+function check(name, fn) {
+n++;
+try { fn(); passed++; console.log(' ok ' + name);}
+catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
+}
+
+const TWO =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 44" width="64" height="44">\n' +
+'<rect x="2" y="2" width="20" height="20" fill="#2f6f8f" />\n' +
+'<rect x="22" y="22" width="40" height="20" fill="#c25b3a" />\n' +
+'</svg>\n';
+
+// 1 — two blocks, auto-fit grid (cols=3,rows=2); rect per block, palette by index.
+check('two blocks, auto grid -> one rect each, palette by index', () => {
+assert.strictEqual(grid({ blocks: [[0,0,1,1],[1,1,2,1]]}), TWO);
+});
+
+// 2 — overflow "clip": a block wider than the pinned grid is drawn clipped to bounds.
+check('overflow clip: 3-wide block in a 2-wide grid -> clipped to 2 cells', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">\n' +
+'<rect x="2" y="2" width="40" height="20" fill="#2f6f8f" />\n' +
+'</svg>\n';
+assert.strictEqual(grid({ blocks: [[0,0,3,1]], cols: 2, rows: 2, overflow: 'clip'}), exp);
+});
+
+// 3 — overflow "skip": a block starting outside the grid is omitted entirely.
+check('overflow skip: block at col 3 in a 2-col grid -> omitted', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">\n' +
+'<rect x="2" y="2" width="20" height="20" fill="#2f6f8f" />\n' +
+'</svg>\n';
+assert.strictEqual(grid({ blocks: [[0,0,1,1],[0,3,1,1]], cols: 2, rows: 2, overflow: 'skip'}), exp);
+});
+
+// 4 — overflow "error" (the default): an overflowing block on a pinned grid THROWS.
+check('overflow error (default): overflowing block throws, naming the grid', () => {
+assert.throws(() => grid({ blocks: [[0,0,3,1]], cols: 2, rows: 2}),
+/block\[0\] at \(row 0, col 0\) size 3x1 exceeds the fixed 2x2 grid \(overflow policy "error"\)/);
+});
+
+// 5 — pinned empty grid -> an empty frame of the declared size.
+check('pinned empty grid -> empty 2x2 frame', () => {
+assert.strictEqual(grid({ blocks: [], cols: 2, rows: 2}),
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">\n</svg>\n');
+});
+
+// 6 — empty auto grid -> a minimal frame (cols=rows=0).
+check('empty auto grid -> minimal frame', () => {
+assert.strictEqual(grid({ blocks: []}),
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4" width="4" height="4">\n</svg>\n');
+});
+
+// 7 — object-form block + custom cell size render identically to the array form.
+check('object-form block + --cell 10', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">\n' +
+'<rect x="2" y="2" width="20" height="20" fill="#2f6f8f" />\n' +
+'</svg>\n';
+assert.strictEqual(grid({ blocks: [{ row:0, col:0, w:2, h:2}], cell: 10}), exp);
+});
+
+// 8 — I3 closed palette + no text: every fill is a palette color; no <text>/<script>.
+check('closed palette + no text', () => {
+const out = grid({ blocks: [[0,0,1,1],[1,0,1,1],[2,0,1,1]]});
+assert.ok(!/<text|<script|<style|font/.test(out), 'no text/script/style/font');
+const closed = new Set(Object.values(PALETTES).flat());
+const fills = (out.match(/fill="([^"]*)"/g) || []).map(s => s.slice(6, -1));
+assert.ok(fills.length === 3 && fills.every(f => closed.has(f)), 'every fill in the closed palette');
+});
+
+// 9 — determinism: same blocks + grid + policy -> byte-identical, twice.
+check('determinism: repeated render is byte-identical', () => {
+const s = { blocks: [[0,0,2,1],[1,0,1,2],[0,2,1,1]], cols: 3, rows: 3};
+assert.strictEqual(grid(s), grid(s));
+});
+
+// 10 — bad coordinate / span are hard, named errors.
+check('bad coord/span throws, naming the block', () => {
+assert.throws(() => grid({ blocks: [[0,-1,1,1]]}), /block\[0\] col must be a non-negative integer/);
+assert.throws(() => grid({ blocks: [[0,0,0,1]]}), /block\[0\] w must be a positive integer/);
+assert.throws(() => grid({ blocks: [[NaN,0,1,1]]}), /block\[0\] row must be a non-negative integer/);
+});
+
+// 11 — unknown palette / unknown overflow policy throw (never a silent fallback).
+check('unknown palette / overflow throws', () => {
+assert.throws(() => grid({ blocks: [[0,0,1,1]], palette: 'nope'}), /unknown palette/);
+assert.throws(() => grid({ blocks: [[0,0,1,1]], overflow: 'nope'}), /unknown overflow policy/);
+});
+
+// 12 — mutation bite (non-vacuity): a wrong-color SVG is rejected.
+check('mutation bite: a wrong-color SVG is rejected', () => {
+const wrong = TWO.replace('fill="#c25b3a"', 'fill="#4a8a52"');
+const got = grid({ blocks: [[0,0,1,1],[1,1,2,1]]});
+assert.strictEqual(got, TWO);
+assert.notStrictEqual(got, wrong);
+});
+
+console.log('\n' + passed + '/' + n + ' passed');
+if (passed!== n) process.exit(1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
 
 ---
 
@@ -415,984 +1673,5 @@ process.exitCode = fail === 0? 0: 1;
 Take the whole folder →
 MIT
 Node / browser, no dependencies
-
----
-
-# Heatmap-sink — a Loop MMT gift
-https://loopmmt.com/gifts/heatmap-sink/
-[coverage: optional · branch: gifts]
-
-Cells In, One Heatmap SVG Out render ← all gifts
-
-Heatmap-sink
-
-heatmap-sink turns a stream of (x,y,value) cells into one standalone, deterministic heatmap SVG with zero dependencies — one <rect> per grid cell, painted from a fixed 5-bucket color scale. It renders no axes, labels, legend, colorbar, or title — only the field — so it drops straight into a README, a report, or a CI comment where a plotting library would be overkill. The load-bearing property: integer grid coordinates and INTEGER color buckets mean no float ever reaches the output, and cells are drawn row-major regardless of arrival order, so the same set of cells produces byte-identical SVG out — in Node or a browser, committable and diffable.
-
-The honest edge
-
-heatmap-sink is a grid-of-rects heatmap primitive, not a plotting library: one <rect> per (x,y) cell, no axes, labels, legend, colorbar, or title, no fonts/CSS/script. It takes NUMBERS ONLY — (x,y,v) triples — so no caller text reaches the output and there is no escaping surface. Colors come from a fixed named 5-bucket scale (missing cells take a fixed empty fill) — never caller-chosen. Two values in the same band draw the SAME color: it shows the FIELD, not the exact magnitude. A non-finite value, a bad coordinate, or a duplicate (x,y) is a hard error, never a guessed cell. Same cells in → byte-identical SVG out, independent of order.
-
-Run it
-
-printf '[0,0,0]\n[1,0,1]\n[0,1,2]\n[1,1,3]\n' | node heatmap-sink.js # a 2x2 heatmap SVG (--palette heat|cool|mono|viridis · --cell N · --min/--max to pin)
-test_heatmap-sink.js (16/16, out-of-band hand-computed SVG oracle) + Plumb conformance GREEN (I1-I5, signed, clock-independent)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-heatmap-sink.js 314 lines on GitHub →
-#!/usr/bin/env node
-/*
-* heatmap-sink — turn (x,y,v) cells into one standalone, deterministic heatmap SVG, no deps.
-* MIT · zero-dependency · standalone gift · lane: sink (consumes data, emits an artifact).
-*
-* THE PRINTED EDGE (read before trusting the output):
-* This is a GRID-OF-RECTS heatmap primitive, not a plotting library. It draws GEOMETRY
-* ONLY — one <rect> per (x,y) grid cell inside a plain <svg> frame. It renders NO axes,
-* tick marks, tick labels, legend, colorbar, title, or interactivity, and it embeds NO
-* fonts, NO CSS, and NO <script>. It takes NUMBERS ONLY — (x,y,v) triples — so no caller
-* text ever reaches the output, and there is no text-escaping surface to get wrong.
-* Colors are NOT free-form input: each cell is painted from a fixed, named, DISCRETE color
-* scale (value → one of N buckets across the data's [min,max]), and missing cells take a
-* fixed empty fill — so the output can never carry an attacker-chosen attribute string.
-* Because there are only N buckets, two values in the same band draw the SAME color: it
-* shows the FIELD, not the exact magnitude, and it is not a substitute for the number. A
-* non-finite v, a non-integer or negative coordinate, a duplicate (x,y), or a cell outside
-* a pinned grid is a HARD ERROR, never silently dropped or guessed. Output is a PURE
-* FUNCTION of the input, independent of cell ORDER: same cells in → byte-identical SVG out.
-*
-* USAGE:
-* printf '[0,0,0]\n[1,0,1]\n[0,1,2]\n[1,1,3]\n' | node heatmap-sink.js # 2x2 heatmap
-* printf '{"x":0,"y":0,"v":9}\n' | node heatmap-sink.js # object cells
-* printf '[0,0,5]\n[1,0,5]\n' | node heatmap-sink.js --palette cool --min 0 --max 10
-* echo '{"cells":[[0,0,1],[1,1,9]],"palette":"mono"}' | node heatmap-sink.js # spec object
-* node heatmap-sink.js --help
-*
-* INPUT (stdin): either
-* - JSONL — one cell per line, each `[x,y,v]` or `{"x":X,"y":Y,"v":V}` (the streaming form)
-* - a single JSON spec object { cells, min, max, palette, cell, cols, rows, empty}
-* x,y are NON-NEGATIVE INTEGER grid coordinates (column, row); v is a finite number.
-* CLI flags (--palette --cell --min --max --cols --rows --empty) OVERRIDE object fields.
-*
-* OUTPUT (stdout): one SVG document string (UTF-8), trailing newline. No cells → an empty frame.
-*
-* DETERMINISM: integer grid coordinates, integer cell size, INTEGER color buckets, cells drawn
-* in row-major order regardless of input order, 3-decimal coordinate precision, stable
-* attribute order. No wall-clock, no randomness. Same cells → same bytes, in Node or a browser.
-* PORTABILITY: pure JS on plain arrays/strings — identical in Node and the browser.
-*/
-'use strict';
-
-// ---- color scales (the ONLY source of cell color; no free-form color input) -----
-// Named, closed sets of N=5 discrete colors, low value → high value. A value v is painted
-// SCALES[name][level(v)]; level is an integer bucket, so no float ever reaches the output.
-var N_BUCKETS = 5;
-var SCALES = {
-heat: ['#ffffcc', '#fed976', '#fd8d3c', '#e31a1c', '#800026'], // light yellow → deep red
-cool: ['#f7fbff', '#c6dbef', '#6baed6', '#2171b5', '#08306b'], // light → deep blue
-mono: ['#f7f7f7', '#cccccc', '#969696', '#636363', '#252525'], // light → dark gray
-viridis: ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725'] // dark purple → yellow
-};
-// Empty (missing) cells: a closed choice, never caller free-form. 'none' omits the rect.
-var EMPTY_FILLS = { light: '#eeeeee', dark: '#333333', none: null};
-var DEFAULTS = { palette: 'heat', cell: 16, empty: 'light'};
-
-// ---- deterministic number formatting (verbatim from svg-sink) -------------------
-// Round to 3 decimals, strip trailing zeros (and a bare trailing dot), normalize -0.
-var PRECISION = 3, SCALE = 1000;
-function num(x) {
-var r = Math.round(x * SCALE) / SCALE;
-var s = r.toFixed(PRECISION);
-s = s.replace(/\.?0+$/, '');
-return (s === '' || s === '-0')? '0': s;
-}
-
-// ---- validation helpers --------------------------------------------------------
-function finiteV(v, x, y) {
-if (typeof v!== 'number' ||!isFinite(v)) {
-throw new Error('cell (' + x + ',' + y + ') value is not a finite number: ' + JSON.stringify(v));
-}
-return v;
-}
-function coord(c, which, cellRepr) {
-if (typeof c!== 'number' ||!isFinite(c) || Math.floor(c)!== c) {
-throw new Error(which + ' coordinate must be a non-negative integer, got ' + JSON.stringify(c) + ' in cell ' + cellRepr);
-}
-if (c < 0) throw new Error(which + ' coordinate must be a non-negative integer, got ' + JSON.stringify(c) + ' in cell ' + cellRepr);
-return c;
-}
-function posInt(v, dflt, name) {
-if (v == null) return dflt;
-var n = Number(v);
-if (!isFinite(n) || Math.floor(n)!== n || n <= 0) throw new Error(name + ' must be a positive integer, got ' + JSON.stringify(v));
-return n;
-}
-function nonNegIntOrNull(v, name) {
-if (v == null) return null;
-var n = Number(v);
-if (!isFinite(n) || Math.floor(n)!== n || n < 0) throw new Error(name + ' must be a non-negative integer, got ' + JSON.stringify(v));
-return n;
-}
-
-// ---- one cell -> {x,y,v} (accepts [x,y,v] or {x,y,v}) --------------------------
-function asCell(raw) {
-var repr = JSON.stringify(raw);
-var x, y, v;
-if (Array.isArray(raw)) {
-if (raw.length!== 3) throw new Error('cell array must be [x,y,v] (3 numbers), got ' + repr);
-x = raw[0]; y = raw[1]; v = raw[2];
-} else if (raw && typeof raw === 'object') {
-if (!('x' in raw) ||!('y' in raw) ||!('v' in raw)) throw new Error('cell object must have x,y,v, got ' + repr);
-x = raw.x; y = raw.y; v = raw.v;
-} else {
-throw new Error('cell must be [x,y,v] or {x,y,v}, got ' + repr);
-}
-coord(x, 'x', repr); coord(y, 'y', repr); finiteV(v, x, y);
-return { x: x, y: y, v: v};
-}
-
-// ---- scale (shared value-domain across all cells; shape from svg-sink/sparkline) --
-function domain(values, min, max) {
-var lo = (min!= null)? Number(min): Infinity;
-var hi = (max!= null)? Number(max): -Infinity;
-if (min == null || max == null) {
-for (var i = 0; i < values.length; i++) {
-var v = values[i];
-if (min == null && v < lo) lo = v;
-if (max == null && v > hi) hi = v;
-}
-}
-if (!isFinite(lo)) lo = 0;
-if (!isFinite(hi)) hi = 0;
-if (lo === hi) { lo -= 1; hi += 1;} // flat field -> unit window, painted mid-scale
-return { lo: lo, hi: hi};
-}
-function level(v, lo, hi) {
-var k = Math.floor(((v - lo) / (hi - lo)) * N_BUCKETS);
-if (k < 0) k = 0;
-if (k >= N_BUCKETS) k = N_BUCKETS - 1; // v == hi -> N clamps to N-1
-return k;
-}
-
-// ---- input normalization -------------------------------------------------------
-// Accept: [[x,y,v],...] | [{x,y,v},...] | {cells,...}. Return a validated spec.
-function normalize(input, flags) {
-var spec = {};
-var cellsRaw;
-if (input &&!Array.isArray(input) && typeof input === 'object') {
-cellsRaw = input.cells;
-if (input.min!= null) spec.min = input.min;
-if (input.max!= null) spec.max = input.max;
-if (input.palette!= null) spec.palette = input.palette;
-if (input.cell!= null) spec.cell = input.cell;
-if (input.cols!= null) spec.cols = input.cols;
-if (input.rows!= null) spec.rows = input.rows;
-if (input.empty!= null) spec.empty = input.empty;
-} else {
-cellsRaw = input;
-}
-flags = flags || {};
-for (var k in flags) if (flags[k]!= null) spec[k] = flags[k];
-
-if (cellsRaw == null) cellsRaw = [];
-if (!Array.isArray(cellsRaw)) throw new Error('input has no cells (expected [[x,y,v],...] or a {cells:...} object)');
-
-var cells = cellsRaw.map(asCell);
-
-spec.palette = (spec.palette!= null)? String(spec.palette): DEFAULTS.palette;
-spec.empty = (spec.empty!= null)? String(spec.empty): DEFAULTS.empty;
-spec.cell = posInt(spec.cell, DEFAULTS.cell, 'cell');
-spec.pinCols = nonNegIntOrNull(spec.cols, 'cols');
-spec.pinRows = nonNegIntOrNull(spec.rows, 'rows');
-if (spec.min!= null) spec.min = numOrThrow(spec.min, 'min');
-if (spec.max!= null) spec.max = numOrThrow(spec.max, 'max');
-if (spec.min!= null && spec.max!= null && spec.min >= spec.max) {
-throw new Error('min must be < max (got min=' + spec.min + ', max=' + spec.max + ')');
-}
-if (!SCALES[spec.palette]) throw new Error('unknown palette "' + spec.palette + '" (expected ' + Object.keys(SCALES).join(' | ') + ')');
-if (!(spec.empty in EMPTY_FILLS)) throw new Error('unknown empty "' + spec.empty + '" (expected ' + Object.keys(EMPTY_FILLS).join(' | ') + ')');
-
-// build the cell map; a duplicate (x,y) is a HARD error (ambiguous cell, no silent last-wins)
-var mapKey = {}, maxX = -1, maxY = -1;
-for (var i = 0; i < cells.length; i++) {
-var c = cells[i], key = c.x + ',' + c.y;
-if (Object.prototype.hasOwnProperty.call(mapKey, key)) {
-throw new Error('duplicate cell at (' + c.x + ',' + c.y + ') — each grid position may appear at most once');
-}
-mapKey[key] = c.v;
-if (c.x > maxX) maxX = c.x;
-if (c.y > maxY) maxY = c.y;
-}
-var cols = (spec.pinCols!= null)? spec.pinCols: maxX + 1;
-var rows = (spec.pinRows!= null)? spec.pinRows: maxY + 1;
-if (spec.pinCols!= null && maxX >= spec.pinCols) throw new Error('cell x=' + maxX + ' is outside the pinned grid cols=' + spec.pinCols);
-if (spec.pinRows!= null && maxY >= spec.pinRows) throw new Error('cell y=' + maxY + ' is outside the pinned grid rows=' + spec.pinRows);
-if (cols < 0) cols = 0;
-if (rows < 0) rows = 0;
-
-spec.cellMap = mapKey;
-spec.cols = cols;
-spec.rows = rows;
-spec.values = cells.map(function (c) { return c.v;});
-return spec;
-}
-function numOrThrow(v, name) {
-var n = Number(v);
-if (typeof n!== 'number' ||!isFinite(n)) throw new Error(name + ' must be a finite number, got ' + JSON.stringify(v));
-return n;
-}
-
-// ---- core: renderHeatmap(spec) -> string (pure, the whole gift) ----------------
-function heatmap(input, flags) {
-var spec = normalize(input, flags);
-var cell = spec.cell, cols = spec.cols, rows = spec.rows;
-var W = cols * cell, H = rows * cell;
-var scale = SCALES[spec.palette];
-var emptyFill = EMPTY_FILLS[spec.empty]; // may be null (omit empty rects)
-var dom = domain(spec.values, spec.min, spec.max);
-
-var body = [];
-// row-major order — INPUT-ORDER-INDEPENDENT and deterministic.
-for (var y = 0; y < rows; y++) {
-for (var x = 0; x < cols; x++) {
-var key = x + ',' + y;
-var fill;
-if (Object.prototype.hasOwnProperty.call(spec.cellMap, key)) {
-fill = scale[level(spec.cellMap[key], dom.lo, dom.hi)];
-} else if (emptyFill == null) {
-continue; // 'none' -> omit the rect entirely
-} else {
-fill = emptyFill;
-}
-body.push('<rect x="' + num(x * cell) + '" y="' + num(y * cell) +
-'" width="' + num(cell) + '" height="' + num(cell) + '" fill="' + fill + '" />');
-}
-}
-
-// Fixed attribute order; xmlns first so the fragment is a valid standalone document.
-var open = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '">';
-return open + '\n' + (body.length? body.join('\n') + '\n': '') + '</svg>\n';
-}
-
-// ---- exports (browser attach · require · direct run) ---------------------------
-if (typeof window!== 'undefined') {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts['heatmap-sink'] = { heatmap: heatmap, SCALES: SCALES, EMPTY_FILLS: EMPTY_FILLS};
-}
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { heatmap: heatmap, num: num, normalize: normalize, domain: domain, SCALES: SCALES, EMPTY_FILLS: EMPTY_FILLS, N_BUCKETS: N_BUCKETS};
-}
-
-// ---- cli -----------------------------------------------------------------------
-var HELP =
-'heatmap-sink — (x,y,v) cells -> a standalone, deterministic heatmap SVG, zero deps.\n\n' +
-" printf '[0,0,0]\\n[1,0,1]\\n[0,1,2]\\n[1,1,3]\\n' | node heatmap-sink.js\n" +
-" printf '{\"x\":0,\"y\":0,\"v\":9}\\n' | node heatmap-sink.js\n" +
-" printf '[0,0,5]\\n[1,0,5]\\n' | node heatmap-sink.js --palette cool --min 0 --max 10\n" +
-" echo '{\"cells\":[[0,0,1],[1,1,9]]}' | node heatmap-sink.js --cell 24\n\n" +
-'INPUT (stdin): JSONL of [x,y,v] or {x,y,v} cells (one per line), OR a {cells,...} spec object.\n' +
-'Flags (override object fields): --palette heat|cool|mono|viridis --cell N --min N --max N\n' +
-' --cols N --rows N --empty light|dark|none\n\n' +
-'Geometry only: one <rect> per cell, no axes/labels/legend/fonts/CSS/script. Numbers in, a\n' +
-'grid out. Colors come from a fixed named 5-bucket scale (not caller input). A non-finite v,\n' +
-'a bad coordinate, or a duplicate (x,y) -> error.\n';
-
-function parseFlags(argv) {
-var f = {};
-for (var i = 0; i < argv.length; i++) {
-var a = argv[i];
-if (a === '--palette') f.palette = argv[++i];
-else if (a === '--cell') f.cell = Number(argv[++i]);
-else if (a === '--min') f.min = Number(argv[++i]);
-else if (a === '--max') f.max = Number(argv[++i]);
-else if (a === '--cols') f.cols = Number(argv[++i]);
-else if (a === '--rows') f.rows = Number(argv[++i]);
-else if (a === '--empty') f.empty = argv[++i];
-}
-return f;
-}
-
-// Parse stdin: a single JSON spec object {cells:...} passes through; otherwise treat the
-// input as JSONL — one cell per non-empty line. Blank lines are skipped.
-function parseStdin(raw) {
-var trimmed = raw.trim();
-if (trimmed === '') return { cells: []};
-// single-object spec form?
-if (trimmed.charAt(0) === '{') {
-try {
-var obj = JSON.parse(trimmed);
-if (obj &&!Array.isArray(obj) && typeof obj === 'object' && 'cells' in obj) return obj;
-} catch (e) { /* fall through to JSONL (multi-line objects) */}
-}
-var cells = [];
-var lines = trimmed.split('\n');
-for (var i = 0; i < lines.length; i++) {
-var ln = lines[i].trim();
-if (ln === '') continue;
-var cell;
-try { cell = JSON.parse(ln);}
-catch (e) { throw new Error('line ' + (i + 1) + ' is not valid JSON: ' + e.message);}
-cells.push(cell);
-}
-return { cells: cells};
-}
-
-function main() {
-var argv = process.argv.slice(2);
-if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) { process.stdout.write(HELP); return;}
-var flags = parseFlags(argv);
-var chunks = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', function (d) { chunks += d;});
-process.stdin.on('end', function () {
-var input;
-try { input = parseStdin(chunks);}
-catch (e) { process.stderr.write('heatmap-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
-var svg;
-try { svg = heatmap(input, flags);}
-catch (e) { process.stderr.write('heatmap-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
-process.stdout.write(svg);
-});
-}
-if (typeof require!== 'undefined' && require.main === module) { main();}
-
-test_heatmap-sink.js 168 lines on GitHub →
-#!/usr/bin/env node
-/*
-* test_heatmap-sink.js — drift-check battery for the heatmap-sink gift.
-*
-* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The expected SVG documents below are
-* hand-computed from the documented math — level(v) = clamp(floor((v-lo)/(hi-lo)*5), 0, 4),
-* lo/hi the auto-fit or pinned domain (flat field -> unit window), cells drawn row-major at
-* (x*cell, y*cell) — written independently of the emitter, not captured from its output. A
-* build cannot certify itself, so the expected strings are the author's fact. The remaining
-* checks are contract properties (determinism, order-independence, closed palette, honest errors).
-*
-* Run: node test_heatmap-sink.js (exit 0 = all pass; nonzero = a named failure)
-*/
-'use strict';
-const assert = require('assert');
-const { heatmap, SCALES, EMPTY_FILLS} = require('./heatmap-sink.js');
-
-let n = 0, passed = 0;
-function check(name, fn) {
-n++;
-try { fn(); passed++; console.log(' ok ' + name);}
-catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
-}
-
-// ---- hand-computed expected SVGs (heat palette, cell=16, empty=light) ------------
-// heat = #ffffcc #fed976 #fd8d3c #e31a1c #800026; empty light = #eeeeee
-const RAMP_2x2 =
-'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
-'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
-'<rect x="16" y="0" width="16" height="16" fill="#fed976" />\n' +
-'<rect x="0" y="16" width="16" height="16" fill="#e31a1c" />\n' +
-'<rect x="16" y="16" width="16" height="16" fill="#800026" />\n' +
-'</svg>\n';
-
-// 1 — full 2x2 grid, values 0..3 auto-domain [0,3] -> one bucket per corner, in order.
-// level(0)=0 level(1)=floor(1/3*5)=1 level(2)=floor(2/3*5)=3 level(3)=clamp(5)=4
-check('ramp 2x2: [0,1,2,3] -> #ffffcc #fed976 #e31a1c #800026', () => {
-assert.strictEqual(heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]}), RAMP_2x2);
-});
-
-// 2 — flat field: all equal -> unit window -> every cell mid-scale (bucket 2 = #fd8d3c).
-check('flat field: [5,5,5,5] -> all #fd8d3c (mid-scale, no divide-by-0)', () => {
-const exp =
-'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
-'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
-'<rect x="16" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
-'<rect x="0" y="16" width="16" height="16" fill="#fd8d3c" />\n' +
-'<rect x="16" y="16" width="16" height="16" fill="#fd8d3c" />\n' +
-'</svg>\n';
-assert.strictEqual(heatmap({ cells: [[0,0,5],[1,0,5],[0,1,5],[1,1,5]]}), exp);
-});
-
-// 3 — single cell -> flat window -> one mid-scale rect, 16x16 frame.
-check('single cell: [0,0,7] -> one #fd8d3c rect', () => {
-const exp =
-'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">\n' +
-'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
-'</svg>\n';
-assert.strictEqual(heatmap({ cells: [[0,0,7]]}), exp);
-});
-
-// 4 — sparse input: two corners set, 3x3 grid, the 7 missing cells take the empty fill.
-check('sparse: [(0,0)=0,(2,2)=10] -> corners painted, 7 empty #eeeeee', () => {
-const exp =
-'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">\n' +
-'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
-'<rect x="16" y="0" width="16" height="16" fill="#eeeeee" />\n' +
-'<rect x="32" y="0" width="16" height="16" fill="#eeeeee" />\n' +
-'<rect x="0" y="16" width="16" height="16" fill="#eeeeee" />\n' +
-'<rect x="16" y="16" width="16" height="16" fill="#eeeeee" />\n' +
-'<rect x="32" y="16" width="16" height="16" fill="#eeeeee" />\n' +
-'<rect x="0" y="32" width="16" height="16" fill="#eeeeee" />\n' +
-'<rect x="16" y="32" width="16" height="16" fill="#eeeeee" />\n' +
-'<rect x="32" y="32" width="16" height="16" fill="#800026" />\n' +
-'</svg>\n';
-assert.strictEqual(heatmap({ cells: [[0,0,0],[2,2,10]]}), exp);
-});
-
-// 5 — pinned domain overrides the flat-window auto-fit: [5,5] on [0,10] -> bucket 2.
-check('pinned: {cells:[5,5],min:0,max:10} -> both #fd8d3c', () => {
-const exp =
-'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 16" width="32" height="16">\n' +
-'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
-'<rect x="16" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
-'</svg>\n';
-assert.strictEqual(heatmap({ cells: [[0,0,5],[1,0,5]], min: 0, max: 10}), exp);
-});
-
-// 6 — empty input -> a valid, empty 0x0 frame, never a crash.
-check('empty: {cells:[]} -> empty <svg> frame', () => {
-assert.strictEqual(heatmap({ cells: []}),
-'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 0 0" width="0" height="0">\n</svg>\n');
-});
-
-// 7 — 'none' empty omits missing rects entirely.
-check("empty:none -> missing cells produce no rect", () => {
-const exp =
-'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
-'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
-'<rect x="16" y="16" width="16" height="16" fill="#800026" />\n' +
-'</svg>\n';
-assert.strictEqual(heatmap({ cells: [[0,0,0],[1,1,10]], empty: 'none'}), exp);
-});
-
-// 8 — object-form cells {x,y,v} render identically to array-form.
-check('object cells {x,y,v} == array cells [x,y,v]', () => {
-const a = heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]});
-const o = heatmap({ cells: [{x:0,y:0,v:0},{x:1,y:0,v:1},{x:0,y:1,v:2},{x:1,y:1,v:3}]});
-assert.strictEqual(o, a);
-assert.strictEqual(o, RAMP_2x2);
-});
-
-// 9 — INPUT-ORDER-INDEPENDENCE: scrambled cell order -> byte-identical SVG (a heatmap is a SET).
-check('order-independent: scrambled cells -> identical bytes', () => {
-const scrambled = heatmap({ cells: [[1,1,3],[0,0,0],[1,0,1],[0,1,2]]});
-assert.strictEqual(scrambled, RAMP_2x2);
-});
-
-// 10 — determinism: same cells -> byte-identical output, twice.
-check('determinism: repeated render is byte-identical', () => {
-const c = { cells: [[0,0,3],[1,0,1],[2,0,4],[0,1,1],[1,1,5],[2,1,9]]};
-assert.strictEqual(heatmap(c), heatmap(c));
-});
-
-// 11 — closed palette + no text: every fill is in the named scale (∪ empty); no <text|script|style.
-check('closed palette: only scale colors + empty, no text/script/style', () => {
-const out = heatmap({ cells: [[0,0,0],[1,0,50],[0,1,100],[1,1,25]], palette: 'cool', min: 0, max: 100});
-const allowed = new Set(SCALES.cool.concat([EMPTY_FILLS.light]));
-const fills = out.match(/fill="([^"]*)"/g).map(s => s.slice(6, -1));
-for (const f of fills) assert.ok(allowed.has(f), 'unexpected fill ' + f);
-assert.ok(!/<text|<script|<style|font/.test(out), 'output must contain no text/script/style/font');
-assert.ok(out.startsWith('<svg ') && out.endsWith('</svg>\n'), 'well-formed svg frame');
-});
-
-// 12 — non-finite value is a hard, named error (never a guessed color).
-check('non-finite value throws, naming the cell', () => {
-assert.throws(() => heatmap({ cells: [[0,0,0],[1,0,NaN]]}), /cell \(1,0\) value is not a finite number/);
-assert.throws(() => heatmap({ cells: [[0,0,Infinity]]}), /is not a finite number/);
-});
-
-// 13 — bad coordinates throw: negative and non-integer are both refused.
-check('negative / non-integer coordinate throws', () => {
-assert.throws(() => heatmap({ cells: [[-1,0,5]]}), /coordinate must be a non-negative integer/);
-assert.throws(() => heatmap({ cells: [[0.5,0,5]]}), /coordinate must be a non-negative integer/);
-});
-
-// 14 — a duplicate (x,y) is a hard error (no silent last-wins).
-check('duplicate cell throws', () => {
-assert.throws(() => heatmap({ cells: [[0,0,1],[0,0,2]]}), /duplicate cell at \(0,0\)/);
-});
-
-// 15 — a cell outside a pinned grid throws (no silent clipping); unknown palette throws.
-check('out-of-grid cell and unknown palette throw', () => {
-assert.throws(() => heatmap({ cells: [[3,0,1]], cols: 2}), /outside the pinned grid/);
-assert.throws(() => heatmap({ cells: [[0,0,1]], palette: 'nope'}), /unknown palette/);
-});
-
-// 16 — mutation bite (non-vacuity): a deliberately-wrong SVG (last fill bumped one bucket down)
-// MUST NOT equal the real render.
-check('mutation bite: a wrong-color SVG is rejected', () => {
-const wrong = RAMP_2x2.replace('fill="#800026"', 'fill="#e31a1c"');
-const got = heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]});
-assert.strictEqual(got, RAMP_2x2);
-assert.notStrictEqual(got, wrong);
-});
-
-console.log('\n' + passed + '/' + n + ' passed');
-if (passed!== n) process.exit(1);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# Histogram-fold — a Loop MMT gift
-https://loopmmt.com/gifts/histogram-fold/
-[coverage: optional · branch: gifts]
-
-One Bucketed Histogram Over a Numeric Stream fold ← all gifts
-
-Histogram-fold
-
-histogram-fold reads a stream of numbers — one JSON number per line (JSON Lines) — and folds them in ONE PASS into a single aggregate record: a contiguous list of fixed-width buckets with a count in each, plus the total count and the observed min and max, with zero dependencies. Buckets are fixed-width by a fixed origin (--width, --origin), so a value's bucket (floor((x-origin)/width), range [lo,hi) lower-closed) never depends on the rest of the stream — that is what makes it one pass. The same numbers in any order fold to a byte-identical record (a histogram is a multiset fold). Non-finite or non-number input is a hard error, never a silent skip, and the IEEE-754 bucket boundary is a documented, pinned rule. Same stream in → byte-identical record out, in Node or a browser.
-
-The honest edge
-
-histogram-fold COUNTS values into fixed-width buckets — it is NOT density estimation (no smoothing or KDE), NOT a quantile/percentile summary (it keeps no per-value order statistics beyond min and max), and it does NOT choose data-driven ‘nice’ bin edges (that would make a value's bin depend on the whole stream and cost the one-pass property). The output is a JSON aggregate, not a chart: hand it to a plotter, a test, or a diff.
-
-Run it
-
-printf '%s\n' 1 2 2 5 | node histogram-fold.js # {bins:[{lo,hi,count}..],width,origin,count,min,max}; --width W --origin O; exit 0 ok | 2 input error
-test_histogram-fold.js (27/27: frozen hand goldens cross-checked by an independent range-membership oracle, order-independence (shuffled==base), the pinned IEEE-754 float boundary (0.3@width0.1->bin 2), numeric-honesty hard errors (Infinity/string/bad-JSON/bad-width), contiguity + exact shared edges, blank-skip + CRLF, mutation bite lower-closed vs upper-closed)
-Zero dependencies, Node or browser, deterministic
-
-The code — every file that ships
-
-histogram-fold.js 237 lines on GitHub →
-#!/usr/bin/env node
-/* histogram-fold.js — fold a JSONL numeric stream into ONE bucketed histogram.
-Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
-
-WHAT IT IS. Give it a stream of numbers — one JSON number per line (JSONL) —
-and it folds them into a single aggregate record: a contiguous list of
-fixed-width buckets with a count in each, plus the total count and the observed
-min and max. Same stream in, byte-identical record out, on every machine and
-every run. It is a FOLD, not a chart: the output is a JSON aggregate, not a
-picture — hand it to a plotter, a test, or a diff.
-
-HOW THE BUCKETS ARE DEFINED (the whole determinism story). Buckets are
-FIXED-WIDTH with a fixed origin, so a value's bucket never depends on the rest
-of the stream — which is exactly what makes the fold ONE PASS (no need to see
-every value first to learn a min/max range). For a value x:
-
-bucket index i = floor((x - origin) / width)
-bucket range [ origin + i*width, origin + (i+1)*width) (lower-closed,
-upper-open)
-
-The default origin is 0 and the default width is 1, so a bare stream of numbers
-buckets into unit integer bins. Override with --width and --origin.
-
-The output bins are CONTIGUOUS from the lowest occupied bucket to the highest,
-with any empty interior bucket carried as a count of 0 — a histogram has no
-holes. Each bin's `hi` equals the next bin's `lo` exactly, because both edges
-are computed as origin + k*width for an integer k (never lo + width, which could
-round differently). An empty stream folds to `{bins:[], count:0, min:null,
-max:null}`.
-
-NUMERIC HONESTY (the character of this gift). A fold over numbers is only
-trustworthy if it refuses to quietly mishandle a number:
-- Every line must be a FINITE JSON number. A line that is not valid JSON, is
-not a number (a string, object, bool, null), or is a number that overflows
-to +/-Infinity (e.g. 1e999, which `JSON.parse` yields as Infinity) or is NaN
-is a HARD ERROR (exit 2) naming the line — never a silent skip.
-- Counts are integers and stay integers.
-- The bucket index is `Math.floor((x - origin) / width)` in IEEE-754 double.
-This is a DELIBERATE, PINNED specification, not an accident: on a float
-boundary the double arithmetic decides the bin, so with width 0.1 the value
-0.3 lands in bin 2 ([0.2,0.3)), because (0.3 - 0) / 0.1 === 2.9999999999996
-in IEEE-754, not 3. The gift does not paper this over with an epsilon (which
-would trade one surprise for a subtler one) — it states the rule, and the
-battery pins the 0.3-with-width-0.1 case so the behavior is a documented
-invariant. For clean boundaries, use an integer or exactly-representable
-width (1, 2, 5, 10, 0.5, 0.25).
-
-USAGE
-printf '%s\n' 1 2 2 5 | node histogram-fold.js # unit integer bins
-node histogram-fold.js --width 10 nums.jsonl # width-10 buckets
-node histogram-fold.js --width 10 --origin 5 < nums.jsonl # origin at 5
-node histogram-fold.js --help
-
-Each non-blank line is one number. Blank lines are skipped. A trailing \r
-(CRLF files) is trimmed. Output is one line of compact JSON (the aggregate
-record) followed by a newline.
-
-Exit codes: 0 success · 2 input error (missing file, a directory, a bad
---width/--origin, a line that is not a finite JSON number, or a bucket range so
-large it would exhaust memory). Always a clean one-line message on stderr,
-never a stack trace.
-
-Released under MIT. Its edge is printed in the README: this COUNTS values into
-fixed-width buckets. It is NOT a density estimate (no smoothing, no KDE), NOT a
-quantile/percentile summary (it keeps no per-value order statistics beyond min
-and max), and the buckets are fixed-width by a fixed origin — it does NOT choose
-"nice" bin edges from the data (that would make a value's bin depend on the
-whole stream and cost the one-pass property).
-*/
-"use strict";
-
-var MAX_BINS = 10000000; // guard: a range/width so large it would exhaust memory
-
-// Parse one input line into a finite number, or throw a clean, line-named Error.
-// (JSON.parse("1e999") === Infinity, so the finite check is load-bearing, not
-// redundant with the parse.)
-function parseNumber(line, lineNo) {
-var v;
-try { v = JSON.parse(line);}
-catch (e) {
-throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
-}
-if (typeof v!== "number") {
-throw new Error("line " + lineNo + " is not a number (got " +
-(v === null? "null": Array.isArray(v)? "array": typeof v) + "): " +
-JSON.stringify(line.slice(0, 40)));
-}
-if (!isFinite(v)) {
-throw new Error("line " + lineNo + " is not a finite number (" + String(v) + ")");
-}
-return v;
-}
-
-// The public fold: JSONL text + {width, origin} -> the aggregate record.
-// { bins: [ {lo, hi, count},...], // contiguous, lowest..highest occupied
-// width, origin,
-// count, // total values folded
-// min, max} // observed value extremes, null if empty
-function fold(text, opts) {
-opts = opts || {};
-var width = opts.width === undefined? 1: opts.width;
-var origin = opts.origin === undefined? 0: opts.origin;
-if (typeof width!== "number" ||!isFinite(width) || width <= 0) {
-throw new Error("width must be a finite number greater than 0 (got " + String(width) + ")");
-}
-if (typeof origin!== "number" ||!isFinite(origin)) {
-throw new Error("origin must be a finite number (got " + String(origin) + ")");
-}
-
-var lines = String(text).split("\n");
-var counts = Object.create(null); // bucket index -> count
-var total = 0, min = null, max = null, minIdx = null, maxIdx = null;
-var i, line, x, idx;
-
-for (i = 0; i < lines.length; i++) {
-line = lines[i];
-if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
-if (line.length === 0) continue; // blank line is not a value
-
-x = parseNumber(line, i + 1);
-idx = Math.floor((x - origin) / width); // IEEE-754; boundary behavior is pinned
-
-counts[idx] = (counts[idx] || 0) + 1;
-total += 1;
-if (min === null || x < min) min = x;
-if (max === null || x > max) max = x;
-if (minIdx === null || idx < minIdx) minIdx = idx;
-if (maxIdx === null || idx > maxIdx) maxIdx = idx;
-}
-
-var bins = [];
-if (total > 0) {
-var span = maxIdx - minIdx + 1;
-if (span > MAX_BINS) {
-throw new Error("bucket range too large (" + span + " bins > " + MAX_BINS +
-"): widen --width or narrow the input range");
-}
-for (idx = minIdx; idx <= maxIdx; idx++) {
-bins.push({
-lo: origin + idx * width,
-hi: origin + (idx + 1) * width,
-count: counts[idx] || 0
-});
-}
-}
-
-return { bins: bins, width: width, origin: origin, count: total, min: min, max: max};
-}
-
-/* ---- exports (browser + Node) ------------------------------------ */
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.histogramFold = fold;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { fold: fold, MAX_BINS: MAX_BINS};
-}
-
-/* ---- CLI (runs only when invoked directly, never on require) ------ */
-function run(text, opts) {
-return JSON.stringify(fold(text, opts)) + "\n";
-}
-
-// Parse a numeric CLI option value; throw a clean Error on a bad value.
-function numOpt(name, raw) {
-var v = Number(raw);
-if (raw === undefined || raw === "" ||!isFinite(v)) {
-throw new Error(name + " requires a finite number (got " + JSON.stringify(raw) + ")");
-}
-return v;
-}
-
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"histogram-fold.js — fold a JSONL numeric stream into one bucketed histogram.\n\n" +
-" printf '%s\\n' 1 2 2 5 | node histogram-fold.js unit integer bins\n" +
-" node histogram-fold.js --width 10 nums.jsonl width-10 buckets\n" +
-" node histogram-fold.js --width 10 --origin 5 < in origin at 5\n" +
-" node histogram-fold.js --help\n\n" +
-"Each non-blank line is one FINITE JSON number. A value x lands in bucket\n" +
-"floor((x - origin) / width); buckets are [lo, hi) (lower-closed). Output is\n" +
-"one line of JSON: {bins:[{lo,hi,count}..], width, origin, count, min, max},\n" +
-"bins contiguous from the lowest to the highest occupied bucket.\n\n" +
-"Edge: this COUNTS into fixed-width buckets. It is NOT density estimation,\n" +
-"NOT a quantile summary, and it does NOT pick 'nice' data-driven bin edges\n" +
-"(that would cost the one-pass property). Non-finite or non-number input is\n" +
-"a hard error, never a silent skip.\n"
-);
-return 0;
-}
-
-var opts = {};
-var files = [];
-var i;
-try {
-for (i = 0; i < args.length; i++) {
-if (args[i] === "--width") { opts.width = numOpt("--width", args[++i]);}
-else if (args[i] === "--origin") { opts.origin = numOpt("--origin", args[++i]);}
-else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
-else { files.push(args[i]);}
-}
-} catch (e) {
-process.stderr.write("histogram-fold: " + e.message + "\n");
-return 2;
-}
-
-function emit(text) {
-try { process.stdout.write(run(text, opts)); return 0;}
-catch (e) { process.stderr.write("histogram-fold: " + e.message + "\n"); return 2;}
-}
-
-if (files.length > 0) {
-var fs = require("fs");
-var text;
-try { text = fs.readFileSync(files[0], "utf8");}
-catch (e) {
-process.stderr.write("histogram-fold: cannot read " + files[0] +
-" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
-return 2;
-}
-return emit(text);
-}
-
-// stdin
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
-});
-return 0;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_histogram-fold.js 196 lines on GitHub →
-#!/usr/bin/env node
-/* test_histogram-fold.js — golden battery for the histogram-fold gift.
-
-Out-of-band and self-verifying. The oracle is TWO independent things, neither a
-copy of the gift's streaming floor-and-tally loop:
-
-(1) RANGE-MEMBERSHIP counting — for a bin [lo, hi), the count is
-values.filter(x => x >= lo && x < hi).length. This is a genuinely
-different algorithm (predicate over the whole set per bin, O(bins*n))
-than the gift's one-pass Map tally, and it uses NO floor-index math. It
-is valid where the bin edges are exact (integer widths), where
-floor-index and range-membership provably agree.
-
-(2) FROZEN hand-computed golden records, pinned by hand from the spec —
-including the deliberate IEEE-754 float-boundary case, where floor-index
-and range-membership DIVERGE (see §7). That divergence is the documented
-numeric-honesty invariant, not a bug, so the pin is checked against the
-hand golden, never against the range oracle.
-
-A planted mutation (the bite, §9) MUST be caught — if the suite passes with the
-mutation live, the suite proves nothing.
-
-Run: node test_histogram-fold.js -> exit 0 GREEN / non-zero RED
-*/
-"use strict";
-var hf = require("./histogram-fold.js");
-
-var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;}
-else { fail++; console.log(" FAIL " + name);}
-}
-function foldRec(nums, opts) { return hf.fold(nums.join("\n"), opts);}
-function J(v) { return JSON.stringify(v);}
-
-/* ---- independent range-membership oracle (no floor-index math) ------------ */
-function rangeCount(values, lo, hi) {
-var n = 0, i;
-for (i = 0; i < values.length; i++) if (values[i] >= lo && values[i] < hi) n++;
-return n;
-}
-
-/* ---- 1. Frozen hand golden: unit bins, cross-checked by range membership -- *
-values [1,2,2,5], width 1, origin 0.
-floor: 1->1, 2->2, 2->2, 5->5; occupied 1..5; contiguous with empty 3,4. */
-(function () {
-var vals = [1, 2, 2, 5];
-var rec = foldRec(vals);
-var goldenBins = [
-{ lo: 1, hi: 2, count: 1},
-{ lo: 2, hi: 3, count: 2},
-{ lo: 3, hi: 4, count: 0},
-{ lo: 4, hi: 5, count: 0},
-{ lo: 5, hi: 6, count: 1}
-];
-ok("unit bins == frozen hand golden", J(rec.bins) === J(goldenBins));
-ok("unit bins: count/min/max", rec.count === 4 && rec.min === 1 && rec.max === 5);
-// independent cross-check: every golden bin count == range membership count
-var allMatch = goldenBins.every(function (b) { return b.count === rangeCount(vals, b.lo, b.hi);});
-ok("unit bins == independent range-membership oracle", allMatch);
-})();
-
-/* ---- 2. width/origin override, cross-checked by range membership ---------- *
-values [5,12,13,27], width 10, origin 0 -> floor 0,1,1,2; occupied 0..2. */
-(function () {
-var vals = [5, 12, 13, 27], opts = { width: 10, origin: 0};
-var rec = foldRec(vals, opts);
-var golden = [
-{ lo: 0, hi: 10, count: 1},
-{ lo: 10, hi: 20, count: 2},
-{ lo: 20, hi: 30, count: 1}
-];
-ok("width-10 bins == frozen hand golden", J(rec.bins) === J(golden));
-ok("width-10 == range-membership oracle",
-golden.every(function (b) { return b.count === rangeCount(vals, b.lo, b.hi);}));
-// origin shift: same values, origin 5, width 10 -> floor((x-5)/10): 0,0,0,2
-var rec2 = foldRec(vals, { width: 10, origin: 5});
-ok("origin shift changes bucketing",
-J(rec2.bins) === J([
-{ lo: 5, hi: 15, count: 3},
-{ lo: 15, hi: 25, count: 0},
-{ lo: 25, hi: 35, count: 1}
-]));
-})();
-
-/* ---- 3. Empty stream folds to the empty record --------------------------- */
-(function () {
-var rec = foldRec([]);
-ok("empty stream -> empty record",
-J(rec) === J({ bins: [], width: 1, origin: 0, count: 0, min: null, max: null}));
-})();
-
-/* ---- 4. Order-independence: a histogram is a MULTISET fold --------------- *
-This is THE fold-lane invariant that separates histogram from an ordered fold
-(merkle): shuffle the stream and the record is byte-identical. */
-(function () {
-var base = [5, 1, 9, 2, 5, 5, 1, 8, 3, 2, 9, 1];
-var shuffled = [9, 1, 2, 5, 8, 1, 5, 3, 2, 9, 5, 1];
-var reversed = base.slice().reverse();
-ok("order-independent: shuffled == base", J(foldRec(shuffled)) === J(foldRec(base)));
-ok("order-independent: reversed == base", J(foldRec(reversed)) === J(foldRec(base)));
-})();
-
-/* ---- 5. Determinism: folds twice byte-identical -------------------------- */
-(function () {
-var vals = [1, 2, 3, 4, 5, 6, 7];
-ok("folds-twice-identical", J(foldRec(vals)) === J(foldRec(vals)));
-})();
-
-/* ---- 6. Contiguity + exact shared edges ---------------------------------- *
-No holes: empty interior buckets are carried as count 0, and bin[i].hi is
-byte-exactly bin[i+1].lo (both edges are origin + k*width, never lo+width). */
-(function () {
-var rec = foldRec([0, 30], { width: 10, origin: 0}); // occupied 0 and 3; 1,2 empty
-ok("contiguous incl. empty interior bins (count 0)",
-rec.bins.length === 4 && rec.bins[1].count === 0 && rec.bins[2].count === 0);
-var sharedEdges = true, i;
-for (i = 0; i + 1 < rec.bins.length; i++) if (rec.bins[i].hi!== rec.bins[i + 1].lo) sharedEdges = false;
-ok("adjacent bins share an exact edge (hi[i] === lo[i+1])", sharedEdges);
-})();
-
-/* ---- 7. The pinned IEEE-754 float boundary (numeric-honesty invariant) ---- *
-With width 0.1, origin 0, the value 0.3 lands in bin index 2 ([0.2,0.3)),
-because (0.3 - 0) / 0.1 === 2.9999999999999996 and floor of that is 2, NOT 3.
-This is the DOCUMENTED behavior, not a bug: the gift does not epsilon-fudge it.
-Checked against the hand golden (index 2), NOT the range oracle — range
-membership would put 0.3 in bin 3, and that divergence IS the trap being
-pinned. A single value -> a single-bin record whose lone bin is index 2. */
-(function () {
-var rec = foldRec([0.3], { width: 0.1, origin: 0});
-ok("float-boundary pin: 0.3 @ width 0.1 -> bin index 2 (lo≈0.2)",
-rec.bins.length === 1 && Math.abs(rec.bins[0].lo - 0.2) < 1e-12);
-// sanity: the arithmetic really does floor to 2 here (documents the trap)
-ok("float-boundary: floor((0.3-0)/0.1) === 2 (the IEEE-754 fact)",
-Math.floor((0.3 - 0) / 0.1) === 2);
-})();
-
-/* ---- 8. Numeric honesty: non-finite / non-number / bad JSON are hard errors */
-(function () {
-function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
-ok("1e999 (overflows to Infinity) is a hard error",
-throws(function () { hf.fold("1e999");}));
-ok("a string line is a hard error", throws(function () { hf.fold("\"12\"");}));
-ok("a null line is a hard error", throws(function () { hf.fold("null");}));
-ok("a bool line is a hard error", throws(function () { hf.fold("true");}));
-ok("an object line is a hard error", throws(function () { hf.fold("{\"v\":1}");}));
-ok("invalid JSON line is a hard error", throws(function () { hf.fold("not-a-number");}));
-ok("width <= 0 is a hard error", throws(function () { hf.fold("1\n2", { width: 0});}));
-ok("non-finite width is a hard error", throws(function () { hf.fold("1\n2", { width: Infinity});}));
-ok("non-finite origin is a hard error", throws(function () { hf.fold("1", { origin: NaN});}));
-})();
-
-/* ---- 9. Blank lines skipped, CRLF trimmed -------------------------------- */
-(function () {
-ok("blank lines skipped (not a value)", J(hf.fold("1\n\n2\n")) === J(hf.fold("1\n2")));
-ok("CRLF trimmed: \\r\\n folds like \\n", J(hf.fold("1\r\n2\r\n")) === J(hf.fold("1\n2")));
-ok("integer counts stay integers",
-hf.fold("1\n1\n1").bins[0].count === 3 && Number.isInteger(hf.fold("1\n1\n1").bins[0].count));
-})();
-
-/* ---- 10. THE MUTATION BITE (non-vacuity) --------------------------------- *
-A WRONG construction: upper-closed bins (lo, hi] via ceil-1 instead of the
-spec's lower-closed [lo, hi) via floor. On a value exactly on an integer edge
-(10, width 10, origin 0) the two disagree: floor-spec -> bin index 1 ([10,20));
-the wrong upper-closed construction -> bin index 0 ((0,10]). The gift's record
-MUST NOT match the wrong one, proving the suite would catch that regression. */
-(function () {
-function wrongFold(vals, width, origin) {
-// upper-closed (lo, hi]: index = ceil((x-origin)/width) - 1
-var counts = {}, minI = null, maxI = null;
-vals.forEach(function (x) {
-var idx = Math.ceil((x - origin) / width) - 1;
-counts[idx] = (counts[idx] || 0) + 1;
-if (minI === null || idx < minI) minI = idx;
-if (maxI === null || idx > maxI) maxI = idx;
-});
-var bins = [];
-for (var i = minI; i <= maxI; i++) bins.push({ lo: origin + i * width, hi: origin + (i + 1) * width, count: counts[i] || 0});
-return bins;
-}
-var vals = [10, 10, 5];
-var gift = foldRec(vals, { width: 10, origin: 0}).bins;
-var wrong = wrongFold(vals, 10, 0);
-ok("mutation bite: lower-closed [lo,hi)!= upper-closed (lo,hi] on an edge value",
-J(gift)!== J(wrong));
-})();
-
-/* ---- report -------------------------------------------------------------- */
-console.log("");
-if (fail === 0) {
-console.log("GREEN: " + pass + " assertions passed, 0 failed [test_histogram-fold]");
-process.exit(0);
-} else {
-console.log("RED: " + pass + " passed, " + fail + " FAILED [test_histogram-fold]");
-process.exit(1);
-}
-
-Take the whole folder →
-MIT
-Zero dependencies, Node or browser, deterministic
 
 ---

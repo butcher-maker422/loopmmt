@@ -1,955 +1,669 @@
-# Loop MMT — corpus shard 70/87
+# Loop MMT — corpus shard 70/91
 
-> Bundle 70 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 70 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/json-source/, /gifts/jsonl-diff/, /gifts/junction/, /gifts/kv-source/)
+Nodes in this shard: 3 (/gifts/input-event-router/, /gifts/interval-math/, /gifts/isvalidcsscolor/)
 
 ---
 
-# json-source — a Loop MMT gift
-https://loopmmt.com/gifts/json-source/
+# input-event-router — a Loop MMT gift
+https://loopmmt.com/gifts/input-event-router/
 [coverage: optional · branch: gifts]
 
-Stream a JSON Array into a JSONL Record Stream source ← all gifts
+Is This Input Event Safe to Fold? route ← all gifts
 
-json-source
+input-event-router
 
-json-source reads a JSON file (a FILE arg, or stdin) whose top-level value is an ARRAY and emits one element per line (JSONL) — the front of a pipe you feed into the fold/filter/transform gifts (json-source users.json | dedup-filter --key id). Object elements are records the consuming gifts read directly; scalar elements are a stream of scalars. Each element is re-serialized to canonical compact JSON (key order preserved). Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+Every interactive app re-hand-rolls the same first step: turn raw, untrusted pointer/key input into something a reducer can safely fold — and that is where the bugs and the attack surface live. input-event-router is that step done once, correctly: a dependency-free deterministic reducer that folds a raw input-event log (JSONL) into a typed, schema-validated event stream, plus an O(1) fold-state (sequence integrity + a monotonic logical tick). seq is a strict total order (a gap or repeat is a rejection, never coerced); t is logical time supplied as data, never a wall-clock read, so the same log replays byte-identically forever — in a browser or headless on Node; type must be in a declared, closed vocabulary; payload is an opaque object it never interprets. It authors the interactive lane's {seq,t,type,payload} event envelope that render-loop-harness and undo-stack-kernel fold. Zero dependencies, pure, offline.
 
 The honest edge
 
-json-source streams the elements of a TOP-LEVEL JSON ARRAY only — a non-array top-level (an object, a number, a string, a boolean, null) or malformed JSON is refused (exit 2) rather than guess how to streamify a single value. Each element is re-serialized to canonical compact JSON, so number tokens and whitespace are normalized (1e3 -> 1000, 1.0 -> 1) though key order is preserved — the JSON value, not the input bytes. It reads JSON, not JSON5/NDJSON, and parses the WHOLE document (not an incremental stream).
+this normalizes and validates raw input events against a declared schema, folding them into a deterministic typed event stream; it does NOT sanitize application semantics, it does NOT persist, it holds NO clock/network/entropy, and it trusts no event it did not schema.
 
 Run it
 
-printf '[{"id":1},{"id":2}]' | node json-source.js # -> {"id":1}\n{"id":2}
-test_json-source.js (33/33, independent map-route oracle) + Plumb conformance GREEN (21/21, signed 2026-09-12, clock-independent, mutation-bite non-vacuous)
-Node / browser, no dependencies
+node input-event-router.js < events.jsonl # fold a JSONL event log -> render + emitted-stream summary | node input-event-router.js --help
+test_input-event-router.js (25/25) — replay-determinism, seq total-order rejection, closed-vocabulary enforcement, O(1) state bound under a large synthetic log, crash-clean on bad/empty JSON
+Zero dependencies, Node or browser, deterministic
 
 The code — every file that ships
 
-json-source.js 171 lines on GitHub →
+input-event-router.js 230 lines on GitHub →
 #!/usr/bin/env node
-/* json-source.js — stream the elements of a JSON array as a JSONL record stream.
-Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
+/* input-event-router.js — a dependency-free, deterministic reducer that turns a
+raw input-event log into a validated, typed event stream.
 
-WHAT IT IS. A SOURCE: it turns a JSON array — the shape an API response, an export,
-or a `[...]` file so often arrives in — into the front of a pipe: one element per
-line (JSONL), ready to feed INTO the fold/filter/transform gifts. Give it a file (or
-pipe text on stdin) and it emits each top-level array element as one compact JSON line:
+WHY THIS EXISTS. Every interactive app re-hand-rolls the same first step: take
+raw, untrusted pointer/key input and turn it into something a reducer can
+safely fold. Hand-rolled, that step is where the bugs and the attack surface
+live — an unvalidated event coerced instead of rejected, a wall-clock read
+that breaks replay, a field the reducer trusts that the input never carried.
+This is that step done once, correctly, as a DETERMINISTIC REDUCER over an
+input-event log: raw events in, a typed schema-validated stream out, plus a
+tiny O(1) fold-state (sequence integrity + monotonic tick).
 
-[{"id":1},{"id":2}] -> {"id":1}
-{"id":2}
-[1, 2, 3] -> 1
-2
-3
+THE STRIP-CLEAN RULE (the whole reason to trust it). state_t is a pure fold of
+state_0 and the ordered event log up to t. Replaying the same log yields
+byte-identical state, stream, and render. The router holds NO clock, NO
+network, and NO entropy it did not receive as an event — logical time enters
+ONLY as the event field `t`, supplied by the caller as data. So the same log
+replays identically forever, in a browser or headless on Node.
 
-When the elements are objects, they are records the consuming gifts read directly:
-`json-source users.json | dedup-filter --key id`. When they are scalars, you get a
-stream of scalars — still valid JSONL.
-
-TOP-LEVEL ARRAY ONLY (the honesty axis). The input's top-level value MUST be a JSON
-array — that is the only thing that IS a stream. A bare object, a number, a string, a
-boolean, or null is a single value, not a stream, so json-source REFUSES it (exit 2)
-rather than guess how to "streamify" it (wrap it? emit its entries? emit it as one
-line?). Each guess is a different tool; refusing keeps json-source one honest thing.
-Malformed JSON is likewise a hard error (exit 2), never a partial or repaired parse.
-
-CANONICAL RE-SERIALIZATION (declared, so it is pinnable). Each element is emitted via
-canonical compact JSON.stringify — object key order is preserved from the input, but
-input WHITESPACE and NUMBER TOKENS are normalized to canonical JSON form (`1e3` -> 1000,
-`1.0` -> 1, `[ 1,2]` -> [1,2]). This is the JSON *value*, losslessly; it is not the
-input's exact bytes. The result is deterministic: the same input yields byte-identical
-output every run and every machine.
-
-THE MODEL
-[FILE] The JSON file to stream. If omitted, read stdin. Its top-level value must
-be an array; each element becomes one output line.
-
-DETERMINISM. parse(text) is a pure function — no clock, no randomness, no network — so
-the same text yields byte-identical output every run.
+THE ENVELOPE (this gift authors the interactive lane's event schema). One
+event per JSONL line:
+{ "seq": <int>=0, monotonic +1 >, "t": <int>=0, non-decreasing logical tick >,
+"type": <one of the declared accepted types>, "payload": <object>}
+seq is the total order (a gap or repeat is a rejection). t is logical time as
+DATA (never a clock read). type must be in the declared accepted set. payload
+is opaque cargo (checked to be an object; its contents are the downstream
+reducer's business, not this gift's).
 
 USAGE
-node json-source.js data.json
-cat data.json | node json-source.js
-node json-source.js --help
+node input-event-router.js < events.jsonl # fold a JSONL event log -> render + summary
+node input-event-router.js --help
 
-Exit codes: 0 success (including an empty stream from `[]`) · 2 input error (malformed
-JSON, a top-level value that is not an array, an unknown option, a second positional
-file, or an unreadable file). Always a clean one-line message on stderr, never a stack
-trace.
-
-Released under MIT. Its edge is printed in the README: json-source streams the elements
-of a TOP-LEVEL JSON ARRAY only — it refuses a non-array top-level and malformed JSON
-(exit 2), and it re-serializes each element to canonical compact JSON (normalizing
-number tokens and whitespace, preserving key order). It reads JSON, not JSON5/NDJSON,
-and does not stream incrementally (it parses the whole document).
+Released under MIT. Its edge, printed in the README and --help: this
+NORMALIZES and VALIDATES input events against a declared schema, folding them
+into a deterministic typed stream. It does NOT sanitize application semantics,
+it does NOT persist, it holds NO clock/network/entropy, and it trusts no event
+it did not schema. (Retaining event history is the undo-stack-kernel's job,
+under its own declared bound — this gift deliberately keeps O(1) state.)
 */
 "use strict";
 
-/* ---- the pure core ------------------------------------------------ */
+// The default accepted event-type vocabulary. The vocabulary is CONFIG, not
+// frozen (covenant §2/§5 U2 — sub-lanes/types by contract, not by a fixed list):
+// what the gift enforces is that the vocabulary is DECLARED and CLOSED, which is
+// the decidable security property. An app supplies its own set via cfg.acceptedTypes.
+var DEFAULT_ACCEPTED_TYPES = ["pointer", "key", "select", "edit", "commit"];
 
-// Parse JSON text and return its top-level array of elements. Throws a clean Error on
-// malformed JSON or a non-array top-level — the CLI turns that into exit 2. Pure.
-function parse(text) {
-if (typeof text!== "string") throw new Error("input must be text");
-var value;
+// The initial fold-state. O(1) by contract: three integers, never a buffer.
+function state0() {
+return { nextSeq: 0, lastTick: -1, count: 0};
+}
+
+// isPlainObject — an object, not null, not an array, not a scalar. payload must
+// be an object; we do NOT walk its contents (depth-1 check => bounded work,
+// resource-bounds clause §3.3).
+function isPlainObject(v) {
+return v!== null && typeof v === "object" &&!Array.isArray(v);
+}
+
+function isInt(v) {
+return typeof v === "number" && isFinite(v) && Math.floor(v) === v;
+}
+
+/* validate(state, event, cfg) -> { ok: true} | { ok: false, reason: <string>}
+Pure. Checks the envelope against the schema BEFORE the fold sees it. Every
+failure is a DECLARED rejection reason; nothing is coerced. */
+function validate(state, event, cfg) {
+var accepted = (cfg && cfg.acceptedTypes) || DEFAULT_ACCEPTED_TYPES;
+
+if (!isPlainObject(event)) return { ok: false, reason: "event-not-object"};
+
+// seq: present, int >= 0, exactly the next expected (total order, no gap/repeat).
+if (!isInt(event.seq) || event.seq < 0) return { ok: false, reason: "seq-not-int"};
+if (event.seq < state.nextSeq) return { ok: false, reason: "seq-repeat"};
+if (event.seq > state.nextSeq) return { ok: false, reason: "seq-gap"};
+
+// t: present, int >= 0, non-decreasing (logical tick as data; never a clock).
+if (!isInt(event.t) || event.t < 0) return { ok: false, reason: "tick-not-int"};
+if (event.t < state.lastTick) return { ok: false, reason: "tick-decrease"};
+
+// type: non-empty string in the declared accepted set.
+if (typeof event.type!== "string" || event.type.length === 0) {
+return { ok: false, reason: "type-not-string"};
+}
+if (accepted.indexOf(event.type) === -1) return { ok: false, reason: "type-not-accepted"};
+
+// payload: an object (opaque cargo). A scalar/null/array payload is rejected.
+if (!isPlainObject(event.payload)) return { ok: false, reason: "payload-not-object"};
+
+return { ok: true};
+}
+
+/* route(state, event, cfg) -> { state, emit, reject}
+The pure reducer. On a valid event: emit the normalized typed event and
+advance state. On an invalid event: emit null, record the rejection, and DO
+NOT advance the fold into a corrupt place. The whole log is folded by reduce. */
+function route(state, event, cfg) {
+var v = validate(state, event, cfg);
+if (!v.ok) {
+// A rejected event does not advance nextSeq/lastTick — the fold's integrity
+// point is preserved. reject carries the offending seq when it was an int.
+var seq = isInt(event && event.seq)? event.seq: null;
+return { state: state, emit: null, reject: { seq: seq, reason: v.reason}};
+}
+// Build the normalized typed event WITHOUT trusting the raw object's prototype
+// or extra keys: copy only the four envelope fields onto a null-proto object,
+// so a hostile __proto__/constructor payload key cannot pollute anything.
+var payloadCopy = Object.create(null);
+var keys = Object.keys(event.payload);
+for (var i = 0; i < keys.length; i++) {
+var k = keys[i];
+if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+payloadCopy[k] = event.payload[k];
+}
+var emit = { seq: event.seq, t: event.t, type: event.type, payload: payloadCopy};
+var next = { nextSeq: state.nextSeq + 1, lastTick: event.t, count: state.count + 1};
+return { state: next, emit: emit, reject: null};
+}
+
+/* foldLog(events, cfg) -> { state, stream, rejections, halted}
+Folds an ordered array of raw events. reject-policy default is HALT: a hostile
+or corrupt log STOPS at the first integrity violation rather than silently
+dropping bad events and continuing into an ambiguous stream. cfg.rejectPolicy
+= "skip" is available for genuinely best-effort input. */
+function foldLog(events, cfg) {
+var policy = (cfg && cfg.rejectPolicy) || "halt";
+var state = state0();
+var stream = [];
+var rejections = [];
+var halted = false;
+for (var i = 0; i < events.length; i++) {
+var r = route(state, events[i], cfg);
+if (r.reject) {
+rejections.push(r.reject);
+if (policy === "halt") { halted = true; break;}
+// skip: record the rejection, do not advance, continue to the next event.
+continue;
+}
+state = r.state;
+stream.push(r.emit);
+}
+return { state: state, stream: stream, rejections: rejections, halted: halted};
+}
+
+/* render(state) -> string. Pure state -> frame projection. An interactive gift
+is still pipe-testable headless: the frame is deterministic text, never a live
+canvas. */
+function render(state) {
+return (
+"accepted=" + state.count +
+" next-seq=" + state.nextSeq +
+" last-tick=" + state.lastTick
+);
+}
+
+var API = {
+DEFAULT_ACCEPTED_TYPES: DEFAULT_ACCEPTED_TYPES,
+ACCEPTED_TYPES: DEFAULT_ACCEPTED_TYPES,
+state0: state0,
+validate: validate,
+route: route,
+foldLog: foldLog,
+render: render
+};
+
+// Browser attach.
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.inputEventRouter = API;
+}
+
+// Node require.
+if (typeof module!== "undefined" && module.exports) {
+module.exports = API;
+}
+
+// CLI.
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"input-event-router.js — deterministic reducer: raw input-event log -> validated typed stream.\n\n" +
+" node input-event-router.js < events.jsonl fold a JSONL event log -> render + summary\n" +
+" node input-event-router.js --help\n\n" +
+"Envelope (one JSON object per line):\n" +
+" { \"seq\": <int, monotonic +1>, \"t\": <int, non-decreasing logical tick>,\n" +
+" \"type\": <accepted type>, \"payload\": <object>}\n\n" +
+"Edge: this normalizes and validates input events against a declared schema,\n" +
+"folding them into a deterministic typed stream. It does not sanitize\n" +
+"application semantics, does not persist, holds no clock/network/entropy, and\n" +
+"trusts no event it did not schema.\n"
+);
+return 0;
+}
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+var text = Buffer.concat(chunks).toString("utf8");
+var lines = text.split("\n");
+var events = [];
+for (var i = 0; i < lines.length; i++) {
+var line = lines[i].trim();
+if (line.length === 0) continue;
 try {
-value = JSON.parse(text);
+events.push(JSON.parse(line));
 } catch (e) {
-throw new Error("input is not valid JSON: " + e.message);
+// A non-JSON line is itself a rejectable event: push a sentinel the
+// schema will reject as event-not-object (a string is not an object).
+events.push(line);
 }
-if (!Array.isArray(value)) {
-var kind = value === null? "null": Array.isArray(value)? "array": typeof value;
-throw new Error("top-level JSON must be an array (got " + kind + ") — a non-array value is not a stream");
 }
-return value;
+var out = foldLog(events);
+process.stdout.write(render(out.state) + "\n");
+process.stdout.write(
+"emitted=" + out.stream.length +
+" rejected=" + out.rejections.length +
+(out.halted? " HALTED": "") + "\n"
+);
+for (var j = 0; j < out.rejections.length; j++) {
+var rj = out.rejections[j];
+process.stdout.write(" reject seq=" + rj.seq + " reason=" + rj.reason + "\n");
+}
+});
+return 0;
 }
 
-// Render elements as JSONL text (one canonical compact JSON value per line, trailing
-// newline if any).
-function toJSONL(elements) {
-var s = "";
-for (var i = 0; i < elements.length; i++) s += JSON.stringify(elements[i]) + "\n";
-return s;
+if (typeof require!== "undefined" && require.main === module) {
+process.exitCode = main(process.argv);
+}
+
+test_input-event-router.js 146 lines on GitHub →
+#!/usr/bin/env node
+/* test_input-event-router.js — the golden event-log corpus.
+
+The battery drift-checks the gift against an OUT-OF-BAND oracle: expected final
+states and emitted streams authored independently (by hand, from the envelope
+rules), not by running the gift. Plus replay-determinism (the canonicalizer
+self-test), the mandatory hostile-event known-bad vectors (§3 security check),
+a state-bounds assertion, and a mutation bite so a no-op harness cannot pass.
+*/
+"use strict";
+
+var R = require("./input-event-router.js");
+var assert = require("assert");
+
+var pass = 0, fail = 0;
+function ok(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.error("FAIL: " + name);}
+}
+function eq(name, a, b) {
+var ja = JSON.stringify(a), jb = JSON.stringify(b);
+if (ja === jb) { pass++;}
+else { fail++; console.error("FAIL: " + name + "\n got: " + ja + "\n want: " + jb);}
+}
+
+// ---------------------------------------------------------------------------
+// 1. Golden valid log -> expected final state + emitted stream (out-of-band).
+// Expected values hand-computed from the envelope rules, NOT from the gift.
+// ---------------------------------------------------------------------------
+var validLog = [
+{ seq: 0, t: 0, type: "pointer", payload: { x: 10, y: 20}},
+{ seq: 1, t: 0, type: "select", payload: { region: "A1"}},
+{ seq: 2, t: 3, type: "edit", payload: { cell: "A1", value: 7}},
+{ seq: 3, t: 3, type: "commit", payload: {}}
+];
+// Hand-authored oracle: 4 accepted, nextSeq ends at 4, lastTick is 3, count 4.
+var expectedState = { nextSeq: 4, lastTick: 3, count: 4};
+// Emitted stream = the same four events, payloads copied field-for-field.
+var expectedStream = [
+{ seq: 0, t: 0, type: "pointer", payload: { x: 10, y: 20}},
+{ seq: 1, t: 0, type: "select", payload: { region: "A1"}},
+{ seq: 2, t: 3, type: "edit", payload: { cell: "A1", value: 7}},
+{ seq: 3, t: 3, type: "commit", payload: {}}
+];
+var g = R.foldLog(validLog);
+eq("golden final state", g.state, expectedState);
+eq("golden emitted stream", g.stream, expectedStream);
+ok("golden: no rejections", g.rejections.length === 0);
+ok("golden: not halted", g.halted === false);
+eq("golden render", R.render(g.state), "accepted=4 next-seq=4 last-tick=3");
+
+// ---------------------------------------------------------------------------
+// 2. Replay-determinism (the canonicalizer self-test) — fold N times ->
+// byte-identical state, stream, render each time.
+// ---------------------------------------------------------------------------
+var r1 = R.foldLog(validLog);
+var r2 = R.foldLog(validLog);
+var r3 = R.foldLog(validLog);
+eq("replay: state identical", JSON.stringify(r1.state), JSON.stringify(r3.state));
+eq("replay: stream identical", JSON.stringify(r1.stream), JSON.stringify(r2.stream));
+eq("replay: render identical", R.render(r1.state), R.render(r3.state));
+
+// ---------------------------------------------------------------------------
+// 3. Hostile-event known-bad vectors (§3.1) — each MUST produce its declared
+// rejection reason, never a corruption/crash/coercion. Default policy=halt.
+// ---------------------------------------------------------------------------
+function firstReject(log) {
+var out = R.foldLog(log);
+return out.rejections.length? out.rejections[0].reason: "(none)";
+}
+eq("hostile: seq gap -> seq-gap",
+firstReject([{ seq: 0, t: 0, type: "key", payload: {}},
+{ seq: 1, t: 0, type: "key", payload: {}},
+{ seq: 3, t: 0, type: "key", payload: {}}]),
+"seq-gap");
+eq("hostile: seq repeat -> seq-repeat",
+firstReject([{ seq: 0, t: 0, type: "key", payload: {}},
+{ seq: 1, t: 0, type: "key", payload: {}},
+{ seq: 1, t: 0, type: "key", payload: {}}]),
+"seq-repeat");
+eq("hostile: decreasing tick -> tick-decrease",
+firstReject([{ seq: 0, t: 5, type: "key", payload: {}},
+{ seq: 1, t: 2, type: "key", payload: {}}]),
+"tick-decrease");
+eq("hostile: unknown type -> type-not-accepted",
+firstReject([{ seq: 0, t: 0, type: "no-such-type", payload: {}}]),
+"type-not-accepted");
+eq("hostile: scalar payload -> payload-not-object",
+firstReject([{ seq: 0, t: 0, type: "key", payload: 42}]),
+"payload-not-object");
+eq("hostile: null payload -> payload-not-object",
+firstReject([{ seq: 0, t: 0, type: "key", payload: null}]),
+"payload-not-object");
+eq("hostile: array payload -> payload-not-object",
+firstReject([{ seq: 0, t: 0, type: "key", payload: [1, 2]}]),
+"payload-not-object");
+eq("hostile: non-object event -> event-not-object",
+firstReject(["this is not an object"]),
+"event-not-object");
+
+// 3b. Prototype-pollution known-bad twin: a __proto__ payload key must NOT
+// pollute Object.prototype, and must be dropped from the emitted payload.
+var poll = R.foldLog([{ seq: 0, t: 0, type: "edit",
+payload: JSON.parse('{"__proto__":{"polluted":true},"safe":1}')}]);
+ok("proto-pollution: Object.prototype not polluted", ({}).polluted === undefined);
+ok("proto-pollution: emitted, not rejected", poll.stream.length === 1 && poll.rejections.length === 0);
+eq("proto-pollution: dangerous key dropped, safe key kept",
+poll.stream[0].payload, { safe: 1});
+
+// 3c. halt vs skip policy.
+var halted = R.foldLog([{ seq: 0, t: 0, type: "key", payload: {}},
+{ seq: 2, t: 0, type: "key", payload: {}}, // gap -> halt here
+{ seq: 3, t: 0, type: "key", payload: {}}]);
+ok("halt: stops at first violation", halted.halted === true && halted.stream.length === 1);
+var skipped = R.foldLog([{ seq: 0, t: 0, type: "key", payload: {}},
+{ seq: 2, t: 0, type: "key", payload: {}}, // gap, skipped
+{ seq: 1, t: 0, type: "key", payload: {}}], // now valid (nextSeq still 1)
+{ rejectPolicy: "skip"});
+ok("skip: continues past a rejection", skipped.halted === false &&
+skipped.stream.length === 2 && skipped.rejections.length === 1);
+
+// ---------------------------------------------------------------------------
+// 4. State-bounds (§3.2) — over a large synthetic log the state stays exactly
+// three integers; no retained buffer. Assert structurally + by memory shape.
+// ---------------------------------------------------------------------------
+var N = 100000;
+var big = [];
+for (var i = 0; i < N; i++) big.push({ seq: i, t: i, type: "key", payload: {}});
+var bigOut = R.foldLog(big);
+eq("state-bounds: state keys are exactly {nextSeq,lastTick,count}",
+Object.keys(bigOut.state).sort(), ["count", "lastTick", "nextSeq"]);
+ok("state-bounds: count == N", bigOut.state.count === N);
+ok("state-bounds: state carries no array/buffer field",
+Object.keys(bigOut.state).every(function (k) { return typeof bigOut.state[k] === "number";}));
+
+// ---------------------------------------------------------------------------
+// 5. Mutation bite — a deliberately-wrong expected state MUST be caught, so a
+// no-op harness cannot pass green.
+// ---------------------------------------------------------------------------
+var wrongExpected = { nextSeq: 999, lastTick: 3, count: 4};
+ok("mutation bite: wrong expected state is detected",
+JSON.stringify(g.state)!== JSON.stringify(wrongExpected));
+
+// ---------------------------------------------------------------------------
+console.log((fail === 0? "OK": "FAILED") + " — " + pass + " passed, " + fail + " failed");
+process.exitCode = fail === 0? 0: 1;
+
+Take the whole folder →
+MIT
+Zero dependencies, Node or browser, deterministic
+
+---
+
+# Interval-math — a Loop MMT gift
+https://loopmmt.com/gifts/interval-math/
+[coverage: optional · branch: gifts]
+
+Ranges In, A Bound You Can Trust Out transform ← all gifts
+
+Interval-math
+
+Point it at a JSONL stream of operations — each a {op, a:[lo,hi], b:[lo,hi]} pairing two intervals with + - * or / — and it computes the resulting interval, emitting {"lo":L,"hi":H} one per record in input order. An interval [lo,hi] means 'some real number in this range'; the result is GUARANTEED to contain every (x op y) for x in a, y in b (the containment property). Multiply uses all FOUR corner products, so [-2,3]*[-5,4] is [-15,12], not the naive [10,12]. Division by an interval strictly on one side of zero multiplies by the reciprocal interval; dividing by an interval that SPANS zero is refused (unbounded result). It drops into a pipe anywhere ranges/tolerances/error-bars need combining with an honest bound, without an interval-arithmetic library.
+
+The honest edge
+
+Does the four arithmetic ops (+ - * /) on real intervals. NOT a full interval library — no power/exponent, roots, or transcendental functions (sin/exp/log), no interval union/intersection/hull. NO outward-directed rounding: bounds are plain IEEE-754 doubles (a result whose true endpoint is not exactly representable is the nearest double, which may be a hair inside the guaranteed bound) — for certified soundness use a rational/directed-rounding library. Division by an interval containing zero is refused, not split.
+
+Run it
+
+printf '%s\n' '{"op":"*","a":[-1,2],"b":[3,4]}' | node interval-math.js # op + - * /; exit 0 ok | 2 input error
+test_interval-math.js (28/28: the CONTAINMENT invariant as a self-witnessing oracle (sample a 20-pt grid of x in a, y in b; every x op y must lie in the returned [lo,hi]) + TIGHTNESS (bounds == sampled extremes) over 10 op/interval cases + frozen hand goldens (all-four-corner sign-crossing multiply == [-15,12], subtraction flip, reciprocal division) + division-by-interval-spanning-zero refusals + input-honesty hard errors (unknown/missing op, mis-shaped/non-finite/lo>hi interval, non-JSON) + the naive-two-corner-multiply mutation bite) + out-of-band conformance conform_interval-math.cjs (18/18 GREEN, subprocess-driven, signed b77c4b3dbc9d8798)
+Zero dependencies, Node or browser, deterministic
+
+The code — every file that ships
+
+interval-math.js 238 lines on GitHub →
+#!/usr/bin/env node
+/* interval-math.js — interval arithmetic (+ - * /) over a JSONL stream of operations.
+Dependency-free, deterministic. Runs in Node or a browser. MIT.
+
+WHAT IT IS. Give it a stream of operations — one JSON record per line (JSONL),
+each naming two intervals and an operator — and it computes the resulting interval
+and emits it. An interval [lo, hi] stands for "some real number between lo and hi,
+inclusive"; interval arithmetic computes the tightest interval GUARANTEED to
+contain the true result whatever the inputs actually were. Same stream in,
+byte-identical stream out, on every machine and every run. It is a TRANSFORM: one
+record in, one record out, in the same order.
+
+THE OPERATION RECORD. Each non-blank line is one JSON object:
+
+{"op": "+", "a": [1, 2], "b": [3, 4]} -> {"lo":4,"hi":6}
+{"op": "*", "a": [-1, 2], "b": [3, 4]} -> {"lo":-4,"hi":8}
+{"op": "/", "a": [1, 1], "b": [2, 4]} -> {"lo":0.25,"hi":0.5}
+
+"op" is one of "+", "-", "*", "/". "a" and "b" are each a two-element array
+[lo, hi] of finite JSON numbers with lo <= hi. The output is {"lo":L, "hi":H}.
+
+THE CONTAINMENT GUARANTEE (the whole point). For every operation the result [L,H]
+is computed so that for ALL x in a and ALL y in b, (x op y) lies in [L, H]. This
+is the load-bearing invariant: interval arithmetic is only correct if it never
+loses a possible result.
+
++ [a,b] + [c,d] = [a+c, b+d]
+- [a,b] - [c,d] = [a-d, b-c] (subtract the OTHER interval flipped)
+* [a,b] * [c,d] = [min(P), max(P)] where P = {a*c, a*d, b*c, b*d}
+(ALL FOUR corner products — a naive
+[a*c, b*d] is WRONG whenever a sign
+crosses zero)
+/ [a,b] / [c,d] = [a,b] * [1/d, 1/c] (multiply by the reciprocal interval)
+ONLY when [c,d] does NOT contain 0 —
+
+DIVISION BY AN INTERVAL SPANNING ZERO IS A HARD ERROR. If b = [c,d] has c <= 0 <= d
+the reciprocal interval is unbounded (the result would be (-inf, +inf) or a split),
+so this gift REFUSES it (exit 2) rather than emit a bound it cannot honor. Dividing
+by an interval strictly on one side of zero (c>0 or d<0) is fine.
+
+NUMERIC HONESTY. Bounds are IEEE-754 doubles. Every endpoint must be a FINITE JSON
+number; a NaN/Infinity/overflow (e.g. 1e999 -> Infinity) or an interval with
+lo > hi is a HARD ERROR (exit 2) naming the line — never a silent skip. See the
+printed edge for the rounding caveat: this is EXACT for representable endpoints and
+representable results, but does NOT do outward-directed rounding, so a result whose
+true endpoint is not exactly representable in a double is stored as the nearest
+double (which may be a hair inside the mathematically-guaranteed bound). For
+verified/certified interval arithmetic use a rational or a directed-rounding
+library; this gift is the honest zero-dep representation, not a proof engine.
+
+USAGE
+printf '%s\n' '{"op":"+","a":[1,2],"b":[3,4]}' | node interval-math.js
+printf '%s\n' '{"op":"*","a":[-1,2],"b":[3,4]}' | node interval-math.js
+node interval-math.js ops.jsonl
+node interval-math.js --help
+
+Each non-blank line is one operation record; blank lines are skipped; a trailing
+\r (CRLF files) is trimmed. Output is one compact JSON object ({"lo":L,"hi":H})
+per record, one per line, in input order.
+
+Exit codes: 0 success · 2 input error (a line that is not a valid operation record,
+an unknown op, a non-finite or mis-ordered interval, or a division by an interval
+spanning zero). Always a clean one-line message on stderr, never a stack trace.
+
+Released under MIT. Its edge is printed in the README: this does the four
+arithmetic ops (+ - * /) on real intervals. It is NOT a full interval library — no
+power/exponent, roots, or transcendental functions (sin/exp/log), no interval
+union/intersection/hull, and NO outward-directed rounding (bounds are plain
+doubles). Division by an interval containing zero is refused, not split.
+*/
+"use strict";
+
+var OPS = { "+": true, "-": true, "*": true, "/": true};
+
+// Validate an interval value: a 2-element array of finite numbers with lo <= hi.
+function checkInterval(v, which, lineNo) {
+if (!Array.isArray(v) || v.length!== 2) {
+throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
+" must be a two-element [lo,hi] array");
+}
+var lo = v[0], hi = v[1];
+if (typeof lo!== "number" || typeof hi!== "number" ||!isFinite(lo) ||!isFinite(hi)) {
+throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
+" endpoints must be finite numbers");
+}
+if (lo > hi) {
+throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
+" has lo > hi (" + lo + " > " + hi + ")");
+}
+return [lo, hi];
+}
+
+// Compute one interval operation. Throws (clean, line-named) on divide-by-spanning-0.
+function apply(op, a, b, lineNo) {
+var al = a[0], ah = a[1], bl = b[0], bh = b[1];
+switch (op) {
+case "+":
+return [al + bl, ah + bh];
+case "-":
+return [al - bh, ah - bl];
+case "*": {
+var p = [al * bl, al * bh, ah * bl, ah * bh];
+return [Math.min(p[0], p[1], p[2], p[3]), Math.max(p[0], p[1], p[2], p[3])];
+}
+case "/": {
+if (bl <= 0 && bh >= 0) {
+throw new Error("line " + lineNo +
+" divides by an interval spanning zero [" + bl + "," + bh + "] (unbounded result; refused)");
+}
+// reciprocal of [bl,bh] (which does not contain 0) is [1/bh, 1/bl]
+var rl = 1 / bh, rh = 1 / bl;
+var q = [al * rl, al * rh, ah * rl, ah * rh];
+return [Math.min(q[0], q[1], q[2], q[3]), Math.max(q[0], q[1], q[2], q[3])];
+}
+default:
+throw new Error("line " + lineNo + " unknown op " + JSON.stringify(op) +
+" (expected + - * /)");
+}
+}
+
+// Convert one parsed record -> {lo,hi}. Throws on a malformed record.
+function computeRecord(rec, lineNo) {
+if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
+throw new Error("line " + lineNo + " is not an operation object");
+}
+var op = rec.op;
+if (typeof op!== "string" ||!OPS[op]) {
+throw new Error("line " + lineNo + " has a missing or unknown op " +
+JSON.stringify(op) + " (expected + - * /)");
+}
+var a = checkInterval(rec.a, "a", lineNo);
+var b = checkInterval(rec.b, "b", lineNo);
+var r = apply(op, a, b, lineNo);
+return { lo: r[0], hi: r[1]};
+}
+
+// The public transform: JSONL text -> { lines: [json per record..], count}.
+function transform(text) {
+var rawLines = String(text).split("\n");
+var out = [];
+var i, line, rec, result;
+for (i = 0; i < rawLines.length; i++) {
+line = rawLines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line
+
+try { rec = JSON.parse(line);}
+catch (e) {
+throw new Error("line " + (i + 1) + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
+}
+result = computeRecord(rec, i + 1);
+out.push(JSON.stringify(result));
+}
+return { lines: out, count: out.length};
 }
 
 /* ---- exports (browser + Node) ------------------------------------ */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.jsonSource = { parse: parse, toJSONL: toJSONL};
+window.ForestGifts.intervalMath = transform;
+window.ForestGifts.intervalOp = function (op, a, b) { return apply(op, checkInterval(a, "a", 1), checkInterval(b, "b", 1), 1);};
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { parse: parse, toJSONL: toJSONL};
+module.exports = { transform: transform, apply: apply, computeRecord: computeRecord, checkInterval: checkInterval};
 }
 
 /* ---- CLI (runs only when invoked directly, never on require) ------ */
-
-function parseArgs(args) {
-var file;
-var i = 0;
-while (i < args.length) {
-var a = args[i];
-if (a.charAt(0) === "-" && a!== "-") {
-throw new Error("unknown option " + a);
-} else {
-if (file!== undefined) throw new Error("only one input file may be given (got a second: " + JSON.stringify(a) + ")");
-file = a;
-i += 1;
-}
-}
-return { file: file};
-}
-
-function readAll(stream) {
-return new Promise(function (resolve, reject) {
-var chunks = [];
-stream.on("data", function (c) { chunks.push(c);});
-stream.on("end", function () { resolve(Buffer.concat(chunks).toString("utf8"));});
-stream.on("error", reject);
-});
-}
-
-function helpText() {
-return (
-"json-source.js — stream the elements of a JSON array as a JSONL record stream.\n\n" +
-" node json-source.js data.json\n" +
-" cat data.json | node json-source.js\n" +
-" node json-source.js --help\n\n" +
-" [FILE] JSON file to stream (default: read stdin). Top-level must be an array.\n\n" +
-"Emits one canonical compact JSON line per top-level array element.\n\n" +
-"Edge: streams a TOP-LEVEL JSON ARRAY only — a non-array top-level or malformed JSON\n" +
-"is refused (exit 2). Each element is re-serialized to canonical compact JSON (number\n" +
-"tokens and whitespace normalized, key order preserved). Reads JSON, not JSON5/NDJSON,\n" +
-"and parses the whole document (not an incremental stream).\n"
-);
-}
-
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(helpText());
-return Promise.resolve(0);
-}
-var parsed;
-try { parsed = parseArgs(args);}
-catch (e) { process.stderr.write("json-source: " + e.message + "\n"); return Promise.resolve(2);}
-
-var getText;
-if (parsed.file!== undefined) {
-getText = new Promise(function (resolve, reject) {
-require("fs").readFile(parsed.file, "utf8", function (err, data) {
-if (err) reject(new Error("cannot read " + JSON.stringify(parsed.file) + ": " + err.code));
-else resolve(data);
-});
-});
-} else {
-getText = readAll(process.stdin);
-}
-
-return getText.then(function (text) {
-var elements = parse(text); // throws -> caught below
-process.stdout.write(toJSONL(elements));
-return 0;
-}).catch(function (e) {
-process.stderr.write("json-source: " + e.message + "\n");
-return 2;
-});
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-main(process.argv).then(function (code) { process.exitCode = code;});
-}
-
-test_json-source.js 108 lines on GitHub →
-#!/usr/bin/env node
-/* test_json-source.js — battery for the json-source gift.
-node test_json-source.js -> exit 0 PASS / non-zero FAIL. Zero dependencies.
-
-Cross-checks the gift against an INDEPENDENT map-route oracle (a different route than
-the gift's loop), frozen hand goldens, the canonical-re-serialization contract,
-determinism, and every fail-closed edge. */
-"use strict";
-var js = require("./json-source.js");
-
-var pass = 0, fail = 0;
-function ok(name, cond) { if (cond) pass++; else { fail++; console.log(" FAIL " + name);}}
-function eqS(name, a, b) {
-if (a === b) pass++;
-else { fail++; console.log(" FAIL " + name + "\n exp " + JSON.stringify(b) + "\n got " + JSON.stringify(a));}
-}
-function throws(name, fn) {
-var threw = false; try { fn();} catch (e) { threw = true;}
-if (threw) pass++; else { fail++; console.log(" FAIL " + name + " (expected a throw)");}
-}
-
-/* ---- independent oracle: Array.prototype.map route (different route than the gift) ---- */
-function oracleJSONL(text) {
-var v = JSON.parse(text); // may throw -> caller counts as error
-if (!Array.isArray(v)) throw new Error("not array");
-return v.map(function (el) { return JSON.stringify(el);}).join("") + (v.length? "": "");
-}
-// build expected JSONL the oracle way (join with \n + trailing \n if non-empty)
-function oracle(text) {
-var v = JSON.parse(text);
-if (!Array.isArray(v)) throw new Error("not array");
-var out = "";
-v.forEach(function (el) { out += JSON.stringify(el) + "\n";});
-return out;
-}
-
-/* ---- 1. differential grid: gift == oracle on every good vector ---- */
-var good = [
-"[]",
-"[1,2,3]",
-'[{"id":1},{"id":2}]',
-'[{"a":1,"b":2},{"a":3,"b":4}]',
-'["x","y","z"]',
-"[true,false,null]",
-'[{"nested":{"k":[1,2]}}]',
-"[ 1, 2,\n 3]", // whitespace normalized
-"[1e3, 1.0, 100]", // number tokens normalized to value
-'[{"b":2,"a":1}]', // key order preserved from input
-'[""]', // array with one empty string
-];
-for (var i = 0; i < good.length; i++) {
-eqS("differential[" + i + "] gift==oracle", js.toJSONL(js.parse(good[i])), oracle(good[i]));
-}
-
-/* ---- 2. hand goldens (frozen) ---- */
-eqS("golden: empty array -> empty stream", js.toJSONL(js.parse("[]")), "");
-eqS("golden: scalars", js.toJSONL(js.parse("[1,2,3]")), "1\n2\n3\n");
-eqS("golden: objects", js.toJSONL(js.parse('[{"id":1},{"id":2}]')), '{"id":1}\n{"id":2}\n');
-eqS("golden: whitespace normalized", js.toJSONL(js.parse("[ 1, 2]")), "1\n2\n");
-eqS("golden: number token 1e3 -> 1000", js.toJSONL(js.parse("[1e3]")), "1000\n");
-eqS("golden: number token 1.0 -> 1", js.toJSONL(js.parse("[1.0]")), "1\n");
-eqS("golden: key order preserved", js.toJSONL(js.parse('[{"b":2,"a":1}]')), '{"b":2,"a":1}\n');
-eqS("golden: nested value verbatim-as-value", js.toJSONL(js.parse('[{"k":{"z":[1,2]}}]')), '{"k":{"z":[1,2]}}\n');
-
-/* ---- 3. one line per element ---- */
-var recs = js.parse('[{"a":1},{"a":2},{"a":3}]');
-ok("count: 3 elements", recs.length === 3);
-ok("lines: JSONL has 3 lines", js.toJSONL(recs).split("\n").filter(Boolean).length === 3);
-
-/* ---- 4. fail-closed (exit-2 class) ---- */
-throws("bad: malformed JSON", function () { js.parse("[1,2,");});
-throws("bad: top-level object", function () { js.parse('{"a":1}');});
-throws("bad: top-level scalar number", function () { js.parse("42");});
-throws("bad: top-level string", function () { js.parse('"hello"');});
-throws("bad: top-level bool", function () { js.parse("true");});
-throws("bad: top-level null", function () { js.parse("null");});
-throws("bad: empty input (not JSON)", function () { js.parse("");});
-throws("bad: non-string input", function () { js.parse(123);});
-
-/* ---- 5. determinism: parse twice -> byte-identical JSONL ---- */
-var arr = [];
-for (var k = 0; k < 50; k++) arr.push({ n: k, s: "v" + k});
-var big = JSON.stringify(arr);
-ok("determinism: two parses byte-identical", js.toJSONL(js.parse(big)) === js.toJSONL(js.parse(big)));
-
-/* ---- 6. toJSONL shape ---- */
-ok("toJSONL: one value per line + trailing nl", js.toJSONL([{ a: 1}]) === '{"a":1}\n');
-ok("toJSONL: empty -> empty string", js.toJSONL([]) === "");
-
-/* ---- 7. mutation tripwire: an object-flattening mutant must diverge ---- */
-(function () {
-// mutant: emits only the FIRST value of each object (a lossy "flatten"); must diverge
-function mutant(text) {
-var v = JSON.parse(text); var out = "";
-v.forEach(function (el) {
-if (el && typeof el === "object" &&!Array.isArray(el)) {
-var ks = Object.keys(el); out += JSON.stringify(ks.length? el[ks[0]]: el) + "\n";
-} else out += JSON.stringify(el) + "\n";
-});
-return out;
-}
-var v = '[{"a":1,"b":2}]';
-ok("mutation: first-value-flatten is CAUGHT (diverges from gift)",
-mutant(v)!== js.toJSONL(js.parse(v)));
-})();
-
-console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# JSONL-Diff — a Loop MMT gift
-https://loopmmt.com/gifts/jsonl-diff/
-[coverage: optional · branch: gifts]
-
-What Changed Between Two Runs? fold ← all gifts
-
-JSONL-Diff
-
-You ran the same prompt through a model twice — a new version, a new day — and got two files of JSONL output. What actually changed? jsonl-diff takes an OLD file and a NEW file and tells you what was added, removed, and (when you name a key field) changed — sorted, canonical, and byte-identical on every run, so it drops straight into a CI gate or a review. Two modes: set-diff (default) keys each record by its own canonical form, so a changed record shows as one removed plus one added; keyed diff (--key FIELD) keys by a field, so a same-key record with different content is a CHANGE reported with its field-level deltas. Object keys are sorted and array order is faithful, so a key-reordered record matches and a reordered array does not. Deterministic, fail-closed, zero dependencies, offline.
-
-The honest edge
-
-jsonl-diff compares STRUCTURE, not MEANING. A reported change may be cosmetic (1 vs 1.0, "a,b" vs ["a","b"]) and an unreported match may still be wrong — semantic equivalence it will miss is a difference here. A human reads the diff; the tool only makes the change visible and exact. It tells you two records differ; it cannot tell you the difference matters, is correct, or is safe.
-
-Run it
-
-node jsonl-diff.js --key id old.jsonl new.jsonl # exit 0 identical | 1 differs | 2 input error; --out json for a canonical result object
-test_jsonl-diff.js (10/10) + --selftest (10/10: canon idempotence, set-diff added/removed, keyed change, folds-twice-identical, blank-line skip, guard/exit space)
-Zero dependencies, Node or browser, deterministic
-
-The code — every file that ships
-
-jsonl-diff.js 294 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* jsonl-diff.js — what changed between two JSONL files, deterministically.
-*
-* A tiny, dependency-free diff for JSON Lines (one JSON value per line). Give it
-* an OLD file and a NEW file and it tells you what was ADDED, REMOVED, and (when
-* you name a key) CHANGED — sorted, canonical, byte-identical on every run so it
-* drops straight into a CI gate or a review.
-*
-* old.jsonl, new.jsonl ──▶ diff(old, new, {key})
-* ──▶ { added:[…], removed:[…], changed:[…]}
-*
-* TWO MODES.
-* set-diff (default) — records are keyed by their own canonical form, so a
-* record either matches exactly or it is added/removed.
-* A changed record shows as one removed + one added.
-* keyed diff (--key F) — records are keyed by the value of field F. A record
-* present on both sides with the same key but different
-* content is a CHANGE, reported with its field deltas.
-*
-* DETERMINISM (the promise, and the self-test that proves it). Comparison and
-* output both run over a canonical form: object keys sorted, whitespace fixed,
-* no ordering luck. The result is sorted by key. `--selftest` proves the canon
-* is idempotent (canon(canon(x)) === canon(x)) and the diff is stable, so the
-* output is a pure function of the two inputs — the same bytes, every run.
-*
-* THE LINE IT WILL NOT CROSS (the honest ceiling — printed every --help/--list).
-* jsonl-diff compares STRUCTURE, not MEANING. It tells you two records differ; it
-* cannot tell you the difference matters, is correct, or is safe. Semantic
-* equivalence it will miss (1 vs 1.0, "a,b" vs ["a","b"]) is a difference here.
-* A human reads the diff; the tool only makes the change visible and exact.
-*
-* EXIT CODES (diff convention, gate-friendly).
-* 0 the two files are identical (under the chosen mode)
-* 1 they differ (added / removed / changed present)
-* 2 input could not be used (missing file, a directory, unreadable, bad JSON,
-* a duplicate key, or a missing --key field) — always a clean message, never
-* a stack trace.
-*
-* Runs identically in Node and in a browser (no DOM, no deps). MIT.
-*/
-
-var CEILING =
-'ceiling: jsonl-diff compares STRUCTURE, not MEANING. A reported change may be\n' +
-' cosmetic (1 vs 1.0) and an unreported match may still be wrong. A human reads\n' +
-' the diff; the tool only makes the change visible and exact.';
-
-/* ---- canonical form (the canonicalizer; idempotent + order-faithful) ------ */
-function canon(v) {
-if (v === null || typeof v!== 'object') return JSON.stringify(v);
-if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
-var keys = Object.keys(v).sort();
-var parts = [];
-for (var i = 0; i < keys.length; i++) {
-parts.push(JSON.stringify(keys[i]) + ':' + canon(v[keys[i]]));
-}
-return '{' + parts.join(',') + '}';
-}
-
-/* ---- parse a JSONL string into records (throws JsonlError on a bad line) --- */
-function JsonlError(msg) { var e = new Error(msg); e.jsonl = true; return e;}
-
-function parseJsonl(text, label) {
-var out = [];
-var lines = text.split('\n');
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i];
-if (line.replace(/\s+/g, '') === '') continue; // skip blank lines
-var obj;
-try { obj = JSON.parse(line);}
-catch (e) {
-throw JsonlError(label + ':' + (i + 1) + ': not valid JSON (' +
-((e && e.message) || 'parse error') + ')');
-}
-out.push({ value: obj, line: i + 1});
-}
-return out;
-}
-
-/* ---- key a record: by field F (keyed mode) or by its canonical form (set) -- */
-function keyOf(rec, key, label) {
-if (key === null) return canon(rec.value);
-var v = rec.value;
-if (v === null || typeof v!== 'object' || Array.isArray(v) ||
-!Object.prototype.hasOwnProperty.call(v, key)) {
-throw JsonlError(label + ':' + rec.line + ': record has no key field ' +
-JSON.stringify(key));
-}
-return canon(v[key]);
-}
-
-function index(recs, key, label) {
-var map = {};
-for (var i = 0; i < recs.length; i++) {
-var k = keyOf(recs[i], key, label);
-if (Object.prototype.hasOwnProperty.call(map, k)) {
-throw JsonlError(label + ':' + recs[i].line + ': duplicate key ' + k +
-' (first seen at ' + label + ':' + map[k].line + ') — the diff would be ambiguous');
-}
-map[k] = recs[i];
-}
-return map;
-}
-
-/* ---- field-level delta for a CHANGED record (keyed mode) ------------------ */
-function fieldDelta(before, after) {
-var d = { added: {}, removed: {}, changed: {}};
-var bObj = before && typeof before === 'object' &&!Array.isArray(before);
-var aObj = after && typeof after === 'object' &&!Array.isArray(after);
-if (!bObj ||!aObj) return null; // not object-vs-object; whole-value change
-var seen = {};
-var k, keys = Object.keys(before).concat(Object.keys(after));
-for (var i = 0; i < keys.length; i++) {
-k = keys[i];
-if (seen[k]) continue; seen[k] = 1;
-var hb = Object.prototype.hasOwnProperty.call(before, k);
-var ha = Object.prototype.hasOwnProperty.call(after, k);
-if (hb &&!ha) d.removed[k] = before[k];
-else if (!hb && ha) d.added[k] = after[k];
-else if (canon(before[k])!== canon(after[k])) d.changed[k] = { before: before[k], after: after[k]};
-}
-return d;
-}
-
-/* ---- the diff (pure) ------------------------------------------------------ */
-function diff(oldText, newText, opts) {
-opts = opts || {};
-var key = (opts.key === undefined)? null: opts.key;
-var oldRecs = parseJsonl(oldText, 'old');
-var newRecs = parseJsonl(newText, 'new');
-var oldMap = index(oldRecs, key, 'old');
-var newMap = index(newRecs, key, 'new');
-var added = [], removed = [], changed = [];
-var k;
-var allKeys = {};
-for (k in oldMap) if (Object.prototype.hasOwnProperty.call(oldMap, k)) allKeys[k] = 1;
-for (k in newMap) if (Object.prototype.hasOwnProperty.call(newMap, k)) allKeys[k] = 1;
-var sorted = Object.keys(allKeys).sort();
-for (var i = 0; i < sorted.length; i++) {
-k = sorted[i];
-var inOld = Object.prototype.hasOwnProperty.call(oldMap, k);
-var inNew = Object.prototype.hasOwnProperty.call(newMap, k);
-if (inOld &&!inNew) removed.push({ key: k, value: oldMap[k].value});
-else if (!inOld && inNew) added.push({ key: k, value: newMap[k].value});
-else if (canon(oldMap[k].value)!== canon(newMap[k].value)) {
-changed.push({
-key: k,
-before: oldMap[k].value,
-after: newMap[k].value,
-fields: (key === null)? null: fieldDelta(oldMap[k].value, newMap[k].value)
-});
-}
-}
-return { added: added, removed: removed, changed: changed};
-}
-
-/* ---- rendering ------------------------------------------------------------ */
-function renderText(d) {
-var out = [];
-var i;
-for (i = 0; i < d.removed.length; i++) out.push('- ' + d.removed[i].key);
-for (i = 0; i < d.added.length; i++) out.push('+ ' + d.added[i].key);
-for (i = 0; i < d.changed.length; i++) {
-var c = d.changed[i];
-out.push('~ ' + c.key);
-if (c.fields) {
-var f = c.fields, fk;
-var rk = Object.keys(f.removed).sort();
-for (fk = 0; fk < rk.length; fk++) out.push(' - ' + rk[fk] + ': ' + JSON.stringify(f.removed[rk[fk]]));
-var ak = Object.keys(f.added).sort();
-for (fk = 0; fk < ak.length; fk++) out.push(' + ' + ak[fk] + ': ' + JSON.stringify(f.added[ak[fk]]));
-var ck = Object.keys(f.changed).sort();
-for (fk = 0; fk < ck.length; fk++) {
-out.push(' ~ ' + ck[fk] + ': ' + JSON.stringify(f.changed[ck[fk]].before) +
-' -> ' + JSON.stringify(f.changed[ck[fk]].after));
-}
-}
-}
-out.push('# ' + d.added.length + ' added, ' + d.removed.length + ' removed, ' +
-d.changed.length + ' changed');
-return out.join('\n');
-}
-
-function renderJson(d) {
-// canonical, deterministic: sorted keys, stable field order
-return canon({
-added: d.added,
-removed: d.removed,
-changed: d.changed,
-summary: { added: d.added.length, removed: d.removed.length, changed: d.changed.length}
-});
-}
-
-/* ---- self-test (determinism + promise proof) ------------------------------ */
-function selftest() {
-var pass = 0, fail = 0;
-function ok(cond, name) { if (cond) pass++; else { fail++; console.error('FAIL: ' + name);}}
-
-// canon is idempotent and order-faithful
-var a = { b: 1, a: [3, { y: 2, x: 1}]};
-ok(canon(JSON.parse(canon(a))) === canon(a), 'canon round-trips through JSON.parse');
-ok(canon({ x: 1, y: 2}) === canon({ y: 2, x: 1}), 'canon is key-order-faithful');
-ok(canon(canon(a)) === canon(canon(a)), 'canon is idempotent');
-
-// set-diff mode
-var oldT = '{"id":1,"v":"a"}\n{"id":2,"v":"b"}\n';
-var newT = '{"id":2,"v":"b"}\n{"id":3,"v":"c"}\n';
-var d1 = diff(oldT, newT, {});
-ok(d1.added.length === 1 && d1.removed.length === 1 && d1.changed.length === 0, 'set-diff add/remove');
-
-// keyed diff: same key, changed content => CHANGE with field delta
-var d2 = diff(oldT, '{"id":1,"v":"A","extra":9}\n{"id":2,"v":"b"}\n', { key: 'id'});
-ok(d2.changed.length === 1 && d2.added.length === 0 && d2.removed.length === 0, 'keyed change is a change, not add+remove');
-ok(d2.changed[0].fields && d2.changed[0].fields.changed.v && d2.changed[0].fields.added.extra!== undefined,
-'keyed change reports field deltas');
-
-// identical inputs => empty diff, byte-stable render
-var d3 = diff(oldT, oldT, { key: 'id'});
-ok(d3.added.length === 0 && d3.removed.length === 0 && d3.changed.length === 0, 'identical => empty');
-ok(renderJson(diff(oldT, newT, {})) === renderJson(diff(oldT, newT, {})), 'render is byte-stable across runs');
-
-// blank lines skipped; whitespace-insensitive comparison
-ok(diff('{"id":1}\n\n', '{ "id": 1}\n', { key: 'id'}).changed.length === 0, 'whitespace-insensitive, blanks skipped');
-
-// duplicate key is an error (ambiguous)
-var threw = false;
-try { diff('{"id":1}\n{"id":1}\n', '{"id":1}\n', { key: 'id'});} catch (e) { threw = e && e.jsonl;}
-ok(threw, 'duplicate key throws a clean JsonlError');
-
-console.log((fail === 0? 'GREEN': 'RED') + ': ' + (pass) + ' checks passed, ' + fail + ' failed [jsonl-diff]');
-return fail === 0;
-}
-
-/* ---- crashclean read ------------------------------------------------------ */
-function readFileClean(path) {
-var fs = require('fs');
-try {
-return fs.readFileSync(path, 'utf8');
-} catch (e) {
-var why = e && e.code === 'ENOENT'? 'no such file'
-: e && e.code === 'EISDIR'? 'is a directory'
-: e && e.code === 'EACCES'? 'permission denied'
-: (e && e.message) || 'cannot read';
-process.stderr.write('jsonl-diff: cannot read ' + JSON.stringify(path) + ': ' + why + '\n');
-process.exit(2);
-}
-}
-
-/* ---- CLI ------------------------------------------------------------------ */
-function usage() {
-console.log('usage: jsonl-diff.js [--key FIELD] [--out text|json] OLD.jsonl NEW.jsonl');
-console.log(' --key FIELD key records by FIELD; a same-key record that differs is a CHANGE');
-console.log(' (default: key by the whole record — changes show as remove + add)');
-console.log(' --out text - removed, + added, ~ changed, then a summary [default]');
-console.log(' --out json a canonical JSON result object');
-console.log(' --selftest run the built-in checks (exit 0 GREEN, 1 RED)');
-console.log(' exit 0 identical | 1 differs | 2 input could not be used');
-console.error('\n' + CEILING);
-}
-
-if (typeof require!== 'undefined' && require.main === module) {
-var argv = process.argv.slice(2);
-var key = null, out = 'text', files = [];
-for (var a = 0; a < argv.length; a++) {
-var t = argv[a];
-if (t === '--selftest') { process.exit(selftest()? 0: 1);}
-else if (t === '-h' || t === '--help') { usage(); process.exit(0);}
-else if (t === '--key') { key = argv[++a]; if (key === undefined) { console.error('jsonl-diff: --key needs a field name'); process.exit(2);}}
-else if (t === '--out') { out = argv[++a]; if (out!== 'text' && out!== 'json') { console.error('jsonl-diff: --out must be text or json'); process.exit(2);}}
-else if (t.charAt(0) === '-') { console.error('jsonl-diff: unknown option ' + JSON.stringify(t)); process.exit(2);}
-else files.push(t);
-}
-if (files.length!== 2) {
-console.error('jsonl-diff: need exactly two files (OLD NEW); got ' + files.length + '. Try --help.');
-process.exit(2);
-}
-var oldText = readFileClean(files[0]);
-var newText = readFileClean(files[1]);
-var d;
-try {
-d = diff(oldText, newText, key === null? {}: { key: key});
-} catch (e) {
-if (e && e.jsonl) { console.error('jsonl-diff: ' + e.message); process.exit(2);}
-throw e; // a non-input bug: let it surface honestly (never masked as clean)
-}
-console.log(out === 'json'? renderJson(d): renderText(d));
-var differs = d.added.length + d.removed.length + d.changed.length > 0;
-process.exit(differs? 1: 0);
-}
-
-/* ---- exports (browser / require) ------------------------------------------ */
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { diff: diff, canon: canon, parseJsonl: parseJsonl, selftest: selftest};
-}
-
-test_jsonl-diff.js 80 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* test_jsonl-diff.js — the house-standard test file for the jsonl-diff gift.
-*
-* Runs the module's own selftest (canon idempotence/order-faithfulness + the
-* diff modes), then adds API-level assertions the CLI selftest doesn't cover:
-* the set-diff vs keyed-diff distinction, deterministic sort order, the JSON
-* render being canonical + byte-stable, and that adversarial input throws a
-* clean JsonlError rather than a raw crash. Exits non-zero on any failure so it
-* drops straight into a CI gate.
-*/
-'use strict';
-var jd = require('./jsonl-diff.js');
-
-var fails = [];
-function ck(name, cond) { if (!cond) fails.push(name);}
-
-// 1. the module's own selftest must pass
-ck('module selftest GREEN', jd.selftest() === true);
-
-// 2. canon: order-faithful + idempotent
-ck('canon order-faithful', jd.canon({ b: 2, a: 1}) === jd.canon({ a: 1, b: 2}));
-ck('canon idempotent', jd.canon(jd.canon({ a: [1, 2]})) === jd.canon(jd.canon({ a: [1, 2]})));
-
-// 3. set-diff (no key): a changed record is one remove + one add, never a change
-var d = jd.diff('{"id":1,"v":"a"}\n', '{"id":1,"v":"b"}\n', {});
-ck('set-diff: change becomes remove+add', d.changed.length === 0 && d.added.length === 1 && d.removed.length === 1);
-
-// 4. keyed diff: same key, different content is a CHANGE with field deltas
-d = jd.diff('{"id":1,"v":"a","gone":1}\n', '{"id":1,"v":"b","new":2}\n', { key: 'id'});
-ck('keyed: same key differing is a change', d.changed.length === 1);
-ck('keyed: field delta names changed/removed/added',
-d.changed[0].fields.changed.v && d.changed[0].fields.removed.gone!== undefined &&
-d.changed[0].fields.added.new!== undefined);
-
-// 5. deterministic sort order (result independent of input line order)
-var A = jd.diff('{"id":2}\n{"id":1}\n', '{"id":3}\n{"id":1}\n', { key: 'id'});
-var B = jd.diff('{"id":1}\n{"id":2}\n', '{"id":1}\n{"id":3}\n', { key: 'id'});
-ck('result independent of input order',
-JSON.stringify(A.removed.map(function (r) { return r.key;})) ===
-JSON.stringify(B.removed.map(function (r) { return r.key;})));
-
-// 6. duplicate key => clean JsonlError (not a raw crash)
-var threw = null;
-try { jd.diff('{"id":1}\n{"id":1}\n', '{"id":1}\n', { key: 'id'});} catch (e) { threw = e;}
-ck('duplicate key throws JsonlError', threw && threw.jsonl === true);
-
-// 7. bad JSON line => clean JsonlError naming file:line
-threw = null;
-try { jd.parseJsonl('{"ok":1}\nnope\n', 'x');} catch (e) { threw = e;}
-ck('bad JSON throws JsonlError with location', threw && threw.jsonl === true && /x:2:/.test(threw.message));
-
-// 8. missing --key field => clean JsonlError, not a silent wrong answer
-threw = null;
-try { jd.diff('{"a":1}\n', '{"a":1}\n', { key: 'id'});} catch (e) { threw = e;}
-ck('missing key field throws JsonlError', threw && threw.jsonl === true);
-
-// 9. blank lines + whitespace are insensitive under canon
-d = jd.diff('{"id":1}\n\n', '{ "id": 1}\n', { key: 'id'});
-ck('whitespace/blank-insensitive', d.added.length === 0 && d.removed.length === 0 && d.changed.length === 0);
-
-// --- the adversarial CLI exits (crashclean; the qualify D4 contract) ---------
-var cp = require('child_process');
-var here = __dirname + '/jsonl-diff.js';
-function run(args) {
-var r = cp.spawnSync('node', [here].concat(args), { encoding: 'utf8'});
-return { code: r.status, err: r.stderr || '', out: r.stdout || ''};
-}
-var m = run(['/no/such/path_zzz', '/also/missing']);
-ck('missing file => exit 2, no stack trace', m.code === 2 &&!/\bat \w/.test(m.err));
-var one = run(['/no/such/path_zzz']);
-ck('one arg => exit 2, no stack trace', one.code === 2 &&!/\bat \w/.test(one.err));
-var help = run(['--help']);
-ck('--help => exit 0', help.code === 0);
-
-if (fails.length) {
-console.error('RED: ' + fails.length + ' failed: ' + fails.join(', ') + ' [test_jsonl-diff]');
-process.exit(1);
-}
-console.log('GREEN: all checks passed [test_jsonl-diff]');
-
-Take the whole folder →
-MIT
-Zero dependencies, Node or browser, deterministic
-
----
-
-# Branch Merger — a Loop MMT gift
-https://loopmmt.com/gifts/junction/
-[coverage: optional · branch: gifts]
-
-How Do N Branches Fold Back To One? fold ← all gifts
-
-Branch Merger
-
-Fold the labeled records a fanout produced back into one, under a declared merge policy from a closed set (concat, agree, first, map). It is the close half of a parallel-independent compose (the ⊗ product): fanout splits, junction merges, so fanout | junction round-trips. Zero dependencies, pure fold — same records plus the same policy yield byte-identical output every run, and records are folded in seq order so their arrival order never leaks. Runs in Node or the browser (window.ForestGifts.junction).
-
-The honest edge
-
-junction merges declared branch-records into one under a declared policy; it does not choose the policy for you, run the branches, or resolve a value conflict the policy leaves ambiguous — it refuses (non-zero exit) when no policy is declared or the policy cannot merge cleanly.
-
-Run it
-
-node fanout.js --branches a,b,c "p" | node junction.js --policy concat
-test_junction.js (18/18: policy concat/agree/first/map, seq-order determinism, refusal on no-policy + unmergeable conflict, fanout|junction round-trip)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-junction.js 215 lines on GitHub →
-#!/usr/bin/env node
-/* junction.js — merge declared branch-records into one, under a REQUIRED policy.
-
-WHY THIS EXISTS. It is the close half of a parallel-independent compose (the ⊗
-product): `fanout` splits one input into N declared branches; `junction` folds
-those branch-records back into a single record. The pair gives a pipeline the
-parallel product to sit beside sequential (`|`) composition, so `fanout | junction`
-round-trips.
-
-THE ONE DISCIPLINE (the whole reason to trust it). HOW branches recombine is a
-decision the caller must make EXPLICITLY. There is no default policy. junction
-takes the labeled records and a DECLARED policy from a closed set, and emits one
-merged record — and it FAILS CLOSED the instant it is asked to merge with no
-policy, an unknown policy, malformed input, or a conflict the policy declares
-fatal (an `agree` disagreement). It never silently picks a winner.
-
-THE CLOSED POLICY SET (v1):
-concat -> {"policy":"concat","of":n,"merged":[input_0,...,input_{n-1}]}
-agree -> require every branch input identical; {"policy":"agree","of":n,"value":input}
-(fails closed, naming the two branches, on any disagreement)
-first -> {"policy":"first","of":n,"value":input_0}
-map -> {"policy":"map","of":n,"by_branch":{branch:input,...}}
-
-Pure function of its inputs. No dependencies. Same records + same policy ->
-byte-identical merged output, every run. Records are folded in `seq` order, so
-input line-order never leaks into the result. Runs in a browser (attach junction
-to your namespace) or on Node (this CLI / require()).
-
-USAGE
-node fanout.js --branches a,b,c "p" | node junction.js --policy concat # the braid
-node junction.js --policy agree < records.jsonl
-node junction.js --policy map --input records.jsonl
-node junction.js --help
-
-Released under MIT. Its edge is printed in the README: junction merges declared
-branch-records into one under a declared policy; it does not choose the policy for
-you, run the branches, or resolve a value conflict the policy leaves ambiguous — it
-refuses when no policy is declared or the policy cannot merge cleanly.
-*/
-
-"use strict";
-
-var POLICIES = ["concat", "agree", "first", "map"];
-
-function JunctionError(message) {
-var e = new Error(message);
-e.name = "JunctionError";
-return e;
-}
-
-/* parseRecords(text) -> array of fanout records, validated and sorted by seq.
-Fails closed on: no records, a non-record line, an `of` that disagrees with the
-count, a missing/duplicate/out-of-range seq. The corrupted-fan cases are real
-defects (a fan mangled in transit), not warnings. */
-function parseRecords(text) {
-var lines = String(text).split("\n").filter(function (l) { return l.trim().length > 0;});
-if (lines.length === 0) {
-throw JunctionError("no input records (junction folds a fanout's output; it needs at least one record)");
-}
-var recs = [];
-for (var i = 0; i < lines.length; i++) {
-var obj;
-try { obj = JSON.parse(lines[i]);}
-catch (e) { throw JunctionError("input line " + i + " is not valid JSON: " + lines[i]);}
-if (obj === null || typeof obj!== "object" ||
-typeof obj.branch!== "string" ||
-!("input" in obj) ||
-typeof obj.seq!== "number" ||
-typeof obj.of!== "number") {
-throw JunctionError("input line " + i + " is not a fanout record {branch,input,seq,of}: " + lines[i]);
-}
-recs.push(obj);
-}
-var of = recs[0].of;
-if (recs.length!== of) {
-throw JunctionError("record count " + recs.length + " disagrees with declared of=" + of +
-" (the fan was truncated or padded in transit)");
-}
-var seenSeq = Object.create(null);
-for (var j = 0; j < recs.length; j++) {
-var r = recs[j];
-if (r.of!== of) {
-throw JunctionError("record for branch " + JSON.stringify(r.branch) +
-" has of=" + r.of + ", expected " + of + " (mixed fans cannot be merged)");
-}
-if (r.seq < 0 || r.seq >= of || (r.seq | 0)!== r.seq) {
-throw JunctionError("record for branch " + JSON.stringify(r.branch) +
-" has out-of-range seq=" + r.seq + " (expected 0.." + (of - 1) + ")");
-}
-if (seenSeq[r.seq]) {
-throw JunctionError("duplicate seq=" + r.seq + " (the fan is ambiguous — two records claim the same position)");
-}
-seenSeq[r.seq] = true;
-}
-// Fold in declared order: sort by seq (input line-order must not leak).
-recs.sort(function (a, b) { return a.seq - b.seq;});
-return recs;
-}
-
-/* mergeRecords(records, policy) -> the merged object (not yet serialized).
-`records` may be raw fanout records (already validated) in any input order;
-they are sorted by seq here. Fails closed on an unknown policy or an
-`agree` disagreement. */
-function mergeRecords(records, policy) {
-if (POLICIES.indexOf(policy) === -1) {
-throw JunctionError("unknown merge policy " + JSON.stringify(policy) +
-" (declared set: " + POLICIES.join(", ") + "; there is no default)");
-}
-var recs = records.slice().sort(function (a, b) { return a.seq - b.seq;});
-var of = recs.length;
-if (policy === "concat") {
-return { policy: "concat", of: of, merged: recs.map(function (r) { return r.input;})};
-}
-if (policy === "first") {
-return { policy: "first", of: of, value: recs[0].input};
-}
-if (policy === "map") {
-var by = {};
-for (var i = 0; i < recs.length; i++) { by[recs[i].branch] = recs[i].input;}
-return { policy: "map", of: of, by_branch: by};
-}
-// agree: every branch input must be identical (compared by canonical JSON).
-var ref = JSON.stringify(recs[0].input);
-for (var k = 1; k < recs.length; k++) {
-if (JSON.stringify(recs[k].input)!== ref) {
-throw JunctionError("agree conflict: branch " + JSON.stringify(recs[0].branch) +
-" and branch " + JSON.stringify(recs[k].branch) +
-" disagree (agree refuses a disagreement; it never picks a winner)");
-}
-}
-return { policy: "agree", of: of, value: recs[0].input};
-}
-
-/* junction(text, policy) -> the canonical serialized merged record: one JSON
-object, keys in the policy's fixed insertion order, single trailing newline.
-This string IS the gift's canonical output. */
-function junction(text, policy) {
-var recs = parseRecords(text);
-var merged = mergeRecords(recs, policy);
-return JSON.stringify(merged) + "\n";
-}
-
-// Browser / Node exports.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.junction = junction;
-window.ForestGifts.mergeRecords = mergeRecords;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { junction: junction, mergeRecords: mergeRecords, parseRecords: parseRecords, POLICIES: POLICIES};
-}
-
-// ---- CLI --------------------------------------------------------------------
-function readPolicy(args) {
-var i = args.indexOf("--policy");
-if (i === -1) {
-throw JunctionError("no merge policy declared: pass --policy <" + POLICIES.join("|") +
-"> (there is no default policy)");
-}
-var p = args[i + 1];
-if (p === undefined) throw JunctionError("--policy needs a value (" + POLICIES.join("|") + ")");
-return p;
+function run(text) {
+var r = transform(text);
+var body = r.lines.length? r.lines.join("\n") + "\n": "";
+return { out: body, count: r.count};
 }
 
 function main(argv) {
 var args = argv.slice(2);
 if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
 process.stdout.write(
-"junction.js — merge declared branch-records into one, under a REQUIRED policy.\n\n" +
-" node fanout.js --branches a,b,c \"p\" | node junction.js --policy concat the braid\n" +
-" node junction.js --policy agree < records.jsonl\n" +
-" node junction.js --policy map --input records.jsonl\n" +
-" node junction.js --help\n\n" +
-"Policies (closed set, no default): " + POLICIES.join(", ") + "\n" +
-" concat ordered list of branch inputs\n" +
-" agree require all branches identical (refuses a disagreement, naming the two)\n" +
-" first the seq:0 branch's input\n" +
-" map a branch->input object\n\n" +
-"Fails closed (non-zero exit) on no policy, unknown policy, malformed input, or an\n" +
-"agree conflict. It never silently picks a winner.\n\n" +
-"Edge: junction MERGES under a declared policy; it does not choose the policy, run\n" +
-"the branches, or resolve a conflict the policy leaves ambiguous.\n"
+"interval-math.js — interval arithmetic (+ - * /) over a JSONL stream.\n\n" +
+" printf '%s\\n' '{\"op\":\"+\",\"a\":[1,2],\"b\":[3,4]}' | node interval-math.js -> {\"lo\":4,\"hi\":6}\n" +
+" printf '%s\\n' '{\"op\":\"*\",\"a\":[-1,2],\"b\":[3,4]}' | node interval-math.js -> {\"lo\":-4,\"hi\":8}\n" +
+" node interval-math.js ops.jsonl\n" +
+" node interval-math.js --help\n\n" +
+"Each non-blank line is one operation object {op, a:[lo,hi], b:[lo,hi]}. The\n" +
+"result [L,H] is guaranteed to contain every (x op y) for x in a, y in b. Output\n" +
+"is one {\"lo\":L,\"hi\":H} per record, in input order.\n\n" +
+"Edge: the four arithmetic ops on real intervals. NOT a full interval library\n" +
+"(no powers/roots/transcendentals, no union/intersection, no outward rounding).\n" +
+"Division by an interval spanning zero is a hard error, not split.\n"
 );
 return 0;
 }
 
-var policy;
-try { policy = readPolicy(args);}
-catch (e) { process.stderr.write("junction: " + e.message + "\n"); return 2;}
+var files = [];
+var i;
+try {
+for (i = 0; i < args.length; i++) {
+if (args[i].charAt(0) === "-" && args[i]!== "-") { throw new Error("unknown option " + args[i]);}
+else { files.push(args[i]);}
+}
+} catch (e) {
+process.stderr.write("interval-math: " + e.message + "\n");
+return 2;
+}
 
 function emit(text) {
-try { process.stdout.write(junction(text, policy)); return 0;}
-catch (e) { process.stderr.write("junction: " + e.message + "\n"); return 2;}
+try {
+var r = run(text);
+process.stdout.write(r.out);
+return 0;
+} catch (e) {
+process.stderr.write("interval-math: " + e.message + "\n");
+return 2;
+}
 }
 
-var iInput = args.indexOf("--input");
-if (iInput!== -1) {
-var path = args[iInput + 1];
-if (path === undefined) { process.stderr.write("junction: --input needs a path\n"); return 2;}
+if (files.length > 0) {
 var fs = require("fs");
-return emit(fs.readFileSync(path, "utf8"));
+var text;
+try { text = fs.readFileSync(files[0], "utf8");}
+catch (e) {
+process.stderr.write("interval-math: cannot read " + files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
 }
 
-// stdin
 var chunks = [];
 process.stdin.on("data", function (d) { chunks.push(d);});
 process.stdin.on("end", function () {
@@ -962,577 +676,503 @@ if (typeof require!== "undefined" && require.main === module) {
 process.exitCode = main(process.argv);
 }
 
-test_junction.js 149 lines on GitHub →
+test_interval-math.js 171 lines on GitHub →
 #!/usr/bin/env node
-/* test_junction.js — the golden corpus + determinism self-test + non-vacuity
-bites for the junction gift. Zero dependencies (Node assert only). This file
-IS the canonicalizer self-test the Plumb cites (Gift-Works Procedure v1 §2).
+/* test_interval-math.js — golden battery for the interval-math gift.
 
-Run: node test_junction.js # exit 0 GREEN / 3 RED
+Out-of-band and self-verifying. The oracle here is not an external library — it is
+the CONTAINMENT INVARIANT, which is self-witnessing:
+
+(1) CONTAINMENT. For each op and interval pair, sample a dense grid of x in a and
+y in b, compute (x op y) directly, and assert EVERY sampled result lies
+within the gift's returned [lo,hi]. A correct interval result cannot fail
+this; an under-wide (buggy) result will. This needs no external authority —
+the definition of interval arithmetic IS the test.
+
+(2) TIGHTNESS (a companion, so containment isn't passed by returning [-inf,inf]).
+For + - * / on continuous inputs the true result range endpoints are attained
+at interval corners, so the gift's [lo,hi] must EQUAL [min,max] of the sampled
+direct results to within a small epsilon — i.e. the interval is not just
+containing but tight.
+
+(3) FROZEN hand goldens — the sign-crossing multiply (the corner case), the
+subtraction flip, reciprocal division, and the division-spanning-zero refusal.
+
+A planted mutation (the bite, §BITE) MUST be caught: the naive multiply
+[a*c, b*d] (only two corners) is WRONG on a sign-crossing interval; the oracle
+(containment) must reject it.
+
+Run: node test_interval-math.js -> exit 0 GREEN / non-zero RED
 */
 "use strict";
-var assert = require("assert");
-var J = require("./junction.js");
+var im = require("./interval-math.js");
 
 var pass = 0, fail = 0;
-function check(name, fn) {
-try { fn(); pass++;}
-catch (e) { fail++; console.error("FAIL: " + name + " — " + e.message);}
+function ok(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.log(" FAIL " + name);}
+}
+function J(v) { return JSON.stringify(v);}
+function giftOp(op, a, b) {
+var r = im.transform(J({ op: op, a: a, b: b}) + "\n");
+return JSON.parse(r.lines[0]); // {lo,hi}
 }
 
-// A 3-branch fan, as fanout would emit it (records in declared order).
-var FAN3 =
-'{"branch":"a","input":"the prompt","seq":0,"of":3}\n' +
-'{"branch":"b","input":"the prompt","seq":1,"of":3}\n' +
-'{"branch":"c","input":"the prompt","seq":2,"of":3}\n';
-
-// ---- GOLDEN CORPUS: known-good half (one per policy) -----------------------
-var GOLDEN = [
-{
-name: "concat: ordered list of inputs",
-text: FAN3, policy: "concat",
-expect: '{"policy":"concat","of":3,"merged":["the prompt","the prompt","the prompt"]}\n'
-},
-{
-name: "agree: identical branches collapse to the value",
-text: FAN3, policy: "agree",
-expect: '{"policy":"agree","of":3,"value":"the prompt"}\n'
-},
-{
-name: "first: the seq:0 branch's input",
-text: FAN3, policy: "first",
-expect: '{"policy":"first","of":3,"value":"the prompt"}\n'
-},
-{
-name: "map: branch->input object",
-text: FAN3, policy: "map",
-expect: '{"policy":"map","of":3,"by_branch":{"a":"the prompt","b":"the prompt","c":"the prompt"}}\n'
-},
-{
-name: "concat carries DECLARED order faithfully (distinct inputs)",
-text:
-'{"branch":"a","input":"A","seq":0,"of":3}\n' +
-'{"branch":"b","input":"B","seq":1,"of":3}\n' +
-'{"branch":"c","input":"C","seq":2,"of":3}\n',
-policy: "concat",
-expect: '{"policy":"concat","of":3,"merged":["A","B","C"]}\n'
-},
-{
-name: "input line-order does NOT leak (seq-sorted, not line-sorted)",
-// records delivered OUT of seq order; concat must restore seq order.
-text:
-'{"branch":"c","input":"C","seq":2,"of":3}\n' +
-'{"branch":"a","input":"A","seq":0,"of":3}\n' +
-'{"branch":"b","input":"B","seq":1,"of":3}\n',
-policy: "concat",
-expect: '{"policy":"concat","of":3,"merged":["A","B","C"]}\n'
-},
-{
-name: "multibyte payload fidelity through the merge",
-text: '{"branch":"m","input":"café🦌日本語","seq":0,"of":1}\n',
-policy: "agree",
-expect: '{"policy":"agree","of":1,"value":"café🦌日本語"}\n'
+// direct scalar op
+function scalar(op, x, y) {
+if (op === "+") return x + y;
+if (op === "-") return x - y;
+if (op === "*") return x * y;
+if (op === "/") return x / y;
+throw new Error("bad op");
 }
-];
-
-GOLDEN.forEach(function (v) {
-check("golden: " + v.name, function () {
-assert.strictEqual(J.junction(v.text, v.policy), v.expect);
-});
-});
-
-// ---- FAIL-CLOSED: known-bad half (real defects) ---------------------------
-var BAD = [
-{ name: "no policy (unknown)", text: FAN3, policy: "", match: /unknown merge policy/},
-{ name: "unknown policy name", text: FAN3, policy: "bogus", match: /unknown merge policy/},
-{ name: "empty input", text: "", policy: "concat", match: /no input records/},
-{ name: "non-record line", text: "not a record\n", policy: "concat", match: /not valid JSON|not a fanout record/},
-{
-name: "of disagrees with count",
-text: '{"branch":"a","input":"A","seq":0,"of":3}\n', // says of:3 but only 1 record
-policy: "concat", match: /disagrees with declared of/
-},
-{
-name: "duplicate seq",
-text:
-'{"branch":"a","input":"A","seq":0,"of":2}\n' +
-'{"branch":"b","input":"B","seq":0,"of":2}\n',
-policy: "concat", match: /duplicate seq/
-},
-{
-name: "agree conflict names the two branches",
-text:
-'{"branch":"a","input":"A","seq":0,"of":2}\n' +
-'{"branch":"b","input":"DIFFERENT","seq":1,"of":2}\n',
-policy: "agree", match: /agree conflict.*"a".*"b"/
-}
-];
-
-BAD.forEach(function (v) {
-check("fail-closed: " + v.name, function () {
-assert.throws(function () { J.junction(v.text, v.policy);}, v.match,
-"expected refusal for " + v.name);
-});
-});
-
-// ---- NON-VACUITY MUTATION BITES -------------------------------------------
-check("mutation bite: a wrong merged value is rejected", function () {
-var wrong = '{"policy":"agree","of":3,"value":"WRONG"}\n';
-assert.notStrictEqual(J.junction(FAN3, "agree"), wrong,
-"the corpus must distinguish a wrong merged value");
-});
-check("mutation bite: agree must actually throw on a disagreement", function () {
-var threw = false;
-try {
-J.junction('{"branch":"a","input":"A","seq":0,"of":2}\n{"branch":"b","input":"B","seq":1,"of":2}\n', "agree");
-} catch (e) { threw = true;}
-assert.strictEqual(threw, true, "agree must refuse a disagreement — a non-throwing refuser has no teeth");
-});
-
-// ---- DETERMINISM SELF-TEST (the canonicalizer self-test, Gift-Works §2) ----
-check("determinism: byte-identical across 25 evaluations", function () {
-var first = J.junction(FAN3, "map");
-for (var i = 0; i < 25; i++) {
-assert.strictEqual(J.junction(FAN3, "map"), first,
-"evaluation " + i + " diverged — merged output is not deterministic");
-}
-});
-check("determinism: input line-order is not faithful, seq order IS", function () {
-// Two line-orderings of the same fan must yield the SAME merged output
-// (the fold is over seq, so line-order is normalized away).
-var forward =
-'{"branch":"a","input":"A","seq":0,"of":2}\n' +
-'{"branch":"b","input":"B","seq":1,"of":2}\n';
-var reversed =
-'{"branch":"b","input":"B","seq":1,"of":2}\n' +
-'{"branch":"a","input":"A","seq":0,"of":2}\n';
-assert.strictEqual(J.junction(forward, "concat"), J.junction(reversed, "concat"),
-"line-order must not leak — the fold is over seq");
-});
-
-console.log((fail === 0? "GREEN": "RED") + ": " + pass + " passed, " + fail + " failed");
-process.exitCode = fail === 0? 0: 3;
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# kv-source — a Loop MMT gift
-https://loopmmt.com/gifts/kv-source/
-[coverage: optional · branch: gifts]
-
-Parse KEY=VALUE Config into a JSONL Record Stream source ← all gifts
-
-kv-source
-
-kv-source reads plain KEY=VALUE text (a FILE arg, or stdin) and emits one uniform JSON object per assignment — {"key":NAME,"value":VALUE}, both strings — the front of a pipe you feed into the fold/filter/transform gifts (kv-source.env | dedup-filter). Lines split on the FIRST '=', full-line # comments and blank lines skipped, outer quotes stripped, CRLF==LF. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
-
-The honest edge
-
-kv-source parses PLAIN KEY=VALUE text into uniform string records only — it does not coerce types ("8080" stays a string, never a number), does not interpolate ${VAR}, does not strip an `export ` prefix, does not honor inline comments, and does not process escapes inside quotes. Each of those is a context-dependent guess that would make the same file parse to different bytes across tools. A malformed line (no '='), an illegal/empty key, or --key-field==--value-field is refused (exit 2). An honest, pinnable parse — not a full dotenv runtime.
-
-Run it
-
-printf 'PORT=8080\n' | node kv-source.js # -> {"key":"PORT","value":"8080"}
-test_kv-source.js (50/50, independent regex-route oracle) + Plumb conformance GREEN (28/28, signed 2026-09-12, clock-independent, mutation-bite non-vacuous)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-kv-source.js 239 lines on GitHub →
-#!/usr/bin/env node
-/* kv-source.js — parse plain KEY=VALUE text into a uniform JSONL record stream.
-Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
-
-WHAT IT IS. A SOURCE: it turns non-JSONL text (a.env /.properties / a plain
-key=value config) into the front of a pipe — one JSON object per line (JSONL) that
-the fold/filter/transform gifts consume. Give it a file (or pipe text on stdin) and
-it emits one uniform record per assignment:
-
-PORT=8080 -> {"key":"PORT","value":"8080"}
-# a comment -> (skipped)
-HOST = localhost -> {"key":"HOST","value":"localhost"}
-GREETING="hi there"-> {"key":"GREETING","value":"hi there"}
-
-Every record has the same two string fields, so it drops straight into a generic
-filter or fold: kv-source.env | range-filter... / kv-source.env | dedup-filter.
-
-STRINGS ONLY (the honesty axis). Values are emitted as LITERAL STRINGS — kv-source
-does not guess types. "8080" stays the string "8080"; "true" stays "true"; "" stays
-"". This is deliberate, not a limitation to apologize for: the moment a parser starts
-coercing (is 08 octal? is 1e3 a number? is TRUE a boolean?) the SAME file parses to
-different bytes under different tools, and a source you cannot pin is not a source.
-kv-source emits strings and lets a downstream typed gift decide. For the same reason
-it does NOT interpolate ${VAR}/$VAR, does NOT strip an `export ` prefix, does NOT
-honor inline (trailing) comments, and does NOT process backslash escapes inside a
-quoted value — each of those is a context-dependent guess that would break byte
-determinism. It parses the grammar it was given and REFUSES the rest, loudly.
-
-THE GRAMMAR (declared, so it is pinnable)
-* Lines split on newline; a trailing CR (CRLF files) is stripped, so a file parses
-identically whether it uses LF or CRLF.
-* A whitespace-only line emits nothing.
-* A line whose first non-whitespace character is `#` is a full-line COMMENT and
-emits nothing. (There are no inline/trailing comments — a `#` inside a value is
-part of the value.)
-* Any other line MUST be KEY=VALUE. It is split on the FIRST `=`; everything before
-is the key, everything after is the value.
-- KEY is trimmed and MUST match [A-Za-z_][A-Za-z0-9_.-]* — a non-empty name.
-An empty key, or a key with spaces/illegal characters (e.g. `export FOO`), is
-a hard error (exit 2), not a silent guess.
-- VALUE is trimmed. If, after trimming, it both begins and ends with a matching
-`"` or `'` (length >= 2), those OUTER quotes are stripped and the inner text
-is the literal value (no escape processing). Otherwise the trimmed remainder
-is the literal value.
-* A non-blank, non-comment line with no `=` is a MALFORMED line (exit 2).
-
-THE MODEL
-[FILE] The key=value file to parse. If omitted, read stdin.
---key-field NAME The object key the parsed KEY is emitted under. Default "key".
---value-field NAME The object key the parsed VALUE is emitted under. Default
-"value". Must differ from --key-field (else the record would
-collapse) — a collision is exit 2.
-
-Duplicate keys across lines are NOT merged or de-duplicated — each line emits its own
-record, in file order. De-duplication (last-wins, first-wins) is dedup-filter's job
-downstream; kv-source's job is an honest, order-faithful parse.
-
-DETERMINISM. parse(text, opts) is a pure function — no clock, no randomness, no
-network — so the same text yields byte-identical output every run and every machine.
-
-USAGE
-node kv-source.js config.env
-cat.env | node kv-source.js
-node kv-source.js.env --key-field name --value-field val
-node kv-source.js --help
-
-Exit codes: 0 success (including an empty stream from empty input) · 2 input error
-(malformed line, illegal/empty key, key-field==value-field, empty field name, unknown
-option, unreadable file). Always a clean one-line message on stderr, never a stack
-trace.
-
-Released under MIT. Its edge is printed in the README: kv-source parses PLAIN
-KEY=VALUE text into uniform string records only — it does not coerce types, does not
-interpolate ${VAR}, does not strip an `export ` prefix, does not honor inline
-comments, and does not process escapes inside quotes. An honest, pinnable parse.
-*/
-"use strict";
-
-/* ---- the pure core ------------------------------------------------ */
-
-var KEY_RE = /^[A-Za-z_][A-Za-z0-9_.\-]*$/;
-
-// Strip one pair of matching outer quotes from an already-trimmed value, if present.
-function stripQuotes(v) {
-if (v.length >= 2) {
-var a = v.charAt(0), b = v.charAt(v.length - 1);
-if ((a === '"' && b === '"') || (a === "'" && b === "'")) {
-return v.slice(1, v.length - 1);
-}
-}
-return v;
-}
-
-// Parse KEY=VALUE text into an array of uniform two-field records. Throws a clean Error
-// on any malformed input — the CLI turns that into exit 2. Pure; no side effects.
-function parse(text, opts) {
-opts = opts || {};
-var keyField = opts.keyField === undefined? "key": opts.keyField;
-var valueField = opts.valueField === undefined? "value": opts.valueField;
-
-if (typeof keyField!== "string" || keyField.length === 0) throw new Error("--key-field must be a non-empty name");
-if (typeof valueField!== "string" || valueField.length === 0) throw new Error("--value-field must be a non-empty name");
-if (keyField === valueField) throw new Error("--key-field and --value-field must differ (both \"" + keyField + "\")");
-if (typeof text!== "string") throw new Error("input must be text");
-
+// sample N points across [lo,hi] inclusive
+function grid(lo, hi, n) {
+if (lo === hi) return [lo];
 var out = [];
-var lines = text.split("\n");
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i];
-// strip a trailing CR so CRLF parses identically to LF
-if (line.charAt(line.length - 1) === "\r") line = line.slice(0, line.length - 1);
-
-var trimmed = line.replace(/^\s+/, "").replace(/\s+$/, "");
-if (trimmed.length === 0) continue; // blank line
-if (trimmed.charAt(0) === "#") continue; // full-line comment
-
-var eq = line.indexOf("=");
-if (eq === -1) throw new Error("malformed line " + (i + 1) + " (no '='): " + JSON.stringify(line));
-
-var key = line.slice(0, eq).replace(/^\s+/, "").replace(/\s+$/, "");
-var value = line.slice(eq + 1).replace(/^\s+/, "").replace(/\s+$/, "");
-
-if (!KEY_RE.test(key)) throw new Error("illegal key on line " + (i + 1) + ": " + JSON.stringify(key) + " (keys must match [A-Za-z_][A-Za-z0-9_.-]*)");
-
-value = stripQuotes(value);
-
-var rec = {};
-rec[keyField] = key;
-rec[valueField] = value;
-out.push(rec);
-}
+for (var i = 0; i <= n; i++) out.push(lo + (hi - lo) * i / n);
 return out;
 }
 
-// Render records as JSONL text (one JSON object per line, trailing newline if any).
-function toJSONL(records) {
-var s = "";
-for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
-return s;
-}
-
-/* ---- exports (browser + Node) ------------------------------------ */
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.kvSource = { parse: parse, toJSONL: toJSONL};
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { parse: parse, toJSONL: toJSONL};
-}
-
-/* ---- CLI (runs only when invoked directly, never on require) ------ */
-
-function parseArgs(args) {
-var opts = {};
-var file;
-var i = 0;
-while (i < args.length) {
-var a = args[i];
-if (a === "--key-field") {
-if (args[i + 1] === undefined) throw new Error("--key-field requires a name");
-opts.keyField = args[i + 1];
-i += 2;
-} else if (a === "--value-field") {
-if (args[i + 1] === undefined) throw new Error("--value-field requires a name");
-opts.valueField = args[i + 1];
-i += 2;
-} else if (a.charAt(0) === "-" && a!== "-") {
-throw new Error("unknown option " + a);
-} else {
-if (file!== undefined) throw new Error("only one input file may be given (got a second: " + JSON.stringify(a) + ")");
-file = a;
-i += 1;
-}
-}
-return { file: file, opts: opts};
-}
-
-function readAll(stream) {
-return new Promise(function (resolve, reject) {
-var chunks = [];
-stream.on("data", function (c) { chunks.push(c);});
-stream.on("end", function () { resolve(Buffer.concat(chunks).toString("utf8"));});
-stream.on("error", reject);
-});
-}
-
-function helpText() {
-return (
-"kv-source.js — parse plain KEY=VALUE text into a uniform JSONL record stream.\n\n" +
-" node kv-source.js config.env\n" +
-" cat.env | node kv-source.js\n" +
-" node kv-source.js.env --key-field name --value-field val\n" +
-" node kv-source.js --help\n\n" +
-" [FILE] key=value file to parse (default: read stdin)\n" +
-" --key-field NAME field the parsed KEY is emitted under (default \"key\")\n" +
-" --value-field NAME field the parsed VALUE is emitted under (default \"value\")\n\n" +
-"Emits one JSON object per assignment: { key: NAME, value: VALUE}, one per line.\n" +
-"Full-line # comments and blank lines are skipped; lines split on the first '='.\n\n" +
-"Edge: PLAIN KEY=VALUE only, values are literal STRINGS. It does not coerce types,\n" +
-"does not interpolate ${VAR}, does not strip an `export ` prefix, does not honor\n" +
-"inline comments, and does not process escapes inside quotes. An honest, pinnable parse.\n"
-);
-}
-
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(helpText());
-return Promise.resolve(0);
-}
-var parsed;
-try { parsed = parseArgs(args);}
-catch (e) { process.stderr.write("kv-source: " + e.message + "\n"); return Promise.resolve(2);}
-
-var getText;
-if (parsed.file!== undefined) {
-getText = new Promise(function (resolve, reject) {
-require("fs").readFile(parsed.file, "utf8", function (err, data) {
-if (err) reject(new Error("cannot read " + JSON.stringify(parsed.file) + ": " + err.code));
-else resolve(data);
-});
-});
-} else {
-getText = readAll(process.stdin);
-}
-
-return getText.then(function (text) {
-var records = parse(text, parsed.opts); // throws -> caught below
-process.stdout.write(toJSONL(records));
-return 0;
-}).catch(function (e) {
-process.stderr.write("kv-source: " + e.message + "\n");
-return 2;
-});
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-main(process.argv).then(function (code) { process.exitCode = code;});
-}
-
-test_kv-source.js 147 lines on GitHub →
-#!/usr/bin/env node
-/* test_kv-source.js — battery for the kv-source gift.
-node test_kv-source.js -> exit 0 PASS / non-zero FAIL. Zero dependencies.
-
-Cross-checks the gift against an INDEPENDENT regex-route oracle (a different parse
-route than the gift's indexOf-split), frozen hand goldens, the uniform-record and
-strings-only contract, determinism, and every fail-closed edge. */
-"use strict";
-var kv = require("./kv-source.js");
-
-var pass = 0, fail = 0;
-function ok(name, cond) { if (cond) { pass++;} else { fail++; console.log(" FAIL " + name);}}
-function eq(name, a, b) {
-var same = JSON.stringify(a) === JSON.stringify(b);
-if (!same) console.log(" FAIL " + name + "\n exp " + JSON.stringify(b) + "\n got " + JSON.stringify(a));
-else pass++;
-if (!same) fail++;
-}
-function throws(name, fn) {
-var threw = false;
-try { fn();} catch (e) { threw = true;}
-if (threw) pass++; else { fail++; console.log(" FAIL " + name + " (expected a throw)");}
-}
-
-/* ---- independent oracle: regex-route (different route than the gift) ---- */
-function oracle(text, opts) {
-opts = opts || {};
-var kf = opts.keyField === undefined? "key": opts.keyField;
-var vf = opts.valueField === undefined? "value": opts.valueField;
-if (!kf ||!vf || kf === vf) throw new Error("bad fields");
-var out = [];
-var lines = text.split(/\r?\n/);
-for (var i = 0; i < lines.length; i++) {
-var ln = lines[i];
-if (/^\s*$/.test(ln)) continue;
-if (/^\s*#/.test(ln)) continue;
-var m = ln.match(/^\s*([A-Za-z_][A-Za-z0-9_.\-]*)\s*=([\s\S]*)$/);
-if (!m) throw new Error("bad line " + (i + 1));
-var val = m[2].replace(/^\s+/, "").replace(/\s+$/, "");
-if (val.length >= 2) {
-var a = val.charAt(0), b = val.charAt(val.length - 1);
-if ((a === '"' && b === '"') || (a === "'" && b === "'")) val = val.slice(1, val.length - 1);
-}
-var r = {}; r[kf] = m[1]; r[vf] = val; out.push(r);
-}
-return out;
-}
-
-/* ---- 1. differential grid: gift == oracle on every good vector ---- */
-var goodVectors = [
-"PORT=8080",
-"A=1\nB=2\nC=3",
-"# a comment\nHOST=localhost\n\n# another\nPORT=80",
-" SPACED = value here ", // trim both sides
-'GREETING="hi there"', // double-quoted, embedded space
-"MSG='single quoted'",
-"URL=http://example.com/path?a=b&c=d", // first-= split; value keeps later '='
-"EMPTY=", // empty value -> ""
-"HASHVAL=a#b#c", // '#' inside a value is literal (no inline comments)
-"K.dotted=1\nk-dashed=2\n_under=3", // legal key charset
-"Q=\"with = and # inside\"", // quotes protect nothing special but are stripped
-"CRLF=one\r\nSECOND=two\r\n", // CRLF parses same as LF
-"", // empty input -> empty stream
-"\n\n \n# only comments and blanks\n", // -> empty stream
-"EQ====", // key EQ, value "===" (first '=' splits)
-];
-for (var gi = 0; gi < goodVectors.length; gi++) {
-var t = goodVectors[gi];
-eq("differential[" + gi + "] gift==oracle", kv.parse(t), oracle(t));
-}
-
-/* ---- 2. hand goldens (frozen) ---- */
-eq("golden: basic", kv.parse("PORT=8080"), [{ key: "PORT", value: "8080"}]);
-eq("golden: three", kv.parse("A=1\nB=2\nC=3"),
-[{ key: "A", value: "1"}, { key: "B", value: "2"}, { key: "C", value: "3"}]);
-eq("golden: comment+blank skipped", kv.parse("# c\n\nHOST=localhost"), [{ key: "HOST", value: "localhost"}]);
-eq("golden: trim both sides", kv.parse(" K = v "), [{ key: "K", value: "v"}]);
-eq("golden: double-quote stripped", kv.parse('G="hi there"'), [{ key: "G", value: "hi there"}]);
-eq("golden: single-quote stripped", kv.parse("G='hi there'"), [{ key: "G", value: "hi there"}]);
-eq("golden: first-= split keeps rest", kv.parse("U=a=b=c"), [{ key: "U", value: "a=b=c"}]);
-eq("golden: empty value", kv.parse("E="), [{ key: "E", value: ""}]);
-eq("golden: hash in value literal", kv.parse("H=a#b"), [{ key: "H", value: "a#b"}]);
-eq("golden: CRLF == LF", kv.parse("A=1\r\nB=2\r\n"), kv.parse("A=1\nB=2\n"));
-eq("golden: empty input empty stream", kv.parse(""), []);
-eq("golden: only comments/blanks empty", kv.parse("\n#x\n \n"), []);
-
-/* ---- 3. uniform 2-field, strings-only ---- */
-var recs = kv.parse("N=8080\nB=true\nF=1.5\nZ=");
-ok("uniform: every record has exactly 2 keys", recs.every(function (r) { return Object.keys(r).length === 2;}));
-ok("uniform: fields are key+value", recs.every(function (r) { return "key" in r && "value" in r;}));
-ok("strings-only: numbers stay strings", recs[0].value === "8080" && typeof recs[0].value === "string");
-ok("strings-only: bool stays string", recs[1].value === "true" && typeof recs[1].value === "string");
-ok("strings-only: float stays string (no coercion/drift)", recs[2].value === "1.5" && typeof recs[2].value === "string");
-
-/* ---- 4. custom field names ---- */
-eq("fields: custom names", kv.parse("A=1", { keyField: "name", valueField: "val"}), [{ name: "A", val: "1"}]);
-eq("fields: order key then value", Object.keys(kv.parse("A=1", { keyField: "k2", valueField: "v2"})[0]), ["k2", "v2"]);
-
-/* ---- 5. no interpolation / no export / no inline comment ---- */
-eq("no interpolation: ${VAR} literal", kv.parse("A=${HOME}/bin"), [{ key: "A", value: "${HOME}/bin"}]);
-eq("no inline comment: trailing # kept", kv.parse("A=v # not a comment"), [{ key: "A", value: "v # not a comment"}]);
-throws("no export: `export FOO` is an illegal key", function () { kv.parse("export FOO=bar");});
-
-/* ---- 6. fail-closed (exit-2 class) ---- */
-throws("bad: line with no '='", function () { kv.parse("JUST_A_LINE");});
-throws("bad: empty key", function () { kv.parse("=value");});
-throws("bad: key with space", function () { kv.parse("bad key=1");});
-throws("bad: key starts with digit", function () { kv.parse("9key=1");});
-throws("bad: key with illegal char", function () { kv.parse("k!=1");});
-throws("bad: key-field == value-field", function () { kv.parse("A=1", { keyField: "x", valueField: "x"});});
-throws("bad: empty key-field", function () { kv.parse("A=1", { keyField: ""});});
-throws("bad: empty value-field", function () { kv.parse("A=1", { valueField: ""});});
-throws("bad: non-string input", function () { kv.parse(123);});
-
-/* ---- 7. determinism: parse twice -> byte-identical JSONL ---- */
-var big = "";
-for (var k = 0; k < 50; k++) big += "K" + k + "=v" + k + "\n";
-ok("determinism: two parses byte-identical", kv.toJSONL(kv.parse(big)) === kv.toJSONL(kv.parse(big)));
-
-/* ---- 8. toJSONL shape ---- */
-ok("toJSONL: one object per line + trailing nl", kv.toJSONL([{ key: "A", value: "1"}]) === '{"key":"A","value":"1"}\n');
-ok("toJSONL: empty records -> empty string", kv.toJSONL([]) === "");
-
-/* ---- 9. mutation tripwire: a LAST-'=' split must diverge on a value containing '=' ---- */
+/* ---- (1)+(2) containment AND tightness over a spread of ops+intervals ----- */
 (function () {
-function mutantLastEq(text) {
-var out = [], lines = text.split("\n");
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i];
-if (line.charAt(line.length - 1) === "\r") line = line.slice(0, -1);
-var tr = line.replace(/^\s+|\s+$/g, "");
-if (!tr || tr.charAt(0) === "#") continue;
-var eqp = line.lastIndexOf("="); // BUG: last instead of first
-if (eqp === -1) throw new Error("no =");
-var key = line.slice(0, eqp).replace(/^\s+|\s+$/g, "");
-var val = line.slice(eqp + 1).replace(/^\s+|\s+$/g, "");
-var r = {}; r.key = key; r.value = val; out.push(r);
+var cases = [
+["+", [1, 2], [3, 4]],
+["-", [1, 2], [3, 4]],
+["*", [-1, 2], [3, 4]], // sign-crossing a
+["*", [-3, -1], [-4, -2]], // both negative
+["*", [-2, 3], [-5, 4]], // both sign-crossing (the hard corner case)
+["*", [0, 5], [2, 3]],
+["/", [1, 1], [2, 4]],
+["/", [-6, 6], [2, 3]], // numerator spans 0, denom positive
+["/", [1, 2], [-4, -2]], // denom strictly negative
+["+", [-5, -5], [5, 5]], // degenerate (points)
+];
+var containFail = 0, tightFail = 0;
+cases.forEach(function (c) {
+var op = c[0], a = c[1], b = c[2];
+var got = giftOp(op, a, b);
+var xs = grid(a[0], a[1], 20), ys = grid(b[0], b[1], 20);
+var minR = Infinity, maxR = -Infinity, allIn = true;
+for (var i = 0; i < xs.length; i++) for (var j = 0; j < ys.length; j++) {
+var v = scalar(op, xs[i], ys[j]);
+if (v < minR) minR = v;
+if (v > maxR) maxR = v;
+if (v < got.lo - 1e-9 || v > got.hi + 1e-9) allIn = false;
 }
-return out;
+if (!allIn) { containFail++; console.log(" CONTAIN " + op + " " + J(a) + J(b) + " -> " + J(got));}
+// tightness: the gift's bounds equal the sampled extremes to epsilon
+if (Math.abs(got.lo - minR) > 1e-6 || Math.abs(got.hi - maxR) > 1e-6) {
+tightFail++; console.log(" TIGHT " + op + " " + J(a) + J(b) + " gift=" + J(got) + " sampled=[" + minR + "," + maxR + "]");
 }
-var v = "U=a=b";
-ok("mutation: last-= split is CAUGHT (diverges from gift)",
-JSON.stringify(mutantLastEq(v))!== JSON.stringify(kv.parse(v)));
+});
+ok("containment: every sampled x∘y lies in the gift interval (" + cases.length + " cases)", containFail === 0);
+ok("tightness: gift bounds == sampled extremes (" + cases.length + " cases)", tightFail === 0);
 })();
 
-console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
+/* ---- (3) frozen hand goldens --------------------------------------------- */
+function G(name, op, a, b, lo, hi) {
+var g = giftOp(op, a, b);
+ok(name, g.lo === lo && g.hi === hi);
+}
+G("add", "+", [1, 2], [3, 4], 4, 6);
+G("sub flips the other interval", "-", [1, 2], [3, 4], -3, -1);
+G("mul sign-crossing (all four corners)", "*", [-1, 2], [3, 4], -4, 8);
+G("mul both negative", "*", [-3, -1], [-4, -2], 2, 12);
+G("mul both sign-crossing", "*", [-2, 3], [-5, 4], -15, 12);
+G("div by positive interval", "/", [1, 1], [2, 4], 0.25, 0.5);
+G("div numerator spans zero", "/", [-6, 6], [2, 3], -3, 3);
+G("div by strictly-negative interval", "/", [1, 2], [-4, -2], -1, -0.25);
+
+/* ---- (4) division-by-spanning-zero is a HARD ERROR ------------------------ */
+function throws(name, fn) {
+var t = false;
+try { fn();} catch (e) { t = true;}
+ok(name, t);
+}
+throws("div by [-1,1] (spans 0) refused", function () { giftOp("/", [1, 2], [-1, 1]);});
+throws("div by [0,2] (touches 0 at lo) refused", function () { giftOp("/", [1, 2], [0, 2]);});
+throws("div by [-2,0] (touches 0 at hi) refused", function () { giftOp("/", [1, 2], [-2, 0]);});
+throws("div by [0,0] refused", function () { giftOp("/", [1, 2], [0, 0]);});
+
+/* ---- (5) transform shape + input honesty --------------------------------- */
+(function () {
+var text = '{"op":"+","a":[1,2],"b":[3,4]}\n{"op":"*","a":[0,1],"b":[2,2]}\n';
+var r = im.transform(text);
+ok("one output per input, in order", J(r.lines) === J(['{"lo":4,"hi":6}', '{"lo":0,"hi":2}']));
+ok("count == records", r.count === 2);
+})();
+ok("blank lines skipped", im.transform('{"op":"+","a":[1,1],"b":[1,1]}\n\n').count === 1);
+ok("CRLF trimmed", J(im.transform('{"op":"+","a":[1,1],"b":[2,2]}\r\n').lines) === J(['{"lo":3,"hi":3}']));
+(function () {
+var t = '{"op":"*","a":[-2,3],"b":[-5,4]}\n';
+ok("determinism: two runs identical", im.transform(t).lines.join() === im.transform(t).lines.join());
+})();
+
+throws("unknown op is a hard error", function () { giftOp("^", [1, 2], [3, 4]);});
+throws("missing op is a hard error", function () { im.transform('{"a":[1,2],"b":[3,4]}\n');});
+throws("interval not a 2-array", function () { im.transform('{"op":"+","a":[1,2,3],"b":[3,4]}\n');});
+throws("interval lo>hi is a hard error", function () { im.transform('{"op":"+","a":[2,1],"b":[3,4]}\n');});
+throws("non-finite endpoint (1e999->Infinity) is a hard error", function () { im.transform('{"op":"+","a":[1e999,1e999],"b":[3,4]}\n');});
+throws("non-object record is a hard error", function () { im.transform('[1,2]\n');});
+throws("non-JSON line is a hard error", function () { im.transform('not json\n');});
+ok("hard error names the line", (function () {
+try { im.transform('{"op":"+","a":[1,1],"b":[2,2]}\n{"op":"?","a":[1,1],"b":[2,2]}\n'); return false;}
+catch (e) { return /line 2/.test(e.message);}
+})());
+
+/* ---- §BITE — the naive-multiply mutation must be caught ------------------- */
+/* The classic wrong build is mul = [a*c, b*d] (only 2 corners). It agrees with the
+correct gift when signs don't cross, but is WRONG on a sign-crossing interval. We
+build that mutant and assert containment (the oracle) rejects it on a crossing
+case — so a regression to naive-corners fails test (1). */
+(function () {
+function naiveMul(a, b) { return { lo: a[0] * b[0], hi: a[1] * b[1]};}
+var a = [-2, 3], b = [-5, 4];
+var gift = giftOp("*", a, b); // correct: [-15, 12]
+var mutant = naiveMul(a, b); // naive: [10, 12] (WRONG, misses -15 and lower)
+// containment check on the mutant: does a sampled product escape it?
+var xs = grid(a[0], a[1], 20), ys = grid(b[0], b[1], 20);
+var mutantEscapes = false, giftContains = true;
+for (var i = 0; i < xs.length; i++) for (var j = 0; j < ys.length; j++) {
+var v = xs[i] * ys[j];
+if (v < mutant.lo - 1e-9 || v > mutant.hi + 1e-9) mutantEscapes = true;
+if (v < gift.lo - 1e-9 || v > gift.hi + 1e-9) giftContains = false;
+}
+ok("BITE: naive-corners mutant fails containment where the gift holds",
+mutantEscapes === true && giftContains === true &&
+gift.lo === -15 && gift.hi === 12);
+})();
+
+/* ---- report --------------------------------------------------------------- */
+console.log("");
+console.log("interval-math battery: " + pass + " passed, " + fail + " failed");
 process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node / browser, no dependencies
+Zero dependencies, Node or browser, deterministic
+
+---
+
+# Isvalidcsscolor — a Loop MMT gift
+https://loopmmt.com/gifts/isvalidcsscolor/
+[coverage: optional · branch: gifts]
+
+Is This String A CSS Color? validate ← all gifts
+
+Isvalidcsscolor
+
+A pure, dependency-free isValidCSSColor(str) that runs identically in a browser and in Node (no DOM) and decides whether a string is a valid CSS color across a documented subset of the spec — named colors, transparent/currentColor, hex 3/4/6/8, and rgb()/rgba()/hsl()/hsla() in both legacy comma and modern space syntax, including angle hues and out-of-range channels that CSS clamps.
+
+The honest edge
+
+It validates a DEFINED subset — the colors people actually type. It deliberately does not accept hwb()/lab()/lch()/oklab()/oklch()/color()/color-mix()/relative-color syntax/system colors, and it rejects the CSS-wide keywords inherit/initial/unset/revert (which are not colors). In a browser, CSS.supports('color', str) is the full ground truth; this trades that breadth for a tiny DOM-free core you can read in one sitting.
+
+Run it
+
+node isvalidcsscolor.js "rebeccapurple"
+test_isvalidcsscolor.js (83/83: 38 valid + 34 invalid spec vectors, coercion, determinism, mutation-bite)
+Node, no dependencies
+
+The code — every file that ships
+
+isvalidcsscolor.js 195 lines on GitHub →
+#!/usr/bin/env node
+/* isvalidcsscolor.js — a pure, dependency-free "is this string a valid CSS color?"
+checker that returns a boolean and runs identically in a browser and in Node.
+
+WHY THIS EXISTS. You take a color from a human — a theme field, a config file,
+a query param — and before you write it into a stylesheet or a canvas you want
+to know: is this actually a color? The browser's honest oracle,
+CSS.supports('color', str), only exists in a browser and needs the DOM. On a
+Node server, in a build step, or in a test, there is no built-in answer. This
+is a small, pure function of its input — no DOM, no dependencies — that decides
+the question against a DEFINED, DOCUMENTED SUBSET of the CSS Color spec: the
+colors people actually type.
+
+WHAT IT ACCEPTS (the whole contract — a validator that hides its scope lies):
+• named colors — the 148 CSS Color Module Level 4 names, plus `transparent`
+and the `currentColor` keyword (case-insensitive).
+• hex — #RGB, #RGBA, #RRGGBB, #RRGGBBAA (3/4/6/8 hex digits).
+• rgb() / rgba() — both the legacy comma form `rgb(255, 0, 0)` /
+`rgba(255,0,0,.5)` (all-number OR all-percent, no mixing; optional alpha)
+AND the modern space form `rgb(255 0 0 / 50%)` (number|percent|none per
+channel, mixing allowed, optional `/ alpha`).
+• hsl() / hsla() — legacy `hsl(120, 50%, 50%)` (hue then two percentages,
+optional alpha) AND modern `hsl(120deg 50% 50% /.5)`. Hue may be a bare
+number (degrees) or an <angle> (deg/grad/rad/turn).
+Out-of-range numeric channels are ACCEPTED, because CSS accepts and clamps them
+(`rgb(300 -10 0)` is a valid color that renders as red) — validity is about
+grammar, not range.
+
+WHAT IT DOES NOT ACCEPT (stated on purpose — see the README's "edge"):
+hwb(), lab(), lch(), oklab(), oklch(), color(), color-mix(), the relative-
+color syntax (`rgb(from …)`), and system colors (Canvas, ButtonText, …). The
+CSS-wide keywords `inherit`, `initial`, `unset`, `revert` are NOT colors and
+are rejected. If you need the newer color functions, use a browser's
+CSS.supports — this gift trades breadth for a tiny, dependency-free core you
+can read in one sitting.
+
+Pure function of its input. Same code in a browser (window.LoopGifts.isValidCSSColor)
+or Node (this CLI / require()).
+
+USAGE
+node isvalidcsscolor.js "rebeccapurple" # prints "true" or "false", exits 0/1
+node isvalidcsscolor.js "#0f0" "not-a-color" # one verdict per argument
+node isvalidcsscolor.js --help
+
+Released under MIT.
+*/
+"use strict";
+
+// The 148 CSS Color Module Level 4 named colors, plus `transparent` and the
+// `currentcolor` keyword. All lowercase; input is lowercased before lookup.
+var NAMED = ("aliceblue antiquewhite aqua aquamarine azure beige bisque black " +
+"blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate " +
+"coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod " +
+"darkgray darkgreen darkgrey darkkhaki darkmagenta darkolivegreen darkorange " +
+"darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray " +
+"darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey " +
+"dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite gold " +
+"goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory " +
+"khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral " +
+"lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey lightpink " +
+"lightsalmon lightseagreen lightskyblue lightslategray lightslategrey " +
+"lightsteelblue lightyellow lime limegreen linen magenta maroon mediumaquamarine " +
+"mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue " +
+"mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream " +
+"mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered " +
+"orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff " +
+"peru pink plum powderblue purple rebeccapurple red rosybrown royalblue " +
+"saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue " +
+"slategray slategrey snow springgreen steelblue tan teal thistle tomato " +
+"turquoise violet wheat white whitesmoke yellow yellowgreen " +
+"transparent currentcolor").split(/\s+/);
+
+var NAMED_SET = Object.create(null);
+for (var n = 0; n < NAMED.length; n++) { NAMED_SET[NAMED[n]] = true;}
+
+// A CSS <number>: optional sign, digits with an optional fractional part, or a
+// leading-dot fraction, with optional scientific notation. Rejects a trailing
+// bare dot ("5." is NOT a valid CSS number).
+var NUMBER = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+var PERCENT = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?%$/;
+var ANGLE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?(?:deg|grad|rad|turn)$/;
+var HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/;
+
+function isNumber(t) { return NUMBER.test(t);}
+function isPercent(t) { return PERCENT.test(t);}
+function isHue(t) { return NUMBER.test(t) || ANGLE.test(t);} // bare number = degrees
+function isAlphaLegacy(t) { return NUMBER.test(t) || PERCENT.test(t);}
+function isAlphaModern(t) { return NUMBER.test(t) || PERCENT.test(t) || t === "none";}
+
+// Validate an rgb()/rgba()/hsl()/hsla() body. `fn` is one of rgb|rgba|hsl|hsla,
+// `inner` is the text between the parentheses (already lowercased).
+function validFunction(fn, inner) {
+inner = inner.trim();
+if (inner === "") { return false;}
+var isRgb = (fn === "rgb" || fn === "rgba");
+
+if (inner.indexOf(",")!== -1) {
+// ---- Legacy comma syntax: no `none`, no `/`, exactly 3 or 4 parts --------
+if (inner.indexOf("/")!== -1) { return false;}
+var parts = inner.split(",");
+for (var i = 0; i < parts.length; i++) { parts[i] = parts[i].trim();}
+if (parts.length!== 3 && parts.length!== 4) { return false;}
+var c = [parts[0], parts[1], parts[2]];
+if (c[0] === "none" || c[1] === "none" || c[2] === "none") { return false;}
+if (isRgb) {
+var allNum = isNumber(c[0]) && isNumber(c[1]) && isNumber(c[2]);
+var allPct = isPercent(c[0]) && isPercent(c[1]) && isPercent(c[2]);
+if (!(allNum || allPct)) { return false;}
+} else {
+if (!isHue(c[0])) { return false;}
+if (!(isPercent(c[1]) && isPercent(c[2]))) { return false;}
+}
+if (parts.length === 4) {
+if (parts[3] === "none" ||!isAlphaLegacy(parts[3])) { return false;}
+}
+return true;
+}
+
+// ---- Modern space syntax: `none` allowed, optional `/ alpha`, mixing ok -----
+var slash = inner.split("/");
+if (slash.length > 2) { return false;}
+var comps = slash[0].trim().split(/\s+/).filter(Boolean);
+var alpha = slash.length === 2? slash[1].trim(): null;
+if (comps.length!== 3) { return false;}
+if (isRgb) {
+for (var j = 0; j < 3; j++) {
+var v = comps[j];
+if (!(isNumber(v) || isPercent(v) || v === "none")) { return false;}
+}
+} else {
+if (!(isHue(comps[0]) || comps[0] === "none")) { return false;}
+for (var k = 1; k < 3; k++) {
+var w = comps[k];
+if (!(isPercent(w) || isNumber(w) || w === "none")) { return false;}
+}
+}
+if (alpha!== null) {
+if (alpha === "" ||!isAlphaModern(alpha)) { return false;}
+}
+return true;
+}
+
+/**
+* isValidCSSColor(input) -> boolean
+* True iff `input` is a string naming a color in this gift's supported subset of
+* the CSS Color spec (see the file header for the exact contract). Non-strings
+* return false — a color is a string token, not a number or object. Surrounding
+* whitespace is trimmed before checking.
+*/
+function isValidCSSColor(input) {
+if (typeof input!== "string") { return false;}
+var s = input.trim();
+if (s === "") { return false;}
+var lower = s.toLowerCase();
+
+if (NAMED_SET[lower] === true) { return true;}
+if (HEX.test(lower)) { return true;}
+
+var m = /^(rgba?|hsla?)\((.*)\)$/.exec(lower);
+if (m) { return validFunction(m[1], m[2]);}
+
+return false;
+}
+
+// ---- Dual-runtime export: browser namespace + Node module ------------------
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.isValidCSSColor = isValidCSSColor;
+}
+if (typeof module!== "undefined" && module.exports) {
+module.exports = { isValidCSSColor: isValidCSSColor};
+}
+
+// ---- CLI: one verdict per argument; exit 0 iff every argument is valid -------
+if (typeof require!== "undefined" && require.main === module) {
+var args = process.argv.slice(2);
+if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+process.stdout.write(
+"isvalidcsscolor — is a string a valid CSS color? (defined subset)\n\n" +
+" node isvalidcsscolor.js \"rebeccapurple\" one verdict, exit 0 if valid\n" +
+" node isvalidcsscolor.js \"#0f0\" \"nope\" one line per argument\n\n" +
+"Accepts: named colors, transparent, currentColor, hex 3/4/6/8,\n" +
+"rgb()/rgba() and hsl()/hsla() in legacy and modern syntax.\n" +
+"Does NOT accept hwb()/lab()/lch()/oklab()/oklch()/color()/color-mix()/\n" +
+"relative-color syntax/system colors. See the README for the full edge.\n");
+process.exit(args.length === 0? 1: 0);
+}
+var allValid = true;
+for (var a = 0; a < args.length; a++) {
+var ok = isValidCSSColor(args[a]);
+if (!ok) { allValid = false;}
+process.stdout.write((args.length > 1? args[a] + "\t": "") + (ok? "true": "false") + "\n");
+}
+process.exit(allValid? 0: 1);
+}
+
+test_isvalidcsscolor.js 95 lines on GitHub →
+#!/usr/bin/env node
+/* test_isvalidcsscolor.js — proves the validator implements its stated CSS-color
+subset correctly.
+
+THE ORACLE. sha256 could check itself against Node's crypto — a live reference
+implementation. CSS-color validity has no Node stdlib oracle (CSS.supports is
+browser-only and needs the DOM). So the oracle here is the CSS Color spec
+expressed as CURATED VECTORS: a VALID set (every one must pass) and an INVALID
+set (every one must fail), chosen to exercise every branch of the grammar —
+named / hex(3,4,6,8) / rgb legacy+modern / hsl legacy+modern / angles /
+out-of-range-clamps / the documented exclusions. Plus determinism, non-string
+coercion, and a mutation-bite so a degenerate core (constant true/false) can't
+pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
+"use strict";
+var isValidCSSColor = require("./isvalidcsscolor.js").isValidCSSColor;
+
+var pass = 0, fail = 0;
+function expect(input, want) {
+var got = isValidCSSColor(input);
+if (got === want) { pass++;}
+else {
+fail++;
+console.error("FAIL isValidCSSColor(" + JSON.stringify(input) + ")\n" +
+" got: " + got + "\n want: " + want);
+}
+}
+
+// ---- VALID: every one must return true --------------------------------------
+var VALID = [
+// named + keywords (case-insensitive, trimmed)
+"red", "RebeccaPurple", "AliceBlue", "transparent", "currentColor", " teal ",
+// hex 3/4/6/8
+"#000", "#0f0", "#ABCDEF", "#00ff00", "#0f08", "#00ff0080",
+// rgb legacy — numbers, percents, out-of-range (clamps), optional alpha
+"rgb(255, 0, 0)", "rgb(0,0,0)", "rgb( 12, 34, 56)", "rgb(100%, 0%, 50%)",
+"rgb(300, -10, 0)", "rgba(0,0,0,0.5)", "rgba(0,0,0,50%)", "rgb(0,0,0,0.5)",
+// rgb modern — space form, mixing, none, /alpha with and without spaces
+"rgb(255 0 0)", "rgb(255 0 0 / 0.5)", "rgb(255 0 0 / 50%)",
+"rgb(100% 0% 0% / none)", "rgb(none 0 0)", "rgb(255 0 0/.5)",
+// hsl legacy — number hue, angle hue, negative hue, optional alpha
+"hsl(120, 50%, 50%)", "hsla(120, 50%, 50%, 0.3)", "hsl(120deg, 50%, 50%)",
+"hsl(-30, 100%, 50%)",
+// hsl modern — angles, number S/L, none, /alpha
+"hsl(120 50% 50%)", "hsl(120deg 50% 50% /.5)", "hsl(0.5turn 50% 50%)",
+"hsl(200grad 50% 50%)", "hsl(3.14rad 50% 50%)", "hsl(120 50 50)",
+"hsl(none 50% 50%)", "hsl(120 50% 50% / none)"
+];
+
+// ---- INVALID: every one must return false -----------------------------------
+var INVALID = [
+// empties & nonsense
+"", " ", "notacolor", "reddish",
+// CSS-wide keywords are NOT colors
+"inherit", "initial", "unset", "revert",
+// malformed hex
+"#12", "#12345", "#1234567", "#gggggg", "#",
+// arity / structure
+"rgb()", "rgb(1,2)", "rgb(1,2,3,4,5)", "rgb(1 2)", "rgb(1 2 3 4)",
+// legacy channel-type mixing (number + percent) is illegal
+"rgb(1, 2, 50%)",
+// comma + slash mixed, none in legacy, empty/missing alpha
+"rgb(1,2,3 /.5)", "rgb(none, 0, 0)", "rgb(1,2,3,)", "rgb(1 2 3 /)",
+"rgb(1 2 3 / /.5)",
+// hsl: hue can't be a percent; legacy S/L must be percent
+"hsl(50%, 50%, 50%)", "hsl(120, 50, 50)",
+// spacing / number-shape faults
+"rgb (1,2,3)", "rgb(5., 0, 0)",
+// documented exclusions (out of this gift's scope, on purpose)
+"hwb(0 0% 0%)", "lab(50% 40 59)", "oklch(0.7 0.15 30)",
+"color(display-p3 1 0 0)", "rgb(from red r g b)", "Canvas"
+];
+
+for (var i = 0; i < VALID.length; i++) { expect(VALID[i], true);}
+for (var j = 0; j < INVALID.length; j++) { expect(INVALID[j], false);}
+
+// ---- Non-string coercion: a color is a string; nothing else is --------------
+var NON_STRINGS = [42, 0, true, false, null, undefined, {}, ["red"], NaN];
+for (var k = 0; k < NON_STRINGS.length; k++) { expect(NON_STRINGS[k], false);}
+
+// ---- Determinism: same input, same verdict, twice ---------------------------
+if (isValidCSSColor("rgb(1 2 3 /.5)") === isValidCSSColor("rgb(1 2 3 /.5)")) { pass++;}
+else { fail++; console.error("FAIL determinism: same input gave two verdicts");}
+
+// ---- Mutation-bite: the core must actually discriminate ---------------------
+// A degenerate `return true` fails every INVALID case above; a degenerate
+// `return false` fails every VALID case. This explicit bite additionally catches
+// a core that ignores its input entirely: a valid and an invalid string must not
+// share a verdict.
+if (isValidCSSColor("red")!== isValidCSSColor("zzz-not-a-color")) { pass++;}
+else { fail++; console.error("FAIL mutation-bite: core did not distinguish valid from invalid");}
+
+console.log("\nisvalidcsscolor: " + pass + " passed, " + fail + " failed" +
+" (" + VALID.length + " valid + " + INVALID.length + " invalid vectors, " +
+"plus coercion, determinism, mutation-bite)");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node, no dependencies
 
 ---

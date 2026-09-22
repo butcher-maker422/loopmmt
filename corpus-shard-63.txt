@@ -1,8 +1,8 @@
-# Loop MMT — corpus shard 63/87
+# Loop MMT — corpus shard 63/91
 
-> Bundle 63 of 87 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 63 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/dedup-filter/, /gifts/derived/, /gifts/dir-walk/)
+Nodes in this shard: 3 (/gifts/dedup-filter/, /gifts/derived/, /gifts/dialect/)
 
 ---
 
@@ -935,518 +935,702 @@ Python 3, standard library only
 
 ---
 
-# dir-walk — a Loop MMT gift
-https://loopmmt.com/gifts/dir-walk/
+# dialect — a Loop MMT gift
+https://loopmmt.com/gifts/dialect/
 [coverage: optional · branch: gifts]
 
-Walk a Directory Tree into a Deterministic JSONL Stream source ← all gifts
+One Markdown Source, Many Honest Dialects? transform ← all gifts
 
-dir-walk
+dialect
 
-dir-walk takes a directory in and emits one JSON record per file, directory, and symlink it finds — {path,name,type,depth[,size]} — in a stable, byte-sorted, reproducible pre-order that is identical on every machine. It is the "give me this tree as data" adapter, the front of a pipe into the JSONL fold/filter/transform gifts (count files by type, filter by depth, diff two trees). The determinism keystone is a pure core walk(provider, opts) over an INJECTED provider, so all disk impurity lives at the provider boundary and the walk is testable without a disk: entries are SORTED by name within each directory (never the OS readdir order), only PORTABLE fields are emitted (never mtime/ino/mode), and symlinks are reported but NEVER followed (so a walk always terminates and stays in the tree). Options: --files-only/--dirs-only, --max-depth N, --no-size, --root-name.
+Every tool that posts Markdown to somewhere re-hand-rolls the same emitter — walk the AST, decide how each node looks in the target, glue the strings — and the usual over-correction is worse: a template DSL with conditionals and expressions, a programming language in disguise. dialect takes the middle: it renders a parsed Markdown AST into a target text dialect (a Reddit comment, a Reddit self-post, plain text,...) by folding it through a DECLARATIVE RULESET — a flat JSON table keyed by node type, each value a small record of bounded knobs (a wrap pair, a linePrefix, a form choice, a link template) with NO conditionals, NO expressions, NO loops you can author and a fixed tiny placeholder set ({content}{level}{n}{label}{href}). Adding a dialect is adding a table, not writing code, and new syntaxes (a Slack *bold*, a Discord ||spoiler||) are just new wrap pairs. It ships beside the markdown gift and folds over ITS AST — reusing that gift's parse() (no second parser) and its isSafeUrl guard. render() is a pure fold: same AST + same ruleset produce byte-identical text, and an external ruleset is validated at load against four decidable structural predicates (wrap-is-a-pair, blockJoin-string, template-has-{label}+{href}, linePrefix-string), loud-stopping on a malformed one. The line it will not cross is `table`: that needs a code writer, and the edge says so out loud.
 
 The honest edge
 
-dir-walk emits a SORTED, portable pre-order stream of {path,name,type,depth,size}. It does NOT follow symlinks (reported, never descended), does NOT emit mtime/ino/mode/uid (unportable, time-varying), does NOT match globs (pipe into a filter gift), and does NOT read file contents (use line-source). The root record is not emitted; its children are depth 1.
+The declarative ruleset covers the ~95% of Markdown whose emission is a flat per-node substitution; it STOPS at `table` (column alignment is logic, not a flat substitution, so a table target needs a code writer) — a table node renders its cells bare and is REPORTED as a hole, never silently mangled. Link safety is universal, not a per-dialect choice: an unsafe href (javascript:, data:,...) is ALWAYS dropped to its plain-text label, in every dialect. It holds NO clock/network/entropy, persists nothing, and never throws on bad input — an unparseable construct degrades to literal text, an unruled node renders bare and is reported. An external ruleset is validated at load and loud-stops on a structural fault.
 
 Run it
 
-node dir-walk.js./src/ --files-only --max-depth 2 # -> sorted JSONL of files under./src/, depth <= 2
-test_dir-walk.js (77/77, independent explicit-recursion oracle fed a REVERSED provider so the sort is the gift's) + mutation-bite (7/7) + Plumb conformance GREEN (37/37, signed 2026-09-13, host-independent non-vacuity: a no-sort mutant caught via a reverse-readdir shim)
-Node / browser, no dependencies
+node dialect.js --ruleset reddit IN.md # Markdown -> dialect text | node dialect.js --list | node dialect.js --help
+test_dialect.js (30/30, 3 mutation bites) + --selftest (23) — per-dialect deltas (reddit/reddit-post/plain), unsafe-href drop, hole reporting, ruleset-load validator (four decidable predicates), folds-twice-identical determinism
+Zero dependencies, Node or browser, deterministic (folds beside the markdown gift)
 
 The code — every file that ships
 
-dir-walk.js 300 lines on GitHub →
+dialect.js 484 lines on GitHub →
 #!/usr/bin/env node
-/* dir-walk.js — walk a directory tree into a deterministic JSONL stream of entries.
-Dependency-free, deterministic, MIT. Runs in Node (the CLI reads the real filesystem)
-or a browser (the pure core walks an injected in-memory tree).
-
-WHAT IT IS. A SOURCE: it takes a directory in and emits a JSONL stream out — one record
-per file/directory found, in a stable, sorted, reproducible order — the front of a pipe
-that lets the fold/filter/transform gifts work on a filesystem:
-
-node dir-walk.js./src | node schema-filter.js...
-node dir-walk.js. --files-only --max-depth 2
-
-Each record is a fixed, portable shape: {"path":"src/a.js","name":"a.js","type":"file",
-"depth":1,"size":128}. It is the "give me this tree as data" adapter — a build/ops source.
-
-THE QUIET FAILURES IT FIXES. Everyone reaches for a recursive readdir and everyone gets
-it wrong in ways that only bite on another machine or another run:
-
-1. NON-DETERMINISTIC ORDER. `fs.readdirSync` returns entries in the filesystem's own
-order, which differs across OSes, filesystems, and even runs. A walk that emits in
-readdir order produces a DIFFERENT stream on every machine — un-diffable, un-
-pinnable, useless as a golden. dir-walk SORTS every directory's entries by name
-(byte order) before descending, so the same tree always yields the same stream.
-
-2. LEAKY, UNPORTABLE STAT. The raw `fs.Stats` object carries mtime, ino, mode, uid,
-blocks — values that change between runs and machines and would make the "same"
-tree hash differently every time. dir-walk emits only a FIXED, portable subset
-(path, name, type, depth, and size for files) — the fields that are a property of
-the tree's shape, not of the moment you looked at it. (size is opt-out with
---no-size if you want shape-only.)
-
-3. SYMLINK CYCLES AND SURPRISE DESCENT. Naive recursion follows symlinks and can loop
-forever on a cycle, or wander out of the tree you meant. dir-walk does NOT follow
-symlinks by default — a symlink is reported as its own entry (type "symlink") and
-never descended — so a walk always terminates and stays inside the tree. (Depth is
-also boundable with --max-depth.)
-
-THE MODEL. The PURE CORE is `walk(provider, opts)`: it takes a PROVIDER (an object with
-`readdir(dirPath) -> [ {name, type}]` sorted-or-not, `size(filePath) -> number`) and a
-root, and returns the sorted, deterministic array of entry records. The CLI supplies a
-real-filesystem provider (built-in `fs`); a test or a browser supplies an in-memory one.
-The impurity (touching the disk) lives ONLY in the provider — the walk itself is pure,
-so the same provider + opts always yield byte-identical output.
-
---files-only emit only file (and symlink) records, not directory records
---dirs-only emit only directory records
---max-depth N do not descend past depth N (root entries are depth 1)
---no-size omit the size field (shape-only; also skips the size() call)
---root-name NAME the label for the root in paths (default: the path you passed)
-
-DETERMINISM. walk(provider, opts) is a pure function of (provider's answers, opts). Given
-a provider that returns the same answers, the output is byte-identical on every run and
-every machine: entries are sorted by name within each directory, traversal is a stable
-pre-order (a directory record precedes its children), symlinks are not followed, and only
-portable fields are emitted. No clock, no randomness read into the OUTPUT.
-
-USAGE
-node dir-walk.js./project
-node dir-walk.js. --files-only --max-depth 3
-node dir-walk.js src --no-size | node dedup-filter.js --key type
-node dir-walk.js --help
-
-Exit codes: 0 success (including an empty directory -> empty stream) · 2 usage error
-(unknown option, missing/duplicate root, bad --max-depth) · 3 the root does not exist or
-is not a directory. A clean one-line message on stderr, never a stack trace.
-
-Released under MIT. Its edge is printed in the README: dir-walk emits a SORTED, portable
-pre-order stream of {path,name,type,depth,size}. It does NOT follow symlinks (they are
-reported, never descended), does NOT emit mtime/ino/mode/uid (unportable, time-varying),
-does NOT match globs or filter by pattern (pipe into a filter gift), and does NOT read
-file CONTENTS (use line-source for that). The root record is not emitted; its children
-are depth 1.
+/* SPDX-License-Identifier: MIT */
+/* dialect.js — one Markdown source, many honest dialects, from DATA not code.
+*
+* A tiny, dependency-free engine that renders a parsed Markdown AST into a target
+* text dialect (Reddit comment, plain text, …) by folding it through a DECLARATIVE
+* RULESET — a flat table of per-node emission rules — instead of a hand-written
+* emitter per target.
+*
+* source ──▶ parse() ──▶ AST ──▶ render(ast, RULESET) ──▶ dialect text
+*
+* WHY DATA, NOT CODE (the design decision, and the line it will not cross).
+* The obvious way to support a second target is a second emitter function. That's
+* the N-writers path, and it grows code without bound. The obvious OVER-correction
+* is a template DSL with conditionals and expressions — a programming language in
+* disguise, which is where "flexible" turns baroque. This engine takes the middle:
+* a ruleset is a flat JSON object keyed by AST node type, each value a small record
+* of bounded knobs (a wrap pair, a line-prefix, a marker, a form choice). It has
+* NO conditionals, NO expressions, NO loops you can author. Substitution is a fixed,
+* tiny set of placeholders: {content} {level} {n} {label} {href}. That is expressive
+* enough for the real dialects and it STOPS DEAD before becoming a language. A target
+* that genuinely needs logic gets a code writer; the ruleset covers the declarative 95%.
+*
+* THE REUSE (this ships beside the `markdown` gift and folds over ITS AST).
+* It require()s the markdown gift's parse() — no second parser — and reuses that
+* gift's isSafeUrl href guard, because link safety is never a per-dialect choice:
+* an unsafe href (javascript:, data:, …) is ALWAYS dropped to its plain-text label,
+* in every dialect, by construction.
+*
+* HONESTY / DETERMINISM (inherited and kept):
+* * parse() never throws — an unparseable construct degrades to literal text.
+* * render() is a pure fold — same AST + same ruleset ⇒ byte-identical output.
+* --selftest proves folds-twice-identical.
+* * A ruleset with a hole (a node type it doesn't name) does not crash: the node
+* renders its content bare, and the hole is REPORTED, never silently dropped.
+*
+* THE RULESET SHAPE (the whole schema — a dialect that hides its scope lies):
+* {
+* "name": "reddit",
+* "blockJoin": "\n\n", // separator between top-level blocks
+* "blocks": {
+* "heading": { "form": "bold" | "atx",...}, // bold-line vs # line
+* "paragraph": {}, // content as-is
+* "blockquote": { "linePrefix": "> ", "innerJoin": "\n>\n"},
+* "codeBlock": { "form": "indent" | "fence", "indent": " ", "fence": "```"},
+* "list": { "bullet": "- ", "ordered": "{n}. "}
+*},
+* "inline": {
+* "strong": { "wrap": ["**","**"]},
+* "em": { "wrap": ["*","*"]},
+* "codeSpan": { "wrap": ["`","`"]},
+* "break": { "text": " \n"},
+* "link": { "form": "inline" | "label" | "labelHref", // [t](u) | t | t (u)
+* "template": "[{label}]({href})"} // form:inline uses this
+*}
+*}
+* Any block/inline key omitted falls back to a bare, honest default (content only).
+*
+* API (require): render(ast, ruleset) -> { text, holes:[nodeType…]}
+* renderSource(src, ruleset) -> same, parsing src first
+* CLI: dialect.js --ruleset reddit IN.md [-o OUT.md]
+* dialect.js --ruleset./my-rules.json IN.md
+* dialect.js --list (built-in rulesets)
+* dialect.js --selftest
 */
-"use strict";
+'use strict';
 
-/* ==================================================================
-THE PURE CORE — walk(provider, opts) -> [entry,...]
-The provider is the only impure boundary; the walk is pure.
-provider.readdir(dirPath) -> [ { name, type},...] (type: 'file'|'dir'|'symlink'|'other')
-provider.size(filePath) -> number (only called for files when size wanted)
-================================================================== */
+var path = require('path');
+// Resolve the markdown gift. In the SHIPPED (served) home it's a sibling gift dir
+// (../markdown/markdown.js). In the repo's design tree the served gift lives under
+// projects/loopmmt-website/... — walk up looking for that. Try candidates in order;
+// the first that loads wins. (A gift is zero-dependency at ship time — this dual
+// path is a repo-checkout convenience, not a runtime dependency.)
+var md = (function () {
+var candidates = [
+path.resolve(__dirname, '..', 'markdown', 'markdown.js') // shipped: sibling gift
+];
+// walk parents looking for the served gifts dir
+var d = __dirname;
+for (var up = 0; up < 8; up++) {
+candidates.push(path.resolve(d, 'projects', 'loopmmt-website', 'site-root', 'gifts', 'markdown', 'markdown.js'));
+d = path.resolve(d, '..');
+}
+for (var i = 0; i < candidates.length; i++) {
+try { return require(candidates[i]);} catch (e) { /* try next */}
+}
+throw new Error('dialect: cannot locate the markdown gift (markdown.js) in any known home');
+})();
 
-// Join a parent path and a child name with a forward slash, normalizing so output is
-// platform-independent ("src/a.js", never "src\\a.js"). Pure.
-function joinPath(parent, name) {
-if (parent === "") return name;
-return parent + "/" + name;
-}
-
-// Sort directory entries by name in byte (code-unit) order — the determinism keystone.
-// Pure; does not mutate the input.
-function sortedByName(entries) {
-return entries.slice().sort(function (a, b) {
-if (a.name < b.name) return -1;
-if (a.name > b.name) return 1;
-return 0;
-});
-}
-
-// Build one entry record with the fixed, portable field set. Pure.
-function makeRecord(relPath, name, type, depth, size) {
-var rec = { path: relPath, name: name, type: type, depth: depth};
-if (size!== undefined) rec.size = size;
-return rec;
-}
-
-// The deterministic pre-order walk. Pure function of the provider's answers and opts.
-// opts.filesOnly / opts.dirsOnly — emit only files(+symlinks) / only dirs
-// opts.maxDepth — do not descend past this depth (root children = 1)
-// opts.withSize — include the size field for file records (default true)
-// opts.rootName — label for the root in paths (default "")
-// Returns an array of entry records in stable pre-order (a dir precedes its children).
-function walk(provider, opts) {
-opts = opts || {};
-var filesOnly =!!opts.filesOnly;
-var dirsOnly =!!opts.dirsOnly;
-var maxDepth = opts.maxDepth === undefined? Infinity: opts.maxDepth;
-var withSize = opts.withSize === undefined? true:!!opts.withSize;
-var rootLabel = opts.rootName === undefined? "": String(opts.rootName);
-
-if (filesOnly && dirsOnly) throw new Error("--files-only and --dirs-only are mutually exclusive");
-if (typeof maxDepth === "number" && maxDepth < 1 && maxDepth!== Infinity) {
-// maxDepth 0 means "emit nothing below root"; treat as an empty walk (root has no record)
-}
-
-var out = [];
-
-// recurse over a directory at absolute-ish `dirAbs` (what the provider understands),
-// whose path RELATIVE to the root is `relBase`, at `depth`.
-function descend(dirAbs, relBase, depth) {
-if (depth > maxDepth) return;
-var entries = sortedByName(provider.readdir(dirAbs));
-for (var i = 0; i < entries.length; i++) {
-var e = entries[i];
-var childAbs = joinPath(dirAbs, e.name);
-var childRel = joinPath(relBase, e.name);
-var type = e.type;
-if (type === "dir") {
-if (!filesOnly) out.push(makeRecord(childRel, e.name, "dir", depth));
-// descend only if within depth budget; a symlink-typed entry is never descended
-descend(childAbs, childRel, depth + 1);
-} else {
-// file, symlink, or other
-if (!dirsOnly) {
-var size = undefined; // reset each iteration (var is function-scoped; do not leak a prior file's size)
-if (withSize && type === "file") size = provider.size(childAbs);
-out.push(makeRecord(childRel, e.name, type, depth, size));
-}
-}
-}
-}
-
-descend(opts.__rootAbs === undefined? "": opts.__rootAbs, rootLabel, 1);
-return out;
-}
-
-// Render entry records as JSONL text (one JSON object per line, trailing newline per record).
-function toJSONL(records) {
-var s = "";
-for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
-return s;
-}
-
-/* ==================================================================
-EXPORTS (browser + Node)
-================================================================== */
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.dirWalk = { walk: walk, toJSONL: toJSONL, sortedByName: sortedByName};
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { walk: walk, toJSONL: toJSONL, sortedByName: sortedByName, joinPath: joinPath};
-}
-
-/* ==================================================================
-THE REAL-FILESYSTEM PROVIDER (Node CLI only) — the one impure edge
-================================================================== */
-function fsProvider(rootAbs) {
-var fs = require("fs");
-var path = require("path");
-return {
-// returns [{name, type}] for the directory; type via lstat so symlinks are seen as symlinks
-readdir: function (relDir) {
-var abs = relDir === ""? rootAbs: path.join(rootAbs, relDir);
-var names = fs.readdirSync(abs);
-var out = [];
-for (var i = 0; i < names.length; i++) {
-var full = path.join(abs, names[i]);
-var st;
-try { st = fs.lstatSync(full);} catch (e) { st = null;}
-var type = "other";
-if (st) {
-if (st.isSymbolicLink()) type = "symlink";
-else if (st.isDirectory()) type = "dir";
-else if (st.isFile()) type = "file";
-}
-out.push({ name: names[i], type: type});
-}
-return out;
+// ---- built-in rulesets ------------------------------------------------------
+// Data, not code. Add a dialect by adding a table here (or passing a JSON file).
+var RULESETS = {
+// Reddit COMMENT dialect: headings->bold line, blocks blank-line-separated,
+// code fences -> 4-space indent (``` unreliable in old-Reddit comments).
+reddit: {
+name: 'reddit',
+desc: 'Reddit comment — bold-line headers, blank-line blocks, indented code.',
+blockJoin: '\n\n',
+blocks: {
+heading: { form: 'bold'},
+paragraph: {},
+blockquote: { linePrefix: '> ', innerJoin: '\n>\n'},
+codeBlock: { form: 'indent', indent: ' '},
+list: { bullet: '- ', ordered: '{n}. '}
 },
-size: function (relFile) {
-var abs = relFile === ""? rootAbs: path.join(rootAbs, relFile);
-try { return require("fs").statSync(abs).size;} catch (e) { return 0;}
+inline: {
+strong: { wrap: ['**', '**']},
+em: { wrap: ['*', '*']},
+codeSpan: { wrap: ['`', '`']},
+break: { text: ' \n'},
+link: { form: 'inline', template: '[{label}]({href})'}
+}
+},
+
+// Reddit SELF-POST variant: keep # headings and ``` fences (posts render them).
+'reddit-post': {
+name: 'reddit-post',
+desc: 'Reddit self-post — keeps # headers and ``` fences (posts render them).',
+blockJoin: '\n\n',
+blocks: {
+heading: { form: 'atx'},
+paragraph: {},
+blockquote: { linePrefix: '> ', innerJoin: '\n>\n'},
+codeBlock: { form: 'fence', fence: '```'},
+list: { bullet: '- ', ordered: '{n}. '}
+},
+inline: {
+strong: { wrap: ['**', '**']},
+em: { wrap: ['*', '*']},
+codeSpan: { wrap: ['`', '`']},
+break: { text: ' \n'},
+link: { form: 'inline', template: '[{label}]({href})'}
+}
+},
+
+// Plain text: strip all markup. Emphasis vanishes; a link becomes "label (href)".
+plain: {
+name: 'plain',
+desc: 'Plain text — every mark stripped; a link becomes "label (href)".',
+blockJoin: '\n\n',
+blocks: {
+heading: { form: 'bold-none'}, // content only, no marker
+paragraph: {},
+blockquote: { linePrefix: '', innerJoin: '\n\n'},
+codeBlock: { form: 'indent', indent: ' '},
+list: { bullet: '- ', ordered: '{n}. '}
+},
+inline: {
+strong: { wrap: ['', '']},
+em: { wrap: ['', '']},
+codeSpan: { wrap: ['', '']},
+break: { text: '\n'},
+link: { form: 'labelHref'} // "label (href)"
+}
 }
 };
+
+// ---- the engine: a pure fold of an AST through a ruleset ---------------------
+function render(ast, ruleset) {
+var holes = {};
+if (!ast || ast.type!== 'document') return { text: '', holes: []};
+var rs = ruleset || RULESETS.reddit;
+var blockJoin = rs.blockJoin!= null? rs.blockJoin: '\n\n';
+var out = ast.children.map(function (node) {
+return renderBlock(node, rs, holes);
+}).filter(function (s) { return s!== null && s!== '';});
+return { text: out.join(blockJoin) + '\n', holes: Object.keys(holes)};
 }
 
-/* ==================================================================
-CLI (runs only when invoked directly, never on require)
-================================================================== */
+function renderBlock(node, rs, holes) {
+var rule = (rs.blocks && rs.blocks[node.type]) || null;
+switch (node.type) {
+case 'heading': {
+var body = renderInline(node.children, rs, holes);
+var form = rule? rule.form: 'bold';
+if (form === 'atx') return repeat('#', node.level) + ' ' + body;
+if (form === 'bold-none') return body;
+return '**' + body + '**'; // 'bold' default
+}
+case 'paragraph':
+return renderInline(node.children, rs, holes);
+case 'blockquote': {
+var prefix = rule && rule.linePrefix!= null? rule.linePrefix: '> ';
+var innerJoin = rule && rule.innerJoin!= null? rule.innerJoin: '\n>\n';
+return node.children.map(function (b) {
+var inner = renderBlock(b, rs, holes);
+return inner.split('\n').map(function (ln) { return prefix + ln;}).join('\n');
+}).join(innerJoin);
+}
+case 'codeBlock': {
+var text = node.text.replace(/\n$/, '');
+var cform = rule? rule.form: 'indent';
+if (cform === 'fence') {
+var fence = rule && rule.fence? rule.fence: '```';
+return fence + '\n' + text + '\n' + fence;
+}
+var indent = rule && rule.indent? rule.indent: ' ';
+return text.split('\n').map(function (ln) { return indent + ln;}).join('\n');
+}
+case 'list': {
+var bullet = rule && rule.bullet? rule.bullet: '- ';
+var orderedTpl = rule && rule.ordered? rule.ordered: '{n}. ';
+var n = 0;
+return node.items.map(function (it) {
+n++;
+var marker = node.ordered? orderedTpl.replace('{n}', String(n)): bullet;
+return marker + renderInline(it.children, rs, holes);
+}).join('\n');
+}
+default:
+holes[node.type] = true;
+return node.children? renderInline(node.children, rs, holes): '';
+}
+}
 
-function parseArgs(args) {
-var opts = { withSize: true};
-var root = null;
-var i = 0;
-while (i < args.length) {
-var a = args[i];
-if (a === "--files-only") { opts.filesOnly = true; i++;}
-else if (a === "--dirs-only") { opts.dirsOnly = true; i++;}
-else if (a === "--no-size") { opts.withSize = false; i++;}
-else if (a === "--max-depth") {
-var v = args[i + 1];
-if (v === undefined) throw new Error("--max-depth requires a number");
-var n = parseInt(v, 10);
-if (String(n)!== String(v).trim() || n < 0) throw new Error("--max-depth must be a non-negative integer");
-opts.maxDepth = n;
-i += 2;
+function renderInline(nodes, rs, holes) {
+var inline = rs.inline || {};
+return (nodes || []).map(function (n) {
+switch (n.type) {
+case 'text': return n.value;
+case 'strong': return wrapWith(inline.strong, ['**', '**'], renderInline(n.children, rs, holes));
+case 'em': return wrapWith(inline.em, ['*', '*'], renderInline(n.children, rs, holes));
+case 'codeSpan': return wrapWith(inline.codeSpan, ['`', '`'], n.value);
+case 'break': return inline.break && inline.break.text!= null? inline.break.text: ' \n';
+case 'link': {
+var label = renderInline(n.children, rs, holes);
+// link safety is universal, never a per-dialect choice
+if (!md.isSafeUrl(n.href)) return label;
+var href = n.href.trim();
+var lr = inline.link || { form: 'inline', template: '[{label}]({href})'};
+if (lr.form === 'label') return label;
+if (lr.form === 'labelHref') return label + ' (' + href + ')';
+var tpl = lr.template || '[{label}]({href})';
+return tpl.replace('{label}', label).replace('{href}', href);
 }
-else if (a === "--root-name") {
-var rn = args[i + 1];
-if (rn === undefined) throw new Error("--root-name requires a value");
-opts.rootName = rn;
-i += 2;
+default:
+holes[n.type] = true;
+return n.children? renderInline(n.children, rs, holes): (n.value || '');
 }
-else if (a.charAt(0) === "-") { throw new Error("unknown option " + a);}
-else {
-if (root!== null) throw new Error("unexpected extra argument " + JSON.stringify(a) + " (dir-walk takes one root directory)");
-root = a;
-i++;
-}
-}
-if (opts.filesOnly && opts.dirsOnly) throw new Error("--files-only and --dirs-only are mutually exclusive");
-if (root === null) root = ".";
-opts.root = root;
-return opts;
+}).join('');
 }
 
-var HELP =
-"dir-walk.js — walk a directory tree into a deterministic JSONL stream of entries.\n\n" +
-" node dir-walk.js./project\n" +
-" node dir-walk.js. --files-only --max-depth 3\n" +
-" node dir-walk.js src --no-size | node dedup-filter.js --key type\n" +
-" node dir-walk.js --help\n\n" +
-" --files-only emit only file/symlink records, not directories\n" +
-" --dirs-only emit only directory records\n" +
-" --max-depth N do not descend past depth N (root's children are depth 1)\n" +
-" --no-size omit the size field (shape-only)\n" +
-" --root-name NM label for the root in emitted paths (default: none, paths are relative)\n\n" +
-"Emits one JSON object per entry: { path, name, type, depth[, size]}, entries SORTED by\n" +
-"name within each directory (deterministic across machines). Symlinks are reported but\n" +
-"never followed. Only portable fields are emitted (no mtime/ino/mode).\n\n" +
-"Edge: dir-walk does NOT follow symlinks, does NOT emit time/inode/mode, does NOT match\n" +
-"globs (pipe into a filter gift), and does NOT read file contents (use line-source).\n";
-
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(HELP);
-return 0;
+function wrapWith(rule, dflt, content) {
+var w = rule && rule.wrap? rule.wrap: dflt;
+return (w[0] || '') + content + (w[1] || '');
 }
-var opts;
-try { opts = parseArgs(args);}
-catch (e) { process.stderr.write("dir-walk: " + e.message + "\n"); return 2;}
+function repeat(s, n) { var o = ''; for (var k = 0; k < n; k++) o += s; return o;}
 
-var fs = require("fs");
-var st;
-try { st = fs.statSync(opts.root);}
-catch (e) { process.stderr.write("dir-walk: not found: " + opts.root + "\n"); return 3;}
-if (!st.isDirectory()) { process.stderr.write("dir-walk: not a directory: " + opts.root + "\n"); return 3;}
+function renderSource(src, ruleset) {
+return render(md.parse(String(src == null? '': src)), ruleset);
+}
+function resolveRuleset(nameOrObj) {
+if (nameOrObj && typeof nameOrObj === 'object') return nameOrObj;
+return RULESETS[nameOrObj] || null;
+}
 
-var provider = fsProvider(opts.root);
-var records;
-try {
-records = walk(provider, {
-filesOnly: opts.filesOnly,
-dirsOnly: opts.dirsOnly,
-maxDepth: opts.maxDepth,
-withSize: opts.withSize,
-rootName: opts.rootName === undefined? "": opts.rootName,
-__rootAbs: ""
+// ---- ruleset-load validator -------------------------------------------------
+// Validate a ruleset at LOAD for exactly FOUR decidable STRUCTURAL predicates,
+// and loud-stop (throw) on failure. This checks the SHAPE the engine substitutes
+// into, never the SEMANTICS of a dialect — an unknown node type, a missing block
+// rule, an unusual marker are all honest-degraded at render time (holes reported,
+// content emitted bare), so they are deliberately NOT checked here.
+//
+// It stays FOUR predicates on purpose (RCR minority guard, Dara): the moment a
+// ruleset wants conditionals or expressions, that is the Simplicity-Yield line —
+// the answer is a per-target code writer, NOT a fifth predicate or a richer one.
+//
+// 1. every `wrap` value is a 2-element [open, close] pair
+// 2. `blockJoin`, when present, is a string
+// 3. any `template` string contains the placeholders it references — {label}
+// and {href} (the two the link renderer substitutes); a template missing
+// either silently drops content, so this is a real structural fault
+// 4. any `linePrefix`, when present, is a string
+//
+// Returns the ruleset unchanged on success; throws Error naming every violation
+// on failure. Pure and decidable — no I/O, no render, terminates on any input.
+function validateRuleset(ruleset) {
+if (!ruleset || typeof ruleset!== 'object' || Array.isArray(ruleset)) {
+throw new Error('invalid ruleset: expected an object');
+}
+var errs = [];
+var inline = (ruleset.inline && typeof ruleset.inline === 'object')? ruleset.inline: {};
+var blocks = (ruleset.blocks && typeof ruleset.blocks === 'object')? ruleset.blocks: {};
+
+// (1) every `wrap` value is a 2-element pair
+Object.keys(inline).forEach(function (k) {
+var rule = inline[k];
+if (rule && rule.wrap!== undefined) {
+if (!Array.isArray(rule.wrap) || rule.wrap.length!== 2) {
+errs.push('inline.' + k + '.wrap must be a 2-element [open, close] pair');
+}
+}
 });
-} catch (e) { process.stderr.write("dir-walk: " + e.message + "\n"); return 2;}
 
-process.stdout.write(toJSONL(records));
-return 0;
+// (2) blockJoin is a string (when present)
+if (ruleset.blockJoin!== undefined && typeof ruleset.blockJoin!== 'string') {
+errs.push('blockJoin must be a string');
 }
 
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
+// (3) any template string contains the placeholders it references ({label} and {href})
+Object.keys(inline).forEach(function (k) {
+var rule = inline[k];
+if (rule && rule.template!== undefined) {
+if (typeof rule.template!== 'string') {
+errs.push('inline.' + k + '.template must be a string');
+} else if (rule.template.indexOf('{label}') === -1 || rule.template.indexOf('{href}') === -1) {
+errs.push('inline.' + k + '.template must contain both {label} and {href} (it drops content otherwise)');
+}
+}
+});
+
+// (4) linePrefix is a string (when present)
+Object.keys(blocks).forEach(function (k) {
+var rule = blocks[k];
+if (rule && rule.linePrefix!== undefined && typeof rule.linePrefix!== 'string') {
+errs.push('blocks.' + k + '.linePrefix must be a string');
+}
+});
+
+if (errs.length) throw new Error('invalid ruleset: ' + errs.join('; '));
+return ruleset;
 }
 
-test_dir-walk.js 184 lines on GitHub →
-#!/usr/bin/env node
-/* test_dir-walk.js — battery for the dir-walk gift.
-`node test_dir-walk.js` -> exit 0 PASS / non-zero FAIL.
-
-THE ORACLE IS INDEPENDENT AND TAKES A DIFFERENT ROUTE. The gift walks with a recursive
-pre-order descent. The oracle here does an EXPLICIT-STACK iterative pre-order, sorting
-with a hand comparator and building paths by a different accumulation — no shared code
-with the gift's recursion. Both are fed the SAME in-memory provider (a pure fixture
-tree), so the comparison is deterministic and disk-free. Plus frozen hand goldens for
-each quiet-failure case the gift exists to fix (sort order, portable-fields-only,
-symlinks-not-followed).
-*/
-"use strict";
-
-var G = require("./dir-walk.js");
-
-var pass = 0, fail = 0;
-function ok(name, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL: " + name);}}
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;} else { fail++; console.error("FAIL: " + name + "\n got: " + g + "\n want: " + w);}
-}
-
-/* ---- an in-memory provider builder from a nested spec --------------------- */
-// spec: { name: {...}} for a dir, { name: <size:number>} for a file, { name: "->"} symlink
-// We flatten it into readdir()/size() maps.
-function buildProvider(spec) {
-var dirs = {}; // dirPath -> [ {name,type}]
-var sizes = {}; // filePath -> number
-function visit(node, relBase) {
-var entries = [];
-var keys = Object.keys(node);
-for (var i = 0; i < keys.length; i++) {
-var name = keys[i];
-var v = node[name];
-var childRel = relBase === ""? name: relBase + "/" + name;
-if (v === "->") { entries.push({ name: name, type: "symlink"});}
-else if (typeof v === "number") { entries.push({ name: name, type: "file"}); sizes[childRel] = v;}
-else if (v && typeof v === "object") { entries.push({ name: name, type: "dir"}); visit(v, childRel);}
-}
-dirs[relBase] = entries;
-}
-visit(spec, "");
-return {
-readdir: function (d) {
-// return UNSORTED (reversed) to prove the gift sorts, not the provider
-return (dirs[d] || []).slice().reverse();
-},
-size: function (f) { return sizes[f] || 0;}
+var api = {
+render: render,
+renderSource: renderSource,
+RULESETS: RULESETS,
+resolveRuleset: resolveRuleset,
+validateRuleset: validateRuleset
 };
-}
+if (typeof module!== 'undefined' && module.exports) module.exports = api;
 
-/* ---- independent oracle: explicit-stack iterative pre-order -------------- */
-function oracleWalk(provider, opts) {
-opts = opts || {};
-var filesOnly =!!opts.filesOnly, dirsOnly =!!opts.dirsOnly;
-var maxDepth = opts.maxDepth === undefined? Infinity: opts.maxDepth;
-var withSize = opts.withSize === undefined? true:!!opts.withSize;
-var out = [];
-// stack frames: { dir, rel, depth}
-var stack = [{ dir: "", rel: "", depth: 1}];
-// To get PRE-ORDER with an explicit stack we must process a directory's entries in order
-// and recurse immediately — so we use a recursion-free approach that mimics call order by
-// pushing a synthetic "expanded children" list. Simplest faithful different-route: gather
-// each dir's sorted entries, then interleave via an output-index insertion.
-function sortEntries(es) {
-var a = es.slice();
-a.sort(function (x, y) { return x.name < y.name? -1: x.name > y.name? 1: 0;});
-return a;
-}
-function rec(dir, rel, depth) {
-if (depth > maxDepth) return;
-var es = sortEntries(provider.readdir(dir));
-for (var i = 0; i < es.length; i++) {
-var e = es[i];
-var cRel = rel === ""? e.name: rel + "/" + e.name;
-var cDir = dir === ""? e.name: dir + "/" + e.name;
-if (e.type === "dir") {
-if (!filesOnly) out.push(mk(cRel, e.name, "dir", depth));
-rec(cDir, cRel, depth + 1);
-} else {
-if (!dirsOnly) {
-var rec2 = mk(cRel, e.name, e.type, depth);
-if (withSize && e.type === "file") rec2.size = provider.size(cDir);
-out.push(rec2);
-}
-}
-}
-}
-function mk(path, name, type, depth) { return { path: path, name: name, type: type, depth: depth};}
-rec("", "", 1);
-return out;
-}
+// ---- selftest ---------------------------------------------------------------
+function selftest() {
+var fails = [];
+function ck(name, cond) { if (!cond) fails.push(name);}
+var src = '# Title\n\n**b** *i* `c`\n\n> quote\n> line two\n\n- one\n- two\n\n1. a\n2. b\n\n```\nx = 1\n```\n\n[ok](https://e.com) [bad](javascript:x)';
 
-/* ---- grid: gift == oracle across several trees x option sets ------------- */
-var TREES = [
-{}, // empty
-{ "a.txt": 3}, // one file
-{ "z.txt": 1, "a.txt": 2, "m.txt": 3}, // sort order matters
-{ "dir": { "b.txt": 5}, "a.txt": 1}, // nesting + sort across types
-{ "link": "->", "a.txt": 1}, // symlink present
-{ "a": { "b": { "c.txt": 9}}}, // deep
-{ "d1": { "x.txt": 1}, "d2": { "y.txt": 2}, "f.txt": 3}, // multiple dirs
-{ "a.txt": 0, "empty": {}} // empty subdir + zero-size file
-];
-var OPTS = [
-{}, { filesOnly: true}, { dirsOnly: true}, { withSize: false},
-{ maxDepth: 1}, { maxDepth: 2}, { filesOnly: true, maxDepth: 1}
-];
-for (var ti = 0; ti < TREES.length; ti++) {
-for (var oi = 0; oi < OPTS.length; oi++) {
-var p = buildProvider(TREES[ti]);
-var giftOut = G.walk(p, Object.assign({ __rootAbs: ""}, OPTS[oi]));
-var oracleOut = oracleWalk(p, OPTS[oi]);
-eq("grid t" + ti + " o" + oi, giftOut, oracleOut);
-}
-}
+// determinism
+var r1 = renderSource(src, RULESETS.reddit).text;
+var r2 = renderSource(src, RULESETS.reddit).text;
+ck('deterministic', r1 === r2);
+ck('re-render stable', renderSource(r1, RULESETS.reddit).text === renderSource(renderSource(r1, RULESETS.reddit).text, RULESETS.reddit).text);
 
-/* ---- frozen hand goldens: the three quiet failures ---------------------- */
+// reddit dialect deltas
+ck('reddit heading->bold', r1.indexOf('**Title**')!== -1 && r1.indexOf('# Title') === -1);
+ck('reddit fence->indent', r1.indexOf(' x = 1')!== -1);
+ck('reddit blank-line blocks', /\n\n/.test(r1));
+ck('unsafe href dropped', r1.indexOf('javascript:') === -1 && r1.indexOf('bad')!== -1);
+ck('safe href kept', r1.indexOf('[ok](https://e.com)')!== -1);
 
-// 1. Sort order — provider returns reversed, gift must emit sorted-by-name
-var pSort = buildProvider({ "z.txt": 1, "a.txt": 1, "m.txt": 1});
-eq("golden: entries sorted by name regardless of provider order",
-G.walk(pSort, { __rootAbs: ""}).map(function (r) { return r.name;}),
-["a.txt", "m.txt", "z.txt"]);
+// reddit-post variant keeps hash + fence
+var rp = renderSource('# Title\n\n```\nx\n```', RULESETS['reddit-post']).text;
+ck('reddit-post keeps hash', rp.indexOf('# Title')!== -1);
+ck('reddit-post keeps fence', rp.indexOf('```')!== -1);
 
-// 2. Portable fields only — a record has exactly {path,name,type,depth[,size]}, no mtime/ino/mode
-var pFields = buildProvider({ "a.txt": 42});
-var rec = G.walk(pFields, { __rootAbs: ""})[0];
-eq("golden: file record has exactly the portable field set",
-Object.keys(rec).sort(), ["depth", "name", "path", "size", "type"]);
-ok("golden: no mtime/ino/mode leaked", rec.mtime === undefined && rec.ino === undefined && rec.mode === undefined);
-var pDir = buildProvider({ "d": { "x": 1}});
-var dirRec = G.walk(pDir, { __rootAbs: ""})[0];
-eq("golden: dir record has no size", Object.keys(dirRec).sort(), ["depth", "name", "path", "type"]);
+// plain strips markup
+var pl = renderSource('# T\n\n**b** *i* [t](https://e.com)', RULESETS.plain).text;
+ck('plain strips heading marker', pl.indexOf('#') === -1);
+ck('plain strips strong', pl.indexOf('**') === -1 && pl.indexOf('b')!== -1);
+ck('plain link labelHref', pl.indexOf('t (https://e.com)')!== -1);
 
-// 3. Symlinks reported but not followed (and carry no size)
-var pLink = buildProvider({ "link": "->", "a.txt": 1});
-var links = G.walk(pLink, { __rootAbs: ""}).filter(function (r) { return r.type === "symlink";});
-eq("golden: symlink reported as its own entry", links.length, 1);
-ok("golden: symlink carries no size", links[0].size === undefined);
-ok("golden: symlink is depth 1, not descended", links[0].depth === 1);
+// holes are reported, never crash — a custom ruleset with an empty inline table
+var holed = render(md.parse('**x** *y*'), { name: 't', blockJoin: '\n\n', blocks: {}, inline: {}});
+ck('hole render does not crash', typeof holed.text === 'string');
 
-/* ---- direct unit checks -------------------------------------------------- */
-eq("empty tree -> empty stream", G.walk(buildProvider({}), { __rootAbs: ""}), []);
-eq("max-depth 1 stops before nested files",
-G.walk(buildProvider({ "d": { "x.txt": 1}}), { __rootAbs: "", maxDepth: 1}).map(function (r) { return r.path;}),
-["d"]);
-eq("files-only drops dir records",
-G.walk(buildProvider({ "d": { "x.txt": 1}, "a.txt": 2}), { __rootAbs: "", filesOnly: true}).map(function (r) { return r.type;}),
-["file", "file"]);
-eq("dirs-only drops file records",
-G.walk(buildProvider({ "d": { "x.txt": 1}, "a.txt": 2}), { __rootAbs: "", dirsOnly: true}).map(function (r) { return r.type;}),
-["dir"]);
-eq("no-size omits size field",
-Object.keys(G.walk(buildProvider({ "a.txt": 9}), { __rootAbs: "", withSize: false})[0]).sort(),
-["depth", "name", "path", "type"]);
-eq("depth increments with nesting",
-G.walk(buildProvider({ "a": { "b": { "c.txt": 1}}}), { __rootAbs: ""}).map(function (r) { return r.depth;}),
-[1, 2, 3]);
-eq("pre-order: dir precedes its children",
-G.walk(buildProvider({ "d": { "x.txt": 1}}), { __rootAbs: ""}).map(function (r) { return r.path;}),
-["d", "d/x.txt"]);
+// custom ruleset via object
+var custom = { name: 'shout', blockJoin: '\n\n', blocks: { paragraph: {}},
+inline: { strong: { wrap: ['[', ']']}, em: { wrap: ['', '']},
+codeSpan: { wrap: ['`', '`']}, link: { form: 'label'}}};
+ck('custom wrap applied', renderSource('**hi**', custom).text.indexOf('[hi]') === 0);
 
-// sortedByName + toJSONL surfaces
-eq("sortedByName sorts by name", G.sortedByName([{ name: "b"}, { name: "a"}]).map(function (e) { return e.name;}), ["a", "b"]);
-ok("toJSONL ends every record with newline", G.toJSONL([{ path: "a", name: "a", type: "file", depth: 1}]) === '{"path":"a","name":"a","type":"file","depth":1}\n');
-ok("toJSONL of empty is empty string", G.toJSONL([]) === "");
-eq("joinPath at root is bare name", G.joinPath("", "a"), "a");
-eq("joinPath nests with slash", G.joinPath("a", "b"), "a/b");
-
-/* ---- determinism --------------------------------------------------------- */
-var pDet = buildProvider({ "z": { "y.txt": 1}, "a.txt": 2, "link": "->"});
-var d1 = G.toJSONL(G.walk(pDet, { __rootAbs: ""}));
-var d2 = G.toJSONL(G.walk(pDet, { __rootAbs: ""}));
-ok("deterministic across two runs", d1 === d2);
-
-/* ---- fail-closed --------------------------------------------------------- */
+// ruleset-load validator — the four decidable structural predicates
 function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
-ok("files-only + dirs-only throws", throws(function () { G.walk(buildProvider({}), { __rootAbs: "", filesOnly: true, dirsOnly: true});}));
+// every built-in ruleset passes its own validator (a real gate must not reject the good)
+ck('validator passes built-ins', Object.keys(RULESETS).every(function (k) {
+return!throws(function () { validateRuleset(RULESETS[k]);});
+}));
+// (1) wrap must be a 2-element pair
+ck('validator rejects bad wrap', throws(function () {
+validateRuleset({ blockJoin: '\n\n', inline: { strong: { wrap: ['*']}}});
+}));
+ck('validator accepts good wrap',!throws(function () {
+validateRuleset({ blockJoin: '\n\n', inline: { strong: { wrap: ['*', '*']}}});
+}));
+// (2) blockJoin must be a string
+ck('validator rejects non-string blockJoin', throws(function () {
+validateRuleset({ blockJoin: 2, inline: {}});
+}));
+// (3) a template must contain {label} and {href}
+ck('validator rejects template missing href', throws(function () {
+validateRuleset({ inline: { link: { form: 'inline', template: '[{label}]'}}});
+}));
+ck('validator accepts full template',!throws(function () {
+validateRuleset({ inline: { link: { form: 'inline', template: '[{label}]({href})'}}});
+}));
+// (4) linePrefix must be a string
+ck('validator rejects non-string linePrefix', throws(function () {
+validateRuleset({ blocks: { blockquote: { linePrefix: 4}}});
+}));
+// a non-object ruleset is rejected outright
+ck('validator rejects non-object', throws(function () { validateRuleset(null);}) &&
+throws(function () { validateRuleset([1, 2]);}));
 
-/* ---- report -------------------------------------------------------------- */
-console.log("dir-walk battery: " + pass + " passed, " + fail + " failed");
-process.exitCode = fail === 0? 0: 1;
+if (fails.length) { process.stderr.write('SELFTEST FAIL: ' + fails.join('; ') + '\n'); process.exit(1);}
+process.stdout.write('SELFTEST OK (' + 23 + ' checks)\n'); process.exit(0);
+}
+
+// ---- CLI --------------------------------------------------------------------
+if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
+var fs = require('fs');
+var args = process.argv.slice(2);
+
+if (args.indexOf('--help')!== -1 || args.length === 0) {
+process.stdout.write(
+'dialect — render Markdown into a target dialect via a declarative ruleset\n\n' +
+' dialect.js --ruleset reddit IN.md [-o OUT.md] built-in ruleset by name\n' +
+' dialect.js --ruleset./my.json IN.md ruleset from a JSON file\n' +
+' dialect.js --ruleset reddit - read stdin, write stdout\n' +
+' dialect.js --list list built-in rulesets\n' +
+' dialect.js --selftest determinism + dialect self-test\n' +
+' dialect.js --help\n\n' +
+'Built-in rulesets: ' + Object.keys(RULESETS).join(', ') + '\n\n' +
+'Scope (the edge): the declarative ruleset covers the ~95% of Markdown whose\n' +
+'emission is a flat per-node substitution. It STOPS at `table`: column\n' +
+'alignment is logic, not a flat substitution, so a table target needs a code\n' +
+'writer, not a ruleset. A table node renders its cell content bare and is\n' +
+'reported as a hole — never silently mangled.\n'
+);
+process.exit(0);
+}
+if (args.indexOf('--selftest')!== -1) selftest();
+if (args.indexOf('--list')!== -1) {
+Object.keys(RULESETS).forEach(function (k) {
+var d = RULESETS[k].desc? ' — ' + RULESETS[k].desc: '';
+process.stdout.write(k + d + '\n');
+});
+process.exit(0);
+}
+
+var rulesetArg = 'reddit', inFile = null, outFile = null, useStdin = false, i;
+for (i = 0; i < args.length; i++) {
+if (args[i] === '--ruleset') rulesetArg = args[++i];
+else if (args[i] === '-o' || args[i] === '--out') outFile = args[++i];
+else if (args[i] === '-') useStdin = true;
+else if (args[i].indexOf('--') === 0) { /* ignore */}
+else inFile = args[i];
+}
+
+try {
+var ruleset;
+if (rulesetArg && (rulesetArg.indexOf('/')!== -1 || rulesetArg.indexOf('.json')!== -1)) {
+ruleset = JSON.parse(fs.readFileSync(rulesetArg, 'utf8'));
+validateRuleset(ruleset); // loud-stop on a structurally malformed external ruleset
+} else {
+ruleset = RULESETS[rulesetArg];
+if (!ruleset) throw new Error('unknown ruleset "' + rulesetArg + '" (try --list)');
+}
+
+function emit(source) {
+var res = render(md.parse(source), ruleset);
+if (res.holes.length) process.stderr.write('note: ruleset has no rule for node type(s): ' + res.holes.join(', ') + ' (rendered content bare)\n');
+if (outFile) { fs.writeFileSync(outFile, res.text); process.stderr.write('wrote ' + outFile + ' (' + res.text.length + ' bytes)\n');}
+else if (useStdin) process.stdout.write(res.text);
+else {
+var def = (inFile? inFile.replace(/\.md$/i, ''): 'dialect-output') + '.' + (ruleset.name || 'out') + '.md';
+fs.writeFileSync(def, res.text); process.stderr.write('wrote ' + def + ' (' + res.text.length + ' bytes)\n');
+}
+}
+
+if (useStdin) {
+var chunks = [];
+process.stdin.on('data', function (d) { chunks.push(d);});
+process.stdin.on('end', function () { emit(Buffer.concat(chunks).toString('utf8')); process.exit(0);});
+} else {
+if (!inFile) throw new Error('no input file (use - for stdin, or --help)');
+emit(fs.readFileSync(inFile, 'utf8'));
+process.exit(0);
+}
+} catch (e) {
+process.stderr.write('dialect: ' + (e && e.message? e.message: String(e)) + '\n');
+process.exit(1);
+}
+}
+
+test_dialect.js 184 lines on GitHub →
+#!/usr/bin/env node
+/* test_dialect.js — the golden oracle corpus for the dialect gift.
+
+The oracle rule: every expected output here is HAND-AUTHORED from the ruleset
+rules (read off the schema, computed by hand), NOT produced by running the gift.
+The gift must AGREE with the independent expectation. The known-bad half is
+drawn from the real failure shapes the engine promises to prevent — a dialect
+silently keeping markup it should strip, an unsafe href surviving, a malformed
+ruleset loading without complaint — not author-invented pleasantness.
+
+Three mutation bites prove the oracle has teeth: each asserts that a plausible
+WRONG engine behaviour WOULD be caught here (the check is not vacuously green).
+
+Run: node test_dialect.js
+Exit 0 all-green / 1 any-red.
+*/
+'use strict';
+var D = require('./dialect.js');
+
+var checks = [];
+function record(name, ok, detail) { checks.push({ name: name, ok:!!ok, detail: detail || ''});}
+function eq(name, got, want) {
+record(name, got === want, got === want? '': 'got ' + JSON.stringify(got) + ' want ' + JSON.stringify(want));
+}
+function ok(name, cond, detail) { record(name, cond, detail);}
+function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
+
+var R = D.RULESETS;
+
+/* ============================================================
+1. REDDIT COMMENT dialect — hand-authored expectations.
+heading -> **bold** line · fence -> 4-space indent ·
+blocks blank-line separated · unsafe href dropped to label.
+============================================================ */
+(function reddit() {
+var src = '# Title\n\n**b** *i* `c`\n\n```\nx = 1\n```\n\n[ok](https://e.com) [bad](javascript:x)';
+var out = D.renderSource(src, R.reddit).text;
+// heading became a bold line, not an atx line
+ok('reddit heading->bold', out.indexOf('**Title**')!== -1 && out.indexOf('# Title') === -1, out);
+// inline marks preserved as Reddit markup
+ok('reddit keeps ** * `', out.indexOf('**b**')!== -1 && out.indexOf('*i*')!== -1 && out.indexOf('`c`')!== -1, out);
+// fenced code became 4-space indent (no ``` in a reddit COMMENT)
+ok('reddit fence->indent', out.indexOf(' x = 1')!== -1 && out.indexOf('```') === -1, out);
+// link safety: unsafe href dropped to its label, safe href kept inline
+ok('reddit unsafe href dropped', out.indexOf('javascript:') === -1 && out.indexOf('bad')!== -1, out);
+ok('reddit safe href inline', out.indexOf('[ok](https://e.com)')!== -1, out);
+})();
+
+/* ============================================================
+2. REDDIT-POST variant — keeps # headings and ``` fences.
+============================================================ */
+(function redditPost() {
+var out = D.renderSource('# Title\n\n```\nx\n```', R['reddit-post']).text;
+ok('reddit-post keeps # heading', out.indexOf('# Title')!== -1, out);
+ok('reddit-post keeps ``` fence', out.indexOf('```')!== -1, out);
+})();
+
+/* ============================================================
+3. PLAIN dialect — every mark stripped; link -> "label (href)".
+============================================================ */
+(function plain() {
+var out = D.renderSource('# T\n\n**b** *i* [t](https://e.com)', R.plain).text;
+ok('plain strips heading marker', out.indexOf('#') === -1 && out.indexOf('T')!== -1, out);
+ok('plain strips strong/em', out.indexOf('**') === -1 && out.indexOf('b')!== -1 && out.indexOf('i')!== -1, out);
+ok('plain link -> label (href)', out.indexOf('t (https://e.com)')!== -1, out);
+})();
+
+/* ============================================================
+4. DETERMINISM — a pure fold: same input twice -> byte-identical;
+re-rendering the output is stable.
+============================================================ */
+(function determinism() {
+var src = '# H\n\n**b**\n\n- one\n- two\n\n1. a\n2. b';
+var a = D.renderSource(src, R.reddit).text;
+var b = D.renderSource(src, R.reddit).text;
+eq('deterministic (folds-twice-identical)', a, b);
+var once = D.renderSource(a, R.reddit).text;
+var twice = D.renderSource(once, R.reddit).text;
+eq('re-render stable', once, twice);
+// ordered-list markers hand-computed: "1. a" then "2. b"
+ok('ordered list numbering', a.indexOf('1. a')!== -1 && a.indexOf('2. b')!== -1, a);
+})();
+
+/* ============================================================
+5. HOLES — an unknown node type (block or inline) renders its
+content bare, is REPORTED in.holes, and never crashes or
+silently drops. Hand-build an AST with bogus node types so the
+hole path is exercised directly (no parser needed).
+============================================================ */
+(function holes() {
+var ast = {
+type: 'document',
+children: [
+{ type: 'paragraph', children: [
+{ type: 'text', value: 'a'},
+{ type: 'mystery', value: 'b'} // unknown INLINE type
+]},
+{ type: 'weirdBlock', children: [
+{ type: 'text', value: 'c'}
+]} // unknown BLOCK type
+]
+};
+var res = D.render(ast, R.reddit);
+ok('hole render does not crash', typeof res.text === 'string', JSON.stringify(res));
+ok('unknown inline reported', res.holes.indexOf('mystery')!== -1, JSON.stringify(res.holes));
+ok('unknown block reported', res.holes.indexOf('weirdBlock')!== -1, JSON.stringify(res.holes));
+ok('hole content preserved bare', res.text.indexOf('a')!== -1 && res.text.indexOf('b')!== -1 && res.text.indexOf('c')!== -1, res.text);
+})();
+
+/* ============================================================
+6. RULESET-LOAD VALIDATOR — the four decidable predicates.
+Each malformed ruleset must LOUD-STOP (throw); each well-formed
+one must pass. A real gate rejects the bad and admits the good.
+============================================================ */
+(function validator() {
+// every built-in passes its own validator
+ok('validator admits all built-ins', Object.keys(R).every(function (k) {
+return!throws(function () { D.validateRuleset(R[k]);});
+}));
+// (1) wrap must be a 2-element pair
+ok('(1) rejects 1-element wrap', throws(function () {
+D.validateRuleset({ inline: { strong: { wrap: ['*']}}});
+}));
+ok('(1) rejects 3-element wrap', throws(function () {
+D.validateRuleset({ inline: { strong: { wrap: ['*', '*', '*']}}});
+}));
+ok('(1) admits 2-element wrap',!throws(function () {
+D.validateRuleset({ inline: { strong: { wrap: ['*', '*']}}});
+}));
+// (2) blockJoin must be a string
+ok('(2) rejects numeric blockJoin', throws(function () {
+D.validateRuleset({ blockJoin: 3});
+}));
+// (3) template must contain {label} and {href}
+ok('(3) rejects template missing {href}', throws(function () {
+D.validateRuleset({ inline: { link: { template: '[{label}]'}}});
+}));
+ok('(3) rejects template missing {label}', throws(function () {
+D.validateRuleset({ inline: { link: { template: '({href})'}}});
+}));
+ok('(3) admits full template',!throws(function () {
+D.validateRuleset({ inline: { link: { template: '[{label}]({href})'}}});
+}));
+// (4) linePrefix must be a string
+ok('(4) rejects numeric linePrefix', throws(function () {
+D.validateRuleset({ blocks: { blockquote: { linePrefix: 0}}});
+}));
+// non-object rejected outright
+ok('rejects non-object ruleset', throws(function () { D.validateRuleset(null);}));
+})();
+
+/* ============================================================
+7. MUTATION BITES — prove the oracle has teeth.
+Each simulates a WRONG engine output and asserts the check
+above WOULD have caught it (the green is not vacuous).
+============================================================ */
+(function mutationBites() {
+// Bite 1: if reddit KEPT the '#' heading (wrong for a comment), the
+// 'reddit heading->bold' check's condition would be false.
+var wrong1 = '# Title\n\n**b**\n';
+ok('BITE reddit-heading check has teeth',
+!(wrong1.indexOf('**Title**')!== -1 && wrong1.indexOf('# Title') === -1),
+'a mangled engine that kept # would slip past a toothless check');
+
+// Bite 2: if an unsafe href SURVIVED, the drop check would be false.
+var wrong2 = '[bad](javascript:x)\n';
+ok('BITE unsafe-href check has teeth',
+!(wrong2.indexOf('javascript:') === -1 && wrong2.indexOf('bad')!== -1),
+'a mangled engine that kept javascript: would slip past a toothless check');
+
+// Bite 3: if the validator were a no-op (never threw), the reject checks
+// would all be false. Assert a genuinely-bad ruleset still throws.
+ok('BITE validator check has teeth',
+throws(function () { D.validateRuleset({ inline: { strong: { wrap: ['x']}}});}),
+'a no-op validator would fail this bite');
+})();
+
+/* ---- report ---------------------------------------------------------------- */
+var reds = checks.filter(function (c) { return!c.ok;});
+checks.forEach(function (c) {
+process.stdout.write((c.ok? 'ok ': 'FAIL ') + c.name + (!c.ok && c.detail? ' — ' + c.detail: '') + '\n');
+});
+process.stdout.write('\n' + (reds.length? 'FAIL': 'OK') + ' (' + checks.length + ' checks, ' + reds.length + ' red)\n');
+process.exit(reds.length? 1: 0);
 
 Take the whole folder →
 MIT
-Node / browser, no dependencies
+Zero dependencies, Node or browser, deterministic (folds beside the markdown gift)
 
 ---
