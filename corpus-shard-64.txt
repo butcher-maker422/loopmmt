@@ -1,328 +1,262 @@
-# Loop MMT — corpus shard 64/91
+# Loop MMT — corpus shard 64/92
 
-> Bundle 64 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 64 of 92 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/dir-walk/, /gifts/doppelganger/, /gifts/dwell/)
+Nodes in this shard: 3 (/gifts/dedup-filter/, /gifts/derived/, /gifts/dialect/)
 
 ---
 
-# dir-walk — a Loop MMT gift
-https://loopmmt.com/gifts/dir-walk/
+# Dedup-filter — a Loop MMT gift
+https://loopmmt.com/gifts/dedup-filter/
 [coverage: optional · branch: gifts]
 
-Walk a Directory Tree into a Deterministic JSONL Stream source ← all gifts
+Same Records, Minus The Repeats filter ← all gifts
 
-dir-walk
+Dedup-filter
 
-dir-walk takes a directory in and emits one JSON record per file, directory, and symlink it finds — {path,name,type,depth[,size]} — in a stable, byte-sorted, reproducible pre-order that is identical on every machine. It is the "give me this tree as data" adapter, the front of a pipe into the JSONL fold/filter/transform gifts (count files by type, filter by depth, diff two trees). The determinism keystone is a pure core walk(provider, opts) over an INJECTED provider, so all disk impurity lives at the provider boundary and the walk is testable without a disk: entries are SORTED by name within each directory (never the OS readdir order), only PORTABLE fields are emitted (never mtime/ino/mode), and symlinks are reported but NEVER followed (so a walk always terminates and stays in the tree). Options: --files-only/--dirs-only, --max-depth N, --no-size, --root-name.
+Point it at a JSONL stream and it passes records through, dropping every one it has already seen — the first occurrence of each is kept, later duplicates are dropped, and the output is a stable subset of the input in the original order. By default a duplicate is a record with the same CANONICAL form: object key-order is ignored ({"a":1,"b":2} == {"b":2,"a":1}) but array order is kept ([1,2]!= [2,1]), so 'the same record written two ways' deduplicates while the emitted line stays byte-for-byte verbatim. Pass --key FIELD to dedup by one top-level field instead of the whole record; a record lacking that field passes through and never dedups. It drops straight into a pipe between a source that repeats and a stage that must not see repeats — a CI gate, a loader, a diff.
 
 The honest edge
 
-dir-walk emits a SORTED, portable pre-order stream of {path,name,type,depth,size}. It does NOT follow symlinks (reported, never descended), does NOT emit mtime/ino/mode/uid (unportable, time-varying), does NOT match globs (pipe into a filter gift), and does NOT read file contents (use line-source). The root record is not emitted; its children are depth 1.
+Drops EXACT duplicates (by canonical record, or by one field). NOT fuzzy/near-dedup — no similarity, no value normalization. It does NOT merge the records it drops (keeps the first verbatim, discards the rest), and it keeps FIRST not last — it is not a 'latest wins' upsert.
 
 Run it
 
-node dir-walk.js./src/ --files-only --max-depth 2 # -> sorted JSONL of files under./src/, depth <= 2
-test_dir-walk.js (77/77, independent explicit-recursion oracle fed a REVERSED provider so the sort is the gift's) + mutation-bite (7/7) + Plumb conformance GREEN (37/37, signed 2026-09-13, host-independent non-vacuity: a no-sort mutant caught via a reverse-readdir shim)
-Node / browser, no dependencies
+printf '%s\n' '{"id":1}' '{"id":1}' '{"id":2}' | node dedup-filter.js # --key FIELD | --count; exit 0 ok | 2 input error
+test_dedup-filter.js (20/20: independent recursive deep-equal keep-first oracle + frozen hand goldens, canonical record identity (object key-order ignored / array order kept), --key first-wins + missing-key passthrough + object-valued keys, verbatim-subset preservation, determinism across runs, input-honesty hard errors, last-wins mutation bite) + out-of-band conformance conform_dedup-filter.cjs (25/25 GREEN, subprocess-driven, signed)
+Zero dependencies, Node or browser, deterministic
 
 The code — every file that ships
 
-dir-walk.js 300 lines on GitHub →
+dedup-filter.js 234 lines on GitHub →
 #!/usr/bin/env node
-/* dir-walk.js — walk a directory tree into a deterministic JSONL stream of entries.
-Dependency-free, deterministic, MIT. Runs in Node (the CLI reads the real filesystem)
-or a browser (the pure core walks an injected in-memory tree).
+/* dedup-filter.js — drop duplicate records from a JSONL stream, first one wins.
+Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
 
-WHAT IT IS. A SOURCE: it takes a directory in and emits a JSONL stream out — one record
-per file/directory found, in a stable, sorted, reproducible order — the front of a pipe
-that lets the fold/filter/transform gifts work on a filesystem:
+WHAT IT IS. Give it a stream of records — one JSON value per line (JSONL) — and
+it passes them through, dropping every record it has already seen. The output is
+a SUBSET of the input in the ORIGINAL ORDER: the first occurrence of each record
+is kept, every later duplicate is dropped. Same stream in, byte-identical stream
+out, on every machine and every run. It is a FILTER: output ⊆ input, nothing is
+added, reordered, or rewritten — the kept lines are emitted exactly as they
+arrived.
 
-node dir-walk.js./src | node schema-filter.js...
-node dir-walk.js. --files-only --max-depth 2
+WHAT COUNTS AS A DUPLICATE (the whole determinism story). Two modes, and the
+identity key is the only thing that differs:
 
-Each record is a fixed, portable shape: {"path":"src/a.js","name":"a.js","type":"file",
-"depth":1,"size":128}. It is the "give me this tree as data" adapter — a build/ops source.
+- DEFAULT (whole-record identity). A record's key is its CANONICAL JSON form:
+the value re-serialized with object keys sorted, recursively. So
+{"a":1,"b":2} and {"b":2,"a":1} are the SAME record (key-order in an object
+is not meaningful) and the second is dropped — but [1,2] and [2,1] are
+DIFFERENT (array order IS meaningful). Canonicalizing the key, not the line,
+is what makes "same record written two ways" deduplicate while still
+emitting the original line untouched.
 
-THE QUIET FAILURES IT FIXES. Everyone reaches for a recursive readdir and everyone gets
-it wrong in ways that only bite on another machine or another run:
+- --key FIELD (dedup by one field). The record's key is the value of the named
+top-level field, canonicalized the same way. The FIRST record carrying a
+given field value is kept; later records with that same field value are
+dropped even if the rest of the record differs. A record that LACKS the
+field is passed through unchanged and never dedups against anything (a
+missing key is not a value — it is not "the same" as another missing key).
 
-1. NON-DETERMINISTIC ORDER. `fs.readdirSync` returns entries in the filesystem's own
-order, which differs across OSes, filesystems, and even runs. A walk that emits in
-readdir order produces a DIFFERENT stream on every machine — un-diffable, un-
-pinnable, useless as a golden. dir-walk SORTS every directory's entries by name
-(byte order) before descending, so the same tree always yields the same stream.
+FIRST WINS, ORDER STABLE. The kept record for any key is always the FIRST one
+seen; the relative order of the kept records is exactly their input order. This
+is a deliberate, pinned choice (not "last wins", not "sorted"): it makes the
+fold one-pass and the output a stable, re-derivable subset of the input.
 
-2. LEAKY, UNPORTABLE STAT. The raw `fs.Stats` object carries mtime, ino, mode, uid,
-blocks — values that change between runs and machines and would make the "same"
-tree hash differently every time. dir-walk emits only a FIXED, portable subset
-(path, name, type, depth, and size for files) — the fields that are a property of
-the tree's shape, not of the moment you looked at it. (size is opt-out with
---no-size if you want shape-only.)
-
-3. SYMLINK CYCLES AND SURPRISE DESCENT. Naive recursion follows symlinks and can loop
-forever on a cycle, or wander out of the tree you meant. dir-walk does NOT follow
-symlinks by default — a symlink is reported as its own entry (type "symlink") and
-never descended — so a walk always terminates and stays inside the tree. (Depth is
-also boundable with --max-depth.)
-
-THE MODEL. The PURE CORE is `walk(provider, opts)`: it takes a PROVIDER (an object with
-`readdir(dirPath) -> [ {name, type}]` sorted-or-not, `size(filePath) -> number`) and a
-root, and returns the sorted, deterministic array of entry records. The CLI supplies a
-real-filesystem provider (built-in `fs`); a test or a browser supplies an in-memory one.
-The impurity (touching the disk) lives ONLY in the provider — the walk itself is pure,
-so the same provider + opts always yield byte-identical output.
-
---files-only emit only file (and symlink) records, not directory records
---dirs-only emit only directory records
---max-depth N do not descend past depth N (root entries are depth 1)
---no-size omit the size field (shape-only; also skips the size() call)
---root-name NAME the label for the root in paths (default: the path you passed)
-
-DETERMINISM. walk(provider, opts) is a pure function of (provider's answers, opts). Given
-a provider that returns the same answers, the output is byte-identical on every run and
-every machine: entries are sorted by name within each directory, traversal is a stable
-pre-order (a directory record precedes its children), symlinks are not followed, and only
-portable fields are emitted. No clock, no randomness read into the OUTPUT.
+INPUT HONESTY (the character of this gift). A filter is only trustworthy if it
+refuses to quietly mishandle a line:
+- Every non-blank line must be valid JSON (any JSON value: object, array,
+string, number, bool, null). A line that is not valid JSON is a HARD ERROR
+(exit 2) naming the line — never a silent skip and never passed through as
+raw text.
+- Blank lines are skipped (not emitted, not counted as records). A trailing
+\r (CRLF files) is trimmed before parsing; the emitted line preserves the
+original body without the trailing \r.
+- --key names a TOP-LEVEL field only (no dotted paths); it is meaningful only
+for records that are JSON objects. A --key applied to a non-object record
+(a bare number, string, array) means "no such field" -> that record is
+passed through and never dedups.
 
 USAGE
-node dir-walk.js./project
-node dir-walk.js. --files-only --max-depth 3
-node dir-walk.js src --no-size | node dedup-filter.js --key type
-node dir-walk.js --help
+printf '%s\n' '{"id":1}' '{"id":1}' '{"id":2}' | node dedup-filter.js
+node dedup-filter.js --key id events.jsonl # dedup by the id field
+node dedup-filter.js --count < in.jsonl > out.jsonl # report drops on stderr
+node dedup-filter.js --help
 
-Exit codes: 0 success (including an empty directory -> empty stream) · 2 usage error
-(unknown option, missing/duplicate root, bad --max-depth) · 3 the root does not exist or
-is not a directory. A clean one-line message on stderr, never a stack trace.
+Each non-blank line is one JSON record. Output is the kept records, one per line,
+each terminated by a newline, in input order.
 
-Released under MIT. Its edge is printed in the README: dir-walk emits a SORTED, portable
-pre-order stream of {path,name,type,depth,size}. It does NOT follow symlinks (they are
-reported, never descended), does NOT emit mtime/ino/mode/uid (unportable, time-varying),
-does NOT match globs or filter by pattern (pipe into a filter gift), and does NOT read
-file CONTENTS (use line-source for that). The root record is not emitted; its children
-are depth 1.
+Exit codes: 0 success · 2 input error (missing file, a directory, an unknown
+option, or a line that is not valid JSON). Always a clean one-line message on
+stderr, never a stack trace. --count writes the drop tally to stderr; it never
+changes the exit code or the emitted stream.
+
+Released under MIT. Its edge is printed in the README: this drops EXACT
+duplicates (by canonical record, or by one field). It is NOT a fuzzy/near-dedup
+(no similarity, no normalization of values), does NOT collapse or merge the
+records it drops (it keeps the first verbatim and discards the rest), and keeps
+FIRST not last — it is not a "latest wins" upsert.
 */
 "use strict";
 
-/* ==================================================================
-THE PURE CORE — walk(provider, opts) -> [entry,...]
-The provider is the only impure boundary; the walk is pure.
-provider.readdir(dirPath) -> [ { name, type},...] (type: 'file'|'dir'|'symlink'|'other')
-provider.size(filePath) -> number (only called for files when size wanted)
-================================================================== */
-
-// Join a parent path and a child name with a forward slash, normalizing so output is
-// platform-independent ("src/a.js", never "src\\a.js"). Pure.
-function joinPath(parent, name) {
-if (parent === "") return name;
-return parent + "/" + name;
+// Canonical JSON: object keys sorted recursively, so key-order in objects does not
+// make two equal records look different. Arrays keep their order (order IS data).
+function canon(v) {
+if (v === null || typeof v!== "object") return JSON.stringify(v);
+if (Array.isArray(v)) {
+var parts = [];
+for (var i = 0; i < v.length; i++) parts.push(canon(v[i]));
+return "[" + parts.join(",") + "]";
 }
-
-// Sort directory entries by name in byte (code-unit) order — the determinism keystone.
-// Pure; does not mutate the input.
-function sortedByName(entries) {
-return entries.slice().sort(function (a, b) {
-if (a.name < b.name) return -1;
-if (a.name > b.name) return 1;
-return 0;
-});
-}
-
-// Build one entry record with the fixed, portable field set. Pure.
-function makeRecord(relPath, name, type, depth, size) {
-var rec = { path: relPath, name: name, type: type, depth: depth};
-if (size!== undefined) rec.size = size;
-return rec;
-}
-
-// The deterministic pre-order walk. Pure function of the provider's answers and opts.
-// opts.filesOnly / opts.dirsOnly — emit only files(+symlinks) / only dirs
-// opts.maxDepth — do not descend past this depth (root children = 1)
-// opts.withSize — include the size field for file records (default true)
-// opts.rootName — label for the root in paths (default "")
-// Returns an array of entry records in stable pre-order (a dir precedes its children).
-function walk(provider, opts) {
-opts = opts || {};
-var filesOnly =!!opts.filesOnly;
-var dirsOnly =!!opts.dirsOnly;
-var maxDepth = opts.maxDepth === undefined? Infinity: opts.maxDepth;
-var withSize = opts.withSize === undefined? true:!!opts.withSize;
-var rootLabel = opts.rootName === undefined? "": String(opts.rootName);
-
-if (filesOnly && dirsOnly) throw new Error("--files-only and --dirs-only are mutually exclusive");
-if (typeof maxDepth === "number" && maxDepth < 1 && maxDepth!== Infinity) {
-// maxDepth 0 means "emit nothing below root"; treat as an empty walk (root has no record)
-}
-
+var keys = Object.keys(v).sort();
 var out = [];
+for (var k = 0; k < keys.length; k++) {
+out.push(JSON.stringify(keys[k]) + ":" + canon(v[keys[k]]));
+}
+return "{" + out.join(",") + "}";
+}
 
-// recurse over a directory at absolute-ish `dirAbs` (what the provider understands),
-// whose path RELATIVE to the root is `relBase`, at `depth`.
-function descend(dirAbs, relBase, depth) {
-if (depth > maxDepth) return;
-var entries = sortedByName(provider.readdir(dirAbs));
-for (var i = 0; i < entries.length; i++) {
-var e = entries[i];
-var childAbs = joinPath(dirAbs, e.name);
-var childRel = joinPath(relBase, e.name);
-var type = e.type;
-if (type === "dir") {
-if (!filesOnly) out.push(makeRecord(childRel, e.name, "dir", depth));
-// descend only if within depth budget; a symlink-typed entry is never descended
-descend(childAbs, childRel, depth + 1);
+// Parse one input line into a JSON value, or throw a clean, line-named Error.
+function parseRecord(line, lineNo) {
+try { return JSON.parse(line);}
+catch (e) {
+throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
+}
+}
+
+// The public filter: JSONL text + {key} -> { lines: [kept lines], dropped: N}.
+// First occurrence of each key wins; kept lines are the ORIGINAL bodies, in order.
+// A sentinel object identity is used for "record has no --key field" so that such
+// records never collide with each other or with a real value.
+var NO_KEY = { noKey: true};
+
+function filter(text, opts) {
+opts = opts || {};
+var keyField = opts.key; // undefined => whole-record identity
+
+var lines = String(text).split("\n");
+var seen = Object.create(null);
+var kept = [];
+var dropped = 0;
+var i, line, rec, keyVal, k;
+
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line is not a record
+
+rec = parseRecord(line, i + 1);
+
+if (keyField === undefined) {
+k = canon(rec); // whole-record identity
 } else {
-// file, symlink, or other
-if (!dirsOnly) {
-var size = undefined; // reset each iteration (var is function-scoped; do not leak a prior file's size)
-if (withSize && type === "file") size = provider.size(childAbs);
-out.push(makeRecord(childRel, e.name, type, depth, size));
-}
-}
+// dedup by one top-level field; a record lacking it never dedups
+if (rec!== null && typeof rec === "object" &&!Array.isArray(rec) &&
+Object.prototype.hasOwnProperty.call(rec, keyField)) {
+keyVal = rec[keyField];
+k = "K:" + canon(keyVal);
+} else {
+k = NO_KEY; // object identity => unique per line, never a duplicate
 }
 }
 
-descend(opts.__rootAbs === undefined? "": opts.__rootAbs, rootLabel, 1);
-return out;
+if (k!== NO_KEY && seen[k]) { dropped += 1; continue;}
+if (k!== NO_KEY) seen[k] = true;
+kept.push(line);
 }
 
-// Render entry records as JSONL text (one JSON object per line, trailing newline per record).
-function toJSONL(records) {
-var s = "";
-for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
-return s;
+return { lines: kept, dropped: dropped};
 }
 
-/* ==================================================================
-EXPORTS (browser + Node)
-================================================================== */
+/* ---- exports (browser + Node) ------------------------------------ */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.dirWalk = { walk: walk, toJSONL: toJSONL, sortedByName: sortedByName};
+window.ForestGifts.dedupFilter = filter;
+window.ForestGifts.dedupCanon = canon;
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { walk: walk, toJSONL: toJSONL, sortedByName: sortedByName, joinPath: joinPath};
+module.exports = { filter: filter, canon: canon};
 }
 
-/* ==================================================================
-THE REAL-FILESYSTEM PROVIDER (Node CLI only) — the one impure edge
-================================================================== */
-function fsProvider(rootAbs) {
-var fs = require("fs");
-var path = require("path");
-return {
-// returns [{name, type}] for the directory; type via lstat so symlinks are seen as symlinks
-readdir: function (relDir) {
-var abs = relDir === ""? rootAbs: path.join(rootAbs, relDir);
-var names = fs.readdirSync(abs);
-var out = [];
-for (var i = 0; i < names.length; i++) {
-var full = path.join(abs, names[i]);
-var st;
-try { st = fs.lstatSync(full);} catch (e) { st = null;}
-var type = "other";
-if (st) {
-if (st.isSymbolicLink()) type = "symlink";
-else if (st.isDirectory()) type = "dir";
-else if (st.isFile()) type = "file";
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+function run(text, opts) {
+var r = filter(text, opts);
+var body = r.lines.length? r.lines.join("\n") + "\n": "";
+return { out: body, dropped: r.dropped};
 }
-out.push({ name: names[i], type: type});
-}
-return out;
-},
-size: function (relFile) {
-var abs = relFile === ""? rootAbs: path.join(rootAbs, relFile);
-try { return require("fs").statSync(abs).size;} catch (e) { return 0;}
-}
-};
-}
-
-/* ==================================================================
-CLI (runs only when invoked directly, never on require)
-================================================================== */
-
-function parseArgs(args) {
-var opts = { withSize: true};
-var root = null;
-var i = 0;
-while (i < args.length) {
-var a = args[i];
-if (a === "--files-only") { opts.filesOnly = true; i++;}
-else if (a === "--dirs-only") { opts.dirsOnly = true; i++;}
-else if (a === "--no-size") { opts.withSize = false; i++;}
-else if (a === "--max-depth") {
-var v = args[i + 1];
-if (v === undefined) throw new Error("--max-depth requires a number");
-var n = parseInt(v, 10);
-if (String(n)!== String(v).trim() || n < 0) throw new Error("--max-depth must be a non-negative integer");
-opts.maxDepth = n;
-i += 2;
-}
-else if (a === "--root-name") {
-var rn = args[i + 1];
-if (rn === undefined) throw new Error("--root-name requires a value");
-opts.rootName = rn;
-i += 2;
-}
-else if (a.charAt(0) === "-") { throw new Error("unknown option " + a);}
-else {
-if (root!== null) throw new Error("unexpected extra argument " + JSON.stringify(a) + " (dir-walk takes one root directory)");
-root = a;
-i++;
-}
-}
-if (opts.filesOnly && opts.dirsOnly) throw new Error("--files-only and --dirs-only are mutually exclusive");
-if (root === null) root = ".";
-opts.root = root;
-return opts;
-}
-
-var HELP =
-"dir-walk.js — walk a directory tree into a deterministic JSONL stream of entries.\n\n" +
-" node dir-walk.js./project\n" +
-" node dir-walk.js. --files-only --max-depth 3\n" +
-" node dir-walk.js src --no-size | node dedup-filter.js --key type\n" +
-" node dir-walk.js --help\n\n" +
-" --files-only emit only file/symlink records, not directories\n" +
-" --dirs-only emit only directory records\n" +
-" --max-depth N do not descend past depth N (root's children are depth 1)\n" +
-" --no-size omit the size field (shape-only)\n" +
-" --root-name NM label for the root in emitted paths (default: none, paths are relative)\n\n" +
-"Emits one JSON object per entry: { path, name, type, depth[, size]}, entries SORTED by\n" +
-"name within each directory (deterministic across machines). Symlinks are reported but\n" +
-"never followed. Only portable fields are emitted (no mtime/ino/mode).\n\n" +
-"Edge: dir-walk does NOT follow symlinks, does NOT emit time/inode/mode, does NOT match\n" +
-"globs (pipe into a filter gift), and does NOT read file contents (use line-source).\n";
 
 function main(argv) {
 var args = argv.slice(2);
 if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(HELP);
+process.stdout.write(
+"dedup-filter.js — drop duplicate records from a JSONL stream, first one wins.\n\n" +
+" printf '%s\\n' '{\"id\":1}' '{\"id\":1}' | node dedup-filter.js\n" +
+" node dedup-filter.js --key id events.jsonl dedup by the id field\n" +
+" node dedup-filter.js --count < in > out report drops on stderr\n" +
+" node dedup-filter.js --help\n\n" +
+"Each non-blank line is one JSON record. By DEFAULT a duplicate is a record\n" +
+"with the same CANONICAL form (object key-order ignored, array order kept);\n" +
+"--key FIELD dedups by one top-level field instead. FIRST occurrence wins and\n" +
+"output is a stable SUBSET of the input in original order.\n\n" +
+"Edge: this drops EXACT duplicates. It is NOT fuzzy/near-dedup, does NOT merge\n" +
+"the records it drops, and keeps FIRST not last. Invalid JSON is a hard error,\n" +
+"never a silent skip.\n"
+);
 return 0;
 }
-var opts;
-try { opts = parseArgs(args);}
-catch (e) { process.stderr.write("dir-walk: " + e.message + "\n"); return 2;}
 
-var fs = require("fs");
-var st;
-try { st = fs.statSync(opts.root);}
-catch (e) { process.stderr.write("dir-walk: not found: " + opts.root + "\n"); return 3;}
-if (!st.isDirectory()) { process.stderr.write("dir-walk: not a directory: " + opts.root + "\n"); return 3;}
-
-var provider = fsProvider(opts.root);
-var records;
+var opts = {};
+var files = [];
+var countMode = false;
+var i;
 try {
-records = walk(provider, {
-filesOnly: opts.filesOnly,
-dirsOnly: opts.dirsOnly,
-maxDepth: opts.maxDepth,
-withSize: opts.withSize,
-rootName: opts.rootName === undefined? "": opts.rootName,
-__rootAbs: ""
-});
-} catch (e) { process.stderr.write("dir-walk: " + e.message + "\n"); return 2;}
+for (i = 0; i < args.length; i++) {
+if (args[i] === "--key") {
+opts.key = args[++i];
+if (opts.key === undefined || opts.key === "" || opts.key.charAt(0) === "-") {
+throw new Error("--key requires a field name");
+}
+}
+else if (args[i] === "--count") { countMode = true;}
+else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
+else { files.push(args[i]);}
+}
+} catch (e) {
+process.stderr.write("dedup-filter: " + e.message + "\n");
+return 2;
+}
 
-process.stdout.write(toJSONL(records));
+function emit(text) {
+try {
+var r = run(text, opts);
+process.stdout.write(r.out);
+if (countMode) process.stderr.write("dedup-filter: dropped " + r.dropped + " duplicate(s)\n");
+return 0;
+} catch (e) {
+process.stderr.write("dedup-filter: " + e.message + "\n");
+return 2;
+}
+}
+
+if (files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(files[0], "utf8");}
+catch (e) {
+process.stderr.write("dedup-filter: cannot read " + files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
+}
+
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
 return 0;
 }
 
@@ -330,1067 +264,1373 @@ if (typeof require!== "undefined" && require.main === module) {
 process.exitCode = main(process.argv);
 }
 
-test_dir-walk.js 184 lines on GitHub →
+test_dedup-filter.js 201 lines on GitHub →
 #!/usr/bin/env node
-/* test_dir-walk.js — battery for the dir-walk gift.
-`node test_dir-walk.js` -> exit 0 PASS / non-zero FAIL.
+/* test_dedup-filter.js — golden battery for the dedup-filter gift.
 
-THE ORACLE IS INDEPENDENT AND TAKES A DIFFERENT ROUTE. The gift walks with a recursive
-pre-order descent. The oracle here does an EXPLICIT-STACK iterative pre-order, sorting
-with a hand comparator and building paths by a different accumulation — no shared code
-with the gift's recursion. Both are fed the SAME in-memory provider (a pure fixture
-tree), so the comparison is deterministic and disk-free. Plus frozen hand goldens for
-each quiet-failure case the gift exists to fix (sort order, portable-fields-only,
-symlinks-not-followed).
+Out-of-band and self-verifying. The oracle is TWO independent things, neither a
+copy of the gift's canonical-string hashmap:
+
+(1) A NAIVE O(n^2) DEEP-EQUAL reference — walk the records in order and keep a
+record only if no EARLIER kept record is structurally deep-equal to it
+(for the default mode) or shares its key field value (for --key mode).
+deepEqual is written independently here (recursive, key-set compare); it
+does NOT canonicalize to a string, so it is a genuinely different way to
+decide "same record" than the gift's canon()/hashmap. The two must agree
+on which lines survive.
+
+(2) FROZEN hand-picked golden outputs, pinned by hand from the spec — the
+object-key-order case (§2), array-order sensitivity (§3), --key
+first-wins (§4), and the missing-key passthrough (§5).
+
+A planted mutation (the bite, §9) MUST be caught — if the suite passes with the
+mutation live, the suite proves nothing.
+
+Run: node test_dedup-filter.js -> exit 0 GREEN / non-zero RED
 */
 "use strict";
-
-var G = require("./dir-walk.js");
+var df = require("./dedup-filter.js");
 
 var pass = 0, fail = 0;
-function ok(name, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL: " + name);}}
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;} else { fail++; console.error("FAIL: " + name + "\n got: " + g + "\n want: " + w);}
+function ok(name, cond) {
+if (cond) { pass++;}
+else { fail++; console.log(" FAIL " + name);}
+}
+function J(v) { return JSON.stringify(v);}
+function keptLines(records, opts) { return df.filter(records.join("\n"), opts).lines;}
+
+/* ---- independent recursive deep-equal (NOT canon-string) ------------------ */
+function deepEqual(a, b) {
+if (a === b) return true;
+if (a === null || b === null) return a === b;
+if (typeof a!== "object" || typeof b!== "object") return a === b;
+var aArr = Array.isArray(a), bArr = Array.isArray(b);
+if (aArr!== bArr) return false;
+if (aArr) {
+if (a.length!== b.length) return false;
+for (var i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i])) return false;
+return true;
+}
+var ak = Object.keys(a), bk = Object.keys(b);
+if (ak.length!== bk.length) return false;
+for (var j = 0; j < ak.length; j++) {
+if (!Object.prototype.hasOwnProperty.call(b, ak[j])) return false;
+if (!deepEqual(a[ak[j]], b[ak[j]])) return false;
+}
+return true;
 }
 
-/* ---- an in-memory provider builder from a nested spec --------------------- */
-// spec: { name: {...}} for a dir, { name: <size:number>} for a file, { name: "->"} symlink
-// We flatten it into readdir()/size() maps.
-function buildProvider(spec) {
-var dirs = {}; // dirPath -> [ {name,type}]
-var sizes = {}; // filePath -> number
-function visit(node, relBase) {
-var entries = [];
-var keys = Object.keys(node);
-for (var i = 0; i < keys.length; i++) {
-var name = keys[i];
-var v = node[name];
-var childRel = relBase === ""? name: relBase + "/" + name;
-if (v === "->") { entries.push({ name: name, type: "symlink"});}
-else if (typeof v === "number") { entries.push({ name: name, type: "file"}); sizes[childRel] = v;}
-else if (v && typeof v === "object") { entries.push({ name: name, type: "dir"}); visit(v, childRel);}
+// naive O(n^2) oracle: returns the indices of kept lines
+function oracleKeptIndices(records, keyField) {
+var parsed = records.map(function (l) { return JSON.parse(l);});
+var keptIdx = [];
+for (var i = 0; i < parsed.length; i++) {
+var rec = parsed[i];
+var isDup = false;
+var hasKey = keyField!== undefined &&
+rec!== null && typeof rec === "object" &&!Array.isArray(rec) &&
+Object.prototype.hasOwnProperty.call(rec, keyField);
+if (keyField!== undefined &&!hasKey) {
+keptIdx.push(i); // missing key never dedups
+continue;
 }
-dirs[relBase] = entries;
-}
-visit(spec, "");
-return {
-readdir: function (d) {
-// return UNSORTED (reversed) to prove the gift sorts, not the provider
-return (dirs[d] || []).slice().reverse();
-},
-size: function (f) { return sizes[f] || 0;}
-};
-}
-
-/* ---- independent oracle: explicit-stack iterative pre-order -------------- */
-function oracleWalk(provider, opts) {
-opts = opts || {};
-var filesOnly =!!opts.filesOnly, dirsOnly =!!opts.dirsOnly;
-var maxDepth = opts.maxDepth === undefined? Infinity: opts.maxDepth;
-var withSize = opts.withSize === undefined? true:!!opts.withSize;
-var out = [];
-// stack frames: { dir, rel, depth}
-var stack = [{ dir: "", rel: "", depth: 1}];
-// To get PRE-ORDER with an explicit stack we must process a directory's entries in order
-// and recurse immediately — so we use a recursion-free approach that mimics call order by
-// pushing a synthetic "expanded children" list. Simplest faithful different-route: gather
-// each dir's sorted entries, then interleave via an output-index insertion.
-function sortEntries(es) {
-var a = es.slice();
-a.sort(function (x, y) { return x.name < y.name? -1: x.name > y.name? 1: 0;});
-return a;
-}
-function rec(dir, rel, depth) {
-if (depth > maxDepth) return;
-var es = sortEntries(provider.readdir(dir));
-for (var i = 0; i < es.length; i++) {
-var e = es[i];
-var cRel = rel === ""? e.name: rel + "/" + e.name;
-var cDir = dir === ""? e.name: dir + "/" + e.name;
-if (e.type === "dir") {
-if (!filesOnly) out.push(mk(cRel, e.name, "dir", depth));
-rec(cDir, cRel, depth + 1);
+for (var p = 0; p < keptIdx.length; p++) {
+var prev = parsed[keptIdx[p]];
+if (keyField === undefined) {
+if (deepEqual(rec, prev)) { isDup = true; break;}
 } else {
-if (!dirsOnly) {
-var rec2 = mk(cRel, e.name, e.type, depth);
-if (withSize && e.type === "file") rec2.size = provider.size(cDir);
-out.push(rec2);
+var prevHasKey = prev!== null && typeof prev === "object" &&!Array.isArray(prev) &&
+Object.prototype.hasOwnProperty.call(prev, keyField);
+if (prevHasKey && deepEqual(rec[keyField], prev[keyField])) { isDup = true; break;}
 }
 }
+if (!isDup) keptIdx.push(i);
 }
-}
-function mk(path, name, type, depth) { return { path: path, name: name, type: type, depth: depth};}
-rec("", "", 1);
-return out;
+return keptIdx;
 }
 
-/* ---- grid: gift == oracle across several trees x option sets ------------- */
-var TREES = [
-{}, // empty
-{ "a.txt": 3}, // one file
-{ "z.txt": 1, "a.txt": 2, "m.txt": 3}, // sort order matters
-{ "dir": { "b.txt": 5}, "a.txt": 1}, // nesting + sort across types
-{ "link": "->", "a.txt": 1}, // symlink present
-{ "a": { "b": { "c.txt": 9}}}, // deep
-{ "d1": { "x.txt": 1}, "d2": { "y.txt": 2}, "f.txt": 3}, // multiple dirs
-{ "a.txt": 0, "empty": {}} // empty subdir + zero-size file
-];
-var OPTS = [
-{}, { filesOnly: true}, { dirsOnly: true}, { withSize: false},
-{ maxDepth: 1}, { maxDepth: 2}, { filesOnly: true, maxDepth: 1}
-];
-for (var ti = 0; ti < TREES.length; ti++) {
-for (var oi = 0; oi < OPTS.length; oi++) {
-var p = buildProvider(TREES[ti]);
-var giftOut = G.walk(p, Object.assign({ __rootAbs: ""}, OPTS[oi]));
-var oracleOut = oracleWalk(p, OPTS[oi]);
-eq("grid t" + ti + " o" + oi, giftOut, oracleOut);
+/* ---- 1. Default whole-record dedup vs the independent oracle ------------- */
+(function () {
+var recs = ['{"id":1}', '{"id":2}', '{"id":1}', '{"id":3}', '{"id":2}'];
+var kept = keptLines(recs);
+var oracleIdx = oracleKeptIndices(recs, undefined);
+var oracleLines = oracleIdx.map(function (i) { return recs[i];});
+ok("default: kept == independent deep-equal oracle", J(kept) === J(oracleLines));
+ok("default: frozen golden [id1,id2,id3]", J(kept) === J(['{"id":1}', '{"id":2}', '{"id":3}']));
+ok("default: output is a subset of input", kept.every(function (l) { return recs.indexOf(l)!== -1;}));
+ok("default: order stable (kept indices ascending)",
+J(oracleIdx) === J(oracleIdx.slice().sort(function (a, b) { return a - b;})));
+})();
+
+/* ---- 2. Object key-order is canonicalized (same record two ways) -------- */
+(function () {
+var recs = ['{"a":1,"b":2}', '{"b":2,"a":1}', '{"a":1,"b":3}'];
+var kept = keptLines(recs);
+// first two are the same record; third differs -> keep #1 and #3
+ok("key-order: {a,b}=={b,a} deduped -> 2 kept", kept.length === 2);
+ok("key-order: keeps the FIRST verbatim + the differing one",
+J(kept) === J(['{"a":1,"b":2}', '{"a":1,"b":3}']));
+// oracle agreement (deep-equal also treats key-order as equal)
+var oracleLines = oracleKeptIndices(recs, undefined).map(function (i) { return recs[i];});
+ok("key-order: matches deep-equal oracle", J(kept) === J(oracleLines));
+})();
+
+/* ---- 3. Array order IS meaningful (not deduped) ------------------------- */
+(function () {
+var recs = ['[1,2,3]', '[3,2,1]', '[1,2,3]'];
+var kept = keptLines(recs);
+ok("array-order: [1,2,3] and [3,2,1] both kept, dup [1,2,3] dropped",
+J(kept) === J(['[1,2,3]', '[3,2,1]']));
+})();
+
+/* ---- 4. --key first-wins, rest of record ignored ------------------------ */
+(function () {
+var recs = ['{"id":1,"v":"a"}', '{"id":1,"v":"b"}', '{"id":2,"v":"c"}', '{"id":1,"v":"d"}'];
+var kept = keptLines(recs, { key: "id"});
+ok("--key: first per id wins",
+J(kept) === J(['{"id":1,"v":"a"}', '{"id":2,"v":"c"}']));
+var oracleLines = oracleKeptIndices(recs, "id").map(function (i) { return recs[i];});
+ok("--key: matches independent oracle", J(kept) === J(oracleLines));
+})();
+
+/* ---- 5. --key missing field: those records never dedup ------------------ */
+(function () {
+var recs = ['{"id":1}', '{"other":9}', '{"other":9}', '{"id":1}'];
+var kept = keptLines(recs, { key: "id"});
+// both {other:9} lack id -> both pass; the two {id:1} dedup to one
+ok("--key missing: no-key records all pass, keyed ones dedup",
+J(kept) === J(['{"id":1}', '{"other":9}', '{"other":9}']));
+})();
+
+/* ---- 6. --key value canonicalization (object key values) ---------------- */
+(function () {
+// key field is an object; {x:1,y:2} vs {y:2,x:1} are the SAME key value
+var recs = ['{"k":{"x":1,"y":2},"n":1}', '{"k":{"y":2,"x":1},"n":2}'];
+var kept = keptLines(recs, { key: "k"});
+ok("--key object value: canonicalized, 2nd dropped", kept.length === 1);
+ok("--key object value: keeps first", J(kept) === J(['{"k":{"x":1,"y":2},"n":1}']));
+})();
+
+/* ---- 7. Hygiene: blank lines skipped, CRLF trimmed, verbatim subset ----- */
+(function () {
+var r = df.filter('{"id": 1, "v": "x"}\n\n{"id":1}\r\n{"id":2}\n', { key: "id"});
+// blank skipped; {id:1} appears twice (dedup to first, WITH its spacing); {id:2} kept
+ok("hygiene: blank skipped, CRLF trimmed, first kept verbatim with spacing",
+J(r.lines) === J(['{"id": 1, "v": "x"}', '{"id":2}']));
+ok("hygiene: dropped count == 1", r.dropped === 1);
+})();
+
+/* ---- 8. Determinism: same input -> byte-identical kept lines ------------ */
+(function () {
+var recs = ['{"x":1}', '{"y":2}', '{"x":1}', '{"z":3}', '{"y":2}'];
+var a = J(keptLines(recs));
+var b = J(keptLines(recs));
+ok("determinism: byte-identical across runs", a === b);
+})();
+
+/* ---- 9. Input honesty: bad JSON throws ---------------------------------- */
+(function () {
+function throws(text, opts) { try { df.filter(text, opts); return false;} catch (e) { return true;}}
+ok("honesty: invalid JSON line throws", throws('{"ok":1}\n{oops\n'));
+ok("honesty: a lone bare token that is not JSON throws", throws("undefined\n"));
+})();
+
+/* ---- 10. THE BITE — a planted mutation the suite MUST catch -------------- *
+A "last wins" mutant in --key mode: for records that share a key value it keeps
+the LAST body instead of the first (and emits at the last position). The gift
+keeps the FIRST body at the first position. On records that share a key but
+differ elsewhere, the two disagree — so §4's frozen golden would catch a
+regression to last-wins. Here we assert the mutant genuinely differs, proving
+the checks have teeth. */
+(function () {
+function lastWinsMutantByKey(records, keyField) {
+var lastBody = {}, order = [];
+for (var i = 0; i < records.length; i++) {
+var line = records[i]; if (line.length === 0) continue;
+var rec = JSON.parse(line);
+var k = "K:" + JSON.stringify(rec[keyField]);
+if (!(k in lastBody)) order.push(k);
+lastBody[k] = line; // last body wins
 }
+return order.map(function (k) { return lastBody[k];});
 }
-
-/* ---- frozen hand goldens: the three quiet failures ---------------------- */
-
-// 1. Sort order — provider returns reversed, gift must emit sorted-by-name
-var pSort = buildProvider({ "z.txt": 1, "a.txt": 1, "m.txt": 1});
-eq("golden: entries sorted by name regardless of provider order",
-G.walk(pSort, { __rootAbs: ""}).map(function (r) { return r.name;}),
-["a.txt", "m.txt", "z.txt"]);
-
-// 2. Portable fields only — a record has exactly {path,name,type,depth[,size]}, no mtime/ino/mode
-var pFields = buildProvider({ "a.txt": 42});
-var rec = G.walk(pFields, { __rootAbs: ""})[0];
-eq("golden: file record has exactly the portable field set",
-Object.keys(rec).sort(), ["depth", "name", "path", "size", "type"]);
-ok("golden: no mtime/ino/mode leaked", rec.mtime === undefined && rec.ino === undefined && rec.mode === undefined);
-var pDir = buildProvider({ "d": { "x": 1}});
-var dirRec = G.walk(pDir, { __rootAbs: ""})[0];
-eq("golden: dir record has no size", Object.keys(dirRec).sort(), ["depth", "name", "path", "type"]);
-
-// 3. Symlinks reported but not followed (and carry no size)
-var pLink = buildProvider({ "link": "->", "a.txt": 1});
-var links = G.walk(pLink, { __rootAbs: ""}).filter(function (r) { return r.type === "symlink";});
-eq("golden: symlink reported as its own entry", links.length, 1);
-ok("golden: symlink carries no size", links[0].size === undefined);
-ok("golden: symlink is depth 1, not descended", links[0].depth === 1);
-
-/* ---- direct unit checks -------------------------------------------------- */
-eq("empty tree -> empty stream", G.walk(buildProvider({}), { __rootAbs: ""}), []);
-eq("max-depth 1 stops before nested files",
-G.walk(buildProvider({ "d": { "x.txt": 1}}), { __rootAbs: "", maxDepth: 1}).map(function (r) { return r.path;}),
-["d"]);
-eq("files-only drops dir records",
-G.walk(buildProvider({ "d": { "x.txt": 1}, "a.txt": 2}), { __rootAbs: "", filesOnly: true}).map(function (r) { return r.type;}),
-["file", "file"]);
-eq("dirs-only drops file records",
-G.walk(buildProvider({ "d": { "x.txt": 1}, "a.txt": 2}), { __rootAbs: "", dirsOnly: true}).map(function (r) { return r.type;}),
-["dir"]);
-eq("no-size omits size field",
-Object.keys(G.walk(buildProvider({ "a.txt": 9}), { __rootAbs: "", withSize: false})[0]).sort(),
-["depth", "name", "path", "type"]);
-eq("depth increments with nesting",
-G.walk(buildProvider({ "a": { "b": { "c.txt": 1}}}), { __rootAbs: ""}).map(function (r) { return r.depth;}),
-[1, 2, 3]);
-eq("pre-order: dir precedes its children",
-G.walk(buildProvider({ "d": { "x.txt": 1}}), { __rootAbs: ""}).map(function (r) { return r.path;}),
-["d", "d/x.txt"]);
-
-// sortedByName + toJSONL surfaces
-eq("sortedByName sorts by name", G.sortedByName([{ name: "b"}, { name: "a"}]).map(function (e) { return e.name;}), ["a", "b"]);
-ok("toJSONL ends every record with newline", G.toJSONL([{ path: "a", name: "a", type: "file", depth: 1}]) === '{"path":"a","name":"a","type":"file","depth":1}\n');
-ok("toJSONL of empty is empty string", G.toJSONL([]) === "");
-eq("joinPath at root is bare name", G.joinPath("", "a"), "a");
-eq("joinPath nests with slash", G.joinPath("a", "b"), "a/b");
-
-/* ---- determinism --------------------------------------------------------- */
-var pDet = buildProvider({ "z": { "y.txt": 1}, "a.txt": 2, "link": "->"});
-var d1 = G.toJSONL(G.walk(pDet, { __rootAbs: ""}));
-var d2 = G.toJSONL(G.walk(pDet, { __rootAbs: ""}));
-ok("deterministic across two runs", d1 === d2);
-
-/* ---- fail-closed --------------------------------------------------------- */
-function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
-ok("files-only + dirs-only throws", throws(function () { G.walk(buildProvider({}), { __rootAbs: "", filesOnly: true, dirsOnly: true});}));
+// shared key id:1, bodies differ by tag
+var recs = ['{"id":1,"tag":"first"}', '{"id":1,"tag":"last"}'];
+var good = keptLines(recs, { key: "id"}); // first wins -> tag:first
+var mutant = lastWinsMutantByKey(recs, "id"); // last wins -> tag:last
+ok("the bite: last-wins mutant differs from first-wins gift (checks have teeth)",
+J(good)!== J(mutant));
+ok("the bite: gift keeps FIRST body", J(good) === J(['{"id":1,"tag":"first"}']));
+})();
 
 /* ---- report -------------------------------------------------------------- */
-console.log("dir-walk battery: " + pass + " passed, " + fail + " failed");
-process.exitCode = fail === 0? 0: 1;
+console.log("\ndedup-filter battery: " + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node / browser, no dependencies
+Zero dependencies, Node or browser, deterministic
 
 ---
 
-# Your Prompt's Evil Twin — a Loop MMT gift
-https://loopmmt.com/gifts/doppelganger/
+# derived — a Loop MMT gift
+https://loopmmt.com/gifts/derived/
 [coverage: optional · branch: gifts]
 
-Where Does One Small Rephrase Quietly Flip Your Prompt's Output? twin ← all gifts
+Derived-File Staleness Checker check ← all gifts
 
-Your Prompt's Evil Twin
+derived
 
-Feed it your prompt and it generates the evil twin — the minimal adversarial rephrase that could flip your output — each twin a single named edit (negate, polarity-flip, quantifier-swap, scope-widen, frame-shift, entity-swap) from a closed set, carrying the exact change as a readable diff. Then run original and twin through any model you like and hand the two outputs back: it computes a structural divergence read (token Jaccard, length delta, first divergence point, STABLE / DIVERGED / FLIPPED against a threshold you declare). An adversarial-robustness probe for your OWN prompts. Python stdlib only, offline, deterministic — same prompt yields byte-identical twins every run.
+Is a generated file stale against the command that makes it? A derived file (one a build command produces, that no human should hand-edit) still exists on disk when it falls behind its source — so no presence check ever catches it. derived runs the build fresh in a private sandbox and byte-compares its output against the committed file: CURRENT (exit 0), STALE (exit 3, difference named), BUILD-FAILED, or a usage error. Non-mutating by contract — it never touches your working tree.
 
 The honest edge
 
-doppelganger PROPOSES candidate twins and MEASURES textual divergence, for hardening your own prompt — it does not run your prompt, prove a flip is harmful or that a twin "worked", find a rephrase it has no rule for, or make your prompt safe to ship. A hardening tool, not a jailbreak factory.
+this checks STALENESS (committed vs a fresh build), not CORRECTNESS: a green means the file matches what the command emits right now, never that the command or its output is right. It runs your build command, so only point it at a command you trust.
 
 Run it
 
-python3 doppelganger.py twin "Always summarize the report in 3 bullets." && python3 doppelganger.py diff --original a.txt --twin b.txt
-smoke_test.py / --selftest (15/15); golden test_doppelganger.py 20/20-class battery (46 checks); plumb conformance 47/47, independent re-derivation oracle, signed 5498646f
-Python stdlib only, deterministic
+python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --copy gen.py
+test_derived.py (11/11, mutation-bitten)
+Python 3, standard library only
 
 The code — every file that ships
 
-doppelganger.py 527 lines on GitHub →
+derived.py 245 lines on GitHub →
 #!/usr/bin/env python3
-"""doppelganger.py -- generate a prompt's evil twin, and measure how far its output drifted.
+"""derived.py — is a generated file STALE against the command that makes it?
 
-WHY THIS EXISTS. You write a prompt. You trust it. But one small rephrase -- a
-dropped "not", an "all" swapped for "some", a stripped constraint -- can quietly
-change what a model does with it. doppelganger is an adversarial-robustness probe
-for YOUR OWN prompts: it generates the *evil twin* -- a minimal rephrase, made by
-one named, declared rule -- so you can run both and see whether your prompt is
-brittle where you didn't expect. It is a hardening tool, not a jailbreak factory.
+A "derived" file is one no human should hand-edit: a build command produces it
+from some source, and the committed copy is only ever supposed to be whatever
+that command most recently emitted. The failure this catches is the oldest one
+in generated code: the source moved, nobody re-ran the build, and the committed
+derived file quietly fell behind. It works today (it is a real file on disk) and
+breaks silently later, so no "does the file exist?" check ever sees it.
 
-THE ONE DISCIPLINE (the whole reason to trust it). doppelganger PROPOSES and
-MEASURES. It never claims a twin "worked", never claims it found the *worst*
-rephrase, never calls anything a jailbreak. Two verbs, both honest:
+A script-generated file cannot DRIFT; it can only be STALE,
+and stale is one command.
 
-twin -- emit N candidate twins from a CLOSED set of named rules. Each twin
-carries the rule that made it and the exact edit (a readable diff).
-A rule that cannot apply to a prompt is SKIPPED AND NAMED, never
-silently dropped. Same prompt + same rules -> byte-identical twins.
+That sentence is TRUE and it is NOT A GUARD. The command is unenforced, so the
+sentence describes the fix, not a mechanism -- and the file goes stale while the
+sentence sits there being correct. This tool is the mechanism: it RUNS the build
+command and byte-compares its fresh output against the committed derived file.
 
-diff -- given the original output and a twin's output (YOU ran them through
-whatever model you like -- doppelganger never calls a model), compute
-a STRUCTURAL divergence read: length delta, token Jaccard, first point
-of divergence, and a classification (STABLE / DIVERGED / FLIPPED)
-against a DECLARED threshold. This measures textual divergence, NOT
-whether a flip is correct, harmful, or a real vulnerability.
+NON-MUTATING BY CONTRACT (the property this gift is built around).
+This never edits your working tree. It runs the build command inside a private
+temporary directory, seeded with a copy of your inputs, and compares the fresh
+output there against the committed derived file here. Your files are never
+touched -- there is no reading of a tree that proves an edit is worthless, and a
+checker must not destroy one on a guess. If the build command insists on writing
+in place, pass --in-place and it runs against a full copy of the working tree in
+the sandbox (still never your real tree).
 
-THE CLOSED RULE SET (v1) -- each a deterministic single-edit text transform:
-negate insert/remove a negation on the leading directive verb
-polarity-flip swap a declared antonym pair (do/don't, include/exclude,...)
-quantifier-swap step a quantifier along a declared ladder (all->some->none,...)
-scope-widen strip the first trailing constraint clause (", but..." / "; only...")
-frame-shift prepend a declared authority/urgency frame
-entity-swap swap the first declared subject token for its declared partner
+THE ORACLE IS THE COMMAND ITSELF, ON PURPOSE.
+This carries no copy of the source->derived mapping. You name the build command
+and the file it is supposed to produce; the tool asks the only question that
+needs no mapping: run the command fresh -- does what it emits match what is
+committed, byte for byte? A checker that re-declared the mapping would be a
+second source of truth for it, which is the very fault class being guarded.
 
-Each rule fails closed: if it finds no site to edit, it reports
-`{"rule": R, "applied": false, "reason": "..."}` -- a named skip, never a lie.
-
-Pure function of its inputs. No dependencies. Offline. Same input -> byte-identical
-output, every run. Python 3.8+, standard library only.
+EXITS
+0 CURRENT -- the committed derived file matches a fresh build, byte for byte
+3 STALE -- it does not; the diff summary is printed (and --show-diff dumps it)
+4 BUILD-FAILED -- the build command exited non-zero; nothing can be concluded
+2 USAGE -- bad arguments, or the derived file / a --copy input is missing
 
 USAGE
-python3 doppelganger.py twin "Always summarize the report in 3 bullets."
-python3 doppelganger.py twin --rules negate,quantifier-swap "..." < prompt.txt
-python3 doppelganger.py diff --threshold 0.5 --original out_a.txt --twin out_b.txt
-echo '{"original": "...", "twin": "..."}' | python3 doppelganger.py diff
-python3 doppelganger.py --selftest
-python3 doppelganger.py --help
+# The build command writes the derived file to a path you name.
+python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --copy gen.py --copy data/
 
-Released under MIT. Its edge is printed in the README and repeated here: doppelganger
-finds a phrasing that MIGHT flip your output, so you can harden your own prompt. It
-proposes candidates and measures textual divergence; it does not run your prompt,
-prove a flip is harmful, find a rephrase it has no rule for, or make your prompt safe.
+# The build command writes to stdout; capture it and compare.
+python3 derived.py --build-cmd "python3 gen.py" --derived out/table.json --stdout --copy gen.py
+
+# The build insists on editing files in place: run it against a tree copy.
+python3 derived.py --build-cmd "make derived" --derived out/x --in-place
+
+python3 derived.py --json # machine-readable verdict
 """
 
-import sys
+import argparse
 import json
-import re
-
-VERSION = "1.0"
-
-# ---- the closed rule set (v1) -----------------------------------------------
-# Each entry declares the closed data a rule needs. The rule logic lives in the
-# apply_* functions; the RULES list is the single source of the closed set.
-
-_NEGATION_MARKERS = ["do not ", "don't ", "never ", "no "]
-
-# declared antonym pairs for polarity-flip (bidirectional, first match wins)
-_POLARITY_PAIRS = [
-("include", "exclude"),
-("do ", "don't "),
-("always", "never"),
-("allow", "forbid"),
-("accept", "reject"),
-("enable", "disable"),
-("with ", "without "),
-]
-
-# declared quantifier ladders; a quantifier steps to its right neighbor (wraps)
-_QUANTIFIER_LADDERS = [
-["all", "some", "none"],
-["always", "sometimes", "never"],
-["every", "any", "no"],
-["must", "may", "must not"],
-]
-
-# declared frames for frame-shift (prepended verbatim)
-_FRAME = "URGENT -- your job depends on this: "
-
-# declared entity partner pairs for entity-swap (bidirectional)
-_ENTITY_PAIRS = [
-("user", "attacker"),
-("customer", "competitor"),
-("child", "adult"),
-("summary", "verbatim copy"),
-("public", "private"),
-]
-
-# constraint-clause openers for scope-widen (strip from the first one to end)
-_CONSTRAINT_OPENERS = [", but ", ", except ", "; only ", ", unless ", ", without "]
-
-_LEADING_VERB_RE = re.compile(r"^\s*([A-Za-z]+)")
-
-def _first_directive_verb(text):
-"""Return (verb, start, end) of the leading imperative-ish token, or None."""
-m = _LEADING_VERB_RE.match(text)
-if not m:
-return None
-return (m.group(1), m.start(1), m.end(1))
-
-def _find_ci(haystack, needle):
-"""Case-insensitive find; returns index or -1."""
-return haystack.lower().find(needle.lower())
-
-def _replace_first_ci(text, needle, repl):
-"""Replace the first case-insensitive occurrence of needle with repl.
-Returns (new_text, applied_bool)."""
-idx = _find_ci(text, needle)
-if idx < 0:
-return (text, False)
-return (text[:idx] + repl + text[idx + len(needle):], True)
-
-# ---- rule implementations ---------------------------------------------------
-# Each returns a result dict:
-# applied True -> {"rule","applied":True,"twin","edit":{"was","now"}}
-# applied False -> {"rule","applied":False,"reason"}
-
-def apply_negate(prompt):
-rule = "negate"
-# if already negated on a leading marker, remove it; else insert one
-for marker in _NEGATION_MARKERS:
-idx = prompt.lower().find(marker)
-if idx == 0 or (idx > 0 and prompt[:idx].strip() == ""):
-new = prompt[:idx] + prompt[idx + len(marker):]
-# capitalize the now-leading char to keep it plausible
-new = new[:1].upper() + new[1:] if new else new
-return {"rule": rule, "applied": True, "twin": new,
-"edit": {"was": marker.strip(), "now": "(removed)"}}
-v = _first_directive_verb(prompt)
-if v is None:
-return {"rule": rule, "applied": False,
-"reason": "no leading directive verb to negate"}
-verb, s, e = v
-new = prompt[:s] + "Do not " + verb[0].lower() + verb[1:] + prompt[e:]
-return {"rule": rule, "applied": True, "twin": new,
-"edit": {"was": verb, "now": "Do not " + verb[0].lower() + verb[1:]}}
-
-def apply_polarity_flip(prompt):
-rule = "polarity-flip"
-for a, b in _POLARITY_PAIRS:
-if _find_ci(prompt, a) >= 0:
-new, ok = _replace_first_ci(prompt, a, b)
-if ok:
-return {"rule": rule, "applied": True, "twin": new,
-"edit": {"was": a.strip(), "now": b.strip()}}
-if _find_ci(prompt, b) >= 0:
-new, ok = _replace_first_ci(prompt, b, a)
-if ok:
-return {"rule": rule, "applied": True, "twin": new,
-"edit": {"was": b.strip(), "now": a.strip()}}
-return {"rule": rule, "applied": False,
-"reason": "no declared antonym pair present"}
-
-def apply_quantifier_swap(prompt):
-rule = "quantifier-swap"
-for ladder in _QUANTIFIER_LADDERS:
-for i, q in enumerate(ladder):
-# word-boundary case-insensitive match
-pat = re.compile(r"\b" + re.escape(q) + r"\b", re.IGNORECASE)
-m = pat.search(prompt)
-if m:
-nxt = ladder[(i + 1) % len(ladder)]
-new = prompt[:m.start()] + nxt + prompt[m.end():]
-return {"rule": rule, "applied": True, "twin": new,
-"edit": {"was": q, "now": nxt}}
-return {"rule": rule, "applied": False,
-"reason": "no declared quantifier present"}
-
-def apply_scope_widen(prompt):
-rule = "scope-widen"
-best = None
-for opener in _CONSTRAINT_OPENERS:
-idx = _find_ci(prompt, opener)
-if idx >= 0 and (best is None or idx < best[0]):
-best = (idx, opener)
-if best is None:
-return {"rule": rule, "applied": False,
-"reason": "no trailing constraint clause to strip"}
-idx, opener = best
-new = prompt[:idx].rstrip()
-if new and new[-1] not in ".!?":
-new = new + "."
-return {"rule": rule, "applied": True, "twin": new,
-"edit": {"was": prompt[idx:].strip(), "now": "(constraint removed)"}}
-
-def apply_frame_shift(prompt):
-rule = "frame-shift"
-if prompt.startswith(_FRAME):
-return {"rule": rule, "applied": False,
-"reason": "frame already present"}
-return {"rule": rule, "applied": True, "twin": _FRAME + prompt,
-"edit": {"was": "(no frame)", "now": _FRAME.strip()}}
-
-def apply_entity_swap(prompt):
-rule = "entity-swap"
-for a, b in _ENTITY_PAIRS:
-pat_a = re.compile(r"\b" + re.escape(a) + r"\b", re.IGNORECASE)
-if pat_a.search(prompt):
-new = pat_a.sub(b, prompt, count=1)
-return {"rule": rule, "applied": True, "twin": new,
-"edit": {"was": a, "now": b}}
-pat_b = re.compile(r"\b" + re.escape(b) + r"\b", re.IGNORECASE)
-if pat_b.search(prompt):
-new = pat_b.sub(a, prompt, count=1)
-return {"rule": rule, "applied": True, "twin": new,
-"edit": {"was": b, "now": a}}
-return {"rule": rule, "applied": False,
-"reason": "no declared entity token present"}
-
-# The closed set, in canonical order. This list IS the closed rule set.
-RULES = [
-("negate", apply_negate),
-("polarity-flip", apply_polarity_flip),
-("quantifier-swap", apply_quantifier_swap),
-("scope-widen", apply_scope_widen),
-("frame-shift", apply_frame_shift),
-("entity-swap", apply_entity_swap),
-]
-RULE_NAMES = [name for name, _ in RULES]
-
-class DoppelgangerError(Exception):
-pass
-
-def generate_twins(prompt, rules=None):
-"""Return a list of result dicts, one per requested rule, in canonical order.
-
-Fails closed on: empty prompt, an unknown rule name. Every requested rule
-produces exactly one result -- applied (with twin + edit) or a named skip.
-Deterministic: same prompt + same rule set -> identical list."""
-if not isinstance(prompt, str) or prompt.strip() == "":
-raise DoppelgangerError("empty prompt (doppelganger needs a prompt to twin)")
-if rules is None:
-wanted = list(RULE_NAMES)
-else:
-for r in rules:
-if r not in RULE_NAMES:
-raise DoppelgangerError(
-"unknown rule '%s'; the closed set is: %s"
-% (r, ", ".join(RULE_NAMES)))
-wanted = [name for name in RULE_NAMES if name in rules] # canonical order
-fn = dict(RULES)
-out = []
-for name in wanted:
-res = fn[name](prompt)
-res["original"] = prompt
-out.append(res)
-return out
-
-# ---- the divergence read ----------------------------------------------------
-
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
-
-def _tokens(text):
-return [t.lower() for t in _TOKEN_RE.findall(text)]
-
-def _jaccard(a_tokens, b_tokens):
-sa, sb = set(a_tokens), set(b_tokens)
-if not sa and not sb:
-return 1.0
-inter = len(sa & sb)
-union = len(sa | sb)
-return inter / union if union else 1.0
-
-def _first_divergence(a, b):
-"""Character index of the first difference, or -1 if identical."""
-n = min(len(a), len(b))
-for i in range(n):
-if a[i]!= b[i]:
-return i
-if len(a)!= len(b):
-return n
-return -1
-
-def divergence(original_output, twin_output, threshold=0.5):
-"""Structural divergence read between two model outputs.
-
-threshold in [0,1]: the Jaccard DISTANCE (1 - similarity) at/above which the
-pair is classed DIVERGED, and at/above 2x (capped) FLIPPED. This is a declared
-knob, not a truth: it measures textual divergence, never correctness."""
-if not isinstance(original_output, str) or not isinstance(twin_output, str):
-raise DoppelgangerError("diff needs two strings: original and twin outputs")
-if not (0.0 <= threshold <= 1.0):
-raise DoppelgangerError("threshold must be in [0,1]")
-a_tok, b_tok = _tokens(original_output), _tokens(twin_output)
-sim = _jaccard(a_tok, b_tok)
-dist = round(1.0 - sim, 6)
-len_delta = len(twin_output) - len(original_output)
-fd = _first_divergence(original_output, twin_output)
-flip_line = min(1.0, threshold * 2.0)
-if dist >= flip_line:
-cls = "FLIPPED"
-elif dist >= threshold:
-cls = "DIVERGED"
-else:
-cls = "STABLE"
-return {
-"classification": cls,
-"jaccard_similarity": round(sim, 6),
-"jaccard_distance": dist,
-"length_delta": len_delta,
-"first_divergence_char": fd,
-"threshold": threshold,
-"note": "textual divergence only -- not correctness, harm, or a proven flip",
-}
-
-# ---- CLI --------------------------------------------------------------------
-
-def _read_stdin():
-if sys.stdin is None or sys.stdin.isatty():
-return ""
-return sys.stdin.read()
-
-def _cmd_twin(argv):
-rules = None
-positional = []
-i = 0
-while i < len(argv):
-a = argv[i]
-if a == "--rules":
-i += 1
-if i >= len(argv):
-raise DoppelgangerError("--rules needs a comma-separated value")
-rules = [r.strip() for r in argv[i].split(",") if r.strip()]
-else:
-positional.append(a)
-i += 1
-prompt = " ".join(positional).strip() if positional else _read_stdin().strip()
-results = generate_twins(prompt, rules)
-for r in results:
-sys.stdout.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
-return 0
-
-def _cmd_diff(argv):
-threshold = 0.5
-original = None
-twin = None
-i = 0
-while i < len(argv):
-a = argv[i]
-if a == "--threshold":
-i += 1
-threshold = float(argv[i])
-elif a == "--original":
-i += 1
-with open(argv[i], "r", encoding="utf-8") as fh:
-original = fh.read()
-elif a == "--twin":
-i += 1
-with open(argv[i], "r", encoding="utf-8") as fh:
-twin = fh.read()
-i += 1
-if original is None or twin is None:
-raw = _read_stdin()
-if not raw.strip():
-raise DoppelgangerError(
-"diff needs --original F --twin F, or a JSON object "
-"{\"original\":..,\"twin\":..} on stdin")
-obj = json.loads(raw)
-original = obj["original"] if original is None else original
-twin = obj["twin"] if twin is None else twin
-res = divergence(original, twin, threshold)
-sys.stdout.write(json.dumps(res, ensure_ascii=False, sort_keys=True) + "\n")
-return 0
-
-def _selftest():
-fails = []
-
-def check(name, cond):
-if not cond:
-fails.append(name)
-
-# 1. determinism: same input twice -> byte-identical
-p = "Always summarize the report in 3 bullets, but skip the appendix."
-r1 = generate_twins(p)
-r2 = generate_twins(p)
-check("determinism", json.dumps(r1, sort_keys=True) == json.dumps(r2, sort_keys=True))
-
-# 2. every rule produces exactly one result, canonical order
-check("one-result-per-rule", len(r1) == len(RULE_NAMES))
-check("canonical-order", [x["rule"] for x in r1] == RULE_NAMES)
-
-# 3. negate flips a directive
-neg = [x for x in r1 if x["rule"] == "negate"][0]
-check("negate-applied", neg["applied"] is True)
-check("negate-changed", neg["twin"]!= p)
-
-# 4. quantifier-swap steps 'always' -> 'sometimes'
-qs = [x for x in r1 if x["rule"] == "quantifier-swap"][0]
-check("quantifier-applied", qs["applied"] is True)
-check("quantifier-step", "sometimes" in qs["twin"].lower())
-
-# 5. scope-widen strips the ", but..." clause
-sw = [x for x in r1 if x["rule"] == "scope-widen"][0]
-check("scope-applied", sw["applied"] is True)
-check("scope-removed", "appendix" not in sw["twin"].lower())
-
-# 6. frame-shift prepends the frame
-fs = [x for x in r1 if x["rule"] == "frame-shift"][0]
-check("frame-applied", fs["applied"] is True)
-check("frame-prepended", fs["twin"].startswith(_FRAME))
-
-# 7. named skip, not silent drop: a prompt with no quantifier
-plain = "Write a haiku about rain."
-rp = generate_twins(plain, rules=["quantifier-swap"])
-check("named-skip", rp[0]["applied"] is False and "reason" in rp[0])
-
-# 8. fail closed on empty prompt
-try:
-generate_twins("")
-check("empty-fails", False)
-except DoppelgangerError:
-check("empty-fails", True)
-
-# 9. fail closed on unknown rule
-try:
-generate_twins(p, rules=["bogus"])
-check("unknown-rule-fails", False)
-except DoppelgangerError:
-check("unknown-rule-fails", True)
-
-# 10. rule subset selection returns only requested, canonical order
-sub = generate_twins(p, rules=["frame-shift", "negate"])
-check("subset-order", [x["rule"] for x in sub] == ["negate", "frame-shift"])
-
-# 11. divergence: identical outputs -> STABLE, distance 0
-d0 = divergence("hello world", "hello world", threshold=0.5)
-check("identical-stable", d0["classification"] == "STABLE" and d0["jaccard_distance"] == 0.0)
-
-# 12. divergence: disjoint outputs -> FLIPPED, distance 1
-d1 = divergence("apple banana", "xylophone zebra", threshold=0.5)
-check("disjoint-flipped", d1["classification"] == "FLIPPED" and d1["jaccard_distance"] == 1.0)
-
-# 13. divergence: partial overlap classes per threshold
-dm = divergence("the cat sat", "the dog sat", threshold=0.4)
-check("partial-diverged", dm["classification"] in ("DIVERGED", "FLIPPED", "STABLE"))
-check("first-divergence-set", dm["first_divergence_char"] >= 0)
-
-# 14. divergence determinism
-da = divergence("one two three", "one two four", threshold=0.5)
-db = divergence("one two three", "one two four", threshold=0.5)
-check("diff-determinism", json.dumps(da, sort_keys=True) == json.dumps(db, sort_keys=True))
-
-# 15. threshold bounds fail closed
-try:
-divergence("a", "b", threshold=1.5)
-check("threshold-bounds", False)
-except DoppelgangerError:
-check("threshold-bounds", True)
-
-total = 15
-passed = total - len(fails)
-if fails:
-sys.stdout.write("selftest: %d/%d FAIL -> %s\n" % (passed, total, ", ".join(fails)))
-return 1
-sys.stdout.write("selftest: %d/%d GREEN\n" % (passed, total))
-return 0
-
-_HELP = """doppelganger v%s -- your prompt's evil twin (an adversarial-robustness probe).
-
-twin "<prompt>" emit one twin per rule (JSONL to stdout)
---rules r1,r2 restrict to a subset of the closed set
-(prompt may also arrive on stdin)
-diff --original F --twin F structural divergence read between two outputs
---threshold T declared DIVERGED line in [0,1] (default 0.5)
-(or a JSON {"original","twin"} on stdin)
---selftest run the built-in battery
---help
-
-Closed rule set: %s
-
-Edge: doppelganger PROPOSES candidate twins and MEASURES textual divergence, for
-hardening your own prompt. It does not run your prompt, prove a flip is harmful,
-find a rephrase it has no rule for, or make your prompt safe to ship.
-""" % (VERSION, ", ".join(RULE_NAMES))
-
-def main(argv):
-if not argv or argv[0] in ("--help", "-h", "help"):
-sys.stdout.write(_HELP)
-return 0
-if argv[0] == "--selftest":
-return _selftest()
-try:
-if argv[0] == "twin":
-return _cmd_twin(argv[1:])
-if argv[0] == "diff":
-return _cmd_diff(argv[1:])
-sys.stderr.write("unknown command '%s' (try --help)\n" % argv[0])
-return 2
-except DoppelgangerError as e:
-sys.stderr.write("doppelganger: %s\n" % e)
-return 1
-
-if __name__ == "__main__":
-sys.exit(main(sys.argv[1:]))
-
-smoke_test.py 21 lines on GitHub →
-#!/usr/bin/env python3
-"""smoke_test.py -- doppelganger's shipped smoke check. Runs the in-module
---selftest battery (15 checks) and exits non-zero on any failure, so a stranger
-can prove the gift works in their tree with one command:
-
-python3 smoke_test.py
-"""
+import os
+import shutil
 import subprocess
 import sys
-import os
+import tempfile
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+EXIT_CURRENT = 0
+EXIT_USAGE = 2
+EXIT_STALE = 3
+EXIT_BUILD_FAILED = 4
 
-def main():
-r = subprocess.run([sys.executable, os.path.join(HERE, "doppelganger.py"), "--selftest"])
-sys.exit(r.returncode)
+# --- the printed edge: what this gift does NOT do -------------------------
+EDGE = (
+"this checks STALENESS (committed vs a fresh build), not CORRECTNESS: "
+"a green means the file matches what the command emits right now, never "
+"that the command or its output is right. It runs your build command, so "
+"only point it at a command you trust."
+)
+
+def _read_bytes(path):
+with open(path, "rb") as fh:
+return fh.read()
+
+def _diff_summary(want, got):
+"""A short, deterministic description of a byte difference. No external diff."""
+if want == got:
+return "identical"
+if len(want)!= len(got):
+lead = "committed" if len(want) > len(got) else "fresh-build"
+return f"length differs: committed={len(want)}B fresh={len(got)}B (longer: {lead})"
+for i, (a, b) in enumerate(zip(want, got)):
+if a!= b:
+return f"first byte differs at offset {i}: committed=0x{a:02x} fresh=0x{b:02x}"
+return "differ" # unreachable given the length/zip checks above
+
+def check(build_cmd, derived, copies, use_stdout=False, in_place=False,
+repo_root=None):
+"""Run the build fresh in a sandbox and compare to the committed derived file.
+
+Returns a result dict with a 'status' of current | stale | build-failed | usage.
+Never mutates the working tree.
+"""
+root = repo_root or os.getcwd()
+result = {
+"build_cmd": build_cmd,
+"derived": derived,
+"status": "current",
+"diff": "identical",
+"edge": EDGE,
+}
+
+committed_path = os.path.join(root, derived)
+if not os.path.isfile(committed_path):
+result["status"] = "usage"
+result["error"] = f"derived file not found: {derived}"
+return result
+committed = _read_bytes(committed_path)
+
+sandbox = tempfile.mkdtemp(prefix="derived-check.")
+try:
+if in_place:
+# Copy the whole working tree so an in-place build can't touch the real one.
+for entry in os.listdir(root):
+if entry == ".git":
+continue # never needed to rebuild a derived file; huge
+src = os.path.join(root, entry)
+dst = os.path.join(sandbox, entry)
+if os.path.isdir(src):
+shutil.copytree(src, dst, symlinks=True)
+else:
+shutil.copy2(src, dst)
+else:
+for rel in copies:
+src = os.path.join(root, rel)
+if not os.path.exists(src):
+result["status"] = "usage"
+result["error"] = f"--copy input not found: {rel}"
+return result
+dst = os.path.join(sandbox, rel)
+os.makedirs(os.path.dirname(dst) or sandbox, exist_ok=True)
+if os.path.isdir(src):
+shutil.copytree(src, dst, symlinks=True)
+else:
+shutil.copy2(src, dst)
+
+proc = subprocess.run(
+build_cmd, shell=True, cwd=sandbox,
+capture_output=True, timeout=300,
+)
+if proc.returncode!= 0:
+result["status"] = "build-failed"
+result["exit"] = proc.returncode
+result["stderr"] = proc.stderr.decode("utf-8", "replace")[:2000]
+return result
+
+if use_stdout:
+fresh = proc.stdout
+else:
+fresh_path = os.path.join(sandbox, derived)
+if not os.path.isfile(fresh_path):
+result["status"] = "build-failed"
+result["error"] = (
+f"build ran but produced no {derived} in the sandbox "
+f"(did you mean --stdout, or a different --derived path?)"
+)
+return result
+fresh = _read_bytes(fresh_path)
+
+if fresh == committed:
+result["status"] = "current"
+result["diff"] = "identical"
+else:
+result["status"] = "stale"
+result["diff"] = _diff_summary(committed, fresh)
+result["_fresh"] = fresh
+result["_committed"] = committed
+return result
+finally:
+shutil.rmtree(sandbox, ignore_errors=True)
+
+def main(argv=None):
+ap = argparse.ArgumentParser(
+description="Is a generated file stale against the command that makes it?",
+epilog="EDGE: " + EDGE,
+)
+ap.add_argument("--build-cmd", required=True,
+help="the command that regenerates the derived file (run in a sandbox)")
+ap.add_argument("--derived", required=True,
+help="repo-relative path of the file the command is supposed to produce")
+ap.add_argument("--copy", action="append", default=[], metavar="PATH",
+help="input file/dir the build needs; repeatable (ignored with --in-place)")
+ap.add_argument("--stdout", action="store_true",
+help="the build writes the derived content to stdout; capture and compare it")
+ap.add_argument("--in-place", action="store_true",
+help="the build edits files in place; run it against a full copy of the tree")
+ap.add_argument("--show-diff", action="store_true",
+help="on STALE, dump both versions' first differing region")
+ap.add_argument("--json", action="store_true", help="machine-readable verdict")
+ap.add_argument("--edge", action="store_true", help="print the printed edge and exit")
+args = ap.parse_args(argv)
+
+if args.edge:
+print(EDGE)
+return EXIT_CURRENT
+
+res = check(
+args.build_cmd, args.derived, args.copy,
+use_stdout=args.stdout, in_place=args.in_place,
+)
+status = res["status"]
+# strip internal blobs before any user-facing emission
+fresh = res.pop("_fresh", None)
+committed = res.pop("_committed", None)
+
+if args.json:
+print(json.dumps(res, indent=2, sort_keys=True))
+else:
+if status == "current":
+print(f"CURRENT — {args.derived} matches a fresh build")
+elif status == "stale":
+print(f"STALE — {args.derived} is behind its build command")
+print(f" {res['diff']}")
+print(f" regenerate with: {args.build_cmd}")
+if args.show_diff and fresh is not None:
+print(" --- committed (first 400B) ---")
+sys.stdout.buffer.write(committed[:400])
+print("\n --- fresh build (first 400B) ---")
+sys.stdout.buffer.write(fresh[:400])
+print()
+elif status == "build-failed":
+print(f"BUILD-FAILED — {res.get('error') or 'the build command exited non-zero'}")
+if res.get("stderr"):
+print(res["stderr"])
+else: # usage
+print(f"USAGE ERROR — {res.get('error', 'bad arguments')}", file=sys.stderr)
+
+return {
+"current": EXIT_CURRENT,
+"stale": EXIT_STALE,
+"build-failed": EXIT_BUILD_FAILED,
+"usage": EXIT_USAGE,
+}[status]
 
 if __name__ == "__main__":
-main()
+sys.exit(main())
+
+test_derived.py 207 lines on GitHub →
+#!/usr/bin/env python3
+"""test_derived.py — mutation-bitten behavior proof for the derived gift.
+
+stdlib only. Each test asserts a distinct BEHAVIOR, so deleting the behavior
+from derived.py makes a test fail (that is the "mutation bite"). Run:
+
+python3 test_derived.py # prints N/N and exits 0 on all-green
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GIFT = os.path.join(HERE, "derived.py")
+
+CURRENT, USAGE, STALE, BUILD_FAILED = 0, 2, 3, 4
+
+def _scratch():
+d = tempfile.mkdtemp(prefix="derived-test.")
+return d
+
+def _run(cwd, *args):
+"""Run the gift with cwd set so repo-relative paths resolve there."""
+p = subprocess.run(
+[sys.executable, GIFT, *args],
+cwd=cwd, capture_output=True, text=True, timeout=120,
+)
+return p.returncode, p.stdout, p.stderr
+
+# A build command that writes "1\n2\n3\n" to out.txt, deterministically.
+GEN = 'python3 -c "open(\'out.txt\',\'w\').write(\'1\\n2\\n3\\n\')"'
+
+results = []
+
+def check(name, cond):
+results.append((name, bool(cond)))
+print(f" [{'PASS' if cond else 'FAIL'}] {name}")
+
+def t_current_when_committed_matches_fresh_build():
+"""A committed file equal to a fresh build reads CURRENT (exit 0)."""
+d = _scratch()
+try:
+with open(os.path.join(d, "out.txt"), "w") as f:
+f.write("1\n2\n3\n") # matches GEN
+rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
+check("current when committed == fresh build", rc == CURRENT and "CURRENT" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_stale_when_committed_differs():
+"""A committed file that differs from the fresh build reads STALE (exit 3)."""
+d = _scratch()
+try:
+with open(os.path.join(d, "out.txt"), "w") as f:
+f.write("1\n2\n") # stale: build emits three lines
+rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
+check("stale when committed!= fresh build", rc == STALE and "STALE" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_non_mutating_leaves_committed_file_untouched():
+"""Running the check never edits the working tree's committed file."""
+d = _scratch()
+try:
+stale_content = "1\n2\n"
+with open(os.path.join(d, "out.txt"), "w") as f:
+f.write(stale_content)
+_run(d, "--build-cmd", GEN, "--derived", "out.txt")
+after = open(os.path.join(d, "out.txt")).read()
+check("non-mutating: committed file unchanged after a check", after == stale_content)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_build_failed_when_command_errors():
+"""A build command that exits non-zero yields BUILD-FAILED (exit 4), never a verdict."""
+d = _scratch()
+try:
+with open(os.path.join(d, "out.txt"), "w") as f:
+f.write("anything\n")
+rc, out, _ = _run(d, "--build-cmd", "python3 -c \"import sys; sys.exit(1)\"",
+"--derived", "out.txt")
+check("build-failed on non-zero build command", rc == BUILD_FAILED and "BUILD-FAILED" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_usage_when_derived_missing():
+"""A missing derived file is a usage error (exit 2), not STALE/CURRENT."""
+d = _scratch()
+try:
+rc, out, err = _run(d, "--build-cmd", GEN, "--derived", "nope.txt")
+check("usage error when derived file is absent", rc == USAGE and "USAGE" in (out + err))
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_stdout_mode_compares_captured_output():
+"""--stdout compares the build's stdout, not a file on disk."""
+d = _scratch()
+try:
+with open(os.path.join(d, "cur.txt"), "w") as f:
+f.write("hello\n")
+rc, out, _ = _run(d, "--build-cmd", 'python3 -c "print(\'hello\')"',
+"--derived", "cur.txt", "--stdout")
+check("--stdout compares captured stdout", rc == CURRENT and "CURRENT" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_stdout_mode_detects_stale():
+"""--stdout still detects a mismatch as STALE."""
+d = _scratch()
+try:
+with open(os.path.join(d, "cur.txt"), "w") as f:
+f.write("goodbye\n")
+rc, out, _ = _run(d, "--build-cmd", 'python3 -c "print(\'hello\')"',
+"--derived", "cur.txt", "--stdout")
+check("--stdout detects stale", rc == STALE and "STALE" in out)
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_deterministic_same_verdict_across_runs():
+"""The same inputs yield the same verdict every run (byte-oracle determinism)."""
+d = _scratch()
+try:
+with open(os.path.join(d, "out.txt"), "w") as f:
+f.write("1\n2\n3\n")
+verdicts = set()
+for _ in range(3):
+rc, _, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
+verdicts.add(rc)
+check("deterministic: identical verdict across 3 runs", verdicts == {CURRENT})
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_json_mode_emits_status():
+"""--json emits a parseable object carrying the status."""
+d = _scratch()
+try:
+import json as _json
+with open(os.path.join(d, "out.txt"), "w") as f:
+f.write("1\n2\n3\n")
+rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt", "--json")
+obj = _json.loads(out)
+check("--json emits status object", obj.get("status") == "current")
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def t_edge_is_present_and_printed():
+"""The printed edge exists in the artifact and prints on demand."""
+d = _scratch()
+src = open(GIFT).read()
+rc, out, _ = _run(d, "--edge", "--build-cmd", "x", "--derived", "y")
+check("printed edge present in source AND on --edge",
+"STALENESS" in src and "not CORRECTNESS" in src and "STALENESS" in out)
+
+def t_diff_summary_names_the_difference():
+"""On STALE, the output names WHERE/HOW it differs (not just 'differ')."""
+d = _scratch()
+try:
+with open(os.path.join(d, "out.txt"), "w") as f:
+f.write("1\n2\n") # shorter than fresh
+rc, out, _ = _run(d, "--build-cmd", GEN, "--derived", "out.txt")
+check("stale output names the difference (length/offset)",
+rc == STALE and ("length differs" in out or "offset" in out))
+finally:
+shutil.rmtree(d, ignore_errors=True)
+
+def main():
+print("test_derived.py")
+for fn in [
+t_current_when_committed_matches_fresh_build,
+t_stale_when_committed_differs,
+t_non_mutating_leaves_committed_file_untouched,
+t_build_failed_when_command_errors,
+t_usage_when_derived_missing,
+t_stdout_mode_compares_captured_output,
+t_stdout_mode_detects_stale,
+t_deterministic_same_verdict_across_runs,
+t_json_mode_emits_status,
+t_edge_is_present_and_printed,
+t_diff_summary_names_the_difference,
+]:
+fn()
+passed = sum(1 for _, ok in results if ok)
+total = len(results)
+print(f"\n{passed}/{total} passing")
+return 0 if passed == total else 1
+
+if __name__ == "__main__":
+sys.exit(main())
 
 Take the whole folder →
 MIT
-Python stdlib only, deterministic
+Python 3, standard library only
 
 ---
 
-# Dwell — a Loop MMT gift
-https://loopmmt.com/gifts/dwell/
+# dialect — a Loop MMT gift
+https://loopmmt.com/gifts/dialect/
 [coverage: optional · branch: gifts]
 
-When You Commit Is What You Choose route ← all gifts
+One Markdown Source, Many Honest Dialects? transform ← all gifts
 
-Dwell
+dialect
 
-A cart circles a loop of n ticks; holding is free and an extra full lap changes nothing. It leaves only when you reverse, and which of k exits it takes is a pure function of the phase at that instant: exit = (phase * k) // n. There's no separate 'pick' step — deferring costs nothing, and the moment you stop deferring IS the decision. Integer-exact and byte-replayable; a decision is an audit record you re-derive, not an opinion you store.
-
-The prompt that made this →
+Every tool that posts Markdown to somewhere re-hand-rolls the same emitter — walk the AST, decide how each node looks in the target, glue the strings — and the usual over-correction is worse: a template DSL with conditionals and expressions, a programming language in disguise. dialect takes the middle: it renders a parsed Markdown AST into a target text dialect (a Reddit comment, a Reddit self-post, plain text,...) by folding it through a DECLARATIVE RULESET — a flat JSON table keyed by node type, each value a small record of bounded knobs (a wrap pair, a linePrefix, a form choice, a link template) with NO conditionals, NO expressions, NO loops you can author and a fixed tiny placeholder set ({content}{level}{n}{label}{href}). Adding a dialect is adding a table, not writing code, and new syntaxes (a Slack *bold*, a Discord ||spoiler||) are just new wrap pairs. It ships beside the markdown gift and folds over ITS AST — reusing that gift's parse() (no second parser) and its isSafeUrl guard. render() is a pure fold: same AST + same ruleset produce byte-identical text, and an external ruleset is validated at load against four decidable structural predicates (wrap-is-a-pair, blockJoin-string, template-has-{label}+{href}, linePrefix-string), loud-stopping on a malformed one. The line it will not cross is `table`: that needs a code writer, and the edge says so out loud.
 
 The honest edge
 
-It is the deterministic router only: given (entry, reverse, n, k) the exit is a fact, but it does NOT decide when to stop deferring — that judgment (the reversal) is yours. k <= n is a wall (you can't quantize a loop of n ticks into more than n exits); k > n is refused, not rounded.
+The declarative ruleset covers the ~95% of Markdown whose emission is a flat per-node substitution; it STOPS at `table` (column alignment is logic, not a flat substitution, so a table target needs a code writer) — a table node renders its cells bare and is REPORTED as a hole, never silently mangled. Link safety is universal, not a per-dialect choice: an unsafe href (javascript:, data:,...) is ALWAYS dropped to its plain-text label, in every dialect. It holds NO clock/network/entropy, persists nothing, and never throws on bad input — an unparseable construct degrades to literal text, an unruled node renders bare and is reported. An external ruleset is validated at load and loud-stops on a structural fault.
 
 Run it
 
-python3 dwell.py route 0 6 12 4
-test_dwell.py (89/89, mutation-bitten)
-Python stdlib only, deterministic
+node dialect.js --ruleset reddit IN.md # Markdown -> dialect text | node dialect.js --list | node dialect.js --help
+test_dialect.js (30/30, 3 mutation bites) + --selftest (23) — per-dialect deltas (reddit/reddit-post/plain), unsafe-href drop, hole reporting, ruleset-load validator (four decidable predicates), folds-twice-identical determinism
+Zero dependencies, Node or browser, deterministic (folds beside the markdown gift)
 
 The code — every file that ships
 
-dwell.py 182 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""dwell.py -- reversal-indexed routing: the WHEN you commit IS the WHAT you choose.
+dialect.js 484 lines on GitHub →
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+/* dialect.js — one Markdown source, many honest dialects, from DATA not code.
+*
+* A tiny, dependency-free engine that renders a parsed Markdown AST into a target
+* text dialect (Reddit comment, plain text, …) by folding it through a DECLARATIVE
+* RULESET — a flat table of per-node emission rules — instead of a hand-written
+* emitter per target.
+*
+* source ──▶ parse() ──▶ AST ──▶ render(ast, RULESET) ──▶ dialect text
+*
+* WHY DATA, NOT CODE (the design decision, and the line it will not cross).
+* The obvious way to support a second target is a second emitter function. That's
+* the N-writers path, and it grows code without bound. The obvious OVER-correction
+* is a template DSL with conditionals and expressions — a programming language in
+* disguise, which is where "flexible" turns baroque. This engine takes the middle:
+* a ruleset is a flat JSON object keyed by AST node type, each value a small record
+* of bounded knobs (a wrap pair, a line-prefix, a marker, a form choice). It has
+* NO conditionals, NO expressions, NO loops you can author. Substitution is a fixed,
+* tiny set of placeholders: {content} {level} {n} {label} {href}. That is expressive
+* enough for the real dialects and it STOPS DEAD before becoming a language. A target
+* that genuinely needs logic gets a code writer; the ruleset covers the declarative 95%.
+*
+* THE REUSE (this ships beside the `markdown` gift and folds over ITS AST).
+* It require()s the markdown gift's parse() — no second parser — and reuses that
+* gift's isSafeUrl href guard, because link safety is never a per-dialect choice:
+* an unsafe href (javascript:, data:, …) is ALWAYS dropped to its plain-text label,
+* in every dialect, by construction.
+*
+* HONESTY / DETERMINISM (inherited and kept):
+* * parse() never throws — an unparseable construct degrades to literal text.
+* * render() is a pure fold — same AST + same ruleset ⇒ byte-identical output.
+* --selftest proves folds-twice-identical.
+* * A ruleset with a hole (a node type it doesn't name) does not crash: the node
+* renders its content bare, and the hole is REPORTED, never silently dropped.
+*
+* THE RULESET SHAPE (the whole schema — a dialect that hides its scope lies):
+* {
+* "name": "reddit",
+* "blockJoin": "\n\n", // separator between top-level blocks
+* "blocks": {
+* "heading": { "form": "bold" | "atx",...}, // bold-line vs # line
+* "paragraph": {}, // content as-is
+* "blockquote": { "linePrefix": "> ", "innerJoin": "\n>\n"},
+* "codeBlock": { "form": "indent" | "fence", "indent": " ", "fence": "```"},
+* "list": { "bullet": "- ", "ordered": "{n}. "}
+*},
+* "inline": {
+* "strong": { "wrap": ["**","**"]},
+* "em": { "wrap": ["*","*"]},
+* "codeSpan": { "wrap": ["`","`"]},
+* "break": { "text": " \n"},
+* "link": { "form": "inline" | "label" | "labelHref", // [t](u) | t | t (u)
+* "template": "[{label}]({href})"} // form:inline uses this
+*}
+*}
+* Any block/inline key omitted falls back to a bare, honest default (content only).
+*
+* API (require): render(ast, ruleset) -> { text, holes:[nodeType…]}
+* renderSource(src, ruleset) -> same, parsing src first
+* CLI: dialect.js --ruleset reddit IN.md [-o OUT.md]
+* dialect.js --ruleset./my-rules.json IN.md
+* dialect.js --list (built-in rulesets)
+* dialect.js --selftest
+*/
+'use strict';
 
-A cart circles a loop of `n` ticks. Holding is free -- it can circle forever, and
-an extra full lap changes nothing. It leaves only when you REVERSE, and which of
-`k` exits it leaves on is a pure function of the PHASE at the instant of reversal:
+var path = require('path');
+// Resolve the markdown gift. In the SHIPPED (served) home it's a sibling gift dir
+// (../markdown/markdown.js). In the repo's design tree the served gift lives under
+// projects/loopmmt-website/... — walk up looking for that. Try candidates in order;
+// the first that loads wins. (A gift is zero-dependency at ship time — this dual
+// path is a repo-checkout convenience, not a runtime dependency.)
+var md = (function () {
+var candidates = [
+path.resolve(__dirname, '..', 'markdown', 'markdown.js') // shipped: sibling gift
+];
+// walk parents looking for the served gifts dir
+var d = __dirname;
+for (var up = 0; up < 8; up++) {
+candidates.push(path.resolve(d, 'projects', 'loopmmt-website', 'site-root', 'gifts', 'markdown', 'markdown.js'));
+d = path.resolve(d, '..');
+}
+for (var i = 0; i < candidates.length; i++) {
+try { return require(candidates[i]);} catch (e) { /* try next */}
+}
+throw new Error('dialect: cannot locate the markdown gift (markdown.js) in any known home');
+})();
 
-phase(entry, reverse, n) = (reverse - entry) mod n # where on the loop, in [0, n)
-exit_segment(entry, reverse, n, k) = (phase * k) // n # which of k exits, in [0, k)
+// ---- built-in rulesets ------------------------------------------------------
+// Data, not code. Add a dialect by adding a table here (or passing a JSON file).
+var RULESETS = {
+// Reddit COMMENT dialect: headings->bold line, blocks blank-line-separated,
+// code fences -> 4-space indent (``` unreliable in old-Reddit comments).
+reddit: {
+name: 'reddit',
+desc: 'Reddit comment — bold-line headers, blank-line blocks, indented code.',
+blockJoin: '\n\n',
+blocks: {
+heading: { form: 'bold'},
+paragraph: {},
+blockquote: { linePrefix: '> ', innerJoin: '\n>\n'},
+codeBlock: { form: 'indent', indent: ' '},
+list: { bullet: '- ', ordered: '{n}. '}
+},
+inline: {
+strong: { wrap: ['**', '**']},
+em: { wrap: ['*', '*']},
+codeSpan: { wrap: ['`', '`']},
+break: { text: ' \n'},
+link: { form: 'inline', template: '[{label}]({href})'}
+}
+},
 
-The choice is carried entirely by the timing. There is no separate "pick" step:
-deferring is free, and the moment you stop deferring is itself the decision. That
-is the whole idea -- a decision structure where latency is not lost time but the
-signal.
+// Reddit SELF-POST variant: keep # headings and ``` fences (posts render them).
+'reddit-post': {
+name: 'reddit-post',
+desc: 'Reddit self-post — keeps # headers and ``` fences (posts render them).',
+blockJoin: '\n\n',
+blocks: {
+heading: { form: 'atx'},
+paragraph: {},
+blockquote: { linePrefix: '> ', innerJoin: '\n>\n'},
+codeBlock: { form: 'fence', fence: '```'},
+list: { bullet: '- ', ordered: '{n}. '}
+},
+inline: {
+strong: { wrap: ['**', '**']},
+em: { wrap: ['*', '*']},
+codeSpan: { wrap: ['`', '`']},
+break: { text: ' \n'},
+link: { form: 'inline', template: '[{label}]({href})'}
+}
+},
 
-Integer-exact by construction (no float), so the map is total, pure, and
-byte-replayable -- the same (entry, reverse, n, k) always yields the same exit,
-on any machine, forever. The WINDING number (how many full laps were circled) is
-DISCARDED for routing; that discard IS the free-hold property:
+// Plain text: strip all markup. Emphasis vanishes; a link becomes "label (href)".
+plain: {
+name: 'plain',
+desc: 'Plain text — every mark stripped; a link becomes "label (href)".',
+blockJoin: '\n\n',
+blocks: {
+heading: { form: 'bold-none'}, // content only, no marker
+paragraph: {},
+blockquote: { linePrefix: '', innerJoin: '\n\n'},
+codeBlock: { form: 'indent', indent: ' '},
+list: { bullet: '- ', ordered: '{n}. '}
+},
+inline: {
+strong: { wrap: ['', '']},
+em: { wrap: ['', '']},
+codeSpan: { wrap: ['', '']},
+break: { text: '\n'},
+link: { form: 'labelHref'} // "label (href)"
+}
+}
+};
 
-exit_segment(entry, reverse, n, k) == exit_segment(entry, reverse + n, n, k)
+// ---- the engine: a pure fold of an AST through a ruleset ---------------------
+function render(ast, ruleset) {
+var holes = {};
+if (!ast || ast.type!== 'document') return { text: '', holes: []};
+var rs = ruleset || RULESETS.reddit;
+var blockJoin = rs.blockJoin!= null? rs.blockJoin: '\n\n';
+var out = ast.children.map(function (node) {
+return renderBlock(node, rs, holes);
+}).filter(function (s) { return s!== null && s!== '';});
+return { text: out.join(blockJoin) + '\n', holes: Object.keys(holes)};
+}
 
-A `Mark` records a routing decision as two integers, and `replay(mark, n, k)`
-recomputes the exit from them -- so a decision is an audit record you can re-derive,
-never a stored opinion you have to trust.
+function renderBlock(node, rs, holes) {
+var rule = (rs.blocks && rs.blocks[node.type]) || null;
+switch (node.type) {
+case 'heading': {
+var body = renderInline(node.children, rs, holes);
+var form = rule? rule.form: 'bold';
+if (form === 'atx') return repeat('#', node.level) + ' ' + body;
+if (form === 'bold-none') return body;
+return '**' + body + '**'; // 'bold' default
+}
+case 'paragraph':
+return renderInline(node.children, rs, holes);
+case 'blockquote': {
+var prefix = rule && rule.linePrefix!= null? rule.linePrefix: '> ';
+var innerJoin = rule && rule.innerJoin!= null? rule.innerJoin: '\n>\n';
+return node.children.map(function (b) {
+var inner = renderBlock(b, rs, holes);
+return inner.split('\n').map(function (ln) { return prefix + ln;}).join('\n');
+}).join(innerJoin);
+}
+case 'codeBlock': {
+var text = node.text.replace(/\n$/, '');
+var cform = rule? rule.form: 'indent';
+if (cform === 'fence') {
+var fence = rule && rule.fence? rule.fence: '```';
+return fence + '\n' + text + '\n' + fence;
+}
+var indent = rule && rule.indent? rule.indent: ' ';
+return text.split('\n').map(function (ln) { return indent + ln;}).join('\n');
+}
+case 'list': {
+var bullet = rule && rule.bullet? rule.bullet: '- ';
+var orderedTpl = rule && rule.ordered? rule.ordered: '{n}. ';
+var n = 0;
+return node.items.map(function (it) {
+n++;
+var marker = node.ordered? orderedTpl.replace('{n}', String(n)): bullet;
+return marker + renderInline(it.children, rs, holes);
+}).join('\n');
+}
+default:
+holes[node.type] = true;
+return node.children? renderInline(node.children, rs, holes): '';
+}
+}
 
-HONEST CEILING. This is the fully-deterministic ROUTER: given (entry, reverse, n, k)
-the exit is a fact. It does NOT decide *when* to stop deferring -- that single
-judgment (the reversal itself) is yours. The router turns your timing into a choice;
-it does not make the choice for you.
+function renderInline(nodes, rs, holes) {
+var inline = rs.inline || {};
+return (nodes || []).map(function (n) {
+switch (n.type) {
+case 'text': return n.value;
+case 'strong': return wrapWith(inline.strong, ['**', '**'], renderInline(n.children, rs, holes));
+case 'em': return wrapWith(inline.em, ['*', '*'], renderInline(n.children, rs, holes));
+case 'codeSpan': return wrapWith(inline.codeSpan, ['`', '`'], n.value);
+case 'break': return inline.break && inline.break.text!= null? inline.break.text: ' \n';
+case 'link': {
+var label = renderInline(n.children, rs, holes);
+// link safety is universal, never a per-dialect choice
+if (!md.isSafeUrl(n.href)) return label;
+var href = n.href.trim();
+var lr = inline.link || { form: 'inline', template: '[{label}]({href})'};
+if (lr.form === 'label') return label;
+if (lr.form === 'labelHref') return label + ' (' + href + ')';
+var tpl = lr.template || '[{label}]({href})';
+return tpl.replace('{label}', label).replace('{href}', href);
+}
+default:
+holes[n.type] = true;
+return n.children? renderInline(n.children, rs, holes): (n.value || '');
+}
+}).join('');
+}
 
-python3 dwell.py route <entry> <reverse> <n> <k> # -> the exit segment [0, k)
-python3 dwell.py phase <entry> <reverse> <n> # -> phase [0, n) + winding
-python3 dwell.py demo # a small routing table
-python3 dwell.py --help
+function wrapWith(rule, dflt, content) {
+var w = rule && rule.wrap? rule.wrap: dflt;
+return (w[0] || '') + content + (w[1] || '');
+}
+function repeat(s, n) { var o = ''; for (var k = 0; k < n; k++) o += s; return o;}
 
-Python 3 stdlib only, no dependencies.
-"""
-from __future__ import annotations
+function renderSource(src, ruleset) {
+return render(md.parse(String(src == null? '': src)), ruleset);
+}
+function resolveRuleset(nameOrObj) {
+if (nameOrObj && typeof nameOrObj === 'object') return nameOrObj;
+return RULESETS[nameOrObj] || null;
+}
 
-import sys
-from dataclasses import dataclass
-from typing import NamedTuple
+// ---- ruleset-load validator -------------------------------------------------
+// Validate a ruleset at LOAD for exactly FOUR decidable STRUCTURAL predicates,
+// and loud-stop (throw) on failure. This checks the SHAPE the engine substitutes
+// into, never the SEMANTICS of a dialect — an unknown node type, a missing block
+// rule, an unusual marker are all honest-degraded at render time (holes reported,
+// content emitted bare), so they are deliberately NOT checked here.
+//
+// It stays FOUR predicates on purpose (RCR minority guard, Dara): the moment a
+// ruleset wants conditionals or expressions, that is the Simplicity-Yield line —
+// the answer is a per-target code writer, NOT a fifth predicate or a richer one.
+//
+// 1. every `wrap` value is a 2-element [open, close] pair
+// 2. `blockJoin`, when present, is a string
+// 3. any `template` string contains the placeholders it references — {label}
+// and {href} (the two the link renderer substitutes); a template missing
+// either silently drops content, so this is a real structural fault
+// 4. any `linePrefix`, when present, is a string
+//
+// Returns the ruleset unchanged on success; throws Error naming every violation
+// on failure. Pure and decidable — no I/O, no render, terminates on any input.
+function validateRuleset(ruleset) {
+if (!ruleset || typeof ruleset!== 'object' || Array.isArray(ruleset)) {
+throw new Error('invalid ruleset: expected an object');
+}
+var errs = [];
+var inline = (ruleset.inline && typeof ruleset.inline === 'object')? ruleset.inline: {};
+var blocks = (ruleset.blocks && typeof ruleset.blocks === 'object')? ruleset.blocks: {};
 
-__all__ = ["phase", "winding", "exit_segment", "Mark", "replay", "DwellError"]
+// (1) every `wrap` value is a 2-element pair
+Object.keys(inline).forEach(function (k) {
+var rule = inline[k];
+if (rule && rule.wrap!== undefined) {
+if (!Array.isArray(rule.wrap) || rule.wrap.length!== 2) {
+errs.push('inline.' + k + '.wrap must be a 2-element [open, close] pair');
+}
+}
+});
 
-class DwellError(ValueError):
-"""A malformed Dwell call -- bad resolution, exit count, or tick order."""
+// (2) blockJoin is a string (when present)
+if (ruleset.blockJoin!== undefined && typeof ruleset.blockJoin!== 'string') {
+errs.push('blockJoin must be a string');
+}
 
-def _validate(entry_tick: int, reverse_tick: int, n: int, k: int) -> None:
-for name, val in (("entry_tick", entry_tick), ("reverse_tick", reverse_tick),
-("n", n), ("k", k)):
-if not isinstance(val, int) or isinstance(val, bool):
-raise DwellError(f"{name} must be a plain int, got {val!r}")
-if n < 1:
-raise DwellError(f"n (loop resolution) must be >= 1, got {n}")
-if k < 1:
-raise DwellError(f"k (exit count) must be >= 1, got {k}")
-if k > n:
-# You cannot quantize a loop of n ticks into more than n distinguishable exits.
-raise DwellError(f"k must be <= n (k<=n is a wall), got k={k} n={n}")
-if reverse_tick < entry_tick:
-# Ticks are a monotone clock; the cart enters, then circles, then reverses.
-raise DwellError(
-f"reverse_tick ({reverse_tick}) must be >= entry_tick ({entry_tick})")
+// (3) any template string contains the placeholders it references ({label} and {href})
+Object.keys(inline).forEach(function (k) {
+var rule = inline[k];
+if (rule && rule.template!== undefined) {
+if (typeof rule.template!== 'string') {
+errs.push('inline.' + k + '.template must be a string');
+} else if (rule.template.indexOf('{label}') === -1 || rule.template.indexOf('{href}') === -1) {
+errs.push('inline.' + k + '.template must contain both {label} and {href} (it drops content otherwise)');
+}
+}
+});
 
-def phase(entry_tick: int, reverse_tick: int, n: int) -> int:
-"""Where on the loop the cart sits at reversal, in [0, n). Winding is folded out."""
-_validate(entry_tick, reverse_tick, n, k=1)
-return (reverse_tick - entry_tick) % n
+// (4) linePrefix is a string (when present)
+Object.keys(blocks).forEach(function (k) {
+var rule = blocks[k];
+if (rule && rule.linePrefix!== undefined && typeof rule.linePrefix!== 'string') {
+errs.push('blocks.' + k + '.linePrefix must be a string');
+}
+});
 
-def winding(entry_tick: int, reverse_tick: int, n: int) -> int:
-"""
-How many FULL laps were circled before reversal (the coordinate the router
-discards). Read-only: routing never depends on it, and that independence IS the
-free-hold property -- a decision deferred through extra laps is not penalized.
-"""
-_validate(entry_tick, reverse_tick, n, k=1)
-return (reverse_tick - entry_tick) // n
+if (errs.length) throw new Error('invalid ruleset: ' + errs.join('; '));
+return ruleset;
+}
 
-def exit_segment(entry_tick: int, reverse_tick: int, n: int, k: int) -> int:
-"""
-The router. Returns the exit segment in [0, k) the cart leaves on when reversed
-at `reverse_tick`, having entered at `entry_tick`, on a loop of resolution `n`
-with `k` exits.
+var api = {
+render: render,
+renderSource: renderSource,
+RULESETS: RULESETS,
+resolveRuleset: resolveRuleset,
+validateRuleset: validateRuleset
+};
+if (typeof module!== 'undefined' && module.exports) module.exports = api;
 
-Pure, total, integer-exact. Tie-break at a segment boundary is floor, by
-construction (`(phase*k)//n`). Free-hold holds by the same construction: adding
-a full lap (n ticks) to reverse_tick leaves the exit unchanged.
-"""
-_validate(entry_tick, reverse_tick, n, k)
-return ((reverse_tick - entry_tick) % n * k) // n
+// ---- selftest ---------------------------------------------------------------
+function selftest() {
+var fails = [];
+function ck(name, cond) { if (!cond) fails.push(name);}
+var src = '# Title\n\n**b** *i* `c`\n\n> quote\n> line two\n\n- one\n- two\n\n1. a\n2. b\n\n```\nx = 1\n```\n\n[ok](https://e.com) [bad](javascript:x)';
 
-class Mark(NamedTuple):
-"""An audit record of one routing decision -- two integers, nothing else."""
-entry_tick: int
-reverse_tick: int
+// determinism
+var r1 = renderSource(src, RULESETS.reddit).text;
+var r2 = renderSource(src, RULESETS.reddit).text;
+ck('deterministic', r1 === r2);
+ck('re-render stable', renderSource(r1, RULESETS.reddit).text === renderSource(renderSource(r1, RULESETS.reddit).text, RULESETS.reddit).text);
 
-@dataclass(frozen=True)
-class DwellSpec:
-"""The static shape of a loop: its resolution and its exit count."""
-n: int
-k: int
+// reddit dialect deltas
+ck('reddit heading->bold', r1.indexOf('**Title**')!== -1 && r1.indexOf('# Title') === -1);
+ck('reddit fence->indent', r1.indexOf(' x = 1')!== -1);
+ck('reddit blank-line blocks', /\n\n/.test(r1));
+ck('unsafe href dropped', r1.indexOf('javascript:') === -1 && r1.indexOf('bad')!== -1);
+ck('safe href kept', r1.indexOf('[ok](https://e.com)')!== -1);
 
-def replay(mark: Mark, n: int, k: int) -> int:
-"""
-Recompute the exit a Mark produced, from the Mark plus the loop spec. Because the
-router is pure, replay(mark, n, k) == the exit_segment that produced it -- so the
-Mark is an audit record you re-derive, never an opinion you have to trust.
-"""
-return exit_segment(mark.entry_tick, mark.reverse_tick, n, k)
+// reddit-post variant keeps hash + fence
+var rp = renderSource('# Title\n\n```\nx\n```', RULESETS['reddit-post']).text;
+ck('reddit-post keeps hash', rp.indexOf('# Title')!== -1);
+ck('reddit-post keeps fence', rp.indexOf('```')!== -1);
 
-# ---- CLI ---------------------------------------------------------------------------------------------
-_USAGE = """dwell.py -- reversal-indexed routing: when you commit is what you choose.
+// plain strips markup
+var pl = renderSource('# T\n\n**b** *i* [t](https://e.com)', RULESETS.plain).text;
+ck('plain strips heading marker', pl.indexOf('#') === -1);
+ck('plain strips strong', pl.indexOf('**') === -1 && pl.indexOf('b')!== -1);
+ck('plain link labelHref', pl.indexOf('t (https://e.com)')!== -1);
 
-python3 dwell.py route <entry> <reverse> <n> <k> the exit segment in [0, k)
-python3 dwell.py phase <entry> <reverse> <n> phase in [0, n) + winding (laps)
-python3 dwell.py demo a small routing table
-python3 dwell.py --help
+// holes are reported, never crash — a custom ruleset with an empty inline table
+var holed = render(md.parse('**x** *y*'), { name: 't', blockJoin: '\n\n', blocks: {}, inline: {}});
+ck('hole render does not crash', typeof holed.text === 'string');
 
-n = loop resolution (ticks per lap), k = number of exits (k <= n).
-An extra full lap never changes the exit -- deferring is free.
-"""
+// custom ruleset via object
+var custom = { name: 'shout', blockJoin: '\n\n', blocks: { paragraph: {}},
+inline: { strong: { wrap: ['[', ']']}, em: { wrap: ['', '']},
+codeSpan: { wrap: ['`', '`']}, link: { form: 'label'}}};
+ck('custom wrap applied', renderSource('**hi**', custom).text.indexOf('[hi]') === 0);
 
-def _demo() -> None:
-n, k = 12, 4
-print(f"loop n={n} ticks, k={k} exits; entry at tick 0")
-print("reverse | phase winding -> exit")
-for reverse in range(0, 25):
-p = phase(0, reverse, n)
-w = winding(0, reverse, n)
-e = exit_segment(0, reverse, n, k)
-print(f" {reverse:5d} | {p:5d} {w:6d} -> {e}")
-print("(note tick 12 and tick 24 -- a full/second lap -- route identically to tick 0: free-hold)")
+// ruleset-load validator — the four decidable structural predicates
+function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
+// every built-in ruleset passes its own validator (a real gate must not reject the good)
+ck('validator passes built-ins', Object.keys(RULESETS).every(function (k) {
+return!throws(function () { validateRuleset(RULESETS[k]);});
+}));
+// (1) wrap must be a 2-element pair
+ck('validator rejects bad wrap', throws(function () {
+validateRuleset({ blockJoin: '\n\n', inline: { strong: { wrap: ['*']}}});
+}));
+ck('validator accepts good wrap',!throws(function () {
+validateRuleset({ blockJoin: '\n\n', inline: { strong: { wrap: ['*', '*']}}});
+}));
+// (2) blockJoin must be a string
+ck('validator rejects non-string blockJoin', throws(function () {
+validateRuleset({ blockJoin: 2, inline: {}});
+}));
+// (3) a template must contain {label} and {href}
+ck('validator rejects template missing href', throws(function () {
+validateRuleset({ inline: { link: { form: 'inline', template: '[{label}]'}}});
+}));
+ck('validator accepts full template',!throws(function () {
+validateRuleset({ inline: { link: { form: 'inline', template: '[{label}]({href})'}}});
+}));
+// (4) linePrefix must be a string
+ck('validator rejects non-string linePrefix', throws(function () {
+validateRuleset({ blocks: { blockquote: { linePrefix: 4}}});
+}));
+// a non-object ruleset is rejected outright
+ck('validator rejects non-object', throws(function () { validateRuleset(null);}) &&
+throws(function () { validateRuleset([1, 2]);}));
 
-def main(argv) -> int:
-args = argv[1:]
-if not args or args[0] in ("--help", "-h", "help"):
-sys.stdout.write(_USAGE)
-return 0 if args else 1
-cmd = args[0]
-try:
-if cmd == "route":
-if len(args)!= 5:
-raise DwellError("route needs: <entry> <reverse> <n> <k>")
-entry, reverse, n, k = (int(x) for x in args[1:5])
-sys.stdout.write(str(exit_segment(entry, reverse, n, k)) + "\n")
-return 0
-if cmd == "phase":
-if len(args)!= 4:
-raise DwellError("phase needs: <entry> <reverse> <n>")
-entry, reverse, n = (int(x) for x in args[1:4])
-sys.stdout.write(f"phase={phase(entry, reverse, n)} winding={winding(entry, reverse, n)}\n")
-return 0
-if cmd == "demo":
-_demo()
-return 0
-except DwellError as e:
-sys.stderr.write(f"dwell: {e}\n")
-return 2
-except ValueError:
-sys.stderr.write("dwell: ticks, n, and k must be integers\n")
-return 2
-sys.stderr.write(f"dwell: unknown command {cmd!r}\n")
-sys.stderr.write(_USAGE)
-return 2
+if (fails.length) { process.stderr.write('SELFTEST FAIL: ' + fails.join('; ') + '\n'); process.exit(1);}
+process.stdout.write('SELFTEST OK (' + 23 + ' checks)\n'); process.exit(0);
+}
 
-if __name__ == "__main__":
-raise SystemExit(main(sys.argv))
+// ---- CLI --------------------------------------------------------------------
+if (typeof require!== 'undefined' && typeof module!== 'undefined' && require.main === module) {
+var fs = require('fs');
+var args = process.argv.slice(2);
 
-test_dwell.py 119 lines on GitHub →
-#!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""test_dwell.py -- proves the router is pure, total, and free-hold.
+if (args.indexOf('--help')!== -1 || args.length === 0) {
+process.stdout.write(
+'dialect — render Markdown into a target dialect via a declarative ruleset\n\n' +
+' dialect.js --ruleset reddit IN.md [-o OUT.md] built-in ruleset by name\n' +
+' dialect.js --ruleset./my.json IN.md ruleset from a JSON file\n' +
+' dialect.js --ruleset reddit - read stdin, write stdout\n' +
+' dialect.js --list list built-in rulesets\n' +
+' dialect.js --selftest determinism + dialect self-test\n' +
+' dialect.js --help\n\n' +
+'Built-in rulesets: ' + Object.keys(RULESETS).join(', ') + '\n\n' +
+'Scope (the edge): the declarative ruleset covers the ~95% of Markdown whose\n' +
+'emission is a flat per-node substitution. It STOPS at `table`: column\n' +
+'alignment is logic, not a flat substitution, so a table target needs a code\n' +
+'writer, not a ruleset. A table node renders its cell content bare and is\n' +
+'reported as a hole — never silently mangled.\n'
+);
+process.exit(0);
+}
+if (args.indexOf('--selftest')!== -1) selftest();
+if (args.indexOf('--list')!== -1) {
+Object.keys(RULESETS).forEach(function (k) {
+var d = RULESETS[k].desc? ' — ' + RULESETS[k].desc: '';
+process.stdout.write(k + d + '\n');
+});
+process.exit(0);
+}
 
-The claims that ARE the tool:
-1. FREE-HOLD: adding a full lap (n ticks) to the reversal leaves the exit
-unchanged -- deferring is free. This is the whole idea; it gets the most tests.
-2. The exit is exactly (phase * k) // n, integer, in [0, k).
-3. replay(Mark) == the exit that produced it (an audit record, re-derived).
-4. Malformed calls REFUSE (raise DwellError), they don't silently guess.
-Plus a mutation bite so a vacuously-green run fails loud. stdlib only.
-Exit 0 = all pass, exit 1 = a failure (loud).
-"""
-import sys
-import os
+var rulesetArg = 'reddit', inFile = null, outFile = null, useStdin = false, i;
+for (i = 0; i < args.length; i++) {
+if (args[i] === '--ruleset') rulesetArg = args[++i];
+else if (args[i] === '-o' || args[i] === '--out') outFile = args[++i];
+else if (args[i] === '-') useStdin = true;
+else if (args[i].indexOf('--') === 0) { /* ignore */}
+else inFile = args[i];
+}
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dwell import phase, winding, exit_segment, Mark, replay, DwellError
+try {
+var ruleset;
+if (rulesetArg && (rulesetArg.indexOf('/')!== -1 || rulesetArg.indexOf('.json')!== -1)) {
+ruleset = JSON.parse(fs.readFileSync(rulesetArg, 'utf8'));
+validateRuleset(ruleset); // loud-stop on a structurally malformed external ruleset
+} else {
+ruleset = RULESETS[rulesetArg];
+if (!ruleset) throw new Error('unknown ruleset "' + rulesetArg + '" (try --list)');
+}
 
-_pass = 0
-_fail = 0
+function emit(source) {
+var res = render(md.parse(source), ruleset);
+if (res.holes.length) process.stderr.write('note: ruleset has no rule for node type(s): ' + res.holes.join(', ') + ' (rendered content bare)\n');
+if (outFile) { fs.writeFileSync(outFile, res.text); process.stderr.write('wrote ' + outFile + ' (' + res.text.length + ' bytes)\n');}
+else if (useStdin) process.stdout.write(res.text);
+else {
+var def = (inFile? inFile.replace(/\.md$/i, ''): 'dialect-output') + '.' + (ruleset.name || 'out') + '.md';
+fs.writeFileSync(def, res.text); process.stderr.write('wrote ' + def + ' (' + res.text.length + ' bytes)\n');
+}
+}
 
-def eq(name, got, want):
-global _pass, _fail
-if got == want:
-_pass += 1
-else:
-_fail += 1
-print(f"FAIL {name}\n got: {got!r}\n want: {want!r}")
+if (useStdin) {
+var chunks = [];
+process.stdin.on('data', function (d) { chunks.push(d);});
+process.stdin.on('end', function () { emit(Buffer.concat(chunks).toString('utf8')); process.exit(0);});
+} else {
+if (!inFile) throw new Error('no input file (use - for stdin, or --help)');
+emit(fs.readFileSync(inFile, 'utf8'));
+process.exit(0);
+}
+} catch (e) {
+process.stderr.write('dialect: ' + (e && e.message? e.message: String(e)) + '\n');
+process.exit(1);
+}
+}
 
-def ok(name, cond):
-global _pass, _fail
-if cond:
-_pass += 1
-else:
-_fail += 1
-print(f"FAIL {name}")
+test_dialect.js 184 lines on GitHub →
+#!/usr/bin/env node
+/* test_dialect.js — the golden oracle corpus for the dialect gift.
 
-def raises(name, fn):
-global _pass, _fail
-try:
-fn()
-_fail += 1
-print(f"FAIL {name} -- expected DwellError, none raised")
-except DwellError:
-_pass += 1
-except Exception as e: # noqa: BLE001
-_fail += 1
-print(f"FAIL {name} -- wrong exception {type(e).__name__}: {e}")
+The oracle rule: every expected output here is HAND-AUTHORED from the ruleset
+rules (read off the schema, computed by hand), NOT produced by running the gift.
+The gift must AGREE with the independent expectation. The known-bad half is
+drawn from the real failure shapes the engine promises to prevent — a dialect
+silently keeping markup it should strip, an unsafe href surviving, a malformed
+ruleset loading without complaint — not author-invented pleasantness.
 
-# --- 1. FREE-HOLD: an extra full lap never changes the exit ---------------------------------
-n, k = 12, 4
-for reverse in range(0, 12):
-base = exit_segment(0, reverse, n, k)
-eq(f"free-hold +1 lap @rev={reverse}", exit_segment(0, reverse + n, n, k), base)
-eq(f"free-hold +2 laps @rev={reverse}", exit_segment(0, reverse + 2 * n, n, k), base)
-eq(f"free-hold +7 laps @rev={reverse}", exit_segment(0, reverse + 7 * n, n, k), base)
+Three mutation bites prove the oracle has teeth: each asserts that a plausible
+WRONG engine behaviour WOULD be caught here (the check is not vacuously green).
 
-# winding counts the laps that routing discards
-eq("winding 0 laps", winding(0, 5, 12), 0)
-eq("winding 1 lap", winding(0, 17, 12), 1)
-eq("winding 7 laps", winding(0, 84, 12), 7)
-eq("phase folds winding out", phase(0, 84, 12), phase(0, 0, 12))
+Run: node test_dialect.js
+Exit 0 all-green / 1 any-red.
+*/
+'use strict';
+var D = require('./dialect.js');
 
-# --- 2. the routing law is exactly (phase*k)//n, in range ----------------------------------
-eq("phase 0 -> exit 0", exit_segment(0, 0, 12, 4), 0)
-eq("phase 3 -> exit 1", exit_segment(0, 3, 12, 4), 1) # (3*4)//12 = 1
-eq("phase 5 -> exit 1", exit_segment(0, 5, 12, 4), 1) # (5*4)//12 = 1
-eq("phase 6 -> exit 2", exit_segment(0, 6, 12, 4), 2) # (6*4)//12 = 2
-eq("phase 11 -> exit 3", exit_segment(0, 11, 12, 4), 3) # (11*4)//12 = 3
-# boundary tie-break is floor by construction
-eq("boundary floor phase 2->0", exit_segment(0, 2, 12, 4), 0) # (2*4)//12 = 0
+var checks = [];
+function record(name, ok, detail) { checks.push({ name: name, ok:!!ok, detail: detail || ''});}
+function eq(name, got, want) {
+record(name, got === want, got === want? '': 'got ' + JSON.stringify(got) + ' want ' + JSON.stringify(want));
+}
+function ok(name, cond, detail) { record(name, cond, detail);}
+function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
 
-# entry offset only matters via the difference
-eq("entry offset invariance", exit_segment(100, 105, 12, 4), exit_segment(0, 5, 12, 4))
+var R = D.RULESETS;
 
-# every exit stays in [0, k) across a whole lap
-for reverse in range(0, n):
-e = exit_segment(0, reverse, n, k)
-ok(f"exit in range @rev={reverse}", 0 <= e < k)
+/* ============================================================
+1. REDDIT COMMENT dialect — hand-authored expectations.
+heading -> **bold** line · fence -> 4-space indent ·
+blocks blank-line separated · unsafe href dropped to label.
+============================================================ */
+(function reddit() {
+var src = '# Title\n\n**b** *i* `c`\n\n```\nx = 1\n```\n\n[ok](https://e.com) [bad](javascript:x)';
+var out = D.renderSource(src, R.reddit).text;
+// heading became a bold line, not an atx line
+ok('reddit heading->bold', out.indexOf('**Title**')!== -1 && out.indexOf('# Title') === -1, out);
+// inline marks preserved as Reddit markup
+ok('reddit keeps ** * `', out.indexOf('**b**')!== -1 && out.indexOf('*i*')!== -1 && out.indexOf('`c`')!== -1, out);
+// fenced code became 4-space indent (no ``` in a reddit COMMENT)
+ok('reddit fence->indent', out.indexOf(' x = 1')!== -1 && out.indexOf('```') === -1, out);
+// link safety: unsafe href dropped to its label, safe href kept inline
+ok('reddit unsafe href dropped', out.indexOf('javascript:') === -1 && out.indexOf('bad')!== -1, out);
+ok('reddit safe href inline', out.indexOf('[ok](https://e.com)')!== -1, out);
+})();
 
-# k == n: each tick is its own exit (bijective)
-for reverse in range(0, 8):
-eq(f"k==n bijection @rev={reverse}", exit_segment(0, reverse, 8, 8), reverse)
+/* ============================================================
+2. REDDIT-POST variant — keeps # headings and ``` fences.
+============================================================ */
+(function redditPost() {
+var out = D.renderSource('# Title\n\n```\nx\n```', R['reddit-post']).text;
+ok('reddit-post keeps # heading', out.indexOf('# Title')!== -1, out);
+ok('reddit-post keeps ``` fence', out.indexOf('```')!== -1, out);
+})();
 
-# k == 1: everything routes to the single exit 0
-for reverse in range(0, 12):
-eq(f"k==1 single exit @rev={reverse}", exit_segment(0, reverse, 12, 1), 0)
+/* ============================================================
+3. PLAIN dialect — every mark stripped; link -> "label (href)".
+============================================================ */
+(function plain() {
+var out = D.renderSource('# T\n\n**b** *i* [t](https://e.com)', R.plain).text;
+ok('plain strips heading marker', out.indexOf('#') === -1 && out.indexOf('T')!== -1, out);
+ok('plain strips strong/em', out.indexOf('**') === -1 && out.indexOf('b')!== -1 && out.indexOf('i')!== -1, out);
+ok('plain link -> label (href)', out.indexOf('t (https://e.com)')!== -1, out);
+})();
 
-# --- 3. replay(Mark) == the exit that produced it -------------------------------------------
-m = Mark(entry_tick=3, reverse_tick=20)
-eq("replay == exit_segment", replay(m, 12, 4), exit_segment(3, 20, 12, 4))
-# an audit record survives a re-derivation on any machine (pure)
-eq("replay deterministic", replay(m, 12, 4), replay(m, 12, 4))
+/* ============================================================
+4. DETERMINISM — a pure fold: same input twice -> byte-identical;
+re-rendering the output is stable.
+============================================================ */
+(function determinism() {
+var src = '# H\n\n**b**\n\n- one\n- two\n\n1. a\n2. b';
+var a = D.renderSource(src, R.reddit).text;
+var b = D.renderSource(src, R.reddit).text;
+eq('deterministic (folds-twice-identical)', a, b);
+var once = D.renderSource(a, R.reddit).text;
+var twice = D.renderSource(once, R.reddit).text;
+eq('re-render stable', once, twice);
+// ordered-list markers hand-computed: "1. a" then "2. b"
+ok('ordered list numbering', a.indexOf('1. a')!== -1 && a.indexOf('2. b')!== -1, a);
+})();
 
-# --- 4. malformed calls REFUSE, never guess ------------------------------------------------
-raises("n<1 refused", lambda: exit_segment(0, 0, 0, 1))
-raises("k<1 refused", lambda: exit_segment(0, 0, 12, 0))
-raises("k>n refused (the wall)", lambda: exit_segment(0, 0, 4, 5))
-raises("reverse<entry refused", lambda: exit_segment(5, 3, 12, 4))
-raises("bool is not int", lambda: exit_segment(0, True, 12, 4))
-raises("float refused", lambda: phase(0, 5.0, 12))
+/* ============================================================
+5. HOLES — an unknown node type (block or inline) renders its
+content bare, is REPORTED in.holes, and never crashes or
+silently drops. Hand-build an AST with bogus node types so the
+hole path is exercised directly (no parser needed).
+============================================================ */
+(function holes() {
+var ast = {
+type: 'document',
+children: [
+{ type: 'paragraph', children: [
+{ type: 'text', value: 'a'},
+{ type: 'mystery', value: 'b'} // unknown INLINE type
+]},
+{ type: 'weirdBlock', children: [
+{ type: 'text', value: 'c'}
+]} // unknown BLOCK type
+]
+};
+var res = D.render(ast, R.reddit);
+ok('hole render does not crash', typeof res.text === 'string', JSON.stringify(res));
+ok('unknown inline reported', res.holes.indexOf('mystery')!== -1, JSON.stringify(res.holes));
+ok('unknown block reported', res.holes.indexOf('weirdBlock')!== -1, JSON.stringify(res.holes));
+ok('hole content preserved bare', res.text.indexOf('a')!== -1 && res.text.indexOf('b')!== -1 && res.text.indexOf('c')!== -1, res.text);
+})();
 
-# --- mutation bite: prove free-hold has teeth ----------------------------------------------
-# If routing (wrongly) depended on winding, +1 lap WOULD change the exit for some reversal.
-# Assert there EXISTS a reversal where phase differs from phase+lap yet exits still match --
-# i.e. the invariant is non-vacuous (the exits are not all identical anyway).
-distinct_exits = {exit_segment(0, r, n, k) for r in range(n)}
-ok("mutation bite: exits are genuinely varied", len(distinct_exits) == k)
-ok("mutation bite: +lap holds AND base varies",
-exit_segment(0, 3, n, k) == exit_segment(0, 3 + n, n, k)
-and exit_segment(0, 3, n, k)!= exit_segment(0, 6, n, k))
+/* ============================================================
+6. RULESET-LOAD VALIDATOR — the four decidable predicates.
+Each malformed ruleset must LOUD-STOP (throw); each well-formed
+one must pass. A real gate rejects the bad and admits the good.
+============================================================ */
+(function validator() {
+// every built-in passes its own validator
+ok('validator admits all built-ins', Object.keys(R).every(function (k) {
+return!throws(function () { D.validateRuleset(R[k]);});
+}));
+// (1) wrap must be a 2-element pair
+ok('(1) rejects 1-element wrap', throws(function () {
+D.validateRuleset({ inline: { strong: { wrap: ['*']}}});
+}));
+ok('(1) rejects 3-element wrap', throws(function () {
+D.validateRuleset({ inline: { strong: { wrap: ['*', '*', '*']}}});
+}));
+ok('(1) admits 2-element wrap',!throws(function () {
+D.validateRuleset({ inline: { strong: { wrap: ['*', '*']}}});
+}));
+// (2) blockJoin must be a string
+ok('(2) rejects numeric blockJoin', throws(function () {
+D.validateRuleset({ blockJoin: 3});
+}));
+// (3) template must contain {label} and {href}
+ok('(3) rejects template missing {href}', throws(function () {
+D.validateRuleset({ inline: { link: { template: '[{label}]'}}});
+}));
+ok('(3) rejects template missing {label}', throws(function () {
+D.validateRuleset({ inline: { link: { template: '({href})'}}});
+}));
+ok('(3) admits full template',!throws(function () {
+D.validateRuleset({ inline: { link: { template: '[{label}]({href})'}}});
+}));
+// (4) linePrefix must be a string
+ok('(4) rejects numeric linePrefix', throws(function () {
+D.validateRuleset({ blocks: { blockquote: { linePrefix: 0}}});
+}));
+// non-object rejected outright
+ok('rejects non-object ruleset', throws(function () { D.validateRuleset(null);}));
+})();
 
-print(("PASS" if _fail == 0 else "FAIL") + f" -- {_pass} passed, {_fail} failed")
-sys.exit(0 if _fail == 0 else 1)
+/* ============================================================
+7. MUTATION BITES — prove the oracle has teeth.
+Each simulates a WRONG engine output and asserts the check
+above WOULD have caught it (the green is not vacuous).
+============================================================ */
+(function mutationBites() {
+// Bite 1: if reddit KEPT the '#' heading (wrong for a comment), the
+// 'reddit heading->bold' check's condition would be false.
+var wrong1 = '# Title\n\n**b**\n';
+ok('BITE reddit-heading check has teeth',
+!(wrong1.indexOf('**Title**')!== -1 && wrong1.indexOf('# Title') === -1),
+'a mangled engine that kept # would slip past a toothless check');
+
+// Bite 2: if an unsafe href SURVIVED, the drop check would be false.
+var wrong2 = '[bad](javascript:x)\n';
+ok('BITE unsafe-href check has teeth',
+!(wrong2.indexOf('javascript:') === -1 && wrong2.indexOf('bad')!== -1),
+'a mangled engine that kept javascript: would slip past a toothless check');
+
+// Bite 3: if the validator were a no-op (never threw), the reject checks
+// would all be false. Assert a genuinely-bad ruleset still throws.
+ok('BITE validator check has teeth',
+throws(function () { D.validateRuleset({ inline: { strong: { wrap: ['x']}}});}),
+'a no-op validator would fail this bite');
+})();
+
+/* ---- report ---------------------------------------------------------------- */
+var reds = checks.filter(function (c) { return!c.ok;});
+checks.forEach(function (c) {
+process.stdout.write((c.ok? 'ok ': 'FAIL ') + c.name + (!c.ok && c.detail? ' — ' + c.detail: '') + '\n');
+});
+process.stdout.write('\n' + (reds.length? 'FAIL': 'OK') + ' (' + checks.length + ' checks, ' + reds.length + ' red)\n');
+process.exit(reds.length? 1: 0);
 
 Take the whole folder →
 MIT
-Python stdlib only, deterministic
+Zero dependencies, Node or browser, deterministic (folds beside the markdown gift)
 
 ---

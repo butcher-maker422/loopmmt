@@ -67,7 +67,7 @@ In the browser, drop the file in and use `window.markdown` (same API).
 ## Test it
 
 ```bash
-node test_markdown.js     # 52 checks: never-throws, text===source, link guard,
+node test_markdown.js     # 61 checks: never-throws, text===source, link guard, blank-fill literal,
                           # emit-invariant, determinism, + a mutation bite
 ```
 

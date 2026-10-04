@@ -1,1219 +1,1599 @@
-# Loop MMT — corpus shard 61/91
+# Loop MMT — corpus shard 61/92
 
-> Bundle 61 of 91 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 61 of 92 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/conform/, /gifts/contract/, /gifts/counter-fold/)
-
----
-
-# conform — a Loop MMT gift
-https://loopmmt.com/gifts/conform/
-[coverage: optional · branch: gifts]
-
-Does This JSONL Match the Schema You Declared? validate ← all gifts
-
-conform
-
-A model — or any producer — emits JSONL: one JSON value per line, meant to be a record of a known shape. conform reads that stream against a record schema you write and, the moment a record does not match, REFUSES: it names the line, the field, and what was wrong, and stops at the FIRST bad record. Declare each field's type — string, number, integer, boolean, enum, array, object — with optional min/max, maxLen, minItems, pattern, or a fixed set of allowed values, and mark it required or not. A clean stream exits 0; the first non-conforming record exits 1 with { line, field, reason}; an unusable input (no schema, unreadable file, bad schema shape) exits 2 — so it drops straight into a CI gate on a producer's output. A line that isn't valid JSON is itself a failure at that line, never a crash. Blank lines are skipped. Structural, not semantic; fields checked in sorted order so the reported field is deterministic. Zero dependencies, pure, offline; runs in Node or a browser (window.GiftConform).
-
-The honest edge
-
-conform proves STRUCTURE, not TRUTH. A clean pass means every record has the declared fields at the declared types — it is not a certificate that the producer's answer is right, sensible, or what it should have said. It validates the schema YOU declared: declare the wrong schema and it faithfully passes the wrong records. A well-typed lie conforms. Choosing a schema that captures what you actually require is your job.
-
-Run it
-
-node conform.js --schema schema.json data.jsonl # exit 0 clean | 1 first non-conforming record (line+field+reason) | 2 input error
-test_conform.js (23/23) + --selftest (19/19: clean pass, missing-required→line/field, wrong type, enum/range, malformed-JSON-as-failure, blank-line skip, fail-first sorted-field order, determinism) + out-of-band conformance (8 vectors GREEN vs frozen corpus + independent oracle; mutation bite VERIFIED — fail-last build goes RED)
-Zero dependencies, Node or browser, deterministic
-
-The code — every file that ships
-
-conform.js 301 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* conform.js — does this JSONL output match the record schema you declared?
-*
-* A model (or any producer) emits JSONL: one JSON value per line. You expect
-* every line to be a record of a known shape — an object with declared fields
-* of declared types. conform reads the stream against a schema you write and,
-* the moment a record does not conform, REFUSES: it names the line, the field,
-* and what was wrong, and stops. A clean run means every record matched the
-* declared STRUCTURE — never that the content is correct or meaningful.
-*
-* Structural, not semantic. conform checks that a field is present and is the
-* declared TYPE (string / number / integer / boolean / enum / array / object),
-* optionally in range or one of a fixed set. It does NOT check that a value is
-* true, sensible, or what the model should have said — a well-typed lie passes.
-*
-* The load-bearing rule: FAIL-CLOSED and FAIL-FIRST. The first non-conforming
-* record is the verdict — conform reports {line, field, reason} and exits 1,
-* so it drops straight into a CI gate on a model's output. A run over a clean
-* stream exits 0. A malformed line (not JSON at all) is itself a conformance
-* failure at that line, never a crash and never a skip.
-*
-* Zero dependencies. Deterministic: the same stream + schema yield the same
-* verdict, every run. Runs in Node or a browser (window.GiftConform).
-*
-* CEILING (printed): conform proves STRUCTURE, not TRUTH. A clean pass means
-* every record has the declared fields at the declared types — it is not a
-* certificate that the model's answer is right. It validates the schema YOU
-* declared; declare the wrong schema and it will faithfully pass the wrong
-* records. Choosing a schema that captures what you actually require is your job.
-*/
-
-'use strict';
-
-var CEILING =
-'conform proves STRUCTURE, not TRUTH: a clean pass means every record has the ' +
-'declared fields at the declared types, never that the content is correct. It ' +
-'validates the schema you declared — declare the wrong one and it passes the ' +
-'wrong records. A well-typed lie conforms.';
-
-/* ---- the type checks (closed set) -------------------------------------- */
-/* Each returns null on OK, or a short reason string on failure. Pure. */
-
-function checkType(value, spec) {
-var t = spec.type;
-if (t === 'string') {
-if (typeof value!== 'string') return 'expected string, got ' + jsType(value);
-if (spec.maxLen!= null && value.length > spec.maxLen)
-return 'string longer than maxLen ' + spec.maxLen + ' (len ' + value.length + ')';
-if (spec.pattern!= null) {
-// pattern is a source string compiled once by the caller into spec._re
-if (spec._re &&!spec._re.test(value)) return 'string does not match pattern ' + spec.pattern;
-}
-return null;
-}
-if (t === 'number') {
-if (typeof value!== 'number' ||!isFinite(value)) return 'expected finite number, got ' + jsType(value);
-if (spec.min!= null && value < spec.min) return 'number below min ' + spec.min + ' (got ' + value + ')';
-if (spec.max!= null && value > spec.max) return 'number above max ' + spec.max + ' (got ' + value + ')';
-return null;
-}
-if (t === 'integer') {
-if (typeof value!== 'number' ||!isFinite(value) || Math.floor(value)!== value)
-return 'expected integer, got ' + jsType(value) + (typeof value === 'number'? ' ' + value: '');
-if (spec.min!= null && value < spec.min) return 'integer below min ' + spec.min + ' (got ' + value + ')';
-if (spec.max!= null && value > spec.max) return 'integer above max ' + spec.max + ' (got ' + value + ')';
-return null;
-}
-if (t === 'boolean') {
-if (typeof value!== 'boolean') return 'expected boolean, got ' + jsType(value);
-return null;
-}
-if (t === 'enum') {
-if (!Array.isArray(spec.values)) return 'schema error: enum field has no values[]';
-if (spec.values.indexOf(value) === -1)
-return 'value ' + JSON.stringify(value) + ' not in enum ' + JSON.stringify(spec.values);
-return null;
-}
-if (t === 'array') {
-if (!Array.isArray(value)) return 'expected array, got ' + jsType(value);
-if (spec.minItems!= null && value.length < spec.minItems)
-return 'array shorter than minItems ' + spec.minItems + ' (len ' + value.length + ')';
-return null;
-}
-if (t === 'object') {
-if (value === null || typeof value!== 'object' || Array.isArray(value))
-return 'expected object, got ' + jsType(value);
-return null;
-}
-return 'schema error: unknown type ' + JSON.stringify(t);
-}
-
-function jsType(v) {
-if (v === null) return 'null';
-if (Array.isArray(v)) return 'array';
-return typeof v;
-}
-
-/* ---- compile a schema (once): pre-build any regexes -------------------- */
-function compileSchema(schema) {
-if (schema === null || typeof schema!== 'object' || Array.isArray(schema))
-throw new Error('schema must be an object mapping field -> spec');
-var out = {};
-var fields = Object.keys(schema).sort(); // deterministic field order
-for (var i = 0; i < fields.length; i++) {
-var f = fields[i], spec = schema[f];
-if (spec === null || typeof spec!== 'object' || Array.isArray(spec))
-throw new Error('schema error: field ' + JSON.stringify(f) + ' spec must be an object');
-var c = {};
-for (var k in spec) if (Object.prototype.hasOwnProperty.call(spec, k)) c[k] = spec[k];
-if (c.type === 'string' && c.pattern!= null) c._re = new RegExp(c.pattern);
-out[f] = c;
-}
-return { fields: fields, specs: out};
-}
-
-/* ---- check one record against the compiled schema --------------------- */
-/* Returns null on OK, or { field, reason} on the FIRST failure (field order
-* is the sorted schema order, so the reported field is deterministic). */
-function checkRecord(rec, compiled) {
-if (rec === null || typeof rec!== 'object' || Array.isArray(rec))
-return { field: null, reason: 'record is not a JSON object (got ' + jsType(rec) + ')'};
-for (var i = 0; i < compiled.fields.length; i++) {
-var f = compiled.fields[i], spec = compiled.specs[f];
-var present = Object.prototype.hasOwnProperty.call(rec, f);
-if (!present) {
-if (spec.required) return { field: f, reason: 'required field missing'};
-continue; // optional + absent = OK
-}
-var reason = checkType(rec[f], spec);
-if (reason) return { field: f, reason: reason};
-}
-return null;
-}
-
-/* ---- the stream verdict: fail-first over JSONL ------------------------ */
-/* lines: array of raw strings (one JSONL line each, no trailing newline).
-* schema: field -> spec map.
-* Returns { ok, checked, verdict} where verdict on failure is
-* { line, field, reason, raw} (line is 1-based; raw is the offending text).
-* Blank lines are skipped (a blank line is not a record). Deterministic. */
-function conform(lines, schema) {
-var compiled = compileSchema(schema);
-var checked = 0;
-for (var i = 0; i < lines.length; i++) {
-var raw = lines[i];
-if (raw == null) continue;
-var trimmed = raw.replace(/\s+$/, '');
-if (trimmed.replace(/^\s+/, '') === '') continue; // blank line: skip
-var rec;
-try {
-rec = JSON.parse(trimmed);
-} catch (e) {
-return { ok: false, checked: checked,
-verdict: { line: i + 1, field: null, reason: 'not valid JSON: ' + e.message, raw: trimmed}};
-}
-var fail = checkRecord(rec, compiled);
-if (fail) {
-return { ok: false, checked: checked,
-verdict: { line: i + 1, field: fail.field, reason: fail.reason, raw: trimmed}};
-}
-checked++;
-}
-return { ok: true, checked: checked, verdict: null};
-}
-
-/* ---- exports ---------------------------------------------------------- */
-var API = { conform: conform, checkRecord: checkRecord, compileSchema: compileSchema, CEILING: CEILING};
-if (typeof module!== 'undefined' && module.exports) module.exports = API;
-if (typeof window!== 'undefined') window.GiftConform = API;
-
-/* ---- CLI -------------------------------------------------------------- */
-function main(argv) {
-var fs = require('fs');
-var args = argv.slice(2);
-if (args.indexOf('--help')!== -1 || args.length === 0) {
-process.stderr.write(
-'conform — assert JSONL records match a declared schema (structural, fail-first).\n\n' +
-'usage:\n' +
-' node conform.js --schema schema.json data.jsonl # exit 0 clean, 1 on first bad record\n' +
-' cat data.jsonl | node conform.js --schema schema.json\n' +
-' node conform.js --selftest\n\n' +
-'CEILING: ' + CEILING + '\n');
-return args.length === 0? 2: 0;
-}
-if (args.indexOf('--selftest')!== -1) return selftest();
-var si = args.indexOf('--schema');
-if (si === -1 ||!args[si + 1]) { process.stderr.write('conform: --schema FILE is required\n'); return 2;}
-var schema;
-try { schema = JSON.parse(fs.readFileSync(args[si + 1], 'utf8'));}
-catch (e) { process.stderr.write('conform: cannot read schema: ' + e.message + '\n'); return 2;}
-// data file = the first non-flag arg that isn't the schema path
-var dataPath = null;
-for (var i = 0; i < args.length; i++) {
-if (args[i] === '--schema') { i++; continue;}
-if (args[i].charAt(0) === '-') continue;
-dataPath = args[i]; break;
-}
-var text;
-try { text = dataPath? fs.readFileSync(dataPath, 'utf8'): fs.readFileSync(0, 'utf8');}
-catch (e) { process.stderr.write('conform: cannot read data: ' + e.message + '\n'); return 2;}
-var lines = text.split('\n');
-var res;
-try { res = conform(lines, schema);}
-catch (e) { process.stderr.write('conform: ' + e.message + '\n'); return 2;}
-process.stderr.write('CEILING: ' + CEILING + '\n');
-if (res.ok) { process.stdout.write('CLEAN: ' + res.checked + ' record(s) conform\n'); return 0;}
-var v = res.verdict;
-process.stdout.write('REFUSE line ' + v.line +
-(v.field? ' field ' + JSON.stringify(v.field): '') + ': ' + v.reason + '\n');
-return 1;
-}
-
-/* ---- selftest: golden corpus, mutation-checkable ---------------------- */
-function selftest() {
-var pass = 0, fail = 0;
-function ck(name, cond) { if (cond) pass++; else { fail++; process.stderr.write(' FAIL ' + name + '\n');}}
-
-var schema = {
-id: { type: 'integer', min: 0, required: true},
-name: { type: 'string', maxLen: 40, required: true},
-score: { type: 'number', min: 0, max: 1},
-kind: { type: 'enum', values: ['a', 'b', 'c']},
-tags: { type: 'array'}
-};
-
-// clean stream
-var clean = [
-'{"id":1,"name":"alpha","score":0.5,"kind":"a","tags":[]}',
-'{"id":2,"name":"beta"}', // optionals absent = OK
-'', // blank line skipped
-'{"id":3,"name":"gamma","kind":"c","tags":["x"]}'
-];
-var r = conform(clean, schema);
-ck('clean-ok', r.ok === true);
-ck('clean-count', r.checked === 3); // blank line not counted
-
-// missing required field -> first-fail on that line/field
-r = conform(['{"id":1,"name":"a"}', '{"name":"noid"}'], schema);
-ck('missing-required-fails', r.ok === false);
-ck('missing-required-line', r.verdict.line === 2);
-ck('missing-required-field', r.verdict.field === 'id');
-ck('missing-required-checked', r.checked === 1); // first line passed
-
-// wrong type
-r = conform(['{"id":"notint","name":"x"}'], schema);
-ck('wrong-type-fails', r.ok === false);
-ck('wrong-type-field', r.verdict.field === 'id');
-
-// out of range
-r = conform(['{"id":1,"name":"x","score":2}'], schema);
-ck('range-fails', r.ok === false && r.verdict.field === 'score');
-
-// enum violation
-r = conform(['{"id":1,"name":"x","kind":"z"}'], schema);
-ck('enum-fails', r.ok === false && r.verdict.field === 'kind');
-
-// maxLen
-r = conform(['{"id":1,"name":"' + new Array(50).join('x') + '"}'], schema);
-ck('maxlen-fails', r.ok === false && r.verdict.field === 'name');
-
-// not-JSON line is a conformance failure, not a crash
-r = conform(['{"id":1,"name":"x"}', 'this is not json'], schema);
-ck('bad-json-fails', r.ok === false && r.verdict.line === 2 && r.verdict.field === null);
-
-// non-object record
-r = conform(['[1,2,3]'], schema);
-ck('non-object-fails', r.ok === false && r.verdict.field === null);
-
-// fail-FIRST: two bad records, only the first is reported
-r = conform(['{"name":"nofirst"}', '{"name":"nosecond"}'], schema);
-ck('fail-first-line', r.verdict.line === 1);
-
-// determinism: same input twice is byte-identical verdict
-var a = JSON.stringify(conform(clean, schema));
-var b = JSON.stringify(conform(clean, schema));
-ck('deterministic', a === b);
-
-// field order deterministic: a record failing two fields reports the
-// alphabetically-first ('id' before 'name')
-r = conform(['{"score":5}'], schema); // id missing AND name missing AND score out of range
-ck('field-order-deterministic', r.verdict.field === 'id');
-
-// pattern
-var ps = { code: { type: 'string', pattern: '^[A-Z]{3}$', required: true}};
-ck('pattern-ok', conform(['{"code":"ABC"}'], ps).ok === true);
-ck('pattern-fails', conform(['{"code":"abcd"}'], ps).ok === false);
-
-// schema error surfaces (bad schema throws, caught by caller)
-var threw = false;
-try { conform(['{}'], { x: 'notaspec'});} catch (e) { threw = true;}
-ck('bad-schema-throws', threw === true);
-
-var msg = (fail === 0? 'GREEN': 'RED') + ': ' + pass + ' checks passed, ' + fail + ' failed [conform]\n';
-process.stderr.write(msg);
-return fail === 0? 0: 1;
-}
-
-if (typeof require!== 'undefined' && require.main === module) {
-process.exit(main(process.argv));
-}
-
-test_conform.js 102 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* test_conform.js — external battery for conform.js.
-*
-* Independent of the in-file --selftest: this file constructs its own JSONL
-* streams and schemas and asserts the PUBLIC behavior (conform / checkRecord /
-* compileSchema / CEILING), so a regression in the core trips here even if the
-* selftest were also broken. Mutation-bitten: mutate a core rule, this goes RED.
-*/
-'use strict';
-var C = require('./conform.js');
-var pass = 0, fail = 0;
-function ck(name, cond) { if (cond) pass++; else { fail++; console.error(' FAIL ' + name);}}
-
-var schema = {
-id: { type: 'integer', required: true},
-email: { type: 'string', pattern: '@', required: true},
-age: { type: 'integer', min: 0, max: 150},
-role: { type: 'enum', values: ['admin', 'user']}
-};
-
-// 1. a fully-conforming stream passes and counts every non-blank record
-var ok = C.conform([
-'{"id":1,"email":"a@x.com","age":30,"role":"admin"}',
-'{"id":2,"email":"b@x.com"}'
-], schema);
-ck('all-conform-ok', ok.ok === true);
-ck('all-conform-count', ok.checked === 2);
-
-// 2. missing required field: named field, right line, fail-closed
-var r = C.conform(['{"id":1,"email":"a@x.com"}', '{"email":"b@x.com"}'], schema);
-ck('missing-id-refused', r.ok === false);
-ck('missing-id-line-2', r.verdict.line === 2);
-ck('missing-id-field', r.verdict.field === 'id');
-
-// 3. type mismatch on a present field
-r = C.conform(['{"id":"one","email":"a@x.com"}'], schema);
-ck('id-string-refused', r.ok === false && r.verdict.field === 'id');
-
-// 4. pattern (email must contain @)
-r = C.conform(['{"id":1,"email":"noatsign"}'], schema);
-ck('email-pattern-refused', r.ok === false && r.verdict.field === 'email');
-
-// 5. range on optional field
-r = C.conform(['{"id":1,"email":"a@x.com","age":200}'], schema);
-ck('age-range-refused', r.ok === false && r.verdict.field === 'age');
-r = C.conform(['{"id":1,"email":"a@x.com","age":-1}'], schema);
-ck('age-negative-refused', r.ok === false && r.verdict.field === 'age');
-
-// 6. enum
-r = C.conform(['{"id":1,"email":"a@x.com","role":"root"}'], schema);
-ck('role-enum-refused', r.ok === false && r.verdict.field === 'role');
-
-// 7. malformed JSON line is a conformance failure at that line, field null
-r = C.conform(['{"id":1,"email":"a@x.com"}', '{ broken'], schema);
-ck('bad-json-refused', r.ok === false && r.verdict.line === 2 && r.verdict.field === null);
-ck('bad-json-reason', /not valid JSON/.test(r.verdict.reason));
-
-// 8. non-object record refused (array / scalar)
-ck('array-record-refused', C.conform(['[1,2]'], schema).ok === false);
-ck('scalar-record-refused', C.conform(['42'], schema).ok === false);
-
-// 9. blank/whitespace lines are skipped, not counted, not failed
-r = C.conform(['{"id":1,"email":"a@x.com"}', ' ', '', '{"id":2,"email":"b@x.com"}'], schema);
-ck('blank-lines-skipped', r.ok === true && r.checked === 2);
-
-// 10. fail-FIRST: the first bad record is the verdict, later ones never reached
-r = C.conform(['{"email":"a@x.com"}', '{"email":"b@x.com"}'], schema); // both missing id
-ck('fail-first-only', r.verdict.line === 1 && r.checked === 0);
-
-// 11. checkRecord is usable standalone and returns the same field verdict
-var cs = C.compileSchema(schema);
-ck('checkRecord-ok', C.checkRecord({ id: 1, email: 'a@x.com'}, cs) === null);
-var cr = C.checkRecord({ email: 'a@x.com'}, cs);
-ck('checkRecord-names-field', cr && cr.field === 'id');
-
-// 12. determinism: identical input -> byte-identical verdict JSON
-var d1 = JSON.stringify(C.conform(['{"email":"x@y"}'], schema));
-var d2 = JSON.stringify(C.conform(['{"email":"x@y"}'], schema));
-ck('deterministic-verdict', d1 === d2);
-
-// 13. deterministic field order: fields are checked in SORTED order
-// (age, email, id, role). For {"email":"noat"}: email is present with a
-// bad pattern and sorts before id, so email's failure is reported first —
-// a deterministic, alphabetical-order verdict.
-r = C.conform(['{"email":"noat"}'], schema);
-ck('field-order-sorted', r.verdict.field === 'email');
-
-// 14. CEILING is present and honest about structure-not-truth
-ck('ceiling-present', typeof C.CEILING === 'string' && C.CEILING.length > 20);
-ck('ceiling-says-structure', /STRUCTURE|structure/.test(C.CEILING));
-
-// 15. schema itself is validated: a bad spec throws (programmer error, not silent)
-var threw = false;
-try { C.conform(['{}'], { x: { type: 'nonsense'}});} catch (e) {}
-// unknown TYPE is a per-record schema-error reason, not a throw; a non-object SPEC throws:
-threw = false;
-try { C.conform(['{}'], { x: 'notanobject'});} catch (e) { threw = true;}
-ck('bad-spec-throws', threw === true);
-
-console.error((fail === 0? 'GREEN': 'RED') + ': ' + pass + ' assertions passed, ' + fail + ' failed [test_conform]');
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Zero dependencies, Node or browser, deterministic
+Nodes in this shard: 3 (/gifts/conductor/, /gifts/confessional/, /gifts/conflict/)
 
 ---
 
-# Contract — a Loop MMT gift
-https://loopmmt.com/gifts/contract/
+# conductor — a Loop MMT gift
+https://loopmmt.com/gifts/conductor/
 [coverage: optional · branch: gifts]
 
-Do Your JSONL Records Match the Shape You Declared? filter ← all gifts
+Provenance Pipeline Runner run ← all gifts
 
-Contract
+conductor
 
-Give it a stream of JSON Lines and a schema you declare, and it walks the records in order and stops at the FIRST one that breaks the contract — naming the record's line, the field, and what was wrong. The schema is plain data (fields → {type, required}), never code: nothing is executed or eval'd, so it is safe to accept from an untrusted source. Types are string, number, boolean, object, array, null, any; a bare "id":"number" is sugar for a required field of that type; --closed rejects the first unexpected field. Same records + same schema → the same first failure, byte-identical every run, so it drops straight into a CI gate on a model's output.
+Run a declared pipeline of small JSONL tools — A | B | C — with a record. conductor typechecks the pipeline before it runs (a broken pipeline never launches a stage), runs the stages in order under one trace-id piping stdout into stdin, and appends a per-stage receipt to a replayable ledger: exit code, bytes in and out, and which stage broke. A failing stage stops the run, is recorded failed, and every later stage is recorded skipped — so 'what happened to this run?' always has an answer.
 
 The honest edge
 
-contract checks STRUCTURE (which fields, at which types), not MEANING. A record that is structurally perfect and semantically nonsense passes — "age": -3 with type number passes, an email that is not an email passes. It makes the declared shape enforceable and names the first record that breaks it; it cannot tell you a structurally-valid value is correct, sensible, in range, or true.
+conductor runs the commands you give it — it is exactly as safe as the commands in the score, and it does not sandbox them. Its typecheck is the TYPE-level gate (ports line up so data can flow), not a proof the RECORDS fit or that a stage is correct. It proves the run happened in order with a receipt; it never proves the run was right.
 
 Run it
 
-node contract.js --schema schema.json records.jsonl # exit 0 all pass | 1 first violating record (line+field+reason) | 2 unusable input/ill-formed schema; --closed rejects unexpected fields; stdin supported
-test_contract.js battery (all pass) + --selftest (15/15: schema compile, per-type match, required/optional, shorthand sugar, closed-mode reject, first-bad-record-wins, cross-process byte-identical)
-Zero dependencies, Node or browser, deterministic
+python3 conductor.py check --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py'
+test_conductor.py (12/12, mutation-bitten)
+Python 3, standard library only
 
 The code — every file that ships
 
-contract.js 332 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* contract.js — assert JSONL output matches a declared record schema, at runtime.
-*
-* A tiny, dependency-free schema check for JSON Lines (one JSON value per line).
-* Give it a stream of records and a SCHEMA you declare, and it walks the records
-* in order and stops at the FIRST one that breaks the contract — naming the
-* record, the field, and what was wrong. Same records + same schema → the same
-* first failure, byte-identical, every run. It drops straight into a CI gate.
-*
-* records.jsonl, schema ──▶ check(records, schema)
-* ──▶ { ok:true}
-* | { ok:false, line, field, reason} (first bad record)
-*
-* THE SCHEMA (declared data, never code). A schema is a plain object naming the
-* fields a record must carry and the STRUCTURE each must have — nothing executes,
-* nothing is eval'd, so a schema is safe to accept from an untrusted source:
-*
-* { "id": { "type": "number", "required": true},
-* "name": { "type": "string", "required": true},
-* "tags": { "type": "array"}, // present-optional, typed if present
-* "meta": { "type": "object", "required": false}}
-*
-* type one of: string number boolean object array null any
-* ("object" means a non-array, non-null object; "array" means Array;
-* "null" means the JSON null; "any" accepts any present value)
-* required true (default) → the field must be present; false → may be absent,
-* but if present it must match `type`.
-*
-* Shorthand: a bare string value is sugar for a required field of that type —
-* { "id": "number"} === { "id": { "type": "number", "required": true}}.
-*
-* By default a record may carry EXTRA fields the schema does not mention; pass
-* { closed: true} (CLI --closed) to reject the first unexpected field instead.
-*
-* DETERMINISM (the promise, and the self-test that proves it). Records are read
-* in file order; fields are checked in the schema's declared key order; the FIRST
-* violation wins and nothing after it is read. There is no map iteration whose
-* order could vary, no clock, no randomness — the verdict is a pure function of
-* (records, schema). `--selftest` proves a conforming stream passes, a broken one
-* fails at the expected line+field, and the check is idempotent.
-*
-* THE LINE IT WILL NOT CROSS (the honest ceiling — printed every --help/--list).
-* contract checks that each record HAS the declared fields at the declared TYPES.
-* It does NOT check the values are correct, sensible, in range, or true. A record
-* that is structurally perfect and semantically nonsense passes. "age": -3 with
-* type number passes; an email that is not an email passes. Structure, not
-* meaning — a human owns the meaning; contract only makes the shape enforceable.
-*
-* EXIT CODES (filter convention, gate-friendly).
-* 0 every record satisfies the schema
-* 1 a record violated the schema — the FIRST one, with line + field + reason
-* 2 the input could not be used (missing file, unreadable, bad JSON in the
-* records, or an ill-formed SCHEMA) — always a clean message, never a stack.
-*
-* Runs identically in Node and in a browser (no DOM, no deps). MIT.
-*/
+conductor.py 381 lines on GitHub →
+#!/usr/bin/env python3
+"""conductor — run a declared pipeline of small JSONL tools, with a record.
 
-var CEILING =
-'ceiling: contract checks STRUCTURE (which fields, which types), not MEANING.\n' +
-' A structurally-valid record with nonsense values passes — "age":-3 is a valid\n' +
-' number. A human owns whether the values are right; contract only makes the\n' +
-' declared shape enforceable and names the first record that breaks it.';
+You have a saved "score" — an ordered pipeline of little JSON-lines tools, the
+kind the `declare` gift writes. You could run it by hand with a shell pipe. What
+the shell won't do: check the pipeline typechecks *before* it runs, thread one
+trace-id through the whole run, and hand you back a record of what each stage
+actually did — its exit code, how many bytes it read and wrote, whether it was
+the stage that broke. `conductor` does that. It is a provenance-runner, not a
+shell wrapper: every run leaves a receipt you can read back, and a run that fails
+tells you *which stage* failed, in order, not just that the pipe collapsed.
 
-/* ---- errors: a clean, tagged failure, never a stack trace ------------------ */
-function ContractError(msg) { var e = new Error(msg); e.contract = true; return e;}
+WHAT IT DOES, in order:
+1. Typecheck first. conductor carries its own copy of the five-verb composition
+gate (the same rule the `typecheck` and `declare` gifts use) and refuses to
+run a pipeline that does not compose — a sink that isn't last, a source that
+isn't first. You never watch a broken pipeline half-run; it is stopped at
+the desk (exit 3), before a single stage is launched.
+2. Run the stages in order, piping each stage's stdout into the next stage's
+stdin, exactly as a shell pipe would — but under one trace-id.
+3. Record every stage to an append-only ledger: trace-id, stage index, slug,
+command, exit code, bytes in, bytes out, and a verdict (ok / failed /
+skipped-after-failure). The ledger is JSON-lines you can replay by trace-id.
+4. Fail clean. If a stage exits non-zero, conductor stops the run, records that
+stage as failed and every later stage as skipped, and exits non-zero itself
+— naming the stage that broke. No later stage runs on a broken input.
 
-/* ---- the closed type vocabulary (data, not code) -------------------------- */
-var TYPES = { string: 1, number: 1, boolean: 1, object: 1, array: 1, 'null': 1, any: 1};
+THE MODEL. Five port-verbs on the shared JSON-lines interface, and only five
+(the same five the `port`, `map`, `typecheck`, and `declare` gifts use):
 
-/* structural type of a JSON value, in this gift's closed vocabulary */
-function typeOf(v) {
-if (v === null) return 'null';
-if (Array.isArray(v)) return 'array';
-var t = typeof v;
-if (t === 'string' || t === 'number' || t === 'boolean' || t === 'object') return t;
-return t; // undefined/function can't come from JSON.parse; guarded by schema validation
+source: nothing -> JSONL (emits; no meaningful stdin)
+transform: JSONL -> JSONL (record in, record out)
+filter: JSONL -> JSONL' (record in, subset out; output type <= input)
+fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
+sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
+
+A pipeline composes iff every adjacent join A -> B has A EMITS (A.verb!= sink)
+and B ACCEPTS (B.verb!= source). conductor carries its own copy of that gate so
+it stands alone — a gift is single-file and zero-dependency by covenant, so it
+agrees with `typecheck` and `declare` by sharing the RULE, not by importing them.
+
+WHY A RECORD, NOT JUST A PIPE. A shell pipe answers "did it work?" with a single
+combined exit status and a jumble of interleaved stderr. When a five-stage
+pipeline produces nothing, the shell won't tell you *which* stage went dark.
+conductor's ledger does: one record per stage, in order, so "what happened to
+this run?" has an answer. This is tracebus's trace-id-and-ledger idea (the
+`tracebus` gift is a routed message bus with a replayable ledger) applied to a
+LINEAR ordered run instead of a fanned-out bus — a different shape, the same
+honesty about leaving a receipt.
+
+THE SCORE / STAGE FORMAT. A stage is `{"slug":..., "port_verb":..., "cmd": [...]}`
+— the port-verb for the typecheck, and `cmd` the argv list conductor executes for
+that stage (e.g. ["python3", "census.py"]). Stages come from `--stage` flags, or
+piped in on stdin as JSON-lines (the shape `declare show` emits, with a `cmd`
+added), or read from a declare score file with `--score` when the score carries
+per-stage `cmd`s. A stage with a port-verb but no `cmd` can be typechecked but
+not run (conductor says so and exits 2 on a run).
+
+HONEST CEILING. conductor runs the commands you give it — it is exactly as safe
+as the commands in the score, and it does not sandbox them. Its typecheck is the
+TYPE-level gate (ports line up so data can flow), NOT a proof the RECORDS fit or
+that a stage is correct; a pipeline can typecheck clean, run to completion, and
+still have done the wrong thing. conductor proves the run happened, in order,
+with a receipt — it never proves the run was right.
+
+conductor's own port-verb is `sink`: it consumes a pipeline (and the data flowing
+through it) and produces side effects — the stages' work and the ledger — with no
+pipeable JSONL on its own stdout. The run record goes to the ledger; conductor's
+stdout is the final stage's stdout, passed through.
+
+No dependencies beyond the Python standard library. MIT licensed.
+
+USAGE
+conductor verbs
+Print the five port-verbs and their contracts (JSON-lines).
+
+conductor check --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py'
+Typecheck the pipeline WITHOUT running it. Exit 0 if it composes, 3 if not,
+4 if a verb is undeclared. (Stage token: slug:verb:cmd, cmd shell-split.)
+
+conductor run --stage census:source:'python3 census.py' --stage map:fold:'python3 map.py' \
+[--ledger FILE] [--input FILE]
+Typecheck, then run the stages in order under one trace-id, piping
+stdout->stdin. --input seeds the first stage's stdin (default: empty).
+Appends one record per stage to --ledger (default: conductor.ledger.jsonl).
+Final stage's stdout goes to conductor's stdout. Exit 0 if every stage
+succeeded, 5 if a stage failed (naming it), 3/4 if the pipeline doesn't
+typecheck.
+
+conductor replay --ledger FILE --trace TRACE_ID
+Print every stage record for a trace-id, in run order (JSON-lines).
+
+EXIT CODES
+0 ok (composed / ran clean / replayed)
+3 the pipeline does not typecheck — not run
+4 a stage's port-verb is undeclared or not one of the five
+5 a stage failed at runtime (the run stopped; the ledger names it)
+2 usage error (bad arguments, a stage with no cmd on a run, unreadable file)
+"""
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import uuid
+
+PORT_VERBS = {
+"source": "nothing -> JSONL (emits; no meaningful stdin)",
+"transform": "JSONL -> JSONL (record in, record out)",
+"filter": "JSONL -> JSONL' (record in, subset out; output type <= input)",
+"fold": "JSONL -> JSONL_agg (records in, an aggregate/narrower record out)",
+"sink": "JSONL -> nothing (terminal side effect, no pipeable stdout)",
 }
 
-/* ---- normalize + validate a schema (throws ContractError if ill-formed) ---- */
-/* returns an ordered list of {field, type, required} so field order is the
-* schema's declared key order — the source of the deterministic field sequence. */
-function compileSchema(schema) {
-if (schema === null || typeof schema!== 'object' || Array.isArray(schema)) {
-throw ContractError('schema: must be a JSON object mapping field names to rules');
-}
-var fields = Object.keys(schema);
-var out = [];
-for (var i = 0; i < fields.length; i++) {
-var name = fields[i];
-var rule = schema[name];
-var type, required;
-if (typeof rule === 'string') { // shorthand: "number" → required number
-type = rule; required = true;
-} else if (rule!== null && typeof rule === 'object' &&!Array.isArray(rule)) {
-type = Object.prototype.hasOwnProperty.call(rule, 'type')? rule.type: 'any';
-required = Object.prototype.hasOwnProperty.call(rule, 'required')? rule.required: true;
-if (typeof required!== 'boolean') {
-throw ContractError('schema: field ' + JSON.stringify(name) +
-': "required" must be true or false');
-}
-} else {
-throw ContractError('schema: field ' + JSON.stringify(name) +
-': rule must be a type string or an object like {"type":"string"}');
-}
-if (typeof type!== 'string' ||!Object.prototype.hasOwnProperty.call(TYPES, type)) {
-throw ContractError('schema: field ' + JSON.stringify(name) +
-': unknown type ' + JSON.stringify(type) +
-' (allowed: string number boolean object array null any)');
-}
-out.push({ field: name, type: type, required: required});
-}
-return out;
-}
+def emits(verb):
+"""True iff a stage with this verb produces pipeable stdout (can feed right)."""
+return verb!= "sink"
 
-/* ---- parse a JSONL string into records (throws ContractError on a bad line) */
-function parseJsonl(text, label) {
-var out = [];
-var lines = String(text).split('\n');
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i];
-if (line.replace(/\s+/g, '') === '') continue; // skip blank lines
-var obj;
-try { obj = JSON.parse(line);}
-catch (e) {
-throw ContractError(label + ':' + (i + 1) + ': not valid JSON (' +
-((e && e.message) || 'parse error') + ')');
-}
-out.push({ value: obj, line: i + 1});
-}
-return out;
-}
+def accepts(verb):
+"""True iff a stage with this verb consumes stdin (can be fed from the left)."""
+return verb!= "source"
 
-/* ---- check ONE record against the compiled schema; return null | {field,reason} */
-function checkRecord(value, compiled, closed) {
-// a record must be a JSON object (not array, not scalar, not null)
-if (value === null || typeof value!== 'object' || Array.isArray(value)) {
-return { field: null, reason: 'record is not a JSON object (got ' + typeOf(value) + ')'};
-}
-// fields, in schema-declared order (deterministic)
-for (var i = 0; i < compiled.length; i++) {
-var r = compiled[i];
-var present = Object.prototype.hasOwnProperty.call(value, r.field);
-if (!present) {
-if (r.required) return { field: r.field, reason: 'missing required field'};
-continue; // optional + absent → fine
-}
-if (r.type === 'any') continue; // present + any type accepted
-var actual = typeOf(value[r.field]);
-if (actual!== r.type) {
-return { field: r.field, reason: 'expected ' + r.type + ', got ' + actual};
-}
-}
-// closed mode: reject the first extra field not named by the schema
-if (closed) {
-var declared = {};
-for (var j = 0; j < compiled.length; j++) declared[compiled[j].field] = 1;
-var keys = Object.keys(value); // insertion order from JSON.parse — deterministic per input
-for (var k = 0; k < keys.length; k++) {
-if (!Object.prototype.hasOwnProperty.call(declared, keys[k])) {
-return { field: keys[k], reason: 'unexpected field (schema is closed)'};
-}
-}
-}
-return null;
-}
+def typecheck_stages(stages):
+"""Decide a pipeline of (slug, verb, cmd) or (slug, verb) tuples.
 
-/* ---- the gift: check a JSONL string against a schema ---------------------- */
-/* opts: { closed:false, label:'records'}
-* returns { ok:true} | { ok:false, line, field, reason} — the FIRST violation. */
-function check(recordsText, schema, opts) {
-opts = opts || {};
-var closed =!!opts.closed;
-var label = opts.label || 'records';
-var compiled = compileSchema(schema); // throws on ill-formed schema (→ exit 2)
-var recs = parseJsonl(recordsText, label); // throws on bad JSON (→ exit 2)
-for (var i = 0; i < recs.length; i++) {
-var bad = checkRecord(recs[i].value, compiled, closed);
-if (bad) return { ok: false, line: recs[i].line, field: bad.field, reason: bad.reason};
-}
-return { ok: true};
-}
+Returns (ok, broken). Raises ValueError on an undeclared/unknown verb. The
+same gate `typecheck`/`declare` carry — copied, per the single-file covenant."""
+for st in stages:
+slug, verb = st[0], st[1]
+if verb not in PORT_VERBS:
+raise ValueError(
+"stage '%s' declares port_verb '%s', not one of the five (%s) — "
+"cannot decide" % (slug, verb, ", ".join(sorted(PORT_VERBS)))
+)
+broken = []
+for i in range(len(stages) - 1):
+a_slug, a_verb = stages[i][0], stages[i][1]
+b_slug, b_verb = stages[i + 1][0], stages[i + 1][1]
+reasons = []
+if not emits(a_verb):
+reasons.append({"side": "from", "slug": a_slug, "verb": a_verb,
+"why": "a sink emits nothing to feed the next stage — "
+"a sink is only legal as the last stage"})
+if not accepts(b_verb):
+reasons.append({"side": "to", "slug": b_slug, "verb": b_verb,
+"why": "a source accepts nothing from the previous stage — "
+"a source is only legal as the first stage"})
+if reasons:
+broken.append({"index": i, "from": a_slug, "to": b_slug, "reasons": reasons})
+return (len(broken) == 0, broken)
 
-/* ================= self-test (proves the promises; no deps) ================= */
-function selftest() {
-var fails = [];
-function ok(name, cond) { if (!cond) fails.push(name);}
+def _emit(obj):
+"""Print one JSON-line, deterministically (sorted keys, compact separators)."""
+sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
 
-var schema = {
-id: { type: 'number', required: true},
-name: 'string', // shorthand → required string
-tags: { type: 'array', required: false} // optional, typed if present
-};
+def _parse_stage_token(tok):
+"""Parse 'slug:verb' or 'slug:verb:cmd' -> (slug, verb, cmd_list_or_None).
 
-// conforming stream (extra field allowed in default open mode) → ok
-var good = '{"id":1,"name":"a","tags":[]}\n{"id":2,"name":"b"}\n{"id":3,"name":"c","extra":9}\n';
-ok('conforming passes', check(good, schema).ok === true);
+Only the first two colons split slug/verb; the remainder is the command
+(shell-split), so a cmd may itself contain colons."""
+parts = tok.split(":", 2)
+if len(parts) < 2:
+raise ValueError("stage token '%s' must be slug:verb[:cmd]" % tok)
+slug, verb = parts[0], parts[1]
+cmd = shlex.split(parts[2]) if len(parts) == 3 and parts[2] else None
+return (slug, verb, cmd)
 
-// missing required field → first bad record named
-var miss = '{"id":1,"name":"a"}\n{"id":2}\n{"id":3,"name":"c"}\n';
-var r1 = check(miss, schema);
-ok('missing field caught', r1.ok === false && r1.line === 2 && r1.field === 'name' &&
-/missing required/.test(r1.reason));
+def _collect_stages(args):
+"""Collect stages from --stage tokens or stdin JSON-lines. Returns (stages, err)."""
+stages = []
+if getattr(args, "stage", None):
+for tok in args.stage:
+try:
+stages.append(_parse_stage_token(tok))
+except ValueError as exc:
+sys.stderr.write("conductor: %s\n" % exc)
+return None, 2
+if getattr(args, "from_stdin", False):
+for line in sys.stdin:
+line = line.strip()
+if not line:
+continue
+try:
+obj = json.loads(line)
+except ValueError:
+sys.stderr.write("conductor: stdin line is not JSON: %s\n" % line)
+return None, 2
+slug = obj.get("slug")
+if slug is None:
+sys.stderr.write("conductor: stdin record has no 'slug': %s\n" % line)
+return None, 2
+stages.append((slug, obj.get("port_verb", ""), obj.get("cmd")))
+if not stages:
+sys.stderr.write("conductor: no stages (use --stage, or --stdin with JSON-lines)\n")
+return None, 2
+return stages, None
 
-// wrong type → named with expected/got
-var wrong = '{"id":"1","name":"a"}\n';
-var r2 = check(wrong, schema);
-ok('type mismatch caught', r2.ok === false && r2.line === 1 && r2.field === 'id' &&
-/expected number, got string/.test(r2.reason));
+def _typecheck_or_report(stages):
+"""Run the gate; emit a report on failure. Returns exit code (0 ok, 3/4 fail)."""
+try:
+ok, broken = typecheck_stages(stages)
+except ValueError as exc:
+_emit({"kind": "error", "status": "undeclared", "detail": str(exc)})
+return 4
+if not ok:
+_emit({"kind": "refused", "reason": "pipeline does not typecheck", "broken_joins": broken})
+return 3
+return 0
 
-// FIRST bad record wins — the second violation is never reported
-var two = '{"id":1,"name":"a"}\n{"id":2}\n{"name":"x"}\n';
-var r3 = check(two, schema);
-ok('first-bad-record wins', r3.ok === false && r3.line === 2 && r3.field === 'name');
+def cmd_verbs(args):
+for name in ["source", "transform", "filter", "fold", "sink"]:
+_emit({"port_verb": name, "contract": PORT_VERBS[name]})
+return 0
 
-// optional present-but-wrong-type → caught
-var badopt = '{"id":1,"name":"a","tags":"oops"}\n';
-var r4 = check(badopt, schema);
-ok('optional typed-if-present', r4.ok === false && r4.field === 'tags' &&
-/expected array, got string/.test(r4.reason));
+def cmd_check(args):
+stages, err = _collect_stages(args)
+if err is not None:
+return err
+code = _typecheck_or_report(stages)
+if code == 0:
+_emit({"kind": "check", "typechecks": True, "n_stages": len(stages)})
+return code
 
-// non-object record → structural reject
-var scal = '{"id":1,"name":"a"}\n[1,2,3]\n';
-var r5 = check(scal, schema);
-ok('non-object record rejected', r5.ok === false && r5.line === 2 && r5.field === null);
+def _append_ledger(ledger_path, record):
+with open(ledger_path, "a") as f:
+f.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
 
-// closed mode → first extra field rejected; open mode → same record passes
-var extra = '{"id":1,"name":"a","surprise":1}\n';
-ok('closed rejects extra', check(extra, schema, { closed: true}).ok === false);
-ok('open allows extra', check(extra, schema).ok === true);
-var rc = check(extra, schema, { closed: true});
-ok('closed names the extra field', rc.field === 'surprise' && /unexpected field/.test(rc.reason));
+def cmd_run(args):
+stages, err = _collect_stages(args)
+if err is not None:
+return err
+# 1. Typecheck first — never launch a stage of a broken pipeline.
+code = _typecheck_or_report(stages)
+if code!= 0:
+return code
+# Every stage must carry a cmd to be run.
+for slug, verb, cmd in stages:
+if not cmd:
+sys.stderr.write("conductor: stage '%s' has no cmd — cannot run "
+"(use slug:verb:cmd)\n" % slug)
+return 2
+ledger_path = args.ledger or "conductor.ledger.jsonl"
+trace_id = args.trace or str(uuid.uuid4())
+# Seed input.
+if args.input:
+try:
+with open(args.input, "rb") as f:
+data = f.read()
+except OSError as exc:
+sys.stderr.write("conductor: cannot read --input %s: %s\n" % (args.input, exc))
+return 2
+else:
+data = b""
+_append_ledger(ledger_path, {"kind": "run-start", "trace_id": trace_id,
+"n_stages": len(stages)})
+failed_index = None
+for i, (slug, verb, cmd) in enumerate(stages):
+if failed_index is not None:
+_append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
+"index": i, "slug": slug, "cmd": cmd,
+"verdict": "skipped", "reason": "an earlier stage failed"})
+continue
+try:
+proc = subprocess.run(cmd, input=data, stdout=subprocess.PIPE,
+stderr=subprocess.PIPE)
+except (OSError, ValueError) as exc:
+_append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
+"index": i, "slug": slug, "cmd": cmd,
+"verdict": "failed", "exit": None,
+"error": str(exc)})
+failed_index = i
+continue
+rec = {"kind": "stage", "trace_id": trace_id, "index": i, "slug": slug,
+"cmd": cmd, "exit": proc.returncode,
+"bytes_in": len(data), "bytes_out": len(proc.stdout),
+"verdict": "ok" if proc.returncode == 0 else "failed"}
+if proc.returncode!= 0:
+rec["stderr_tail"] = proc.stderr.decode("utf-8", "replace")[-500:]
+_append_ledger(ledger_path, rec)
+if proc.returncode!= 0:
+failed_index = i
+continue
+data = proc.stdout
+if failed_index is None:
+# Final stage's stdout is conductor's stdout (a sink typically emits none).
+sys.stdout.buffer.write(data)
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id, "verdict": "ok"})
+_emit_run_summary(trace_id, ledger_path, ok=True, failed_index=None, stages=stages)
+return 0
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id, "verdict": "failed",
+"failed_index": failed_index})
+_emit_run_summary(trace_id, ledger_path, ok=False, failed_index=failed_index, stages=stages)
+return 5
 
-// 'null' type and 'any' type
-var s2 = { x: { type: 'null'}, y: { type: 'any'}};
-ok('null type matches null', check('{"x":null,"y":0}\n', s2).ok === true);
-ok('null type rejects non-null', check('{"x":0,"y":0}\n', s2).ok === false);
-ok('any accepts anything present', check('{"x":null,"y":{"deep":[1]}}\n', s2).ok === true);
+def _emit_run_summary(trace_id, ledger_path, ok, failed_index, stages):
+summary = {"kind": "run-summary", "trace_id": trace_id, "ledger": ledger_path,
+"n_stages": len(stages), "ok": ok}
+if not ok:
+summary["failed_stage"] = {"index": failed_index, "slug": stages[failed_index][0]}
+# summary goes to stderr so it never pollutes the passed-through final stdout
+sys.stderr.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
 
-// ill-formed schema → thrown ContractError (would be exit 2)
-var threw = false;
-try { check('{}\n', { f: { type: 'weird'}});} catch (e) { threw =!!e.contract;}
-ok('bad schema throws', threw);
+def cmd_replay(args):
+if not args.ledger or not args.trace:
+sys.stderr.write("conductor: replay needs --ledger and --trace\n")
+return 2
+try:
+with open(args.ledger, "r") as f:
+lines = f.readlines()
+except OSError as exc:
+sys.stderr.write("conductor: cannot read ledger %s: %s\n" % (args.ledger, exc))
+return 2
+found = False
+for line in lines:
+line = line.strip()
+if not line:
+continue
+try:
+rec = json.loads(line)
+except ValueError:
+continue
+if rec.get("trace_id") == args.trace:
+found = True
+_emit(rec)
+if not found:
+sys.stderr.write("conductor: no records for trace-id %s in %s\n" % (args.trace, args.ledger))
+return 2
+return 0
 
-// determinism / idempotence — same inputs, same verdict object twice
-ok('idempotent verdict',
-JSON.stringify(check(miss, schema)) === JSON.stringify(check(miss, schema)));
+def build_parser():
+p = argparse.ArgumentParser(prog="conductor",
+description="Run a declared pipeline of JSONL tools, with a record.")
+sub = p.add_subparsers(dest="cmd", required=True)
 
-// empty stream (no records) → vacuously ok
-ok('empty stream ok', check('\n\n', schema).ok === true);
+sp_verbs = sub.add_parser("verbs", help="print the five port-verbs and contracts")
+sp_verbs.set_defaults(func=cmd_verbs)
 
-if (fails.length) { print('SELFTEST FAIL: ' + fails.join(', ')); return 1;}
-print('SELFTEST OK (' + 15 + ' checks)');
-return 0;
-}
+sp_check = sub.add_parser("check", help="typecheck the pipeline without running it")
+sp_check.add_argument("--stage", action="append", help="slug:verb[:cmd] (repeatable, in order)")
+sp_check.add_argument("--stdin", dest="from_stdin", action="store_true", help="read stages as JSON-lines on stdin")
+sp_check.set_defaults(func=cmd_check)
 
-/* ================= tiny I/O shim (Node CLI; browser export) ================ */
-function print(s) {
-if (typeof process!== 'undefined' && process.stdout) process.stdout.write(s + '\n');
-else if (typeof console!== 'undefined') console.log(s);
-}
-function eprint(s) {
-if (typeof process!== 'undefined' && process.stderr) process.stderr.write(s + '\n');
-else if (typeof console!== 'undefined') console.error(s);
-}
+sp_run = sub.add_parser("run", help="typecheck then run the stages in order, with a record")
+sp_run.add_argument("--stage", action="append", help="slug:verb:cmd (repeatable, in order)")
+sp_run.add_argument("--stdin", dest="from_stdin", action="store_true", help="read stages as JSON-lines on stdin")
+sp_run.add_argument("--ledger", help="append per-stage records here (default: conductor.ledger.jsonl)")
+sp_run.add_argument("--input", help="file to seed the first stage's stdin (default: empty)")
+sp_run.add_argument("--trace", help="use this trace-id (default: a fresh uuid4)")
+sp_run.set_defaults(func=cmd_run)
 
-var HELP =
-'contract — assert JSONL records match a declared structural schema.\n\n' +
-'usage:\n' +
-' contract --schema <schema.json> [<records.jsonl>] [--closed]\n' +
-' contract --selftest\n' +
-' contract --help | --list\n\n' +
-'reads records from the file argument or stdin. exit 0 = all pass,\n' +
-'1 = first record that violates the schema (line + field + reason on stderr),\n' +
-'2 = unusable input or ill-formed schema.\n\n' +
-' --schema F the declared schema (a JSON object; see below)\n' +
-' --closed reject the first field a record carries that the schema omits\n' +
-' --selftest run the built-in proofs and exit\n\n' +
-'schema: { "field": {"type":"string","required":true},...}\n' +
-' type: string number boolean object array null any · required: true|false\n' +
-' shorthand: "field":"number" === required field of that type\n\n' +
-CEILING;
+sp_replay = sub.add_parser("replay", help="print every stage record for a trace-id")
+sp_replay.add_argument("--ledger", required=True)
+sp_replay.add_argument("--trace", required=True)
+sp_replay.set_defaults(func=cmd_replay)
 
-function readAll(fd) {
-var fs = require('fs');
-return fs.readFileSync(fd === undefined? 0: fd, 'utf8');
-}
+return p
 
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf('--help') >= 0 || args.indexOf('-h') >= 0) { print(HELP); return 0;}
-if (args.indexOf('--list') >= 0) { print(HELP); return 0;}
-if (args.indexOf('--selftest') >= 0) return selftest();
+def main(argv=None):
+parser = build_parser()
+args = parser.parse_args(argv)
+return args.func(args)
 
-var closed = false, schemaPath = null, recPath = null, i;
-for (i = 0; i < args.length; i++) {
-if (args[i] === '--closed') closed = true;
-else if (args[i] === '--schema') { schemaPath = args[++i];}
-else if (args[i].slice(0, 9) === '--schema=') { schemaPath = args[i].slice(9);}
-else if (args[i].charAt(0) === '-') { eprint('contract: unknown option ' + args[i]); return 2;}
-else recPath = args[i];
-}
-if (!schemaPath) { eprint('contract: --schema <file> is required (see --help)'); return 2;}
+if __name__ == "__main__":
+sys.exit(main())
 
-var fs = require('fs'), schema, records;
-try { schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));}
-catch (e) { eprint('contract: cannot read schema ' + JSON.stringify(schemaPath) +
-': ' + ((e && e.message) || 'error')); return 2;}
-try { records = recPath? fs.readFileSync(recPath, 'utf8'): readAll(0);}
-catch (e) { eprint('contract: cannot read records: ' + ((e && e.message) || 'error')); return 2;}
+test_conductor.py 210 lines on GitHub →
+#!/usr/bin/env python3
+"""Tests for the conductor gift.
 
-var res;
-try { res = check(records, schema, { closed: closed, label: recPath || 'stdin'});}
-catch (e) {
-if (e && e.contract) { eprint('contract: ' + e.message); return 2;}
-throw e;
-}
-if (res.ok) return 0;
-eprint('contract: ' + (recPath || 'stdin') + ':' + res.line + ': ' +
-(res.field === null? '': 'field ' + JSON.stringify(res.field) + ': ') + res.reason);
-return 1;
-}
+Mutation-bitten. The load-bearing behaviors, each asserted so that deleting the
+behavior would fail the test:
+* typecheck-first: a broken pipeline must NOT launch any stage (assert no
+ledger records for stages, exit 3);
+* fail-clean: a failing stage stops the run, is recorded 'failed', and every
+later stage is recorded 'skipped' (assert both, exit 5);
+* the ledger records every stage in order with exit/bytes;
+* replay returns exactly the records for a trace-id.
 
-/* ---- exports (browser) + CLI (Node) --------------------------------------- */
-var API = { check: check, compileSchema: compileSchema, typeOf: typeOf, selftest: selftest, CEILING: CEILING};
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = API;
-if (require.main === module) process.exit(main(process.argv));
-} else if (typeof window!== 'undefined') {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.contract = API;
-}
+Uses tiny real python subprocess stages so execution is genuinely exercised.
+Run: python3 -m unittest test_conductor -v (stdlib only, no deps)
+"""
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout, redirect_stderr
 
-test_contract.js 106 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* test_contract.js — out-of-band battery for the contract gift.
-*
-* Oracles are hand-computed here, independent of contract.js's own --selftest:
-* the test asserts WHAT the answer must be, the gift computes it, we compare.
-* A green battery + a green --selftest are two witnesses, not one restated.
-*/
-var C = require('./contract.js');
-var fails = [];
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g!== w) fails.push(name + '\n got: ' + g + '\n want: ' + w);
-}
-function truthy(name, cond) { if (!cond) fails.push(name);}
+import conductor as cd
 
-var schema = {
-id: { type: 'number', required: true},
-name: 'string',
-tags: { type: 'array', required: false}
-};
+PY = sys.executable
 
-/* 1. a fully-conforming stream → ok:true (extra field allowed, open mode) */
-eq('T1 conforming', C.check(
-'{"id":1,"name":"a","tags":[]}\n{"id":2,"name":"b"}\n{"id":3,"name":"c","x":9}\n', schema),
-{ ok: true});
+# tiny real stages (as shell-quotable command strings for slug:verb:cmd tokens)
+# emit: prints two json-lines, ignores stdin (a source)
+EMIT = "%s -c \"print('{\\\"a\\\":1}');print('{\\\"a\\\":2}')\"" % PY
+# pass: echoes stdin to stdout unchanged (a transform)
+PASS = "%s -c \"import sys;sys.stdout.write(sys.stdin.read())\"" % PY
+# count: reads stdin, prints one summary line (a fold)
+COUNT = "%s -c \"import sys;n=len([l for l in sys.stdin if l.strip()]);print('{\\\"n\\\":%%d}'%%n)\"" % PY
+# boom: exits 1 after reading stdin (a failing stage)
+BOOM = "%s -c \"import sys;sys.stdin.read();sys.exit(1)\"" % PY
+# sink: reads stdin, writes nothing to stdout, exit 0
+SINK = "%s -c \"import sys;sys.stdin.read()\"" % PY
 
-/* 2. missing required field on record 2 → line 2, field name, missing */
-eq('T2 missing required', C.check('{"id":1,"name":"a"}\n{"id":2}\n', schema),
-{ ok: false, line: 2, field: 'name', reason: 'missing required field'});
+def run(argv, stdin_text=None):
+obuf, ebuf = io.StringIO(), io.StringIO()
+old_stdin = sys.stdin
+if stdin_text is not None:
+sys.stdin = io.StringIO(stdin_text)
+# conductor.run writes final stdout via sys.stdout.buffer; capture that too
+old_stdout_buffer = getattr(sys.stdout, "buffer", None)
+try:
+with redirect_stdout(obuf), redirect_stderr(ebuf):
+# give the redirected StringIO a.buffer that tees to bytes
+class _B:
+def __init__(self, s): self.s = s
+def write(self, b): self.s.write(b.decode("utf-8", "replace"))
+sys.stdout.buffer = _B(obuf)
+code = cd.main(argv)
+finally:
+sys.stdin = old_stdin
+out_recs = [json.loads(l) for l in obuf.getvalue().splitlines() if l.strip().startswith("{")]
+err_recs = [json.loads(l) for l in ebuf.getvalue().splitlines() if l.strip().startswith("{")]
+return code, out_recs, err_recs
 
-/* 3. wrong type on id (string not number), record 1 */
-eq('T3 wrong type', C.check('{"id":"1","name":"a"}\n', schema),
-{ ok: false, line: 1, field: 'id', reason: 'expected number, got string'});
+def read_ledger(path):
+recs = []
+if os.path.exists(path):
+with open(path) as f:
+for line in f:
+line = line.strip()
+if line:
+recs.append(json.loads(line))
+return recs
 
-/* 4. FIRST bad record wins — record 2 fails (missing name), record 3 also would */
-eq('T4 first wins', C.check('{"id":1,"name":"a"}\n{"id":2}\n{"name":"z"}\n', schema),
-{ ok: false, line: 2, field: 'name', reason: 'missing required field'});
+class TmpCase(unittest.TestCase):
+def setUp(self):
+self.d = tempfile.mkdtemp()
+self.ledger = os.path.join(self.d, "l.jsonl")
 
-/* 5. optional field present but wrong type → caught at that field */
-eq('T5 optional typed', C.check('{"id":1,"name":"a","tags":"nope"}\n', schema),
-{ ok: false, line: 1, field: 'tags', reason: 'expected array, got string'});
+def tearDown(self):
+import shutil
+shutil.rmtree(self.d, ignore_errors=True)
 
-/* 6. a record that is not an object (an array) → field null, structural reason */
-eq('T6 non-object', C.check('{"id":1,"name":"a"}\n[1,2]\n', schema),
-{ ok: false, line: 2, field: null, reason: 'record is not a JSON object (got array)'});
+class TestGate(unittest.TestCase):
+def test_emits_accepts(self):
+self.assertFalse(cd.emits("sink"))
+self.assertFalse(cd.accepts("source"))
+self.assertTrue(cd.emits("source"))
+self.assertTrue(cd.accepts("sink"))
 
-/* 7. closed mode rejects the first unexpected field; open mode passes it */
-eq('T7 closed rejects', C.check('{"id":1,"name":"a","surprise":1}\n', schema, { closed: true}),
-{ ok: false, line: 1, field: 'surprise', reason: 'unexpected field (schema is closed)'});
-eq('T7 open allows', C.check('{"id":1,"name":"a","surprise":1}\n', schema),
-{ ok: true});
+class TestCheck(unittest.TestCase):
+def test_check_valid(self):
+code, out, _ = run(["check", "--stage", "a:source", "--stage", "b:fold"])
+self.assertEqual(code, 0)
+self.assertTrue(out[-1]["typechecks"])
 
-/* 8. null type + any type */
-var s2 = { x: { type: 'null'}, y: { type: 'any'}};
-eq('T8 null ok', C.check('{"x":null,"y":0}\n', s2), { ok: true});
-eq('T8 null bad', C.check('{"x":5,"y":0}\n', s2),
-{ ok: false, line: 1, field: 'x', reason: 'expected null, got number'});
-eq('T8 any ok', C.check('{"x":null,"y":{"z":[1,2]}}\n', s2), { ok: true});
+def test_check_broken_is_3(self):
+code, out, _ = run(["check", "--stage", "a:sink", "--stage", "b:transform"])
+self.assertEqual(code, 3)
+self.assertEqual(out[-1]["kind"], "refused")
 
-/* 9. shorthand string rule === {type,required:true} */
-eq('T9 shorthand', C.check('{"name":5}\n', { name: 'string'}),
-{ ok: false, line: 1, field: 'name', reason: 'expected string, got number'});
+def test_check_undeclared_is_4(self):
+code, out, _ = run(["check", "--stage", "a:source", "--stage", "b:emits"])
+self.assertEqual(code, 4)
 
-/* 10. boolean + object types */
-var s3 = { flag: 'boolean', meta: { type: 'object'}};
-eq('T10 bool+object ok', C.check('{"flag":true,"meta":{}}\n', s3), { ok: true});
-eq('T10 object rejects array', C.check('{"flag":false,"meta":[]}\n', s3),
-{ ok: false, line: 1, field: 'meta', reason: 'expected object, got array'});
+class TestTypecheckFirstNoLaunch(TmpCase):
+"""THE typecheck-first guarantee: a broken pipeline must NOT run any stage.
+Assert exit 3 AND zero stage records in the ledger — deleting the pre-run
+typecheck would let a stage launch and write a record."""
 
-/* 11. empty stream (blank lines only) → vacuously ok */
-eq('T11 empty ok', C.check('\n \n\n', schema), { ok: true});
+def test_broken_pipeline_launches_nothing(self):
+code, out, err = run(["run",
+"--stage", "a:sink:%s" % SINK, # sink not last
+"--stage", "b:transform:%s" % PASS,
+"--ledger", self.ledger])
+self.assertEqual(code, 3)
+led = read_ledger(self.ledger)
+stage_recs = [r for r in led if r.get("kind") == "stage"]
+self.assertEqual(stage_recs, [], "a broken pipeline launched a stage — typecheck-first failed")
 
-/* 12. ill-formed schema throws a tagged ContractError (→ exit 2 path) */
-var threw = false;
-try { C.check('{}\n', { f: { type: 'nope'}});} catch (e) { threw = e && e.contract === true;}
-truthy('T12 bad schema throws tagged', threw);
-var threw2 = false;
-try { C.check('{}\n', [1, 2, 3]);} catch (e) { threw2 = e && e.contract === true;}
-truthy('T12 non-object schema throws', threw2);
+class TestRunCleanRecords(TmpCase):
+def test_full_run_records_every_stage_in_order(self):
+code, out, err = run(["run",
+"--stage", "emit:source:%s" % EMIT,
+"--stage", "pass:transform:%s" % PASS,
+"--stage", "count:fold:%s" % COUNT,
+"--ledger", self.ledger, "--trace", "T1"])
+self.assertEqual(code, 0)
+led = read_ledger(self.ledger)
+stage_recs = [r for r in led if r.get("kind") == "stage"]
+self.assertEqual([r["index"] for r in stage_recs], [0, 1, 2])
+self.assertEqual([r["slug"] for r in stage_recs], ["emit", "pass", "count"])
+self.assertTrue(all(r["verdict"] == "ok" for r in stage_recs))
+# bytes flow: emit produces >0, count reads what pass passed
+self.assertGreater(stage_recs[0]["bytes_out"], 0)
+self.assertEqual(stage_recs[1]["bytes_in"], stage_recs[0]["bytes_out"])
+# run-summary on stderr says ok
+self.assertTrue(err[-1]["ok"])
 
-/* 13. bad JSON in records throws (→ exit 2), with line number */
-var threwJ = false, msgJ = '';
-try { C.check('{"id":1,"name":"a"}\n{oops\n', schema);} catch (e) { threwJ = e && e.contract === true; msgJ = e.message;}
-truthy('T13 bad json throws', threwJ && /:2:/.test(msgJ));
+class TestFailClean(TmpCase):
+"""A failing stage stops the run: it is recorded 'failed', every LATER stage
+'skipped', exit 5, and the summary names the failed stage. Deleting the
+fail-stop would let a later stage run on broken input."""
 
-/* 14. determinism — identical verdict object across repeated calls */
-truthy('T14 idempotent',
-JSON.stringify(C.check('{"id":2}\n', schema)) === JSON.stringify(C.check('{"id":2}\n', schema)));
+def test_failure_stops_and_marks_skipped(self):
+code, out, err = run(["run",
+"--stage", "emit:source:%s" % EMIT,
+"--stage", "boom:transform:%s" % BOOM, # fails
+"--stage", "count:fold:%s" % COUNT, # must be skipped
+"--ledger", self.ledger, "--trace", "T2"])
+self.assertEqual(code, 5)
+led = read_ledger(self.ledger)
+by_slug = {r["slug"]: r for r in led if r.get("kind") == "stage"}
+self.assertEqual(by_slug["boom"]["verdict"], "failed")
+self.assertEqual(by_slug["count"]["verdict"], "skipped")
+# summary names the failed stage
+summ = err[-1]
+self.assertFalse(summ["ok"])
+self.assertEqual(summ["failed_stage"]["slug"], "boom")
 
-/* 15. required:false absent is fine; required:false present-and-right is fine */
-var s4 = { a: { type: 'number', required: false}};
-eq('T15 optional absent', C.check('{}\n', s4), { ok: true});
-eq('T15 optional present ok', C.check('{"a":7}\n', s4), { ok: true});
+def test_missing_cmd_on_run_is_exit2(self):
+code, out, err = run(["run", "--stage", "a:source", "--ledger", self.ledger])
+self.assertEqual(code, 2)
 
-/* 16. field order determinism — id checked before name (schema-declared order);
-* a record missing BOTH reports id first, not name */
-eq('T16 field order', C.check('{}\n', schema),
-{ ok: false, line: 1, field: 'id', reason: 'missing required field'});
+class TestReplay(TmpCase):
+def test_replay_returns_only_that_trace(self):
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TA"])
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TB"])
+code, out, _ = run(["replay", "--ledger", self.ledger, "--trace", "TA"])
+self.assertEqual(code, 0)
+self.assertTrue(out)
+self.assertTrue(all(r["trace_id"] == "TA" for r in out))
+# TB records are NOT in TA's replay
+self.assertFalse(any(r["trace_id"] == "TB" for r in out))
 
-if (fails.length) {
-console.error('BATTERY FAIL (' + fails.length + '):\n ' + fails.join('\n '));
-process.exit(1);
-}
-console.log('BATTERY OK — all checks passed');
-process.exit(0);
+def test_replay_unknown_trace_is_exit2(self):
+run(["run", "--stage", "emit:source:%s" % EMIT, "--stage", "sink:sink:%s" % SINK,
+"--ledger", self.ledger, "--trace", "TA"])
+code, _, _ = run(["replay", "--ledger", self.ledger, "--trace", "NOPE"])
+self.assertEqual(code, 2)
+
+class TestStdinStages(TmpCase):
+def test_stages_from_stdin_run(self):
+stdin = "\n".join([
+json.dumps({"slug": "emit", "port_verb": "source", "cmd": cd.shlex.split(EMIT)}),
+json.dumps({"slug": "sink", "port_verb": "sink", "cmd": cd.shlex.split(SINK)}),
+])
+code, out, err = run(["run", "--stdin", "--ledger", self.ledger, "--trace", "TS"],
+stdin_text=stdin)
+self.assertEqual(code, 0)
+
+class TestVerbs(unittest.TestCase):
+def test_verbs_five_in_order(self):
+code, out, _ = run(["verbs"])
+self.assertEqual(code, 0)
+self.assertEqual([r["port_verb"] for r in out],
+["source", "transform", "filter", "fold", "sink"])
+
+if __name__ == "__main__":
+unittest.main()
 
 Take the whole folder →
 MIT
-Zero dependencies, Node or browser, deterministic
+Python 3, standard library only
 
 ---
 
-# Counter-fold — a Loop MMT gift
-https://loopmmt.com/gifts/counter-fold/
+# Your Prompt Goes to Confession — a Loop MMT gift
+https://loopmmt.com/gifts/confessional/
 [coverage: optional · branch: gifts]
 
-A Binary Counter's +1 as a Fold, Closed Under Its Own I/O fold ← all gifts
+What Does Your Prompt Quietly Fail to Constrain? confess ← all gifts
 
-Counter-fold
+Your Prompt Goes to Confession
 
-counter-fold reads the STATE of a binary counter — the SET of its set bits, one JSON non-negative integer bit-index per line (JSON Lines) — and folds it into the NEXT value by adding ONE, using a HAND-BUILT ripple carry (clear the trailing run of set low bits, set the next clear bit), with zero dependencies. The counter's value is the sparse binary number sum of 2**i over the set bits, and it is UNBOUNDED: a bit index is a POSITION, small even when the value is astronomical (a 2**100 counter is just bit {100}), so it counts past 2**53 with no loss — it never holds the value as a native number. Output is the SAME SHAPE as input — the new set of set bits, one index per line, sorted — so the gift is CLOSED UNDER ITS OWN I/O: its output pipes straight back into itself, and counter-fold | counter-fold == counter-fold --steps 2. That closed loop is the point: the counter's state circulating through its own output channel, each pass advancing it one tick — Shea's mercury delay line as a counter. --steps N adds N in-process (N=0 canonicalises: dedup + sort). Because the set bits are sorted and duplicates collapse, the SAME value in ANY order folds to a BYTE-IDENTICAL record. Same counter in → counter+1 out, in Node or a browser.
+Feed it your prompt and it admits what it does NOT constrain — reading a closed checklist of eight constrainable dimensions (output-format, length, tone, audience, refusal, edge-cases, scope-boundary, grounding) and confessing which your prompt closed (with the phrase that closed it) and which it left open (with the absence that left it open). Its chain verb accumulates two or more confessions to show what NONE of your prompts constrained — order-independent and idempotent. The collection's own honest edge, turned into a tool you point at your own prompts. Python stdlib only, offline, deterministic — same prompt yields a byte-identical confession every run.
 
 The honest edge
 
-counter-fold is ONE deterministic binary counter incremented N times, its +1 a hand-built ripple carry — NOT a general adder (it adds ONE per step via --steps N; it does not add two counters), NOT a bounded register (it is sparse and unbounded, so it never overflows), and NOT a value printer (it emits the SET of set bits, the counter's state; value = sum of 2**i). The output is the same shape as the input, so it is closed under its own I/O (counter-fold | counter-fold == --steps 2). Fully order-independent — duplicates collapse, output sorted.
+confessional CONFESSES the constrainable dimensions your prompt left open, from a declared checklist — it cannot find a gap outside that checklist, cannot tell you whether an open dimension matters for your task, and cannot make your prompt complete. It confesses; it does not audit. Its deepest edge: it cannot find the gap you never named.
 
 Run it
 
-printf '%s\n' 0 1 | node counter-fold.js # counter+1 as sorted JSONL bit indices; --steps N (+N; 0 canonicalises); exit 0 ok | 2 input error
-test_counter-fold.js (29/29: ripple-carry correctness on known values — 0->1, 3->4 through a run of ones, 11->12, 5->6 gap-stops-carry, 7->8 — agreement with an INDEPENDENT BigInt value-arithmetic oracle (decode bits->sum 2**i->+N->re-encode, a different method than the ripple carry) across 9 vectors x 5 step-counts; the TIER-B closure (--steps N == piping the fold into itself N times); UNBOUNDED past 2**53 ({60}/{100}/all-ones-0..59+1=={60}); determinism; order-independence shuffled==sorted; dedup + steps-0 canonicalisation; numeric/steps honesty throws) + out-of-band conformance conform_counter-fold.cjs (51/51 GREEN, subprocess-driven, signed 723dd8e8031bd2f2, independent BigInt value oracle + wrong-carry mutation bite proven RED 15/51)
-Zero dependencies, Node or browser, deterministic
+python3 confessional.py confess "Summarize the report in 3 bullets." && python3 confessional.py chain conf_a.json conf_b.json
+smoke_test.py / --selftest (21/21); golden test_confessional.py 32 checks; plumb conformance 15/15, independent re-derivation oracle that caught a real over-broad-detector bug, signed S09.1231
+Python stdlib only, deterministic
 
 The code — every file that ships
 
-counter-fold.js 183 lines on GitHub →
-#!/usr/bin/env node
-/**
-* counter-fold — a hand-built binary counter, one increment as a FOLD, in a trace loop.
-*
-* WHAT
-* Reads the STATE of a binary counter -- the SET of its set bits, one non-negative
-* integer bit-index per line (JSON Lines) -- and folds it into the counter's NEXT
-* value by adding ONE, using a hand-built RIPPLE CARRY (clear the trailing run of
-* set low bits, set the next clear bit). Output is the same shape as input: the new
-* set of set bits, one index per line, sorted. So the gift is CLOSED UNDER ITS OWN
-* I/O -- its output pipes straight back into itself:
-* counter-fold < s0 | counter-fold | counter-fold == counter-fold --steps 3 < s0
-* That feedback -- the counter's state circulating through its own output channel,
-* each pass advancing it by one tick -- is Shea's mercury delay line as a COUNTER
-* (Loop 1.0's loop-line memory generalized): a register that counts by feeding its
-* own state back. It is the Tier-B property: the reducer transition stays the `fold`
-* atom; the loop (↻) is only wrapped around it, no new primitive. --steps N
-* internalizes that loop (adds N).
-*
-* THE INCREMENT (a hand-built ripple carry, not native +1)
-* The counter's value is the sparse binary number whose set bits are the input:
-* value = sum of 2**i over the set bits i. Adding one is a ripple carry: starting
-* at bit 0, clear each set bit in the trailing run of ones, then set the first clear
-* bit reached. {0,1,3} (value 11) -> clear 0, clear 1, set 2 -> {2,3} (value 12).
-* The counter is UNBOUNDED and SPARSE: only set bits are represented, and a bit
-* index is a position (small even when the value is astronomical), so the counter
-* counts past 2**53 with no loss -- it never holds the value as a native number.
-*
-* USAGE
-* node counter-fold.js [--steps N] [FILE] # stdin if no FILE
-* printf '%s\n' 0 1 | node counter-fold.js # counter = 3, +1 -> 4
-* -> 2
-* --steps N add N in-process (default 1). N=0 canonicalises the input (dedups +
-* sorts the bit set) without incrementing.
-* --help
-*
-* EXIT CODES
-* 0 success
-* 2 input error: a line that is not a FINITE, NON-NEGATIVE INTEGER (a bit index);
-* a bad --steps (non-integer or < 0); a missing file or a directory. Always a
-* clean one-line message on stderr, never a stack trace.
-*
-* EDGE (what this is NOT)
-* ONE deterministic binary counter incremented N times -- NOT a general adder (it
-* adds ONE per step, via --steps N; it does not add two counters), NOT a bounded
-* register (it is sparse and unbounded, so it never overflows), and NOT a value
-* printer (it emits the SET of set bits, the counter's state -- value = sum of 2**i).
-* Bits are unordered on input (a SET -- duplicates collapse, order is irrelevant)
-* and SORTED on output (ascending), so the same counter value is a byte-identical
-* record regardless of input order.
-*
-* Zero dependencies. Node builtin `require('fs')` for file reads only; runs in a
-* browser with no require (attaches `counterFold` to window.ForestGifts). MIT.
-*/
-"use strict";
+confessional.py 606 lines on GitHub →
+#!/usr/bin/env python3
+"""confessional.py -- your prompt goes to confession, and admits what it does NOT constrain.
 
-/* one +1 ripple-carry step over a Set of bit indices -> a new Set of bit indices */
-function step(bits) {
-var next = new Set(bits);
-var i = 0;
-while (next.has(i)) { next.delete(i); i++;} // clear the trailing run of set low bits
-next.add(i); // set the first clear bit (the carry lands)
-return next;
+WHY THIS EXISTS. Every prompt is a set of things you told the model to do. But the
+gaps -- the things you *didn't* pin down -- are where its behavior drifts. You asked
+for a summary but never said how long; you named a tone but never a format; you set a
+task but never what to refuse. confessional reads a prompt and emits its honest
+ceilings: the constrainable dimensions a well-formed prompt of this kind *could* have
+pinned down, that yours left open. It turns the collection's own signature -- an honest
+edge on everything -- into a tool you point at your own prompts.
+
+THE ONE DISCIPLINE (the whole reason to trust it -- I1). confessional reports the gaps
+it can NAME. It reads what your prompt DECLARES and what a standard checklist of
+constrainable dimensions would EXPECT, and confesses the difference. It never claims to
+have found every gap, never claims a gap is a bug, never claims your prompt is complete
+when it stays silent. Its deepest, printed edge: it cannot find the gap you never named
+-- a dimension outside its declared checklist is invisible to it, by construction. It
+confesses; it does not audit.
+
+TWO VERBS, both honest:
+
+confess -- read one prompt; emit its open dimensions (the ones it does NOT constrain)
+and its closed dimensions (the ones it does), each named, each with the
+evidence (the phrase that closed it, or the absence that left it open).
+A dimension it has no detector for is NEVER reported closed on a guess:
+undetectable -> reported OPEN with reason "no declared detector matched",
+a named uncertainty, never a silent claim. Same prompt -> byte-identical
+confession, every run.
+
+chain -- read TWO OR MORE confessions (this gift's own JSON output, piped or by
+file) and ACCUMULATE them: a dimension is closed in the chain iff SOME
+link closed it; the residual open set is the intersection of every link's
+open set. This is the cumulative property -- confess prompt A, confess
+prompt B, chain them, and you see what NEITHER prompt constrained. The
+chain is order-independent and idempotent (chaining a confession with
+itself changes nothing).
+
+THE CLOSED DIMENSION SET (v1) -- each a constrainable axis with a deterministic detector:
+output-format is the shape of the answer pinned? (bullets, JSON, table, prose,...)
+length is the size bounded? (N words/sentences/paragraphs, "brief", "detailed")
+tone is the register named? (formal, casual, technical,...)
+audience is the reader named? (for a child, for an expert,...)
+refusal is the out-of-scope / refusal behavior stated? (if you can't, say...)
+edge-cases are empty / malformed / ambiguous inputs addressed?
+scope-boundary is what to leave OUT stated? (only X, do not cover Y)
+grounding is the source-of-truth / citation requirement stated?
+
+Each detector fails closed: it reports a dimension CLOSED only on a positive textual
+match it can name; otherwise the dimension is OPEN with a stated reason. It never
+infers "probably constrained".
+
+Pure function of its inputs. No dependencies. Offline. Same input -> byte-identical
+output, every run. Python 3.8+, standard library only.
+
+USAGE
+python3 confessional.py confess "Summarize the report in 3 bullets."
+python3 confessional.py confess < prompt.txt
+python3 confessional.py confess --dimensions output-format,length,refusal "..."
+python3 confessional.py confess prompt_a.txt | python3 confessional.py chain prompt_b_confession.json
+python3 confessional.py chain conf_a.json conf_b.json
+python3 confessional.py --selftest
+python3 confessional.py --help
+
+Released under MIT. Its edge is printed in the README and repeated here: confessional
+surfaces the constrainable dimensions your prompt left open, from a DECLARED checklist.
+It cannot find a gap outside that checklist, cannot tell you whether an open dimension
+matters for your task, and cannot make your prompt complete. It reports declared and
+detectable gaps; the gap you never named stays hidden.
+"""
+
+import sys
+import json
+import re
+
+VERSION = "1.0"
+
+# ---------------------------------------------------------------------------
+# The closed dimension set. Each entry: a name, a human gloss, and a detector.
+# A detector returns (closed: bool, evidence: str). closed=True ONLY on a
+# positive, nameable textual match; otherwise closed=False with a reason.
+# Detectors are pure functions of the lowercased prompt text.
+# ---------------------------------------------------------------------------
+
+def _find(patterns, text):
+"""Return the first matching phrase (the matched span) or None."""
+for pat in patterns:
+m = re.search(pat, text)
+if m:
+return m.group(0).strip()
+return None
+
+def _d_output_format(text):
+hit = _find([
+r"\b\d+\s+bullet(s)?\b",
+r"\bbullet(ed|s|-point| point)\b",
+r"\bas (a)?(json|table|list|markdown|csv|xml|yaml)\b",
+r"\bin (json|table|list|markdown|csv|xml|yaml) format\b",
+r"\b(json|markdown|csv|xml|yaml)-?formatted\b",
+r"\bnumbered list\b",
+r"\bone (sentence|paragraph|word)\b",
+r"\bin prose\b",
+r"\bplain text\b",
+r"\bformat(ted)? as\b",
+], text)
+if hit:
+return True, hit
+return False, "no output-shape phrase found (no bullets/JSON/table/list/prose spec)"
+
+def _d_length(text):
+hit = _find([
+r"\b\d+\s+(word|sentence|paragraph|bullet|line|character)s?\b",
+r"\b(under|no more than|at most|fewer than|less than|up to|max(imum)?)\s+\d+\b",
+r"\b(brief|briefly|concise|concisely|short|terse|succinct)\b",
+r"\b(detailed|in-depth|comprehensive|thorough|exhaustive|at length)\b",
+r"\bone-?liner\b",
+r"\btl;dr\b",
+r"\bkeep it (short|brief|to)\b",
+], text)
+if hit:
+return True, hit
+return False, "no length bound found (no count, no brief/detailed cue)"
+
+def _d_tone(text):
+hit = _find([
+r"\b(formal|informal|casual|professional|technical|academic|conversational|friendly|neutral|playful|serious|clinical)\s+(tone|voice|register|style|language)\b",
+r"\bin a (formal|casual|professional|technical|friendly|neutral|playful) (tone|voice|way|manner)\b",
+r"\btone[:=]\s*\w+",
+r"\b(sound|be|write|respond)\s+(formal|casual|professional|friendly|technical)\b",
+r"\bplain(-|)?english\b",
+], text)
+if hit:
+return True, hit
+return False, "no register named (no formal/casual/technical tone spec)"
+
+def _d_audience(text):
+hit = _find([
+r"\bfor (a |an)?(child|kid|beginner|expert|layperson|layman|novice|five[-]year[-]old|5[-]year[-]old|student|developer|engineer|doctor|nurse|manager|executive|non-?technical|technical) (audience|reader)?",
+r"\bexplain like i'?m\b",
+r"\beli5\b",
+r"\bassume (the reader|they|no|the audience)\b",
+r"\btarget audience[:=]",
+r"\bwrite for\b",
+r"\byour audience is\b",
+], text)
+if hit:
+return True, hit
+return False, "no reader named (no audience/for-a-... spec)"
+
+def _d_refusal(text):
+hit = _find([
+r"\bif you (can'?t|cannot|don'?t know|are unsure|are not sure|aren'?t sure)\b",
+r"\b(refuse|decline|do not answer|don'?t answer|say (you)?(can'?t|cannot))\b",
+r"\bif (the (answer|information)|there) is (no|not|none|unknown|unclear)\b.{0,40}\b(say|respond|reply|return|state)\b",
+r"\bif (you|it) (is|are) (not)?(unclear|uncertain|unknown|unsure|out of scope)\b",
+r"\bwhen unsure\b",
+r"\bif unable\b",
+r"\bout[-]of[-]scope\b",
+r"\bif you don'?t have (enough)?(the)?(information|context|data)\b",
+r"\bonly (answer|respond) if\b",
+], text)
+if hit:
+return True, hit
+return False, "no refusal/fallback behavior stated (no if-you-can't clause)"
+
+def _d_edge_cases(text):
+hit = _find([
+r"\b(empty|blank|missing|null|malformed|invalid|ambiguous|unclear|incomplete|contradictory)\s+(input|prompt|data|request|file|field|value)\b",
+r"\bif (the)?(input|data|request|field) is (empty|blank|missing|invalid|malformed|ambiguous)\b",
+r"\bedge case(s)?\b",
+r"\bcorner case(s)?\b",
+r"\bhandle.{0,30}\b(empty|missing|invalid|malformed|ambiguous)\b",
+r"\bif nothing\b",
+], text)
+if hit:
+return True, hit
+return False, "no edge-case handling stated (empty/malformed/ambiguous input unaddressed)"
+
+def _d_scope_boundary(text):
+hit = _find([
+r"\b(do not|don'?t|never|avoid)\b.{0,40}\b(include|cover|mention|discuss|add|address)\b",
+r"\bonly (cover|include|discuss|address|answer|focus on)\b",
+r"\bexclud(e|ing)\b",
+r"\bleave out\b",
+r"\bnothing (else|more|about)\b",
+r"\bstrictly\b.{0,20}\b(about|on|to)\b",
+r"\blimit(ed)? (yourself)?to\b",
+r"\bstay on\b",
+], text)
+if hit:
+return True, hit
+return False, "no scope boundary stated (nothing said to leave OUT)"
+
+def _d_grounding(text):
+hit = _find([
+r"\b(cite|citation|source|sources|reference|references)\b",
+r"\bbased (only)?on (the|this|these|provided)\b",
+r"\bfrom the (document|text|context|passage|data)\b",
+r"\bdo not (make up|invent|fabricate|hallucinate)\b",
+r"\bdon'?t (make up|invent|fabricate|hallucinate)\b",
+r"\bonly use (the|information)\b",
+r"\bquote\b",
+r"\bground(ed)? in\b",
+], text)
+if hit:
+return True, hit
+return False, "no grounding requirement stated (no cite/source/no-fabrication rule)"
+
+DIMENSIONS = [
+("output-format", "is the shape of the answer pinned?", _d_output_format),
+("length", "is the size bounded?", _d_length),
+("tone", "is the register named?", _d_tone),
+("audience", "is the reader named?", _d_audience),
+("refusal", "is out-of-scope / refusal behavior stated?", _d_refusal),
+("edge-cases", "are empty/malformed/ambiguous inputs addressed?", _d_edge_cases),
+("scope-boundary", "is what to leave OUT stated?", _d_scope_boundary),
+("grounding", "is the source-of-truth / citation rule stated?", _d_grounding),
+]
+
+DIM_NAMES = [d[0] for d in DIMENSIONS]
+
+# ---------------------------------------------------------------------------
+# confess
+# ---------------------------------------------------------------------------
+
+def confess(prompt, dimensions=None):
+"""Return the confession dict for one prompt.
+
+dimensions: optional list of dimension names to restrict to. Unknown names
+are reported in 'skipped_unknown', never silently dropped (fail-loud).
+"""
+if dimensions is None:
+selected = DIMENSIONS
+skipped_unknown = []
+else:
+want = list(dimensions)
+selected = [d for d in DIMENSIONS if d[0] in want]
+skipped_unknown = [n for n in want if n not in DIM_NAMES]
+
+text = prompt.lower()
+closed = []
+opend = []
+for name, gloss, detector in selected:
+is_closed, evidence = detector(text)
+rec = {"dimension": name, "gloss": gloss, "evidence": evidence}
+if is_closed:
+closed.append(rec)
+else:
+opend.append(rec)
+
+return {
+"gift": "confessional",
+"version": VERSION,
+"kind": "confession",
+"prompt": prompt,
+"closed": closed,
+"open": opend,
+"open_dimensions": [r["dimension"] for r in opend],
+"closed_dimensions": [r["dimension"] for r in closed],
+"skipped_unknown": skipped_unknown,
+"edge": ("declared/detectable dimensions only; a gap outside the checklist "
+"is invisible, and an open dimension is not necessarily one that "
+"matters for your task."),
 }
 
-/* parse JSONL bit indices -> Set of ints; throws on a non-negative-integer line */
-function parse(text) {
-var bits = new Set();
-var lines = String(text).split("\n");
-for (var i = 0; i < lines.length; i++) {
-var raw = lines[i];
-if (raw.charCodeAt(raw.length - 1) === 13) raw = raw.slice(0, -1); // CRLF
-if (raw.length === 0) continue; // blank line skipped
-var v;
-try { v = JSON.parse(raw);}
-catch (e) { throw new Error("line " + (i + 1) + ": not valid JSON: " + raw);}
-if (typeof v!== "number" ||!isFinite(v) || Math.floor(v)!== v || v < 0) {
-throw new Error("line " + (i + 1) + ": bit index must be a finite non-negative integer: " + raw);
-}
-bits.add(v);
-}
-return bits;
-}
+# ---------------------------------------------------------------------------
+# chain -- accumulate confessions (and chains)
+# ---------------------------------------------------------------------------
 
-/* sorted array of bit indices from a Set (ascending) -> canonical order */
-function sortedBits(bits) {
-var arr = [];
-bits.forEach(function (b) { arr.push(b);});
-arr.sort(function (a, b) { return a - b;});
-return arr;
-}
+def _open_set(link):
+"""The open-dimension set of a confession OR a chain link."""
+if link.get("kind") == "chain":
+return set(link.get("open_dimensions", []))
+return set(link.get("open_dimensions", []))
 
-/**
-* Fold a JSONL bit-set forward N increments (+N).
-* @param {string} text JSONL of non-negative integer bit indices (the counter's set bits)
-* @param {{steps?:number}} opts steps N (integer >= 0; default 1)
-* @returns {{steps:number, count:number, bits:number[]}} count = number of set bits
-* @throws {Error} on a bad line or a bad steps value.
-*/
-function fold(text, opts) {
-opts = opts || {};
-var steps = opts.steps === undefined? 1: opts.steps;
-if (typeof steps!== "number" ||!isFinite(steps) || Math.floor(steps)!== steps || steps < 0) {
-throw new Error("steps must be an integer >= 0 (got " + steps + ")");
-}
-var bits = parse(text);
-for (var s = 0; s < steps; s++) bits = step(bits);
-var arr = sortedBits(bits);
-return { steps: steps, count: arr.length, bits: arr};
-}
+def _closed_set(link):
+if link.get("kind") == "chain":
+return set(link.get("closed_dimensions", []))
+return set(link.get("closed_dimensions", []))
 
-/* ------------------------------------------------------------------ exports */
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { fold: fold, step: step, parse: parse, sortedBits: sortedBits};
-}
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.counterFold = fold;
-}
+def _universe(link):
+"""Every dimension this link considered (open + closed)."""
+return _open_set(link) | _closed_set(link)
 
-/* ----------------------------------------------------------------- CLI main */
-function main(argv) {
-var args = argv.slice(2);
-var steps = 1, file = null;
-for (var i = 0; i < args.length; i++) {
-var a = args[i];
-if (a === "--help" || a === "-h") {
-process.stdout.write(
-"usage: counter-fold.js [--steps N] [FILE]\n" +
-" --steps N add N in-process (default 1; N=0 canonicalises)\n" +
-" (no FILE) read the counter's set bits from stdin\n" +
-" FILE read the counter's set bits from a file\n" +
-" --help\n" +
-"Each non-blank line is one set bit as a JSON non-negative integer. Output is\n" +
-"the next value's set bits, same shape, one index per line, sorted -- so\n" +
-"`counter-fold | counter-fold` adds two (closed under its own I/O).\n"
-);
-process.exit(0);
-} else if (a === "--steps") {
-var nx = args[i + 1];
-if (nx === undefined) { process.stderr.write("counter-fold: --steps requires a value\n"); process.exit(2);}
-steps = Number(nx); i += 1;
-} else if (a.indexOf("--steps=") === 0) {
-steps = Number(a.slice(8));
-} else if (a.charAt(0) === "-" && a!== "-") {
-process.stderr.write("counter-fold: unknown option: " + a + "\n"); process.exit(2);
-} else {
-if (file!== null) { process.stderr.write("counter-fold: more than one FILE given\n"); process.exit(2);}
-file = a;
-}
+def chain(links):
+"""Accumulate >=1 confessions/chains.
+
+A dimension is CLOSED in the chain iff SOME link closed it.
+The residual OPEN set is: (dimensions considered by every link) minus the
+union of everything any link closed. Restricting to the common universe keeps
+the property honest -- a dimension no link even looked at is not reported open.
+"""
+if not links:
+raise ValueError("chain requires at least one confession")
+
+universes = [_universe(l) for l in links]
+common_universe = set.intersection(*universes) if universes else set()
+
+closed_union = set()
+for l in links:
+closed_union |= _closed_set(l)
+
+residual_open = sorted(common_universe - closed_union)
+chained_closed = sorted(common_universe & closed_union)
+
+sources = []
+for l in links:
+sources.append({
+"kind": l.get("kind"),
+"prompt": l.get("prompt") if l.get("kind") == "confession" else None,
+"links": len(l.get("sources", [])) if l.get("kind") == "chain" else 1,
+})
+
+return {
+"gift": "confessional",
+"version": VERSION,
+"kind": "chain",
+"n_links": len(links),
+"open_dimensions": residual_open,
+"closed_dimensions": chained_closed,
+"sources": sources,
+"edge": ("chain shows what NO link constrained, over the dimensions common "
+"to all links; a dimension some link never considered is left out "
+"rather than guessed."),
 }
 
-function run(text) {
-var rec;
-try { rec = fold(text, { steps: steps});}
-catch (e) { process.stderr.write("counter-fold: " + e.message + "\n"); process.exit(2); return;}
-// closed under I/O: emit the SET of set bits as JSONL (one index per line)
-var out = "";
-for (var i = 0; i < rec.bits.length; i++) out += JSON.stringify(rec.bits[i]) + "\n";
-process.stdout.write(out);
-}
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
 
-if (file === null || file === "-") {
-var chunks = [];
-process.stdin.on("data", function (c) { chunks.push(c);});
-process.stdin.on("end", function () { run(Buffer.concat(chunks).toString("utf8"));});
-} else {
-var fs = require("fs");
-var text;
-try {
-var st = fs.statSync(file);
-if (st.isDirectory()) { process.stderr.write("counter-fold: is a directory: " + file + "\n"); process.exit(2); return;}
-text = fs.readFileSync(file, "utf8");
-} catch (e) {
-process.stderr.write("counter-fold: cannot read file: " + file + "\n"); process.exit(2); return;
-}
-run(text);
-}
-}
+def render_confession(c):
+lines = []
+lines.append("CONFESSION")
+lines.append("=" * 60)
+p = c["prompt"]
+show = p if len(p) <= 200 else p[:197] + "..."
+lines.append("prompt: " + show)
+lines.append("")
+lines.append("CLOSED (%d) -- what this prompt DOES constrain:" % len(c["closed"]))
+if c["closed"]:
+for r in c["closed"]:
+lines.append(" [x] %-14s (%s)" % (r["dimension"], r["evidence"]))
+else:
+lines.append(" (none)")
+lines.append("")
+lines.append("OPEN (%d) -- what it does NOT constrain:" % len(c["open"]))
+if c["open"]:
+for r in c["open"]:
+lines.append(" [] %-14s %s" % (r["dimension"], r["evidence"]))
+else:
+lines.append(" (none)")
+if c["skipped_unknown"]:
+lines.append("")
+lines.append("skipped (unknown dimension names): " + ", ".join(c["skipped_unknown"]))
+lines.append("")
+lines.append("edge: " + c["edge"])
+return "\n".join(lines)
 
-if (typeof require!== "undefined" && require.main === module) {
-main(process.argv);
-}
+def render_chain(c):
+lines = []
+lines.append("CHAIN CONFESSION (%d links)" % c["n_links"])
+lines.append("=" * 60)
+lines.append("closed by SOME link (%d): %s" % (
+len(c["closed_dimensions"]),
+", ".join(c["closed_dimensions"]) or "(none)"))
+lines.append("")
+lines.append("open in EVERY link (%d) -- what NONE of them constrained:" % len(c["open_dimensions"]))
+if c["open_dimensions"]:
+for d in c["open_dimensions"]:
+lines.append(" [] " + d)
+else:
+lines.append(" (none -- together the links close every common dimension)")
+lines.append("")
+lines.append("edge: " + c["edge"])
+return "\n".join(lines)
 
-test_counter-fold.js 92 lines on GitHub →
-#!/usr/bin/env node
-/* test_counter-fold.js — external battery for the counter-fold gift.
-*
-* node test_counter-fold.js -> exit 0 GREEN / non-zero RED
-*
-* Proves ripple-carry correctness on known counter values (0->1, 3->4 through a run
-* of ones, 11->12), agreement with an INDEPENDENT value-arithmetic method (decode the
-* bit set to a BigInt = sum of 2**i, add N, re-encode -- a different method than the
-* hand-built ripple carry), the TIER-B closure property (--steps N equals piping the
-* fold into itself N times -- the trace ↻ loop), UNBOUNDEDNESS past 2**53, plus
-* determinism, order-independence, empty/steps-0, dedup, and numeric-honesty errors.
-*/
-"use strict";
-var m = require("./counter-fold.js");
-var fold = m.fold;
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-var pass = 0, fail = 0;
-function ok(name, cond) { if (cond) pass++; else { fail++; console.error(" RED " + name);}}
-function throws(name, fn) { try { fn(); fail++; console.error(" RED " + name + " (did not throw)");} catch (e) { pass++;}}
-function J(v) { return JSON.stringify(v);}
-function jsonl(bits) { return bits.map(function (b) { return J(b);}).join("\n");}
-function toJSONL(rec) { return rec.bits.map(function (b) { return J(b);}).join("\n");}
+def _read_stdin():
+if sys.stdin is not None and not sys.stdin.isatty():
+return sys.stdin.read()
+return ""
 
-/* ---- independent method: bit set <-> BigInt value (NOT a ripple carry) ------ */
-function bitsToVal(bits) { var v = 0n; for (var i = 0; i < bits.length; i++) v += (1n << BigInt(bits[i])); return v;}
-function valToBits(v) { var b = [], i = 0n; while (v > 0n) { if (v & 1n) b.push(Number(i)); v >>= 1n; i++;} return b;}
-function expectPlus(bits, n) { return valToBits(bitsToVal(bits) + BigInt(n));}
+def _load_json_arg(arg):
+"""arg is a path OR a raw JSON string."""
+try:
+with open(arg, "r") as f:
+return json.load(f)
+except (FileNotFoundError, IsADirectoryError, OSError):
+return json.loads(arg)
 
-/* ---- ripple carry on known counter values ---------------------------------- */
-ok("0 -> 1: {} +1 == {0}", J(fold("", { steps: 1}).bits) === J([0]));
-ok("1 -> 2: {0} +1 == {1}", J(fold(jsonl([0]), { steps: 1}).bits) === J([1]));
-ok("3 -> 4: {0,1} +1 == {2} (carry through a run of ones)", J(fold(jsonl([0, 1]), { steps: 1}).bits) === J([2]));
-ok("11 -> 12: {0,1,3} +1 == {2,3}", J(fold(jsonl([0, 1, 3]), { steps: 1}).bits) === J([2, 3]));
-ok("5 -> 6: {0,2} +1 == {1,2} (gap stops the carry)", J(fold(jsonl([0, 2]), { steps: 1}).bits) === J([1, 2]));
-ok("7 -> 8: {0,1,2} +1 == {3}", J(fold(jsonl([0, 1, 2]), { steps: 1}).bits) === J([3]));
+def _cmd_confess(argv):
+dims = None
+as_json = False
+rest = []
+i = 0
+while i < len(argv):
+a = argv[i]
+if a == "--dimensions":
+i += 1
+dims = [d.strip() for d in argv[i].split(",") if d.strip()]
+elif a == "--json":
+as_json = True
+else:
+rest.append(a)
+i += 1
 
-/* ---- agreement with the INDEPENDENT value-arithmetic method, over vectors x N */
-var vectors = [[], [0], [1], [0, 1], [0, 2], [0, 1, 2, 3], [5], [3, 7], [0, 1, 2, 3, 4, 5]];
-var Ns = [1, 2, 3, 7, 16];
-var allAgree = true;
-vectors.forEach(function (v) {
-Ns.forEach(function (n) {
-if (J(fold(jsonl(v), { steps: n}).bits)!== J(expectPlus(v, n))) allAgree = false;
-});
-});
-ok("agrees with independent BigInt value-arithmetic across vectors x steps", allAgree);
+if rest:
+# a single arg may be a prompt string OR a file path
+joined = " ".join(rest)
+try:
+with open(joined, "r") as f:
+prompt = f.read()
+except (FileNotFoundError, IsADirectoryError, OSError):
+prompt = joined
+else:
+prompt = _read_stdin()
 
-/* ---- TIER-B closure: --steps N == piping the fold N times ------------------- */
-var seed = [0, 2, 5]; // value 37
-function piped(text, n) { var t = text; for (var i = 0; i < n; i++) t = toJSONL(fold(t, { steps: 1})); return t;}
-[2, 3, 4, 8].forEach(function (n) {
-ok("closed under I/O: --steps " + n + " == piped " + n,
-toJSONL(fold(jsonl(seed), { steps: n})) === piped(jsonl(seed), n));
-});
+prompt = prompt.strip()
+if not prompt:
+sys.stderr.write("confessional: no prompt given (arg, file, or stdin)\n")
+return 2
 
-/* ---- UNBOUNDED: counts past 2**53 with no loss ----------------------------- */
-ok("unbounded: {60} (2**60) +1 == {0,60}", J(fold(jsonl([60]), { steps: 1}).bits) === J([0, 60]));
-ok("unbounded: all ones 0..59 (2**60 - 1) +1 == {60}",
-J(fold(jsonl([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59]), { steps: 1}).bits) === J([60]));
-ok("unbounded: {100} +1 stays exact (value > Number.MAX_SAFE_INTEGER)",
-J(fold(jsonl([100]), { steps: 1}).bits) === J([0, 100]));
+c = confess(prompt, dimensions=dims)
+if as_json:
+print(json.dumps(c, indent=2, sort_keys=True))
+else:
+print(render_confession(c))
+return 0
 
-/* ---- determinism + order-independence (a SET; shuffled == base) ------------- */
-var shuffled = [5, 0, 2];
-ok("order-independent: shuffled seed == sorted seed (1 step, byte-identical)",
-J(fold(jsonl(shuffled), { steps: 1}).bits) === J(fold(jsonl(seed), { steps: 1}).bits));
-ok("determinism: folds twice identical", J(fold(jsonl(seed), { steps: 3})) === J(fold(jsonl(seed), { steps: 3})));
+def _cmd_chain(argv):
+as_json = False
+args = []
+for a in argv:
+if a == "--json":
+as_json = True
+else:
+args.append(a)
 
-/* ---- dedup: duplicate set bits collapse (a set) ---------------------------- */
-ok("duplicate bits collapse (steps 0 canonicalises)",
-J(fold("0\n0\n2\n", { steps: 0}).bits) === J([0, 2]));
-ok("steps 0 sorts + dedups", J(fold("3\n0\n3\n", { steps: 0}).bits) === J([0, 3]));
+links = []
+# stdin may carry the first confession (piped)
+piped = _read_stdin().strip()
+if piped:
+try:
+links.append(json.loads(piped))
+except json.JSONDecodeError:
+sys.stderr.write("confessional: stdin was not a valid confession JSON\n")
+return 2
+for a in args:
+try:
+links.append(_load_json_arg(a))
+except (json.JSONDecodeError, ValueError) as e:
+sys.stderr.write("confessional: could not load confession '%s': %s\n" % (a, e))
+return 2
 
-/* ---- empty stream + record shape ------------------------------------------- */
-ok("empty +0 -> {steps:0,count:0,bits:[]}", J(fold("", { steps: 0})) === J({ steps: 0, count: 0, bits: []}));
-ok("count is the number of set bits (popcount)", fold(jsonl([0, 1, 2, 3]), { steps: 0}).count === 4);
-ok("blank lines skipped", J(fold("0\n\n2\n\n", { steps: 0}).bits) === J([0, 2]));
-ok("CRLF trimmed", J(fold("0\r\n1\r\n", { steps: 1}).bits) === J([2]));
+if len(links) < 1:
+sys.stderr.write("confessional: chain needs >=1 confession (stdin and/or file args)\n")
+return 2
 
-/* ---- numeric / shape honesty: hard errors ---------------------------------- */
-throws("negative bit index -> throw", function () { fold("-1\n", { steps: 1});});
-throws("non-integer bit index -> throw", function () { fold("0.5\n", { steps: 1});});
-throws("non-finite bit index -> throw", function () { fold("1e999\n", { steps: 1});});
-throws("non-number line -> throw", function () { fold("\"x\"\n", { steps: 1});});
-throws("bad JSON line -> throw", function () { fold("0\nabc\n", { steps: 1});});
+for l in links:
+if l.get("gift")!= "confessional" or l.get("kind") not in ("confession", "chain"):
+sys.stderr.write("confessional: a chain input is not a confessional confession/chain\n")
+return 2
 
-/* ---- bad steps guards ------------------------------------------------------ */
-throws("steps=-1 -> throw", function () { fold("0", { steps: -1});});
-throws("steps=1.5 -> throw", function () { fold("0", { steps: 1.5});});
+result = chain(links)
+if as_json:
+print(json.dumps(result, indent=2, sort_keys=True))
+else:
+print(render_chain(result))
+return 0
 
-console.log((fail === 0? "GREEN": "RED") + ": " + pass + " assertions passed, " + fail + " failed [test_counter-fold]");
-process.exit(fail === 0? 0: 1);
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+def _selftest():
+checks = []
+
+def ok(name, cond):
+checks.append((name, bool(cond)))
+
+# 1. a bare prompt closes nothing much and opens most dimensions
+c1 = confess("Summarize the report.")
+ok("bare prompt opens output-format", "output-format" in c1["open_dimensions"])
+ok("bare prompt opens length", "length" in c1["open_dimensions"])
+
+# 2. a well-specified prompt closes the dimension it names
+c2 = confess("Summarize the report in 3 bullets.")
+ok("3 bullets closes output-format", "output-format" in c2["closed_dimensions"])
+ok("3 bullets closes length", "length" in c2["closed_dimensions"])
+
+# 3. determinism -- byte-identical on re-run
+a = json.dumps(confess("Explain X briefly for a beginner."), sort_keys=True)
+b = json.dumps(confess("Explain X briefly for a beginner."), sort_keys=True)
+ok("confess is deterministic", a == b)
+
+# 4. detectors fire on their targets
+ok("tone detector", "tone" in confess("Answer in a formal tone.")["closed_dimensions"])
+ok("audience detector", "audience" in confess("Explain like I'm five.")["closed_dimensions"])
+ok("refusal detector", "refusal" in confess("If you can't find it, say so.")["closed_dimensions"])
+ok("edge-case detector", "edge-cases" in confess("If the input is empty, return nothing.")["closed_dimensions"])
+ok("scope detector", "scope-boundary" in confess("Only cover the summary; do not add opinions.")["closed_dimensions"])
+ok("grounding detector", "grounding" in confess("Cite your sources; do not make up facts.")["closed_dimensions"])
+
+# 5. fail-closed: an unmatched dimension is OPEN, never guessed closed
+c5 = confess("Write something.")
+ok("unmatched -> open (grounding)", "grounding" in c5["open_dimensions"])
+ok("open+closed partition the set",
+sorted(c5["open_dimensions"] + c5["closed_dimensions"]) == sorted(DIM_NAMES))
+
+# 6. --dimensions restriction + unknown-name is surfaced, not dropped
+c6 = confess("Summarize.", dimensions=["length", "made-up-dim"])
+ok("restricted to known dims", set(c6["open_dimensions"] + c6["closed_dimensions"]) <= {"length"})
+ok("unknown dim surfaced", "made-up-dim" in c6["skipped_unknown"])
+
+# 7. chain: a dim closed by SOME link is closed in the chain
+ca = confess("Answer in 3 bullets.") # closes output-format(+length)
+cb = confess("Use a formal tone.") # closes tone
+ch = chain([ca, cb])
+ok("chain closes union (output-format)", "output-format" in ch["closed_dimensions"])
+ok("chain closes union (tone)", "tone" in ch["closed_dimensions"])
+ok("chain residual open = intersection of opens",
+"grounding" in ch["open_dimensions"]) # neither closed grounding
+
+# 8. chain idempotent: chaining a confession with itself == its own open set
+ci = chain([ca, ca])
+ok("chain idempotent open set", set(ci["open_dimensions"]) == set(ca["open_dimensions"]))
+
+# 9. chain order-independent
+o1 = set(chain([ca, cb])["open_dimensions"])
+o2 = set(chain([cb, ca])["open_dimensions"])
+ok("chain order-independent", o1 == o2)
+
+# 10. chain over common universe: restricted confession doesn't leak a dim
+cr = confess("Summarize.", dimensions=["length"]) # universe={length}
+cf = confess("Summarize in 5 words.") # full universe
+chr_ = chain([cr, cf])
+ok("chain restricts to common universe", set(chr_["open_dimensions"] + chr_["closed_dimensions"]) == {"length"})
+
+passed = sum(1 for _, v in checks if v)
+total = len(checks)
+for name, v in checks:
+print(" %s %s" % ("ok " if v else "FAIL", name))
+print("selftest: %d/%d" % (passed, total))
+return 0 if passed == total else 1
+
+HELP = """confessional -- your prompt admits what it does NOT constrain.
+
+usage:
+confessional confess [--dimensions a,b,c] [--json] ["prompt" | file]
+confessional confess < prompt.txt
+confessional chain [--json] [confession.json...] (stdin may carry one)
+confessional --selftest
+confessional --help
+
+dimensions (v1): output-format, length, tone, audience, refusal,
+edge-cases, scope-boundary, grounding
+
+edge: reports declared/detectable gaps from a closed checklist; cannot find a
+gap outside it, cannot say whether an open dimension matters for your task, and
+cannot make your prompt complete.
+"""
+
+def main(argv):
+if not argv or argv[0] in ("-h", "--help", "help"):
+sys.stdout.write(HELP)
+return 0
+if argv[0] == "--selftest":
+return _selftest()
+if argv[0] == "--version":
+print("confessional " + VERSION)
+return 0
+if argv[0] == "confess":
+return _cmd_confess(argv[1:])
+if argv[0] == "chain":
+return _cmd_chain(argv[1:])
+sys.stderr.write("confessional: unknown command '%s' (try --help)\n" % argv[0])
+return 2
+
+if __name__ == "__main__":
+sys.exit(main(sys.argv[1:]))
+
+smoke_test.py 21 lines on GitHub →
+#!/usr/bin/env python3
+"""smoke_test.py -- confessional's shipped smoke check. Runs the in-module
+--selftest battery (21 checks) and exits non-zero on any failure, so a stranger
+can prove the gift works in their tree with one command:
+
+python3 smoke_test.py
+"""
+import subprocess
+import sys
+import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+def main():
+r = subprocess.run([sys.executable, os.path.join(HERE, "confessional.py"), "--selftest"])
+sys.exit(r.returncode)
+
+if __name__ == "__main__":
+main()
 
 Take the whole folder →
 MIT
-Zero dependencies, Node or browser, deterministic
+Python stdlib only, deterministic
+
+---
+
+# Conflict — a Loop MMT gift
+https://loopmmt.com/gifts/conflict/
+[coverage: optional · branch: gifts]
+
+A Broken Merge Can't Land filter ← all gifts
+
+Conflict
+
+A merge that goes wrong leaves <<<<<<<, =======, >>>>>>> markers wedged into a file; once committed, that file no longer parses — it isn't 'a merge in progress,' it's broken source that landed, and it hides until something tries to read it. Conflict is the one-command gate: wire it into a pre-commit hook or CI and a file carrying the marker triad simply cannot land. The clever part is the TRIAD RULE — ======= alone is a legal line (a Markdown rule, a comment banner), so conflict fires only on all three markers together, line-start only, and never cries wolf on a legal ======= or a marker mid-line.
+
+The honest edge
+
+This is a check, not an immunity — it protects you only when it is RUN, so wire it into a hook or CI rather than trusting a human to remember. And it detects the standard git marker triad; a tool that uses different markers needs a different pattern. Visibility, not immunity.
+
+Run it
+
+python3 conflict.py --help
+test_conflict.py (18 checks / 7 tests, mutation-bitten, triad-rule + line-start guards + throwaway-repo end-to-end)
+Python standard library only, read-only, deterministic
+
+The code — every file that ships
+
+conflict.py 172 lines on GitHub →
+#!/usr/bin/env python3
+"""conflict — refuse to commit a file that no longer parses.
+
+A merge that goes wrong leaves `<<<<<<<`, `=======`, `>>>>>>>` markers wedged
+into a file. Once committed, that file no longer parses — it isn't "a merge in
+progress," it's broken source that landed. Worse, it hides: the failure surfaces
+only when something tries to read the file, and if that read happens in a quiet
+place, it can sit on your main branch for days while everything downstream of it
+silently degrades.
+
+`conflict` is the one-command gate that catches it. It scans a git tree for the
+merge-marker triad and exits non-zero if any file carries an unresolved merge, so
+you can wire it into a pre-commit hook or CI and a broken file simply cannot land.
+
+WHY IT'S HONEST
+
+- **The triad, never the lone middle.** `=======` on its own is a legal line — a
+Markdown horizontal rule, a Python separator comment, an ASCII banner. It is a
+conflict marker ONLY in the company of `<<<<<<<` and `>>>>>>>` in the same
+file. `conflict` fires on the *triad within one file*, never on a bare
+`=======`. A lint that cries wolf on a legal line gets disabled, and a disabled
+lint is worse than none.
+
+- **Decidable from bytes.** A conflict marker on a branch needs no judgment, no
+review, no discussion — it is arithmetic. `conflict` reports the finding as an
+exit code, not a paragraph: exit codes don't decay, don't need finding, and
+cost nothing to re-run.
+
+- **It is read-only.** It reads blobs out of git (or off disk) and compares. It
+writes nothing and fixes nothing.
+
+THE HONEST EDGE
+
+This is a check, not an immunity — it protects you only when it is RUN. Wire it
+into a hook or CI so "run it" isn't something a human has to remember. And it
+detects the standard git marker triad; a tool that uses different markers needs a
+different pattern. Visibility, not immunity.
+
+USAGE
+python3 conflict.py # scan the working tree (tracked files)
+python3 conflict.py --ref main # scan any committed tree by ref
+python3 conflict.py --ignore _snapshots/ --ignore vendor/
+# skip path substrings (repeatable)
+
+EXIT 0 = clean · 3 = unresolved merge found (the alarm) · 2 = error/usage
+
+MIT licensed. Python standard library only. Read-only. Deterministic.
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+
+# The three markers git leaves on a conflicted merge. `=======` is only a marker
+# in the company of the other two — see the triad rule in main().
+MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
+
+def git_files(ref: str | None) -> list[str]:
+"""List tracked files at `ref` (committed tree) or in the working tree."""
+if ref:
+out = subprocess.run(
+["git", "ls-tree", "-r", "--name-only", ref],
+capture_output=True, text=True,
+).stdout
+else:
+out = subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout
+return out.split()
+
+def read_blob(f: str, ref: str | None) -> bytes:
+"""Read a file's bytes at `ref` or from the working tree."""
+if ref:
+return subprocess.run(["git", "show", f"{ref}:{f}"], capture_output=True).stdout
+with open(f, "rb") as fh:
+return fh.read()
+
+def marker_lines(text: str) -> dict[str, list[int]]:
+"""Map each marker to the 1-based line numbers where a line STARTS with it."""
+lines = text.split("\n")
+return {m: [i + 1 for i, ln in enumerate(lines) if ln.startswith(m)] for m in MARKERS}
+
+def has_conflict(text: str) -> bool:
+"""True iff `text` contains the full marker TRIAD (not a lone `=======`)."""
+found = marker_lines(text)
+return all(found[m] for m in MARKERS)
+
+def is_ignored(path: str, ignore: tuple[str,...]) -> bool:
+"""True iff `path` contains any ignore substring (skip it)."""
+return any(ig in path for ig in ignore)
+
+def scan(ref: str | None = None, ignore: tuple[str,...] = ()) -> list[tuple[str, dict]]:
+"""Return [(path, marker_lines)] for every tracked file carrying the triad."""
+hits: list[tuple[str, dict]] = []
+for f in git_files(ref):
+if is_ignored(f, ignore):
+continue
+try:
+raw = read_blob(f, ref)
+except (OSError, FileNotFoundError):
+continue
+try:
+text = raw.decode("utf-8")
+except UnicodeDecodeError:
+continue # a binary blob has no markers to read
+if has_conflict(text):
+hits.append((f, marker_lines(text)))
+return hits
+
+def _parse_args(argv: list[str]) -> tuple[str | None, tuple[str,...]]:
+ref: str | None = None
+ignore: list[str] = []
+i = 0
+while i < len(argv):
+a = argv[i]
+if a == "--ref":
+if i + 1 >= len(argv):
+raise ValueError("--ref needs a git ref")
+ref = argv[i + 1]
+i += 2
+elif a == "--ignore":
+if i + 1 >= len(argv):
+raise ValueError("--ignore needs a path substring")
+ignore.append(argv[i + 1])
+i += 2
+elif a in ("-h", "--help"):
+raise ValueError("__help__")
+else:
+raise ValueError(f"unknown argument: {a}")
+return ref, tuple(ignore)
+
+def main(argv: list[str]) -> int:
+try:
+ref, ignore = _parse_args(argv)
+except ValueError as exc:
+if str(exc) == "__help__":
+sys.stdout.write(__doc__)
+return 2
+sys.stderr.write(f"conflict: {exc}\n")
+return 2
+
+hits = scan(ref, ignore)
+where = f"`{ref}`" if ref else "the working tree"
+
+if not hits:
+sys.stdout.write(f"conflict: clean — no unresolved merge in {where}.\n")
+return 0
+
+sys.stderr.write(
+f"conflict: {len(hits)} file(s) in {where} carry an UNRESOLVED MERGE.\n"
+)
+for f, found in hits:
+ln = found["<<<<<<< "][0]
+sys.stderr.write(
+f" {f}:{ln} <<<<<<< / ======= / >>>>>>> "
+f"({len(found['<<<<<<< '])} conflict block(s))\n"
+)
+sys.stderr.write(
+"\nA conflict marker on a branch is not a merge in progress — it is a "
+"FILE THAT NO LONGER PARSES, landed. Resolve it. Do not commit over it.\n"
+)
+return 3
+
+if __name__ == "__main__":
+raise SystemExit(main(sys.argv[1:]))
+
+test_conflict.py 181 lines on GitHub →
+#!/usr/bin/env python3
+"""test_conflict.py — the certifying properties of the conflict gift.
+
+Run: python3 test_conflict.py (exit 0 = all pass, 1 = a failure)
+
+The load-bearing property is the TRIAD RULE: a lone `=======` (a legal line) must
+NOT fire, while the full marker triad must. Each test is MUTATION-BITTEN — it is
+here because a plausible mutation of conflict.py makes it fail loud. The core is
+pure (marker_lines / has_conflict / is_ignored), so it's tested directly; the
+git-facing shell is exercised in a throwaway repo.
+"""
+import os
+import subprocess
+import sys
+
+import conflict as c
+
+_FAILURES: list[str] = []
+_PASSES = 0
+
+def check(cond: bool, msg: str) -> None:
+global _PASSES
+if cond:
+_PASSES += 1
+else:
+_FAILURES.append(msg)
+
+CONFLICTED = """\
+line before
+<<<<<<< HEAD
+ours
+=======
+theirs
+>>>>>>> origin/main
+line after
+"""
+
+# a lone `=======` in legal, innocent company — MUST NOT fire
+INNOCENT_RULE = """\
+Section One
+=======
+Section Two
+
+Some prose under a Markdown setext rule.
+"""
+
+INNOCENT_BANNER = """\
+# ============================================================
+# a decorative comment banner, not a conflict
+# ============================================================
+def f(): pass
+"""
+
+# --- 1. the triad fires; a lone middle does not (the core property) ----------
+def test_triad_rule():
+check(c.has_conflict(CONFLICTED), "the full marker triad must be detected")
+check(not c.has_conflict(INNOCENT_RULE), "a lone ======= (Markdown rule) must NOT fire")
+check(not c.has_conflict(INNOCENT_BANNER), "a ==== banner must NOT fire")
+# a triad that is missing one leg must NOT fire
+missing_close = CONFLICTED.replace(">>>>>>> origin/main\n", "")
+check(not c.has_conflict(missing_close), "two-of-three markers must NOT fire (needs the triad)")
+
+# --- 2. golden: marker_lines reports the exact line numbers ------------------
+def test_marker_lines_golden():
+found = c.marker_lines(CONFLICTED)
+check(found["<<<<<<< "] == [2], f"open marker line wrong: {found['<<<<<<< ']}")
+check(found["======="] == [4], f"middle marker line wrong: {found['=======']}")
+check(found[">>>>>>> "] == [6], f"close marker line wrong: {found['>>>>>>> ']}")
+# the three exact line-number asserts above ARE the golden: they pin the
+# detected positions, not merely the count.
+
+# --- 3. only a line that STARTS with a marker counts ------------------------
+def test_startswith_only():
+# a single marker mid-line (e.g. inside a string) is not a line-start conflict
+embedded = 'x = "<<<<<<< not a real marker"\n'
+check(not c.has_conflict(embedded), "a marker mid-line must not count as a conflict")
+# the discriminating case: ALL THREE markers mid-line. Under startswith this
+# is clean (no line STARTS with a marker); a naive `m in ln` would flag it.
+triad_midline = "a <<<<<<< b\nc ======= d\ne >>>>>>> f\n"
+check(
+not c.has_conflict(triad_midline),
+"three markers mid-line must NOT fire (startswith, not substring)",
+)
+
+# --- 4. is_ignored honors substrings ----------------------------------------
+def test_is_ignored():
+check(c.is_ignored("a/_snapshots/x.txt", ("_snapshots/",)), "ignore substring should match")
+check(not c.is_ignored("a/src/x.txt", ("_snapshots/",)), "non-matching path must not be ignored")
+check(not c.is_ignored("anything", ()), "empty ignore never ignores")
+
+# --- 5. arg parse: --ref, --ignore (repeatable), unknown ---------------------
+def test_parse_args():
+ref, ig = c._parse_args(["--ref", "main", "--ignore", "a/", "--ignore", "b/"])
+check(ref == "main", f"--ref not parsed: {ref}")
+check(ig == ("a/", "b/"), f"--ignore not repeatable: {ig}")
+raised = False
+try:
+c._parse_args(["--bogus"])
+except ValueError:
+raised = True
+check(raised, "unknown arg must raise")
+
+# --- 6. END-TO-END against a throwaway repo ---------------------------------
+def _run_git(cwd, *args):
+subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+
+def test_end_to_end():
+import tempfile
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+# one clean file, one conflicted file
+with open(os.path.join(repo, "clean.py"), "w") as fh:
+fh.write("def ok(): pass\n")
+with open(os.path.join(repo, "broken.py"), "w") as fh:
+fh.write(CONFLICTED)
+_run_git(repo, "add", "-A")
+_run_git(repo, "commit", "-qm", "with a conflict")
+
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+hits = c.scan(ref=None)
+finally:
+os.chdir(cwd0)
+paths = sorted(f for f, _ in hits)
+check(paths == ["broken.py"], f"end-to-end should flag only broken.py: {paths}")
+
+# --- 7. ignore actually excludes a conflicted file --------------------------
+def test_end_to_end_ignore():
+import tempfile
+with tempfile.TemporaryDirectory() as repo:
+_run_git(repo, "init", "-q")
+_run_git(repo, "config", "user.email", "t@t")
+_run_git(repo, "config", "user.name", "t")
+os.makedirs(os.path.join(repo, "_snapshots"))
+with open(os.path.join(repo, "_snapshots", "past.txt"), "w") as fh:
+fh.write(CONFLICTED) # a deliberate record of a past conflict
+_run_git(repo, "add", "-A")
+_run_git(repo, "commit", "-qm", "snapshot")
+cwd0 = os.getcwd()
+os.chdir(repo)
+try:
+with_ignore = c.scan(ref=None, ignore=("_snapshots/",))
+without = c.scan(ref=None)
+finally:
+os.chdir(cwd0)
+check(with_ignore == [], f"ignored path should not be flagged: {with_ignore}")
+check(len(without) == 1, f"without ignore the file should flag: {without}")
+
+def run() -> int:
+tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+for t in tests:
+try:
+t()
+except Exception as exc:
+_FAILURES.append(f"{t.__name__} raised: {exc!r}")
+total = _PASSES + len(_FAILURES)
+if _FAILURES:
+print(f"FAIL — {len(_FAILURES)} of {total} checks failed:")
+for f in _FAILURES:
+print(f" ✗ {f}")
+return 1
+print(f"OK — {_PASSES}/{total} checks passed ({len(tests)} tests).")
+return 0
+
+if __name__ == "__main__":
+sys.exit(run())
+
+Take the whole folder →
+MIT
+Python standard library only, read-only, deterministic
 
 ---

@@ -101,6 +101,27 @@ var r = md.render("# Title\n\nbody **b**");
 eq("render.text === source", r.text, "# Title\n\nbody **b**");
 eq("render.html folds AST",  r.html, "<h1>Title</h1>\n<p>body <strong>b</strong></p>");
 
+// --- blank-fill runs stay literal (S28.1306 fix: a run of 3+ '_' / '*' was eaten as EMPTY strong
+// nodes, silently deleting form blanks like "By: ______" and "as of ________, 2026") -----------------
+eq("underscore blank is literal", md.toHTML(md.parse("By: ______")), "<p>By: ______</p>");
+eq("blank then comma literal", md.toHTML(md.parse("as of ________________, 2026 between")), "<p>as of ________________, 2026 between</p>");
+eq("odd-length blank does not open em across text", md.toHTML(md.parse("a _______ b and c _______ d")), "<p>a _______ b and c _______ d</p>");
+eq("asterisk rule literal", md.toHTML(md.parse("x *** y")), "<p>x *** y</p>");
+eq("empty strong is literal", md.toHTML(md.parse("a **** b")), "<p>a **** b</p>");
+eq("blank beside bold keeps both", md.toHTML(md.parse("**Name:** ______")), "<p><strong>Name:</strong> ______</p>");
+eq("regular strong unchanged", md.toHTML(md.parse("__init__ and **b** and _e_")), "<p><strong>init</strong> and <strong>b</strong> and <em>e</em></p>");
+eq("blank survives in list item", md.toHTML(md.parse("3. _________________ *(to list)*")), "<ol><li>_________________ <em>(to list)</em></li></ol>");
+(function () {  // no parse of a blank-bearing line may yield an empty strong/em node
+  var bad = 0;
+  ["By: ___", "____", "a ___ b ___ c", "***", "_ _", "** **x", "****x", "__x"].forEach(function (src) {
+    JSON.stringify(md.parse(src), function (k, v) {
+      if (v && (v.type === "strong" || v.type === "em") && (!v.children || v.children.length === 0)) bad++;
+      return v;
+    });
+  });
+  eq("no empty emphasis node anywhere", bad, 0);
+})();
+
 // --- mutation bite: prove the emit-invariant test is not vacuously green ---------------------
 // If SAFE_TAGS were emptied, the kitchen-sink render MUST now show leaked tags.
 (function () {

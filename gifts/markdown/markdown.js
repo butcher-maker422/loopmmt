@@ -211,18 +211,27 @@ function parseInline(text) {
       buf += c; i++; continue;
     }
 
+    // blank-fill / rule run: 3+ of the same '_' or '*' NOT followed by a word character is LITERAL.
+    // ("By: ______", "as of ________, 2026"). Without this, the run was consumed as a stack of EMPTY
+    // strong nodes and the blank silently vanished (S28.1306). A run followed by a word char
+    // (e.g. "***bold-italic***" opener) falls through to the normal delimiter logic below.
+    if (c === '_' || c === '*') {
+      var r = i; while (r < s.length && s[r] === c) r++;
+      if (r - i >= 3 && !/[A-Za-z0-9]/.test(s[r] || '')) { buf += s.slice(i, r); i = r; continue; }
+    }
+
     // strong: ** or __  (greedy to the matching closer; falls through to text if unmatched)
     if ((s.startsWith('**', i) || s.startsWith('__', i))) {
       var delim = s.substr(i, 2);
       var ends = s.indexOf(delim, i + 2);
-      if (ends > i + 1) { flush(); nodes.push({ type: 'strong', children: parseInline(s.slice(i + 2, ends)) }); i = ends + 2; continue; }
+      if (ends > i + 2) { flush(); nodes.push({ type: 'strong', children: parseInline(s.slice(i + 2, ends)) }); i = ends + 2; continue; }
       buf += c; i++; continue;
     }
 
     // em: * or _  (single delimiter; unmatched -> literal)
     if (c === '*' || c === '_') {
       var ende = s.indexOf(c, i + 1);
-      if (ende > i) { flush(); nodes.push({ type: 'em', children: parseInline(s.slice(i + 1, ende)) }); i = ende + 1; continue; }
+      if (ende > i + 1) { flush(); nodes.push({ type: 'em', children: parseInline(s.slice(i + 1, ende)) }); i = ende + 1; continue; }
       buf += c; i++; continue;
     }
 
