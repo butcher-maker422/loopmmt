@@ -2,7 +2,431 @@
 
 > Bundle 91 of 92 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/weir/, /gifts/worklog/, /gifts/wuphf/)
+Nodes in this shard: 3 (/gifts/ward/, /gifts/weir/, /gifts/worklog/)
+
+---
+
+# Ward — a Loop MMT gift
+https://loopmmt.com/gifts/ward/
+[coverage: optional · branch: gifts]
+
+Self-Verifying Integrity Badge refuse ← all gifts
+
+Ward
+
+A status badge that will not go solid on hope. Every filled cell carries a witness beneath it — a file that must exist, a file that must contain a string, or a command that must exit 0 — and renders solid only when that witness agrees right now. Any claim whose witness is missing or disagrees renders a hollow ring, never a silent solid.
+
+The prompt that made this → — Ward was grown from “One Shape, Wide Latitude,” a planning-only fable-seed experiment. You can also see it live as the Ward receipt →, the nine-cell close badge a real session produces.
+
+The honest edge
+
+You cannot make a cell lie by asserting harder — but Ward checks the witness agrees, not that you chose the right witness. A meaningful witness is still your call.
+
+Run it
+
+python3 ward.py badge.json --root.
+smoke_test.py
+Python stdlib only, ~200 lines
+
+The code — every file that ships
+
+ward.py 324 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+ward — a self-verifying integrity badge that will not go solid on hope.
+
+THE IDEA.
+A status badge is a grid of cells, one per claim you want to show as "done".
+The temptation with any badge is to colour a cell in because you BELIEVE the
+thing is finished. `ward` refuses to. A cell renders SOLID only when its claim
+is backed by a witness that actually agrees right now; any claim whose witness
+is missing, disagrees, or is malformed renders as a HOLLOW RING — never a
+silent solid. The badge's own honesty is the feature: you cannot make a cell
+lie by asserting harder.
+
+It is the badge-shaped sibling of a "status board that won't go green on hope":
+same principle (a claim needs a witness), rendered as a compact grid you can
+drop into a README, a terminal, or an HTML page.
+
+WITNESS KINDS (per cell).
+file:PATH solid iff PATH exists
+contains:PATH::TEXT solid iff PATH exists AND contains TEXT
+cmd:SHELL solid iff `SHELL` exits 0
+(no witness) a cell with no witness is DECLARED-only -> renders as a
+ring, because a claim with nothing beneath it is exactly
+what this tool exists to expose.
+
+THE COERCE WELD (the load-bearing honesty rule).
+Every cell state is routed through one gate: an unknown, missing, or errored
+witness result can only ever become a RING. There is no code path from a bad
+witness to a solid cell. That is what makes the badge trustworthy — not that
+it is always green, but that green always means something.
+
+OUTPUT.
+--format text a 3x3 (or NxM) grid of glyphs + a legend + a presence caveat
+--format html an HTML fragment (cells carry data-state so you can style them)
+--format json the resolved cells, for piping
+
+EXIT CODES.
+0 every declared claim resolved SOLID (a fully-earned badge)
+1 at least one claim rendered as a RING (unearned) -- LOUD, by design
+2 usage / IO error
+
+HONEST EDGE.
+`ward` checks that a witness EXISTS AND AGREES, never that it is the RIGHT
+witness. Point a cell at the wrong file and it will happily go solid — choosing
+a meaningful witness is your job. Presence is not proof of substance. Python
+stdlib only, offline, deterministic.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import html
+
+# GIFT-010: a command witness that never finishes must not hang the badge. A
+# witness that does not complete within this bound is uncertainty -> RING (never
+# a solid), and its whole process group is killed so grandchildren don't survive.
+WITNESS_TIMEOUT_S = 30
+
+def _run_shell_bounded(shell_cmd, cwd, timeout):
+"""Run a shell command in its own process group; kill the group on timeout.
+Returns (returncode, timed_out): returncode is None when timed_out is True."""
+proc = subprocess.Popen(
+shell_cmd, shell=True, cwd=cwd,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+start_new_session=True,
+)
+try:
+proc.wait(timeout=timeout)
+return proc.returncode, False
+except subprocess.TimeoutExpired:
+try:
+os.killpg(proc.pid, signal.SIGKILL)
+except (ProcessLookupError, PermissionError):
+pass
+proc.wait()
+return None, True
+
+RING = "ring" # hollow — unearned; the only state a bad witness can reach
+SOLID = "solid" # filled — witness exists and agrees
+
+_GLYPH = {SOLID: "\u25c9", RING: "\u25cb"} # ◉ solid ring-dot / ○ hollow ring
+
+# GIFT-010 follow-on: the diagnostic REASON a cell resolved as it did. The
+# correctness core is unchanged — the coerce weld still lets ONLY `ok` reach
+# SOLID; every other reason is a RING. The reason is purely additive telemetry:
+# a caller who ignored it before behaves identically. `ok` earns SOLID; each
+# other token names WHY a cell rings, so a wall of rings is diagnosable instead
+# of uniformly opaque. (The audit's ask: surface the timeout — and, generalized,
+# every ring cause — for diagnostics.)
+REASON_OK = "ok" # witness exists and cleanly agrees -> SOLID
+REASON_NO_WITNESS = "no-witness" # declared-only cell (empty spec)
+REASON_MISSING_FILE = "missing-file" # file:/contains: target absent
+REASON_CONTAINS_MISS = "contains-miss" # file present, text not found
+REASON_MALFORMED = "malformed" # contains: with no '::' separator
+REASON_CMD_FAIL = "cmd-fail" # cmd: witness exited non-zero
+REASON_TIMEOUT = "timeout" # cmd: witness exceeded the bound (a hang)
+REASON_UNKNOWN_KIND = "unknown-kind" # witness prefix not recognized
+REASON_ERROR = "error" # an exception while resolving (the weld's net)
+
+# A ring reason is anything that is not OK. The one solid-earning reason is OK,
+# and this is the single place the earned<->reason correspondence is stated, so
+# the coerce weld ("only a clean witness reaches SOLID") stays decidable.
+_SOLID_REASON = REASON_OK
+
+def _resolve_witness(spec, root, timeout=WITNESS_TIMEOUT_S):
+"""Return (earned, reason). `earned` is True (earn SOLID) only on a clean,
+agreeing witness, in which case `reason` is REASON_OK. Any error, miss,
+malformed spec, or `cmd:` witness that exceeds `timeout` seconds returns
+(False, <a specific ring reason>) -> the coerce weld renders a RING. There is
+deliberately no path here that returns True on uncertainty (a hang is
+uncertainty); the reason token names WHICH uncertainty it was."""
+if not spec:
+return False, REASON_NO_WITNESS
+try:
+if spec.startswith("file:"):
+path = spec[len("file:"):]
+if os.path.exists(os.path.join(root, path)):
+return True, REASON_OK
+return False, REASON_MISSING_FILE
+if spec.startswith("contains:"):
+body = spec[len("contains:"):]
+if "::" not in body:
+return False, REASON_MALFORMED
+path, text = body.split("::", 1)
+full = os.path.join(root, path)
+if not os.path.exists(full):
+return False, REASON_MISSING_FILE
+with open(full, encoding="utf-8", errors="replace") as fh:
+if text in fh.read():
+return True, REASON_OK
+return False, REASON_CONTAINS_MISS
+if spec.startswith("cmd:"):
+shell = spec[len("cmd:"):]
+rc, timed_out = _run_shell_bounded(shell, root, timeout)
+if timed_out:
+return False, REASON_TIMEOUT # uncertainty -> RING; never solid on a hang
+if rc == 0:
+return True, REASON_OK
+return False, REASON_CMD_FAIL
+except Exception:
+return False, REASON_ERROR # the weld: any error is a RING, never a solid
+return False, REASON_UNKNOWN_KIND # unknown witness kind -> RING
+
+def resolve(cells, root, timeout=WITNESS_TIMEOUT_S):
+"""cells: list of {label, witness}. Returns list of
+{label, state, witness, reason}. The coerce weld lives here: state is SOLID
+iff the witness cleanly agreed (reason == REASON_OK). `reason` is additive —
+it names WHY a ring rang (missing-file, contains-miss, cmd-fail, timeout,
+malformed, unknown-kind, no-witness, error) — and never changes state."""
+out = []
+for c in cells:
+earned, reason = _resolve_witness(c.get("witness", ""), root, timeout)
+# The weld, restated as an invariant: earned iff reason is the solid one.
+state = SOLID if earned else RING
+out.append({
+"label": c.get("label", ""),
+"witness": c.get("witness", ""),
+"state": state,
+"reason": reason,
+})
+return out
+
+def _grid(resolved, cols):
+rows = []
+for i in range(0, len(resolved), cols):
+rows.append(resolved[i:i + cols])
+return rows
+
+def render_text(resolved, cols):
+lines = []
+for row in _grid(resolved, cols):
+lines.append(" " + " ".join(_GLYPH[c["state"]] for c in row))
+legend = f"\n {_GLYPH[SOLID]} earned (witness agrees) {_GLYPH[RING]} unearned (ring \u2014 no green on hope)"
+caveat = "\n note: a solid cell means its witness EXISTS AND AGREES, not that the witness is the RIGHT one."
+labels = "\n".join(
+f" {_GLYPH[c['state']]} {c['label']}" + _reason_gloss(c)
+for c in resolved
+)
+return "\n".join(lines) + "\n" + labels + legend + caveat
+
+def _reason_gloss(cell):
+"""A short human tail naming WHY a ring rang (or nothing for a solid). Uses
+the machine reason token so the text render is diagnosable, not just red."""
+if cell["state"] == SOLID:
+return ""
+return f" [ring: {cell.get('reason', REASON_UNKNOWN_KIND)}]"
+
+def render_html(resolved, cols):
+out = ['<div class="ward" role="img" aria-label="integrity badge">']
+for row in _grid(resolved, cols):
+out.append(' <div class="ward__row">')
+for c in row:
+# data-reason carries the diagnostic token (styleable + inspectable);
+# the title names the ring cause for a hover, additively.
+reason = c.get("reason", REASON_UNKNOWN_KIND)
+title = str(c["label"])
+if c["state"] == RING:
+title = f"{title} \u2014 ring: {reason}"
+out.append(
+f' <span class="ward__cell" data-state="{c["state"]}" '
+f'data-reason="{html.escape(reason, quote=True)}" '
+f'title="{html.escape(title, quote=True)}">{_GLYPH[c["state"]]}</span>'
+)
+out.append(' </div>')
+out.append(' <p class="ward__caveat">A solid cell means its witness exists and agrees, '
+'never that the witness is the right one.</p>')
+out.append('</div>')
+return "\n".join(out)
+
+def load_cells(path):
+with open(path, encoding="utf-8") as fh:
+data = json.load(fh)
+if isinstance(data, dict):
+data = data.get("cells", [])
+if not isinstance(data, list):
+raise ValueError("badge spec must be a list of cells, or {\"cells\": [...]}")
+return data
+
+def main(argv=None):
+argv = argv if argv is not None else sys.argv[1:]
+ap = argparse.ArgumentParser(
+prog="ward",
+description="A self-verifying integrity badge that will not go solid on hope.")
+ap.add_argument("spec", nargs="?", help="path to a JSON badge spec (list of {label, witness})")
+ap.add_argument("--root", default=".", help="root the witnesses resolve against (default:.)")
+ap.add_argument("--cols", type=int, default=3, help="grid columns (default: 3 -> a 3x3 ward)")
+ap.add_argument("--format", choices=("text", "html", "json"), default="text")
+ap.add_argument("--selftest", action="store_true", help="prove the coerce weld (no bad witness -> solid)")
+args = ap.parse_args(argv)
+
+if args.selftest:
+return _selftest()
+if not args.spec:
+ap.print_help()
+return 2
+try:
+cells = load_cells(args.spec)
+except Exception as e:
+print(f"ward: cannot read spec: {e}", file=sys.stderr)
+return 2
+
+resolved = resolve(cells, args.root)
+if args.format == "json":
+print(json.dumps(resolved, indent=2))
+elif args.format == "html":
+print(render_html(resolved, args.cols))
+else:
+print(render_text(resolved, args.cols))
+
+unearned = [c for c in resolved if c["state"] == RING]
+return 1 if unearned else 0
+
+def _selftest():
+"""Non-vacuity: the weld must hold AND every ring must name its reason. A
+missing file, a failing command, a malformed witness, an absent witness, an
+unknown kind, and a timeout must ALL render RING; only a real, agreeing
+witness earns SOLID. GIFT-010 follow-on: each case also asserts the exact
+diagnostic REASON token, so the reason field is proven discriminating (a
+ring that always said 'unknown' would pass state but fail reason here)."""
+import tempfile
+ok = True
+with tempfile.TemporaryDirectory() as d:
+with open(os.path.join(d, "present.txt"), "w") as f:
+f.write("the witness text is here")
+# (label, witness, want_state, want_reason)
+cases = [
+("real file", "file:present.txt", SOLID, REASON_OK),
+("missing file", "file:nope.txt", RING, REASON_MISSING_FILE),
+("contains hit", "contains:present.txt::witness", SOLID, REASON_OK),
+("contains miss", "contains:present.txt::absent", RING, REASON_CONTAINS_MISS),
+("contains missing file","contains:nope.txt::x", RING, REASON_MISSING_FILE),
+("cmd pass", "cmd:true", SOLID, REASON_OK),
+("cmd fail", "cmd:false", RING, REASON_CMD_FAIL),
+("malformed contains", "contains:present.txt", RING, REASON_MALFORMED),
+("unknown kind", "wat:present.txt", RING, REASON_UNKNOWN_KIND),
+("no witness", "", RING, REASON_NO_WITNESS),
+]
+cells = [{"label": lbl, "witness": w} for lbl, w, _, _ in cases]
+resolved = resolve(cells, d)
+for (lbl, _w, want_state, want_reason), got in zip(cases, resolved):
+good = got["state"] == want_state and got["reason"] == want_reason
+ok = ok and good
+print(f" [selftest] {lbl:22s} -> {got['state']:5s}/{got['reason']:13s} "
+f"(want {want_state}/{want_reason}) -> {'PASS' if good else 'FAIL'}")
+
+# The timeout reason is proven separately: a witness that outlives its
+# bound must ring with REASON_TIMEOUT, never a solid on a hang.
+t_cells = [{"label": "hang", "witness": "cmd:sleep 5"}]
+t_resolved = resolve(t_cells, d, timeout=1)
+t_got = t_resolved[0]
+t_good = t_got["state"] == RING and t_got["reason"] == REASON_TIMEOUT
+ok = ok and t_good
+print(f" [selftest] {'timeout (hang)':22s} -> {t_got['state']:5s}/{t_got['reason']:13s} "
+f"(want {RING}/{REASON_TIMEOUT}) -> {'PASS' if t_good else 'FAIL'}")
+
+# The weld invariant, stated decidably: earned iff reason is the solid one.
+weld_holds = all(
+(c["state"] == SOLID) == (c["reason"] == _SOLID_REASON)
+for c in resolved + t_resolved
+)
+ok = ok and weld_holds
+print(f" [selftest] {'weld: SOLID iff reason==ok':22s} -> {'PASS' if weld_holds else 'FAIL'}")
+print(f"\nward selftest: {'ALL PASS' if ok else 'FAILURE'} "
+f"(the coerce weld holds; every ring names its reason)" if ok
+else "\nward selftest: FAILURE")
+return 0 if ok else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+smoke_test.py 81 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""smoke_test for ward — proves the coerce weld and the three witness kinds.
+
+Run: python3 smoke_test.py (exit 0 = all pass)
+
+The point of these tests is the WELD: there must be no path from a missing,
+failing, malformed, or absent witness to a SOLID cell. If any such path existed,
+the badge could lie, and the whole tool would be pointless.
+"""
+import os
+import tempfile
+import sys
+
+import ward
+
+_PASS = 0
+_FAIL = 0
+
+def check(name, got, want):
+global _PASS, _FAIL
+if got == want:
+_PASS += 1
+print(f"ok {name}")
+else:
+_FAIL += 1
+print(f"XX {name}: got {got!r}, want {want!r}")
+
+def main():
+with tempfile.TemporaryDirectory() as d:
+with open(os.path.join(d, "here.txt"), "w") as f:
+f.write("alpha beta gamma")
+
+# file: witness
+r = ward.resolve([{"label": "f", "witness": "file:here.txt"}], d)
+check("file present -> solid", r[0]["state"], ward.SOLID)
+r = ward.resolve([{"label": "f", "witness": "file:gone.txt"}], d)
+check("file missing -> ring", r[0]["state"], ward.RING)
+
+# contains: witness
+r = ward.resolve([{"label": "c", "witness": "contains:here.txt::beta"}], d)
+check("contains hit -> solid", r[0]["state"], ward.SOLID)
+r = ward.resolve([{"label": "c", "witness": "contains:here.txt::omega"}], d)
+check("contains miss -> ring", r[0]["state"], ward.RING)
+r = ward.resolve([{"label": "c", "witness": "contains:here.txt"}], d)
+check("contains malformed -> ring", r[0]["state"], ward.RING)
+
+# cmd: witness
+r = ward.resolve([{"label": "x", "witness": "cmd:true"}], d)
+check("cmd pass -> solid", r[0]["state"], ward.SOLID)
+r = ward.resolve([{"label": "x", "witness": "cmd:false"}], d)
+check("cmd fail -> ring", r[0]["state"], ward.RING)
+
+# the weld: unknown + absent witness -> ring, never solid
+r = ward.resolve([{"label": "u", "witness": "mystery:here.txt"}], d)
+check("unknown kind -> ring", r[0]["state"], ward.RING)
+r = ward.resolve([{"label": "n", "witness": ""}], d)
+check("no witness -> ring", r[0]["state"], ward.RING)
+
+# exit-code contract: any ring -> main returns 1
+import json
+spec = os.path.join(d, "spec.json")
+with open(spec, "w") as f:
+json.dump([{"label": "ok", "witness": "file:here.txt"},
+{"label": "bad", "witness": "file:gone.txt"}], f)
+rc = ward.main([spec, "--root", d, "--format", "json"])
+check("one ring -> exit 1", rc, 1)
+
+with open(spec, "w") as f:
+json.dump([{"label": "ok", "witness": "file:here.txt"}], f)
+rc = ward.main([spec, "--root", d, "--format", "json"])
+check("all solid -> exit 0", rc, 0)
+
+print(f"\n{_PASS}/{_PASS + _FAIL} green")
+return 0 if _FAIL == 0 else 1
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only, ~200 lines
 
 ---
 
@@ -1099,691 +1523,5 @@ sys.exit(main())
 Take the whole folder →
 MIT
 Python stdlib only (calls local git), deterministic
-
----
-
-# WUPHF — a Loop MMT gift
-https://loopmmt.com/gifts/wuphf/
-[coverage: optional · branch: gifts]
-
-How Do You Say One Thing To Every Channel At Once? broadcast ← all gifts
-
-WUPHF
-
-Say one thing once and see it shaped for every channel at once — SMS, email, voicemail, fax, chat, social — side by side, each with the honest cost that channel imposes: the SMS segment count, the character count against the cap, where the text gets cut, how long the voicemail takes to read aloud. It's Ryan's WUPHF from The Office played straight and made honest: on the show it's a disaster because it hides the mismatch between channels; this reveals it. Under the hood it's the typed member of the fanout family — one message rendered N ways, a pure function (same message plus the same channels yield byte-identical output every run), and it sends nothing. You copy each render and send it yourself. Runs in Node or the browser (window.ForestGifts.wuphf).
-
-The honest edge
-
-WUPHF renders your message for every channel and counts the cost each imposes — it does not send anything, connect to any service, fire a mailto, or judge whether the words are good; you copy each render and send it yourself.
-
-Run it
-
-node wuphf.js "your message"
-test_wuphf.js (21/21: golden + GSM-7/UCS-2 SMS segment math at boundaries + social 280 cap + determinism + non-vacuity bites + fails-closed); Plumb conformance conform_wuphf.cjs 15/15 signed, bite-proven
-Node / browser, no dependencies
-
-The code — every file that ships
-
-wuphf.js 475 lines on GitHub →
-#!/usr/bin/env node
-/* wuphf.js — say one thing once, see it shaped for every channel at once.
-
-WHY THIS EXISTS. You write an announcement and then you retype it: once for
-email, once for the group text, once for Slack, once for the post. Each
-channel has its own shape and its own rules — a text is capped at 160
-characters before it splits into billed segments, a tweet dies at 280, a
-voicemail has to be *spoken* and land in under half a minute, a fax wants a
-cover sheet. Nobody remembers all those rules, so the same message goes out
-mangled in one place and truncated in another, and you don't find out until
-later. WUPHF refuses that. You type the message ONCE; it renders that exact
-message for every channel you declared, side by side, and — this is the whole
-point — it shows you the COST each channel imposes: the segment count, the
-character count against the cap, where the text will be cut, how long the
-voicemail takes to read aloud. You copy each one and send it yourself.
-
-THE JOKE, PLAYED STRAIGHT. WUPHF is Ryan's startup from *The Office* — text
-one thing and it blasts to fax, email, and phone at once. On the show it's a
-disaster precisely because it HIDES the mismatch between the channels. This
-gift is the honest inversion: it makes the mismatch visible. Same idea, one
-message to every channel; opposite ethic, the cost is never hidden.
-
-THE ONE DISCIPLINE (the whole reason to trust it). WUPHF renders and counts;
-it does NOT send. There is no network call, no credential, no mailto that
-fires on its own. Every channel is a declared, closed member of a fixed set —
-an unknown channel is a non-zero exit with the channel named, never a silent
-default. Each render is a PURE function of (message, channel): same message +
-same channel set -> byte-identical output, every run, every machine. It counts
-the cost each channel imposes; it does not judge whether your words are good.
-
-It is the TYPED member of the fanout family (the parallel-independent compose,
-the ⊗ product): `fanout` splits one payload into N identical labeled copies;
-WUPHF splits one message into N channel-SHAPED renders. Same jig, typed branches.
-
-USAGE
-node wuphf.js "your message" # all channels
-node wuphf.js --channels sms,social "your message" # a chosen subset
-echo -n "your message" | node wuphf.js # message from stdin (exact bytes)
-node wuphf.js --json "your message" # machine-readable JSONL
-node wuphf.js --list # the declared channels
-node wuphf.js --help
-
-OUTPUT (text mode): one card per channel, in declared order — the render plus
-its honest cost line. With --json: one JSONL record per channel:
-{"channel":"sms","render":"…","cost":{…},"seq":0,"of":6}
-
-Released under MIT. Its edge is printed in the README: WUPHF shows your message
-shaped for every channel at once and counts the cost each imposes; it does not
-send anything, connect to any service, or judge whether the words are good.
-*/
-
-"use strict";
-
-/* ------------------------------------------------------------------ *
-* The declared, CLOSED channel set. Adding a channel is a new entry
-* here (config, not code) — never an inferred or default branch.
-* Order in this array is the canonical, declared render order.
-* ------------------------------------------------------------------ */
-var CHANNELS = ["sms", "email", "voicemail", "fax", "chat", "social"];
-
-// A structured refusal. The CLI turns this into a non-zero exit; require()
-// callers get a thrown Error they can catch.
-function WuphfError(message) {
-var e = new Error(message);
-e.name = "WuphfError";
-return e;
-}
-
-/* ---- helpers: all pure, no clock, no randomness -------------------- */
-
-// Collapse runs of whitespace to single spaces and trim — the shared
-// "one line of speech" normalization used where a channel is single-line.
-function oneLine(s) {
-return String(s).replace(/\s+/g, " ").trim();
-}
-
-// GSM-7 basic + extension coverage test. Characters outside GSM-7 force the
-// whole SMS into UCS-2 encoding (70-char segments instead of 160). This is the
-// real rule carriers use; it is decidable and testable.
-var GSM7_BASIC =
-"@\u00a3$\u00a5\u00e8\u00e9\u00f9\u00ec\u00f2\u00c7\n\u00d8\u00f8\r\u00c5\u00e5" +
-"\u0394_\u03a6\u0393\u039b\u03a9\u03a0\u03a8\u03a3\u0398\u039e\u00c6\u00e6\u00df\u00c9" +
-"!\"#\u00a4%&'()*+,-./0123456789:;<=>?" +
-"\u00a1ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c4\u00d6\u00d1\u00dc\u00a7" +
-"\u00bfabcdefghijklmnopqrstuvwxyz\u00e4\u00f6\u00f1\u00fc\u00e0";
-// Characters that are GSM-7 but cost TWO septets (the extension table).
-var GSM7_EXT = "\f^{}\\[~]|\u20ac";
-
-function isGsm7(str) {
-for (var i = 0; i < str.length; i++) {
-var ch = str.charAt(i);
-if (GSM7_BASIC.indexOf(ch) === -1 && GSM7_EXT.indexOf(ch) === -1) return false;
-}
-return true;
-}
-
-// Count SMS septets: extension-table chars cost 2. (Only meaningful in GSM-7.)
-function gsm7Septets(str) {
-var n = 0;
-for (var i = 0; i < str.length; i++) {
-n += (GSM7_EXT.indexOf(str.charAt(i))!== -1)? 2: 1;
-}
-return n;
-}
-
-// UTF-16 code-UNIT length is what UCS-2 SMS segmentation actually counts.
-function ucs2Units(str) {
-return str.length;
-}
-
-/* ---- the SMS cost model (decidable, tested) ------------------------ *
-* Returns { encoding, units, cap_single, cap_multi, segments}.
-* Single-segment caps: 160 (GSM-7) / 70 (UCS-2).
-* Multi-segment caps (UDH concatenation overhead): 153 / 67.
-* ------------------------------------------------------------------ */
-function smsCost(message) {
-var gsm = isGsm7(message);
-var units = gsm? gsm7Septets(message): ucs2Units(message);
-var capSingle = gsm? 160: 70;
-var capMulti = gsm? 153: 67;
-var segments = (units <= capSingle)? 1: Math.ceil(units / capMulti);
-if (units === 0) segments = 1; // an empty message is one (empty) segment
-return {
-encoding: gsm? "GSM-7": "UCS-2",
-units: units,
-cap_single: capSingle,
-cap_multi: capMulti,
-segments: segments
-};
-}
-
-/* ---- per-channel renderers ----------------------------------------- *
-* Each returns { render: string, cost: {...}}. All pure.
-* The `cost` object is channel-specific and always includes a `label`
-* — a one-line human summary of the honest cost.
-* ------------------------------------------------------------------ */
-
-function renderSms(message) {
-var body = oneLine(message);
-var c = smsCost(body);
-var overNote = c.segments > 1
-? c.segments + " segments (" + c.units + " " +
-(c.encoding === "GSM-7"? "septets": "UTF-16 units") + ", " +
-c.encoding + ") — this text will be BILLED and DELIVERED as " +
-c.segments + " parts"
-: "1 segment (" + c.units + "/" + c.cap_single + " " +
-(c.encoding === "GSM-7"? "septets": "UTF-16 units") + ", " + c.encoding + ")";
-return {
-render: body,
-cost: {
-encoding: c.encoding,
-units: c.units,
-cap_single: c.cap_single,
-cap_multi: c.cap_multi,
-segments: c.segments,
-label: overNote
-}
-};
-}
-
-// Email: derive a subject from the first sentence/line (capped), body is the rest.
-// If the message is a single short line, subject == that line and body is empty.
-function renderEmail(message) {
-var norm = String(message).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-var firstBreak = norm.search(/[\n.!?]/);
-var subject, body;
-if (firstBreak === -1) {
-subject = oneLine(norm);
-body = "";
-} else {
-// subject = text up to (and excluding) the first break char; keep terminal punct off.
-subject = oneLine(norm.slice(0, firstBreak));
-body = norm.slice(firstBreak).replace(/^[\n.!?\s]+/, "");
-}
-var SUBJECT_CAP = 78; // RFC 2822 recommended max subject line before folding
-var subjTrimmed = subject.length > SUBJECT_CAP;
-if (subjTrimmed) subject = subject.slice(0, SUBJECT_CAP - 1).replace(/\s+\S*$/, "") + "\u2026";
-var render = "Subject: " + subject + "\n\n" + (body.length? body: "(no additional body)");
-return {
-render: render,
-cost: {
-subject_chars: subject.length,
-subject_cap: SUBJECT_CAP,
-subject_trimmed: subjTrimmed,
-body_chars: body.length,
-label: "subject " + subject.length + "/" + SUBJECT_CAP +
-(subjTrimmed? " (trimmed)": "") + " \u00b7 body " + body.length + " chars"
-}
-};
-}
-
-// Voicemail: a spoken script + an honest read-aloud estimate.
-// 150 words/minute is the standard careful-speech rate; we report seconds.
-function renderVoicemail(message) {
-var spoken = oneLine(message);
-var words = spoken.length? spoken.split(" ").length: 0;
-var seconds = Math.round((words / 150) * 60);
-var WPM = 150;
-var TARGET = 30; // a voicemail that reads over ~30s is too long
-var over = seconds > TARGET;
-var script = spoken.length
-? "\u201c" + spoken + "\u201d"
-: "(nothing to say)";
-return {
-render: script,
-cost: {
-words: words,
-seconds: seconds,
-target_seconds: TARGET,
-wpm: WPM,
-over: over,
-label: words + " words \u2248 " + seconds + "s aloud (@" + WPM + " wpm)" +
-(over? " \u2014 over the ~" + TARGET + "s a voicemail should stay under": "")
-}
-};
-}
-
-// Fax: a cover-sheet header (To/From/Re/Date left blank for the sender to fill)
-// followed by the message body. Date is deliberately a placeholder, NOT the
-// system clock — a gift is a pure fold with no clock (determinism).
-function renderFax(message) {
-var body = String(message).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
-var render =
-"\u2014\u2014\u2014 FAX COVER \u2014\u2014\u2014\n" +
-"TO: ____________________\n" +
-"FROM: ____________________\n" +
-"DATE: ____________________\n" +
-"RE: ____________________\n" +
-"\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\n\n" +
-(body.length? body: "(no message)");
-var lines = body.length? body.split("\n").length: 0;
-return {
-render: render,
-cost: {
-body_chars: body.length,
-body_lines: lines,
-label: "cover sheet + " + body.length + " chars (" + lines + " line" +
-(lines === 1? "": "s") + ") \u2014 fill in To/From/Date/Re before sending"
-}
-};
-}
-
-// Chat (Slack/Discord-style): plain single block, no cap enforced but char count reported.
-function renderChat(message) {
-var body = String(message).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
-return {
-render: body.length? body: "(empty)",
-cost: {
-chars: body.length,
-label: body.length + " chars \u2014 no hard cap, but keep it scannable"
-}
-};
-}
-
-// Social: 280-char cap (X/Bluesky/Mastodon-common), honest over-count + truncation point.
-function renderSocial(message) {
-var CAP = 280;
-var body = oneLine(message);
-var over = body.length > CAP;
-var shown = over? body.slice(0, CAP - 1) + "\u2026": body;
-return {
-render: shown,
-cost: {
-chars: body.length,
-cap: CAP,
-over: over,
-truncated_at: over? CAP - 1: null,
-label: body.length + "/" + CAP + " chars" +
-(over? " \u2014 OVER by " + (body.length - CAP) + "; shown truncated at " + (CAP - 1): " \u2014 fits")
-}
-};
-}
-
-var RENDERERS = {
-sms: renderSms,
-email: renderEmail,
-voicemail: renderVoicemail,
-fax: renderFax,
-chat: renderChat,
-social: renderSocial
-};
-
-/* ---- channel parsing (fails closed, declared-order preserved) ------ */
-function parseChannels(spec) {
-// spec: undefined -> all channels in declared order; else array of tokens.
-if (spec === undefined || spec === null) return CHANNELS.slice();
-if (!Array.isArray(spec)) {
-throw WuphfError("channels: expected a list of channel names");
-}
-var picked = [];
-var seen = Object.create(null);
-for (var i = 0; i < spec.length; i++) {
-var name = (typeof spec[i] === "string")? spec[i].trim().toLowerCase()
-: String(spec[i]).trim().toLowerCase();
-if (name.length === 0) {
-throw WuphfError("channels: empty channel name at position " + i +
-" (WUPHF has no default channel \u2014 declare a real one)");
-}
-if (!RENDERERS[name]) {
-throw WuphfError("channels: unknown channel " + JSON.stringify(name) +
-" (declared channels: " + CHANNELS.join(", ") + ")");
-}
-if (seen[name]) {
-throw WuphfError("channels: duplicate channel " + JSON.stringify(name));
-}
-seen[name] = true;
-picked.push(name);
-}
-if (picked.length === 0) {
-throw WuphfError("channels: none declared (pass one of: " + CHANNELS.join(", ") + ")");
-}
-// Emit in CANONICAL declared order, not the order the caller listed them,
-// so output is stable regardless of how the subset was typed.
-return CHANNELS.filter(function (c) { return seen[c];});
-}
-
-/* ---- the atom: one message -> N channel renders -------------------- *
-* wuphf(message, channels?) -> array of { channel, render, cost, seq, of}
-* Pure: no I/O, no clock, no randomness. `message` coerced via String().
-* ------------------------------------------------------------------ */
-function wuphf(message, channels) {
-var chans = parseChannels(channels);
-var msg = (typeof message === "string")? message: String(message);
-var of = chans.length;
-var out = [];
-for (var i = 0; i < of; i++) {
-var c = chans[i];
-var r = RENDERERS[c](msg);
-out.push({ channel: c, render: r.render, cost: r.cost, seq: i, of: of});
-}
-return out;
-}
-
-/* wuphfJSONL — canonical serialized form: one JSON object per line, fixed key
-order (channel,render,cost,seq,of), declared order, single trailing newline.
-Same message + same channels -> byte-identical text every run. */
-function wuphfJSONL(message, channels) {
-var recs = wuphf(message, channels);
-var lines = [];
-for (var i = 0; i < recs.length; i++) {
-var r = recs[i];
-lines.push(
-"{" +
-"\"channel\":" + JSON.stringify(r.channel) + "," +
-"\"render\":" + JSON.stringify(r.render) + "," +
-"\"cost\":" + JSON.stringify(r.cost) + "," +
-"\"seq\":" + r.seq + "," +
-"\"of\":" + r.of +
-"}"
-);
-}
-return lines.join("\n") + "\n";
-}
-
-/* wuphfText — the human card view: one titled card per channel with its render
-and its honest cost line. Pure (no color, no clock). */
-function wuphfText(message, channels) {
-var recs = wuphf(message, channels);
-var blocks = [];
-for (var i = 0; i < recs.length; i++) {
-var r = recs[i];
-var title = r.channel.toUpperCase();
-var head = "\u2500\u2500 " + title + " " +
-new Array(Math.max(2, 40 - title.length)).join("\u2500");
-blocks.push(
-head + "\n" +
-r.render + "\n" +
-" \u2192 " + r.cost.label
-);
-}
-return blocks.join("\n\n") + "\n";
-}
-
-// Browser: attach to a namespace. Node/require: export. CLI: run below.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.wuphf = wuphf;
-window.ForestGifts.wuphfJSONL = wuphfJSONL;
-window.ForestGifts.wuphfText = wuphfText;
-window.ForestGifts.WUPHF_CHANNELS = CHANNELS.slice();
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = {
-wuphf: wuphf,
-wuphfJSONL: wuphfJSONL,
-wuphfText: wuphfText,
-parseChannels: parseChannels,
-smsCost: smsCost,
-CHANNELS: CHANNELS.slice()
-};
-}
-
-// ---- CLI (runs only when invoked directly, never on require) ----------------
-function readChannelsArg(args) {
-var i = args.indexOf("--channels");
-if (i === -1) return undefined; // -> all channels
-var csv = args[i + 1];
-if (csv === undefined) throw WuphfError("--channels needs a comma-separated value");
-return csv.split(",");
-}
-
-function positionalMessage(args) {
-var flagsWithValue = { "--channels": true};
-for (var i = 0; i < args.length; i++) {
-var a = args[i];
-if (a.charAt(0) === "-") { if (flagsWithValue[a]) i++; continue;}
-return a;
-}
-return null;
-}
-
-function main(argv) {
-var args = argv.slice(2);
-
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"wuphf.js \u2014 say one thing once, see it shaped for every channel at once.\n\n" +
-" node wuphf.js \"your message\" all channels\n" +
-" node wuphf.js --channels sms,social \"your message\" a chosen subset\n" +
-" echo -n \"your message\" | node wuphf.js message from stdin (exact bytes)\n" +
-" node wuphf.js --json \"your message\" machine-readable JSONL\n" +
-" node wuphf.js --list the declared channels\n" +
-" node wuphf.js --help\n\n" +
-"Renders your ONE message for every declared channel and shows the cost each\n" +
-"imposes (SMS segments, char caps, read-aloud seconds, truncation). Fails closed\n" +
-"(non-zero exit, channel named) on an unknown, empty, or duplicate channel.\n\n" +
-"Edge: WUPHF renders and counts \u2014 it does NOT send anything, connect to any\n" +
-"service, or judge whether the words are good. You copy each and send it yourself.\n"
-);
-return 0;
-}
-
-if (args.indexOf("--list")!== -1) {
-process.stdout.write(CHANNELS.join("\n") + "\n");
-return 0;
-}
-
-var asJson = args.indexOf("--json")!== -1;
-
-var channelSpec;
-try {
-channelSpec = readChannelsArg(args);
-} catch (e) {
-process.stderr.write("wuphf: " + e.message + "\n");
-return 2;
-}
-
-var message = positionalMessage(args);
-
-function emit(msg) {
-try {
-process.stdout.write(asJson? wuphfJSONL(msg, channelSpec)
-: wuphfText(msg, channelSpec));
-return 0;
-} catch (e) {
-process.stderr.write("wuphf: " + e.message + "\n");
-return 2;
-}
-}
-
-if (message!== null) return emit(message);
-
-// stdin: exact bytes.
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-var buf = Buffer.concat(chunks);
-process.exitCode = emit(buf.toString("utf8"));
-});
-return 0;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_wuphf.js 179 lines on GitHub →
-#!/usr/bin/env node
-/* test_wuphf.js — golden corpus + per-channel cost correctness + SMS segment
-math + determinism self-test + non-vacuity bite for the WUPHF gift. Zero
-dependencies (Node assert only). This file IS the canonicalizer self-test the
-Plumb cites (Gift-Works Procedure v1 §2): a gift whose output is byte-identical
-across repeated evaluation has proven its canonical form is idempotent.
-
-Run: node test_wuphf.js # exit 0 GREEN / non-zero RED
-*/
-"use strict";
-var assert = require("assert");
-var W = require("./wuphf.js");
-
-var pass = 0, fail = 0;
-function check(name, fn) {
-try { fn(); pass++;}
-catch (e) { fail++; console.error("FAIL: " + name + " \u2014 " + e.message);}
-}
-
-// ---- the declared channel set is exactly six, in declared order ------------
-check("the declared channel set is the six known channels in declared order", function () {
-assert.deepStrictEqual(W.CHANNELS,
-["sms", "email", "voicemail", "fax", "chat", "social"]);
-});
-
-// ---- GOLDEN CORPUS: JSONL is a fixed oracle, written out literally ---------
-check("a short GSM-7 message renders sms as one segment with the exact JSONL", function () {
-var out = W.wuphfJSONL("hi team", ["sms"]);
-assert.strictEqual(out,
-'{"channel":"sms","render":"hi team","cost":{"encoding":"GSM-7","units":7,"cap_single":160,"cap_multi":153,"segments":1,"label":"1 segment (7/160 septets, GSM-7)"},"seq":0,"of":1}\n');
-});
-
-check("all six channels render in declared order with of=6", function () {
-var recs = W.wuphf("Standup at 10", ["social", "sms", "fax", "email", "chat", "voicemail"]);
-// declared-order canonicalization: listed order ignored, CHANNELS order used
-assert.deepStrictEqual(recs.map(function (r) { return r.channel;}),
-["sms", "email", "voicemail", "fax", "chat", "social"]);
-recs.forEach(function (r) { assert.strictEqual(r.of, 6);});
-assert.deepStrictEqual(recs.map(function (r) { return r.seq;}), [0, 1, 2, 3, 4, 5]);
-});
-
-// ---- SMS SEGMENT MATH: the decidable core, tested at the boundaries --------
-check("160 GSM-7 chars is exactly one segment; 161 becomes two", function () {
-var s160 = new Array(161).join("a"); // 160 chars
-var s161 = new Array(162).join("a"); // 161 chars
-assert.strictEqual(W.smsCost(s160).segments, 1);
-assert.strictEqual(W.smsCost(s161).segments, 2);
-});
-
-check("a non-GSM-7 char (emoji) forces UCS-2 and a 70-char single-segment cap", function () {
-var c = W.smsCost("\ud83e\udd8c"); // deer emoji -> UCS-2
-assert.strictEqual(c.encoding, "UCS-2");
-assert.strictEqual(c.cap_single, 70);
-// one emoji = 2 UTF-16 units, still one segment
-assert.strictEqual(c.units, 2);
-assert.strictEqual(c.segments, 1);
-});
-
-check("a GSM-7 extension char (euro sign) costs two septets", function () {
-var c = W.smsCost("\u20ac"); // euro is in the GSM-7 extension table -> 2 septets
-assert.strictEqual(c.encoding, "GSM-7");
-assert.strictEqual(c.units, 2);
-});
-
-check("71 UCS-2 units cross into two segments at the 67-cap", function () {
-// build a UCS-2 message of 71 units: 70 latin + 1 that forces UCS-2 would be 71,
-// but to force UCS-2 we need a non-GSM char; use 69 'a' + one 2-unit emoji = 71 units
-var msg = new Array(70).join("a") + "\ud83e\udd8c"; // 69 + 2 = 71 units, UCS-2
-var c = W.smsCost(msg);
-assert.strictEqual(c.encoding, "UCS-2");
-assert.strictEqual(c.units, 71);
-assert.strictEqual(c.segments, 2); // 71 > 70 -> ceil(71/67) = 2
-});
-
-// ---- SOCIAL: 280 cap, honest over-count + truncation ----------------------
-check("social under 280 fits and is not truncated", function () {
-var recs = W.wuphf("just a quick note", ["social"]);
-assert.strictEqual(recs[0].cost.over, false);
-assert.strictEqual(recs[0].cost.truncated_at, null);
-assert.strictEqual(recs[0].render, "just a quick note");
-});
-
-check("social over 280 reports the over-count and truncates with an ellipsis", function () {
-var long = new Array(301).join("x"); // 300 chars
-var recs = W.wuphf(long, ["social"]);
-assert.strictEqual(recs[0].cost.over, true);
-assert.strictEqual(recs[0].cost.chars, 300);
-assert.strictEqual(recs[0].cost.truncated_at, 279);
-assert.strictEqual(recs[0].render.length, 280); // 279 chars + ellipsis
-assert.ok(/\u2026$/.test(recs[0].render));
-});
-
-// ---- VOICEMAIL: read-aloud estimate at 150 wpm ----------------------------
-check("voicemail estimates seconds from words at 150 wpm and flags over-30s", function () {
-var words = [];
-for (var i = 0; i < 150; i++) words.push("word"); // 150 words = 60s
-var recs = W.wuphf(words.join(" "), ["voicemail"]);
-assert.strictEqual(recs[0].cost.words, 150);
-assert.strictEqual(recs[0].cost.seconds, 60);
-assert.strictEqual(recs[0].cost.over, true);
-});
-
-// ---- EMAIL: subject/body split -------------------------------------------
-check("email splits a subject from the first sentence and puts the rest in the body", function () {
-var recs = W.wuphf("Server maintenance tonight. It runs from 10pm to midnight.", ["email"]);
-assert.ok(/^Subject: Server maintenance tonight\n\n/.test(recs[0].render));
-assert.ok(/It runs from 10pm to midnight\.$/.test(recs[0].render));
-});
-
-check("email with a single short line has that line as subject and an empty body note", function () {
-var recs = W.wuphf("Lunch moved to 1pm", ["email"]);
-assert.ok(/^Subject: Lunch moved to 1pm/.test(recs[0].render));
-assert.ok(/\(no additional body\)$/.test(recs[0].render));
-});
-
-// ---- FAX: cover sheet present, date is NOT the system clock ----------------
-check("fax renders a cover sheet and uses a blank date placeholder, not the clock", function () {
-var recs = W.wuphf("Please review the attached.", ["fax"]);
-assert.ok(/FAX COVER/.test(recs[0].render));
-assert.ok(/DATE: _{5,}/.test(recs[0].render)); // blank placeholder, no real date
-assert.ok(!/20\d\d/.test(recs[0].render)); // no year -> no clock leaked
-assert.ok(/Please review the attached\.$/.test(recs[0].render));
-});
-
-// ---- DETERMINISM: byte-identical across repeated evaluation ---------------
-check("the same message and channels yield byte-identical JSONL on repeat runs", function () {
-var msg = "caf\u00e9\ud83e\udd8c \u65e5\u672c\u8a9e \u2014 ship it";
-var a = W.wuphfJSONL(msg); // all channels
-var b = W.wuphfJSONL(msg);
-assert.strictEqual(a, b);
-});
-
-check("multibyte fidelity survives JSON escaping in every channel", function () {
-var out = W.wuphfJSONL("q\"uote\nnewline\t\u65e5", ["chat"]);
-assert.ok(out.indexOf('\\"')!== -1); // quote escaped
-assert.ok(out.indexOf("\\n")!== -1); // newline escaped
-assert.ok(out.indexOf("\u65e5")!== -1); // non-latin preserved raw
-});
-
-// ---- FAILS CLOSED: unknown / empty / duplicate channel --------------------
-check("an unknown channel is refused with the channel named", function () {
-assert.throws(function () { W.wuphf("x", ["pigeon"]);}, /unknown channel "pigeon"/);
-});
-
-check("an empty channel token is refused (no default channel)", function () {
-assert.throws(function () { W.wuphf("x", [""]);}, /empty channel name/);
-});
-
-check("a duplicate channel is refused", function () {
-assert.throws(function () { W.wuphf("x", ["sms", "sms"]);}, /duplicate channel/);
-});
-
-check("an empty channel list is refused", function () {
-assert.throws(function () { W.wuphf("x", []);}, /none declared/);
-});
-
-// ---- NON-VACUITY BITE: the test must be able to FAIL ----------------------
-// If the renderer were the identity function, these expectations would break.
-// Prove the harness actually catches a wrong answer.
-check("NON-VACUITY: sms of a 200-char message is really 2 segments, not 1", function () {
-var s = new Array(201).join("a"); // 200 chars GSM-7
-var recs = W.wuphf(s, ["sms"]);
-assert.strictEqual(recs[0].cost.segments, 2); // would be 1 if the model were broken
-assert.notStrictEqual(recs[0].cost.segments, 1);
-});
-
-check("NON-VACUITY: the six renders are genuinely DIFFERENT from each other", function () {
-var recs = W.wuphf("Team meeting moved to 3pm in the big room", W.CHANNELS);
-var renders = recs.map(function (r) { return r.render;});
-var uniq = {};
-renders.forEach(function (x) { uniq[x] = true;});
-// at least sms/email/voicemail/fax must differ; not all six identical
-assert.ok(Object.keys(uniq).length >= 4,
-"expected channel renders to differ; got " + Object.keys(uniq).length + " distinct");
-});
-
-// ---------------------------------------------------------------------------
-console.log((fail === 0? "GREEN": "RED") + ": " + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
 
 ---
