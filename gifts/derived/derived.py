@@ -182,9 +182,9 @@ def main(argv=None):
         description="Is a generated file stale against the command that makes it?",
         epilog="EDGE: " + EDGE,
     )
-    ap.add_argument("--build-cmd", required=True,
+    ap.add_argument("--build-cmd", default=None,
                     help="the command that regenerates the derived file (run in a sandbox)")
-    ap.add_argument("--derived", required=True,
+    ap.add_argument("--derived", default=None,
                     help="repo-relative path of the file the command is supposed to produce")
     ap.add_argument("--copy", action="append", default=[], metavar="PATH",
                     help="input file/dir the build needs; repeatable (ignored with --in-place)")
@@ -201,6 +201,9 @@ def main(argv=None):
     if args.edge:
         print(EDGE)
         return EXIT_CURRENT
+    # --build-cmd and --derived are required for a check, never for --edge: the edge must print on its own.
+    if not args.build_cmd or not args.derived:
+        ap.error("--build-cmd and --derived are required (or pass --edge alone to print the edge)")
 
     res = check(
         args.build_cmd, args.derived, args.copy,

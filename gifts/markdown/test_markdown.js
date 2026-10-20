@@ -68,7 +68,7 @@ eq("escape text", md.toHTML(md.parse("a < b & c > d")), "<p>a &lt; b &amp; c &gt
 eq("safe http link",  md.toHTML(md.parse("[x](https://a.com)")), '<p><a href="https://a.com">x</a></p>');
 eq("safe relative",   md.toHTML(md.parse("[x](/path)")), '<p><a href="/path">x</a></p>');
 eq("safe anchor",     md.toHTML(md.parse("[x](#sec)")), '<p><a href="#sec">x</a></p>');
-eq("safe mailto",     md.toHTML(md.parse("[x](mailto:a@b.com)")), '<p><a href="mailto:a@b.com">x</a></p>');
+eq("safe mailto",     md.toHTML(md.parse("[x](mailto:a@example.com)")), '<p><a href="mailto:a@example.com">x</a></p>');
 eq("drop javascript", md.toHTML(md.parse("[x](javascript:alert(1))")), "<p>x</p>");
 eq("drop data",       md.toHTML(md.parse("[x](data:text/html,<script>)")), "<p>x</p>");
 eq("drop protorel",   md.toHTML(md.parse("[x](//evil.host)")), "<p>x</p>");

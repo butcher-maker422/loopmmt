@@ -57,14 +57,26 @@ deterministic layer, not the whole defense.
 
 ## Shapes it knows
 
-`github-pat` · `github-token` · `aws-access-key-id` · `google-api-key` · `slack-token` ·
-`stripe-key` · `openai-key` · `jwt` · `private-key-block` · `basic-auth-url` · `hex-40-token` ·
-`secret-assignment` *(heuristic — a generic `secret = …` assignment; drop it with
-`--no-heuristic` if it is too eager)*.
+`github-pat` · `github-token` · `gitlab-pat` · `aws-access-key-id` · `google-api-key` ·
+`slack-token` · `stripe-key` · `openai-key` · `jwt` · `private-key-block` ·
+`assigned-hex-40` (a 40-hex value assigned to a `*TOKEN`/`*PAT`/`*SECRET` name) ·
+`basic-auth-url-literal` (a URL carrying a literal `user:password@`) — and three
+**heuristic** shapes, on by default, dropped with `--no-heuristic` if they are too eager:
+`basic-auth-url` (any `user:…@` in a URL, a `${PLACEHOLDER}` included), `hex-40-token`
+(a bare 40-hex run — as often a git commit id) and `secret-assignment` (a generic
+`secret = …` with a value written in place). Since 17 Oct 2026 `secret-assignment` no longer
+flags a function call on the right-hand side — `secret = crypto.randomBytes(32)` is a key
+generated when the program runs, not a secret written in the file. A secret wrapped in a call
+(`password = String("…")`) was never reliably caught and still is not: the honest ceiling.
+
+One token is one finding: when two shapes see the same characters (a literal password URL
+is also a URL with credentials), scrub reports the decided shape once, not both.
 
 ## Provenance
 
 Stripped from the Loop MMT band gate's exit-9 credential scan — the check that refuses to
 seal a session bundle if a token is in it. The general kernel (scan for a secret shape, fail
 loud, carve out a vouched-for line) is universal; the methodology-specific patterns stayed
-home. MIT-licensed, © 2026 Shea Gunther.
+home. Since October 2026 the shape list is rendered from the same register Loop's own
+repository scanners read, so the gift and the guards it came from cannot drift apart.
+MIT-licensed, © 2026 Shea Gunther.

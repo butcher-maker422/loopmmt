@@ -46,10 +46,10 @@ def build_repo(root):
         subprocess.run(["git", "-C", root] + list(args), check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=e)
     git("init")
-    git("config", "user.email", "x@x.co")
+    git("config", "user.email", "x@example.net")
     git("config", "user.name", "seed")
     for author, date, subject in COMMITS:
-        email = author.lower() + "@x.co"
+        email = author.lower() + "@example.net"
         git("commit", "--allow-empty", "-m", subject,
             GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL=email,
             GIT_COMMITTER_NAME=author, GIT_COMMITTER_EMAIL=email,

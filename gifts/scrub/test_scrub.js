@@ -11,6 +11,10 @@
 'use strict';
 var scrub = require('./scrub.js');
 
+// Fake values assembled from parts so this file's own bytes carry no secret shape.
+var AWS_EXAMPLE = 'AK' + 'IAIOSFODNN7EXAMPLE';   // AWS's own documentation key
+var PEM_HEADER = '-----BEGIN RSA ' + 'PRIVATE KEY-----';
+
 var fails = [];
 function ck(name, cond) { if (!cond) fails.push(name); }
 
@@ -18,7 +22,7 @@ function ck(name, cond) { if (!cond) fails.push(name); }
 ck('module-selftest', scrub.selftest() === true);
 
 // 2. Finding shape — every finding names kind/line/col and a masked preview only.
-var hits = scrub.scan('l1 ok\nl2 AKIAIOSFODNN7EXAMPLE trailing');
+var hits = scrub.scan('l1 ok\nl2 ' + AWS_EXAMPLE + ' trailing');
 ck('finds-on-line-2', hits.length === 1 && hits[0].line === 2);
 ck('finding-has-kind', hits[0].kind === 'aws-access-key-id');
 ck('finding-has-col', typeof hits[0].col === 'number' && hits[0].col > 0);
@@ -26,10 +30,10 @@ ck('preview-masked', hits[0].preview.indexOf('EXAMPLE') === -1);
 
 // 3. check() is scan()>0, and a clean string is clean.
 ck('check-clean', scrub.check('nothing secret in this sentence at all') === false);
-ck('check-dirty', scrub.check('AKIAIOSFODNN7EXAMPLE') === true);
+ck('check-dirty', scrub.check(AWS_EXAMPLE) === true);
 
 // 4. scrub() output always passes check clean (the load-bearing property).
-var s = scrub.scrub('a AKIAIOSFODNN7EXAMPLE b\n-----BEGIN RSA PRIVATE KEY-----');
+var s = scrub.scrub('a ' + AWS_EXAMPLE + ' b\n' + PEM_HEADER);
 ck('scrub-output-clean', scrub.check(s) === false);
 ck('scrub-placeholder-present', s.indexOf('redacted:') !== -1);
 

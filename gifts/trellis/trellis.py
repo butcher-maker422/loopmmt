@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-License-Identifier: CC-BY-NC-4.0
+# SPDX-License-Identifier: MIT
 """
 The Trellis -- a 2-D consistency localizer + generator.
 Loop MMT(tm) - Phase 1 of the Trellis V1 plan (S12.1337 -> built S12.1423).

@@ -1,8 +1,1223 @@
-# Loop MMT — corpus shard 74/92
+# Loop MMT — corpus shard 74/95
 
-> Bundle 74 of 92 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 74 of 95 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/life-fold/, /gifts/line-source/, /gifts/loop21-component-factory/)
+Nodes in this shard: 3 (/gifts/lead-in/, /gifts/legible/, /gifts/life-fold/)
+
+---
+
+# The Lead-In — a Loop MMT gift
+https://loopmmt.com/gifts/lead-in/
+[coverage: optional · branch: gifts]
+
+Which Of Your Categories Is This Text About — And Which Words Said So? read ← all gifts
+
+The Lead-In
+
+Declare your own kinds in a small JSON vocabulary — a plain sentence, the lead-in cues that point to each, examples it must read and counterexamples it must not — and the Lead-In reads any text against it: which kinds it is about, with every cue and its position as evidence. A vocabulary that cannot read its own examples refuses to load, so the file is its own test, and it grows only when two different sessions on two different texts saw the same cue lead to the same kind. Python stdlib only, offline, deterministic.
+
+The honest edge
+
+It reads words, not meaning: a text that names its subject in words no vocabulary lists reads as no kind. On an independent 20-request test set it read 5 exactly, with 2 false hits.
+
+Run it
+
+python3 lead_in.py read toy-money.json "what does it cost to rent the hall" && python3 lead_in.py check toy-money.json
+test_lead_in.py 7/7 (behavior, not prose); engine battery 63/63, kill sheet 12/12; plumb conformance 13/13, signed f506c955
+Python stdlib only, deterministic
+
+The code — every file that ships
+
+lead_in.py 774 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""lead_in.py — The Lead-In: read a piece of text into a declared vocabulary of kinds,
+and show the words that led there.
+
+Spec: the Lead-In Blueprint (B3 is what this file implements); its design record lives with the Blueprint.
+
+The engine knows nothing about any domain. A VOCABULARY (JSON) declares kinds; each kind carries lead-in
+cues, a plain sentence, examples and counterexamples. A vocabulary that cannot read its own examples does
+not load (the self-certifying load). A READING is pure and total: same text + same vocabulary -> the same
+bytes, no network, no clock, no randomness, no model call.
+
+The self-test is a FLOOR, not a certificate (Gold Wash V4a, the Witness Ceiling): a vocabulary passing its own
+examples is grading its own homework, so `check` also reports how many cues its examples actually exercise
+(non-vacuity) and `heldout_score.py` reports recall on sentences it never saw (liveness).
+
+Consumer class (pattern 3.13, the Fail-Direction Split): a vocabulary declares `consumer` horizon (default; a reading
+shapes attention and fails SAFE — no kind is a SKIP with a door back) or gate (a decision hangs on it; no kind is
+REFUSED, fail CLOSED). A reading carries its consumer class so a downstream reader cannot mistake one for the other.
+
+Printed edge (honest ceiling): it reads words, not meaning. A text that names its subject in words no
+vocabulary lists reads as no kind. A model or a person may PROPOSE a kind for such a text (`stray`);
+proposals become cues only through `fold`, a decidable, monotone bar — never by judgment alone.
+
+HOW IT LEARNS (the witness rule; its decision record lives with the Blueprint). The witness rule, verbatim: "A cue joins the vocabulary when two
+sessions, on two different texts, have seen it lead to the same kind, and a third session blesses it." Mechanically:
+stray the cue's tokens must occur, in order, in the text (a proposal names words the text actually has); a text
+under MIN_STRAY_TOKENS tokens is refused; each row records its `proposer` (the session id) and, when known,
+its `source` (who wrote the text).
+fold a (kind, cue) is promoted only when its witnesses are >= 2 distinct texts from >= 2 distinct proposer
+sessions; with --write, the blessing DECIDED is looked up in the events directory and its session must not be any
+witness's session. A row with no proposer counts as a text, never as a session.
+Ceiling, verbatim: "Two sessions are two occasions, not two minds." Recall is reported only against an independent
+panel; every same-author number says so.
+
+Verbs:
+read <vocab.json> [TEXT|-] [--json] [--stray-log PATH] read one text
+check <vocab.json>... [--json] lint + self-test + targets + collisions
+list [DIR] the vocabulary registry view
+stray <vocab.json> --kind K --cue C --log PATH --proposer SID [--source WHO] TEXT
+record "this text is K; C should have led there"
+fold <vocab.json> --log PATH [--write --decided ID] promote eligible strays (dry run unless --write;
+--write needs the recorded DECIDED id — the bless)
+
+Exit (The Verdict classes): 0 OK or SKIP · 3 FLAG · 4 REFUSED · 2 ERROR.
+
+Declared effect (its own tool-decl block: the author's claim, checked by parity):
+```tool-decl
+writes = read-only
+writes.read = writes-tree
+writes.stray = writes-tree
+writes.fold = writes-tree
+network = none
+secrets = none
+reads = the vocabulary JSON files named, their target_registry JSON, and the stray log named by --log
+cold = loud
+```
+`read` writes only with --stray-log (one appended line); `fold` writes only with --write.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import unicodedata
+
+TOP_KEYS = {"vocabulary", "version", "title", "provenance", "source", "mode", "consumer", "min_score", "tie_margin",
+"target_registry", "kinds", "na", "history"}
+REQUIRED_TOP = {"vocabulary", "version", "title", "provenance", "mode", "kinds"}
+KIND_KEYS = {"id", "label", "plain", "cues", "negative", "targets", "examples", "counterexamples"}
+REQUIRED_KIND = {"id", "label", "plain", "cues", "examples"}
+NA_KEYS = {"plain", "cues", "examples"}
+PROVENANCES = ("authored", "derived", "folded")
+MODES = ("multi", "single")
+CONSUMERS = ("horizon", "gate")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+TOKEN_RE = re.compile(r"[a-z0-9]+")
+CUE_TOKEN_RE = re.compile(r"^[a-z0-9]+\*?$")
+PLAIN_MAX_WORDS = 25
+STOP = {"a", "an", "the", "of", "in", "on", "to", "and", "or", "for", "by", "with", "over", "at", "as", "is"}
+
+EXIT = {"OK": 0, "SKIP": 0, "FLAG": 3, "REFUSED": 4, "ERROR": 2}
+
+class Refused(Exception):
+"""Input outside the contract (The Verdict class REFUSED). The message names why."""
+
+class LoadError(Exception):
+"""A file that cannot be read (The Verdict class ERROR)."""
+
+# ---------------------------------------------------------------- normalization and cues
+
+def normalize(text):
+"""NFKC, lowercase, tokens = maximal runs of [a-z0-9]. The one rule for text and cues alike."""
+return TOKEN_RE.findall(unicodedata.normalize("NFKC", str(text)).lower())
+
+def parse_cue(cue, where):
+"""-> (display, tokens, weight). A cue is a string or {"cue": str, "w": int}; `*` ends a token only."""
+weight = None
+if isinstance(cue, dict):
+if set(cue) - {"cue", "w"} or "cue" not in cue:
+raise Refused(f"{where}: a cue object takes only 'cue' and 'w'")
+weight = cue.get("w")
+if weight is not None and (not isinstance(weight, int) or isinstance(weight, bool) or weight < 1):
+raise Refused(f"{where}: cue weight must be an integer >= 1")
+cue = cue["cue"]
+if not isinstance(cue, str):
+raise Refused(f"{where}: a cue must be a string")
+raw = unicodedata.normalize("NFKC", cue).lower()
+pieces = re.sub(r"[^a-z0-9*]+", " ", raw).split()
+if not pieces:
+raise Refused(f"{where}: empty cue")
+for piece in pieces:
+if not CUE_TOKEN_RE.match(piece):
+raise Refused(f"{where}: cue '{cue}' — '*' may only end a token")
+display = " ".join(pieces)
+return display, tuple(pieces), weight if weight is not None else len(pieces)
+
+def _token_hit(cue_token, token):
+if cue_token.endswith("*"):
+return token.startswith(cue_token[:-1])
+return token == cue_token
+
+def first_match(cue_tokens, tokens):
+"""Index of the first contiguous match of cue_tokens in tokens, else None."""
+n = len(cue_tokens)
+for i in range(len(tokens) - n + 1):
+if all(_token_hit(cue_tokens[j], tokens[i + j]) for j in range(n)):
+return i
+return None
+
+# ---------------------------------------------------------------- the vocabulary
+
+class Kind:
+def __init__(self, raw, where):
+self.raw = raw
+self.id = raw["id"]
+self.label = raw["label"]
+self.plain = raw["plain"]
+self.cues = [parse_cue(c, f"{where}.cues[{i}]") for i, c in enumerate(raw["cues"])]
+self.negative = [parse_cue(c, f"{where}.negative[{i}]") for i, c in enumerate(raw.get("negative", []))]
+self.targets = list(raw.get("targets", []))
+self.examples = list(raw["examples"])
+self.counterexamples = list(raw.get("counterexamples", []))
+
+class Vocabulary:
+def __init__(self, raw, path):
+self.raw = raw
+self.path = path
+self.id = raw["vocabulary"]
+self.version = raw["version"]
+self.provenance = raw["provenance"]
+self.mode = raw["mode"]
+self.consumer = raw.get("consumer", "horizon")
+self.min_score = raw.get("min_score", 1)
+self.tie_margin = raw.get("tie_margin", 0)
+self.kinds = [Kind(k, f"kinds[{i}]") for i, k in enumerate(raw["kinds"])]
+na = raw.get("na") or {}
+self.na_plain = na.get("plain", "")
+self.na_cues = [parse_cue(c, f"na.cues[{i}]") for i, c in enumerate(na.get("cues", []))]
+self.na_examples = list(na.get("examples", []))
+self.registry_ids = None # set by _resolve_targets when a target_registry is declared
+
+def _need(cond, msg):
+if not cond:
+raise Refused(msg)
+
+def _lint(raw):
+_need(isinstance(raw, dict), "a vocabulary is a JSON object")
+unknown = set(raw) - TOP_KEYS
+_need(not unknown, f"unknown top-level key(s): {sorted(unknown)}")
+missing = REQUIRED_TOP - set(raw)
+_need(not missing, f"missing top-level key(s): {sorted(missing)}")
+_need(isinstance(raw["vocabulary"], str) and ID_RE.match(raw["vocabulary"]), "vocabulary: bad id")
+_need(isinstance(raw["version"], int) and not isinstance(raw["version"], bool) and raw["version"] >= 1,
+"version: an integer >= 1")
+_need(raw["provenance"] in PROVENANCES, f"provenance: one of {PROVENANCES}")
+_need(raw["provenance"]!= "derived" or isinstance(raw.get("source"), str), "a derived vocabulary names its source")
+_need(raw["mode"] in MODES, f"mode: one of {MODES}")
+_need(raw.get("consumer", "horizon") in CONSUMERS, f"consumer: one of {CONSUMERS}")
+for key in ("min_score", "tie_margin"):
+if key in raw:
+_need(isinstance(raw[key], int) and not isinstance(raw[key], bool) and raw[key] >= 0, f"{key}: an integer >= 0")
+_need(isinstance(raw["kinds"], list) and raw["kinds"], "kinds: a non-empty list")
+seen = set()
+for i, k in enumerate(raw["kinds"]):
+where = f"kinds[{i}]"
+_need(isinstance(k, dict), f"{where}: an object")
+unknown = set(k) - KIND_KEYS
+_need(not unknown, f"{where}: unknown key(s) {sorted(unknown)}")
+missing = REQUIRED_KIND - set(k)
+_need(not missing, f"{where}: missing key(s) {sorted(missing)}")
+_need(isinstance(k["id"], str) and ID_RE.match(k["id"]), f"{where}.id: bad id")
+_need(k["id"] not in seen, f"{where}.id: duplicate kind id '{k['id']}'")
+seen.add(k["id"])
+_need(isinstance(k["cues"], list) and k["cues"], f"{where}.cues: at least one cue")
+_need(isinstance(k["examples"], list) and k["examples"], f"{where}.examples: at least one example")
+for field in ("examples", "counterexamples", "targets", "negative"):
+_need(isinstance(k.get(field, []), list), f"{where}.{field}: a list")
+_need(all(isinstance(t, str) for t in k["examples"] + k.get("counterexamples", [])),
+f"{where}: examples and counterexamples are strings")
+plain = k["plain"]
+_need(isinstance(plain, str) and plain.strip(), f"{where}.plain: a sentence")
+words = normalize(plain)
+_need(len(words) <= PLAIN_MAX_WORDS, f"{where}.plain: at most {PLAIN_MAX_WORDS} words (has {len(words)})")
+label_words = {w for w in normalize(k["label"]) if w not in STOP}
+named = sorted(label_words & set(words))
+_need(not named, f"{where}.plain: explain it without naming it — uses label word(s) {named}")
+na = raw.get("na")
+if na is not None:
+_need(isinstance(na, dict), "na: an object")
+unknown = set(na) - NA_KEYS
+_need(not unknown, f"na: unknown key(s) {sorted(unknown)}")
+_need(isinstance(na.get("cues", []), list) and isinstance(na.get("examples", []), list), "na: cues/examples are lists")
+reg = raw.get("target_registry")
+if reg is not None:
+_need(isinstance(reg, dict) and set(reg) == {"path", "records_key", "id_field"},
+"target_registry: exactly {path, records_key, id_field}")
+
+def _resolve_targets(vocab):
+reg = vocab.raw.get("target_registry")
+referenced = sorted({t for k in vocab.kinds for t in k.targets})
+if reg is None:
+_need(not referenced, "kinds declare targets but no target_registry")
+return
+path = reg["path"]
+if not os.path.isabs(path):
+path = os.path.join(os.path.dirname(os.path.abspath(vocab.path)), path)
+try:
+with open(path, encoding="utf-8") as fh:
+data = json.load(fh)
+except (OSError, ValueError) as error:
+raise Refused(f"target_registry unreadable: {path}: {error}")
+records = data.get(reg["records_key"]) if reg["records_key"] else data
+_need(isinstance(records, list), "target_registry: records is not a list")
+ids = {r.get(reg["id_field"]) for r in records if isinstance(r, dict)}
+ids.discard(None)
+vocab.registry_ids = ids
+unresolved = [t for t in referenced if t not in ids]
+_need(not unresolved, f"targets that do not resolve in {reg['path']}: {unresolved}")
+
+def build(raw, path="<memory>"):
+"""Lint, compile, resolve targets, self-test. REFUSED on any failure."""
+_lint(raw)
+vocab = Vocabulary(raw, path)
+_resolve_targets(vocab)
+st = self_test(vocab)
+if not st.ok:
+raise Refused(f"{vocab.id}: does not read its own examples — " + " | ".join(st.failures))
+return vocab
+
+def load(path):
+try:
+with open(path, encoding="utf-8") as fh:
+raw = json.load(fh)
+except OSError as error:
+raise LoadError(f"cannot read {path}: {error}")
+except ValueError as error:
+raise Refused(f"{path}: not valid JSON: {error}")
+return build(raw, path)
+
+# ---------------------------------------------------------------- reading
+
+class KindReading:
+def __init__(self, kind, score, evidence):
+self.id = kind.id
+self.label = kind.label
+self.plain = kind.plain
+self.targets = list(kind.targets)
+self.score = score
+self.evidence = evidence
+
+def to_json(self):
+return {"id": self.id, "label": self.label, "score": self.score, "plain": self.plain,
+"targets": self.targets, "evidence": [[c, i] for c, i in self.evidence]}
+
+class Reading:
+def __init__(self, vocab, verdict, reason, kinds, na_score, na_evidence, scores):
+self.vocabulary = vocab.id
+self.consumer = vocab.consumer
+self.version = vocab.version
+self.verdict = verdict
+self.reason = reason
+self.kinds = kinds
+self.na_score = na_score
+self.na_evidence = na_evidence
+self.scores = scores
+
+def to_json(self):
+return {"vocabulary": self.vocabulary, "version": self.version, "consumer": self.consumer,
+"verdict": self.verdict,
+"reason": self.reason, "kinds": [k.to_json() for k in self.kinds],
+"na_score": self.na_score, "na_evidence": [[c, i] for c, i in self.na_evidence],
+"advisory": "a reading informs; it never gates (reads words, not meaning)"}
+
+def line(self):
+head = f"[read {self.vocabulary}: "
+if self.verdict == "OK":
+parts = [f"{_named(k)} ({', '.join(c for c, _ in k.evidence)})" for k in self.kinds]
+return head + " · ".join(parts) + "]"
+if self.reason == "plumbing":
+return head + f"n/a — plumbing ({', '.join(c for c, _ in self.na_evidence)})]"
+if self.reason == "gate-no-kind":
+return head + "REFUSED — gate vocabulary, no kind read; deciding nothing]"
+if self.reason == "ambiguous":
+tops = sorted(self.scores.items(), key=lambda kv: (-kv[1], kv[0]))[:2]
+return head + "ambiguous — " + " · ".join(f"{k} {s}" for k, s in tops) + "]"
+return head + "no kind]"
+
+def _named(k):
+"""The id, plus the label when the id alone would not tell a person what the kind is (Theo's rule)."""
+return k.id if "-".join(normalize(k.label)) == k.id else f"{k.id} «{k.label}»"
+
+def _score(cues, negative, tokens):
+evidence, total = [], 0
+for display, toks, weight in cues:
+at = first_match(toks, tokens)
+if at is not None:
+evidence.append((display, at))
+total += weight
+for display, toks, weight in negative:
+if first_match(toks, tokens) is not None:
+total -= weight
+evidence.sort(key=lambda e: (e[1], e[0]))
+return max(total, 0), evidence
+
+def read(text, vocab, stray_log=None):
+"""Pure and total (the optional stray_log append is the one side effect, opt-in)."""
+tokens = normalize(text)
+scored = []
+for kind in vocab.kinds:
+score, evidence = _score(kind.cues, kind.negative, tokens)
+scored.append((kind, score, evidence))
+na_score, na_evidence = _score(vocab.na_cues, [], tokens)
+scores = {k.id: s for k, s, _ in scored}
+best = max(scores.values()) if scores else 0
+hits = [KindReading(k, s, e) for k, s, e in scored if s >= max(vocab.min_score, 1)]
+hits.sort(key=lambda r: (-r.score, r.id))
+if na_score > 0 and na_score > best:
+reading = Reading(vocab, "SKIP", "plumbing", [], na_score, na_evidence, scores)
+elif not hits:
+reading = Reading(vocab, "SKIP", "none", [], na_score, na_evidence, scores)
+elif vocab.mode == "single" and len(hits) > 1 and hits[0].score - hits[1].score <= vocab.tie_margin:
+reading = Reading(vocab, "FLAG", "ambiguous", hits, na_score, na_evidence, scores)
+else:
+kept = hits[:1] if vocab.mode == "single" else hits
+reading = Reading(vocab, "OK", "", kept, na_score, na_evidence, scores)
+if vocab.consumer == "gate" and reading.verdict == "SKIP" and reading.reason == "none":
+reading = Reading(vocab, "REFUSED", "gate-no-kind", [], na_score, na_evidence, scores)
+if stray_log and reading.reason in ("none", "gate-no-kind"):
+_append(stray_log, {"event": "miss", "vocabulary": vocab.id, "version": vocab.version,
+"text": " ".join(tokens), "sha": _sha(tokens)})
+return reading
+
+# ---------------------------------------------------------------- self-test, collisions, coverage
+
+class SelfTest:
+def __init__(self):
+self.examples_total = self.examples_right = 0
+self.counter_total = self.counter_right = 0
+self.na_total = self.na_right = 0
+self.failures = []
+
+@property
+def ok(self):
+return not self.failures
+
+def self_test(vocab):
+st = SelfTest()
+for kind in vocab.kinds:
+for text in kind.examples:
+st.examples_total += 1
+r = read(text, vocab)
+ids = [k.id for k in r.kinds] if r.verdict == "OK" else []
+good = (ids == [kind.id]) if vocab.mode == "single" else (kind.id in ids)
+if good:
+st.examples_right += 1
+else:
+st.failures.append(f"example of {kind.id} misread: \"{text}\" -> {r.line()}")
+for text in kind.counterexamples:
+st.counter_total += 1
+r = read(text, vocab)
+if kind.id in [k.id for k in r.kinds]:
+st.failures.append(f"counterexample of {kind.id} reads {kind.id}: \"{text}\" -> {r.line()}")
+else:
+st.counter_right += 1
+for text in vocab.na_examples:
+st.na_total += 1
+r = read(text, vocab)
+if (r.verdict, r.reason) == ("SKIP", "plumbing"):
+st.na_right += 1
+else:
+st.failures.append(f"n/a example does not read plumbing: \"{text}\" -> {r.line()}")
+return st
+
+def collisions(vocab):
+"""Cue strings owned by more than one kind -> [(cue, [kind ids])], sorted."""
+owners = {}
+for kind in vocab.kinds:
+for display, _toks, _w in kind.cues:
+owners.setdefault(display, [])
+if kind.id not in owners[display]:
+owners[display].append(kind.id)
+return sorted((c, sorted(ks)) for c, ks in owners.items() if len(ks) > 1)
+
+def cues_tested(vocab):
+"""-> (cues fired by at least one of their own kind's examples, all cues). Non-vacuity (the Chalk Line rule)."""
+tested = total = 0
+for kind in vocab.kinds:
+example_tokens = [normalize(e) for e in kind.examples]
+for _display, toks, _w in kind.cues:
+total += 1
+if any(first_match(toks, ex) is not None for ex in example_tokens):
+tested += 1
+return tested, total
+
+def target_coverage(vocab):
+"""-> (registry ids some kind leads to, registry ids), or None without a registry."""
+if vocab.registry_ids is None:
+return None
+led = {t for k in vocab.kinds for t in k.targets} & vocab.registry_ids
+return len(led), len(vocab.registry_ids)
+
+def check_line(vocab):
+st = self_test(vocab)
+cov = target_coverage(vocab)
+circ = "yes (derived — not evidence)" if vocab.provenance == "derived" else "no"
+parts = [f"{vocab.id} v{vocab.version}", f"{len(vocab.kinds)} kinds",
+f"{st.examples_right}/{st.examples_total} examples",
+f"{st.counter_right}/{st.counter_total} counterexamples",
+"cues tested {}/{}".format(*cues_tested(vocab))]
+if st.na_total:
+parts.append(f"n/a {st.na_right}/{st.na_total}")
+parts += [f"consumer: {vocab.consumer}", f"circular: {circ}", f"collisions: {len(collisions(vocab))}",
+f"targets: {cov[0]}/{cov[1]}" if cov else "targets: —"]
+return " · ".join(parts)
+
+# ---------------------------------------------------------------- strays and fold
+
+def _sha(tokens):
+return hashlib.sha256(" ".join(tokens).encode("utf-8")).hexdigest()[:16]
+
+def _append(path, row):
+parent = os.path.dirname(os.path.abspath(path))
+os.makedirs(parent, exist_ok=True)
+with open(path, "a", encoding="utf-8") as fh:
+fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+HELDOUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heldout")
+
+def heldout_shas(heldout_dir=None):
+"""{sha of normalized text} over every held-out set. A held-out text filed as a stray or folded into a vocabulary
+would grade the reader on its own homework, so it is refused at both doors (the contamination guard)."""
+import glob as _glob
+shas = set()
+for path in _glob.glob(os.path.join(heldout_dir or HELDOUT_DIR, "*.json")):
+with open(path, encoding="utf-8") as fh:
+data = json.load(fh)
+for item in data.get("items", []):
+shas.add(_sha(normalize(item.get("text", ""))))
+return shas
+
+MIN_STRAY_TOKENS = 6
+MIN_WITNESS_TEXTS = 2
+MIN_WITNESS_SESSIONS = 2
+
+def record_stray(vocab, kind_id, cue, text, log, proposer, source=None, heldout_dir=None):
+"""A judgment-rung assertion: this text is kind_id, and cue should have led there. Proposes only.
+Refused unless the cue's words occur in order in the text, the text has MIN_STRAY_TOKENS tokens, and the
+proposing session is named (P1 item 2)."""
+if kind_id not in {k.id for k in vocab.kinds}:
+raise Refused(f"stray: no kind '{kind_id}' in {vocab.id}")
+if not str(proposer or "").strip():
+raise Refused("stray: --proposer <session id> is required (the witness rule counts sessions)")
+display, toks, _w = parse_cue(cue, "stray.cue")
+tokens = normalize(text)
+if len(tokens) < MIN_STRAY_TOKENS:
+raise Refused(f"stray: the text has {len(tokens)} token(s); a proposal needs at least {MIN_STRAY_TOKENS}")
+if first_match(toks, tokens) is None:
+raise Refused(f"stray: the cue '{display}' does not occur, in order, in the text — a cue must name words "
+"the text actually has")
+if _sha(tokens) in heldout_shas(heldout_dir):
+raise Refused("stray: this text is in a held-out set; filing it would contaminate the measure")
+row = {"event": "assert", "vocabulary": vocab.id, "kind": kind_id, "cue": display,
+"text": " ".join(tokens), "sha": _sha(tokens), "proposer": str(proposer).strip()}
+if source:
+row["source"] = str(source)
+_append(log, row)
+return row
+
+def read_strays(log):
+rows = []
+try:
+with open(log, encoding="utf-8") as fh:
+for n, line in enumerate(fh, 1):
+line = line.strip()
+if not line:
+continue
+try:
+rows.append(json.loads(line))
+except ValueError:
+raise Refused(f"{log}:{n}: not a JSON line")
+except FileNotFoundError:
+return []
+return rows
+
+class FoldResult:
+def __init__(self, vocabulary, promoted, refused, waiting):
+self.vocabulary = vocabulary
+self.promoted = promoted
+self.refused = refused
+self.waiting = waiting
+
+def _owner_of(vocab, cue_tokens, kind_id):
+"""Another kind whose cue would match this cue's words, or whose words this cue would match."""
+bare = [t.rstrip("*") for t in cue_tokens]
+for kind in vocab.kinds:
+if kind.id == kind_id:
+continue
+for display, toks, _w in kind.cues:
+if first_match(toks, bare) is not None or first_match(cue_tokens, [t.rstrip("*") for t in toks]) is not None:
+return kind.id, display
+return None
+
+def fold(vocab, strays, decided=None, decided_session=None, heldout_dir=None):
+"""Promote (kind, cue) pairs whose witnesses are >= 2 distinct texts from >= 2 distinct proposer sessions (the
+witness rule, P1 item 3), one at a time, in sorted order. When `decided_session` is given (the session that
+recorded the blessing DECIDED), a pair that session witnessed is refused: the bless must come from a third
+session.
+
+Each promotion must be monotone (every prior example and counterexample still reads right), collision-free
+(no other kind owns the cue) and must make its own texts read the kind. Returns the new vocabulary
+(unchanged if nothing promoted) — the caller decides whether to write it.
+"""
+groups = {}
+held = heldout_shas(heldout_dir)
+contaminated = []
+for row in strays:
+if row.get("event")!= "assert" or row.get("vocabulary")!= vocab.id:
+continue
+if row.get("sha") in held or _sha(normalize(row.get("text", ""))) in held:
+contaminated.append({"kind": row.get("kind"), "cue": row.get("cue"),
+"why": "a held-out text was filed as a stray; it is never folded"})
+continue
+groups.setdefault((row["kind"], row["cue"]), {}).setdefault(row["sha"], [row["text"], set()])
+if row.get("proposer"):
+groups[(row["kind"], row["cue"])][row["sha"]][1].add(row["proposer"])
+current = vocab
+promoted, refused, waiting = [], list(contaminated), []
+for (kind_id, cue), witnessed in sorted(groups.items()):
+texts = {sha: entry[0] for sha, entry in witnessed.items()}
+sessions = sorted(set().union(*(entry[1] for entry in witnessed.values())))
+kind = next((k for k in current.kinds if k.id == kind_id), None)
+if kind is None:
+refused.append({"kind": kind_id, "cue": cue, "why": "no such kind"})
+continue
+if cue in [d for d, _t, _w in kind.cues]:
+continue
+if len(texts) < MIN_WITNESS_TEXTS or len(sessions) < MIN_WITNESS_SESSIONS:
+waiting.append({"kind": kind_id, "cue": cue, "count": len(texts), "sessions": len(sessions)})
+continue
+if decided_session and decided_session in sessions:
+refused.append({"kind": kind_id, "cue": cue, "why": f"the blessing session {decided_session} is one of "
+"its witnesses; the bless must come from a third session"})
+continue
+_d, toks, _w = parse_cue(cue, "fold")
+owner = _owner_of(current, toks, kind_id)
+if owner:
+refused.append({"kind": kind_id, "cue": cue, "why": f"cue owned by {owner[0]} ('{owner[1]}')"})
+continue
+raw = json.loads(json.dumps(current.raw))
+k_raw = next(k for k in raw["kinds"] if k["id"] == kind_id)
+k_raw["cues"].append(cue)
+new_texts = [texts[s] for s in sorted(texts)]
+k_raw["examples"].extend(t for t in new_texts if t not in k_raw["examples"])
+raw["version"] = current.version + 1
+if raw["provenance"] == "authored":
+raw["provenance"] = "folded"
+entry = {"version": raw["version"], "event": "fold", "note": f"{kind_id} += '{cue}' from {len(texts)} strays",
+"witnesses": sessions}
+if decided:
+entry["decided"] = decided
+raw.setdefault("history", []).append(entry)
+try:
+current = build(raw, current.path)
+except Refused as error:
+why = str(error)
+if "counterexample" in why:
+why = "non-monotone: a counterexample would read the kind — " + why
+refused.append({"kind": kind_id, "cue": cue, "why": why})
+continue
+promoted.append({"kind": kind_id, "cue": cue, "texts": new_texts, "sessions": sessions})
+return FoldResult(current, promoted, refused, waiting)
+
+def write_vocabulary(vocab, path):
+with open(path, "w", encoding="utf-8") as fh:
+json.dump(vocab.raw, fh, indent=1, ensure_ascii=False)
+fh.write("\n")
+
+# ---------------------------------------------------------------- CLI
+
+def _cmd_read(args):
+vocab = load(args.vocab)
+text = sys.stdin.read() if args.text in (None, "-") else args.text
+reading = read(text, vocab, stray_log=args.stray_log)
+print(json.dumps(reading.to_json(), sort_keys=True, ensure_ascii=False) if args.json else reading.line())
+return EXIT[reading.verdict]
+
+def _cmd_check(args):
+worst = 0
+for path in args.vocab:
+try:
+vocab = load(path)
+except Refused as error:
+print(f"REFUSED {path}: {error}", file=sys.stderr)
+worst = max(worst, 4)
+continue
+except LoadError as error:
+print(f"ERROR {error}", file=sys.stderr)
+worst = 2 if worst == 0 else worst
+continue
+if args.json:
+st = self_test(vocab)
+print(json.dumps({"vocabulary": vocab.id, "version": vocab.version, "provenance": vocab.provenance,
+"kinds": len(vocab.kinds), "examples": [st.examples_right, st.examples_total],
+"counterexamples": [st.counter_right, st.counter_total], "na": [st.na_right, st.na_total],
+"collisions": collisions(vocab), "targets": target_coverage(vocab)}, sort_keys=True))
+else:
+print(check_line(vocab))
+for cue, owners in collisions(vocab):
+print(f" collision: '{cue}' owned by {', '.join(owners)}")
+return worst
+
+def _cmd_list(args):
+directory = args.dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocabularies")
+try:
+names = sorted(os.listdir(directory))
+except OSError as error:
+raise LoadError(f"no vocabulary directory: {directory} ({error.strerror})")
+worst = 0
+for name in names:
+if not name.endswith(".json"):
+continue
+path = os.path.join(directory, name)
+try:
+vocab = load(path)
+print(f"{check_line(vocab)} · provenance {vocab.provenance}")
+except (Refused, LoadError) as error:
+print(f"REFUSED {name}: {error}")
+worst = 4
+return worst
+
+def _cmd_stray(args):
+vocab = load(args.vocab)
+row = record_stray(vocab, args.kind, args.cue, args.text, args.log, args.proposer, args.source)
+print(f"stray recorded: {row['kind']} <- '{row['cue']}' ({row['sha']})")
+return 0
+
+EVENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "core", "_events")
+
+def decided_session_of(decision_id, events_dir=None):
+"""The session that recorded DECIDED `decision_id` in the events directory (the bless must be on record, not named).
+Refused when no such event exists."""
+import glob as _glob
+for path in sorted(_glob.glob(os.path.join(events_dir or EVENTS_DIR, "*.jsonl"))):
+with open(path, encoding="utf-8") as fh:
+for line in fh:
+if decision_id not in line:
+continue
+try:
+event = json.loads(line)
+except ValueError:
+continue
+if event.get("verb") == "DECIDED" and event.get("decision_id") == decision_id:
+return event.get("session") or ""
+raise Refused(f"fold --write: no DECIDED '{decision_id}' is recorded in the events directory (--events) — record the bless first")
+
+def _cmd_fold(args):
+vocab = load(args.vocab)
+if args.write and not args.decided:
+raise Refused("fold --write needs --decided <decision_id>: a fold rewrites the vocabulary from its own misses, "
+"so it needs a recorded bless (derive-bless-enforce; V4a). Dry-run without --write first.")
+decided_session = decided_session_of(args.decided, args.events) if args.write else None
+result = fold(vocab, read_strays(args.log), decided=args.decided, decided_session=decided_session)
+for p in result.promoted:
+print(f"PROMOTE {p['kind']} += '{p['cue']}' ({len(p['texts'])} strays)")
+for r in result.refused:
+print(f"REFUSE {r['kind']} '{r['cue']}': {r['why']}")
+for w in result.waiting:
+print(f"WAIT {w['kind']} '{w['cue']}' ({w['count']} of {MIN_WITNESS_TEXTS} texts, {w.get('sessions', 0)} of "
+f"{MIN_WITNESS_SESSIONS} sessions)")
+if result.promoted and args.write:
+write_vocabulary(result.vocabulary, args.vocab)
+print(f"wrote {args.vocab} v{result.vocabulary.version}")
+elif result.promoted:
+print("dry run — pass --write to fold")
+return 0
+
+def main(argv=None):
+ap = argparse.ArgumentParser(prog="lead_in.py", description=__doc__.split("\n\n")[0])
+sub = ap.add_subparsers(dest="verb", required=True)
+p = sub.add_parser("read"); p.add_argument("vocab"); p.add_argument("text", nargs="?")
+p.add_argument("--json", action="store_true"); p.add_argument("--stray-log")
+p = sub.add_parser("check"); p.add_argument("vocab", nargs="+"); p.add_argument("--json", action="store_true")
+p = sub.add_parser("list"); p.add_argument("dir", nargs="?")
+p = sub.add_parser("stray"); p.add_argument("vocab"); p.add_argument("text")
+p.add_argument("--kind", required=True); p.add_argument("--cue", required=True); p.add_argument("--log", required=True)
+p.add_argument("--proposer", required=True); p.add_argument("--source")
+p = sub.add_parser("fold"); p.add_argument("vocab"); p.add_argument("--log", required=True)
+p.add_argument("--write", action="store_true"); p.add_argument("--decided"); p.add_argument("--events")
+args = ap.parse_args(argv)
+handler = {"read": _cmd_read, "check": _cmd_check, "list": _cmd_list, "stray": _cmd_stray, "fold": _cmd_fold}[args.verb]
+try:
+return handler(args)
+except Refused as error:
+print(f"REFUSED: {error}", file=sys.stderr)
+return 4
+except LoadError as error:
+print(f"ERROR: {error}", file=sys.stderr)
+return 2
+
+if __name__ == "__main__":
+try:
+sys.exit(main())
+except BrokenPipeError: # `lead_in.py read … | head` closed the pipe: a quiet exit, never a traceback
+try:
+sys.stdout = open(os.devnull, "w")
+except OSError:
+pass
+sys.exit(0)
+
+toy-money.json 31 lines on GitHub →
+{
+"vocabulary": "toy-money",
+"version": 1,
+"title": "Toy vocabulary: does this sentence talk about money, time, or neither? (the engine's own test fixture)",
+"provenance": "authored",
+"mode": "multi",
+"kinds": [
+{
+"id": "money",
+"label": "Money",
+"plain": "Something that is paid, priced, owed or saved.",
+"cues": ["price*", "pay*", "dollar*", "cost*", {"cue": "credit card", "w": 3}, "invoice*", "refund*"],
+"negative": [{"cue": "pay attention", "w": 3}],
+"examples": ["How much does the monthly plan cost?", "Send the invoice for October.", "She paid with a credit card."],
+"counterexamples": ["Please pay attention to the warning label."]
+},
+{
+"id": "time",
+"label": "Time",
+"plain": "When something happens, or for how long it lasts.",
+"cues": ["deadline*", "tomorrow", "schedul*", "hour*", "minute*", "weekly", "monthly"],
+"examples": ["The deadline moved to tomorrow.", "Schedule the call for an hour."],
+"counterexamples": ["The price went up."]
+}
+],
+"na": {
+"plain": "Small talk with no money or time in it.",
+"cues": ["hello", "thanks", "thank you"],
+"examples": ["Hello there, thanks!"]
+}
+}
+
+Take the whole folder →
+MIT
+Python stdlib only, deterministic
+
+---
+
+# Text Legibility Gauge — a Loop MMT gift
+https://loopmmt.com/gifts/legible/
+[coverage: optional · branch: gifts]
+
+Readable Text, or Machine Rubble? gauge ← all gifts
+
+Text Legibility Gauge
+
+Guess whether a string is human-readable text or machine-drawn rubble, and say how sure you are. A text extractor hands you a `.text` field and, by design, can't tell you whether it's readable — the classic failure is a subsetted CID font whose glyphs decode one byte at a time into control-character rubble that only looks like a populated string. assess(text) returns a label (readable / suspect / likely-binary / empty) with the raw score and signal counts exposed, scoring the density of characters human text almost never contains: C0 controls (minus tab/newline) plus U+FFFD, and nothing else. The load-bearing rule: it reports but never scores the C1 band, so legitimate multibyte-as-Latin1 (日本語, Cyrillic) never reads as binary — the CJK false-positive it refuses to make.
+
+The honest edge
+
+legible is a heuristic, not a verdict, and it detects control-character rubble — NOT wrong encoding. Mojibake (valid bytes, wrong charset) is still printable characters, so it reads `readable` even though no human can read it: a `readable` means “not control-char rubble,” never “correctly decoded.” It does not decode, validate, or understand the text, and never proves it correct or meaningful. It is a gauge you read, never a gate you route on.
+
+Run it
+
+node legible.js "some text"
+test_legible.js (20/20, hand-oracle drift-check + CID known-bad + CJK-as-Latin1 regression guard)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+legible.js 217 lines on GitHub →
+#!/usr/bin/env node
+/* legible.js — a pure, dependency-free, HONEST gauge that guesses whether a
+string is human-readable text or machine-drawn rubble, and says how sure it is.
+
+WHY THIS EXISTS. A text extractor (ratchet-pdf-text, ratchet-png-text,
+exif-parser, a MIME part decoder) hands you a `.text` field and, by design,
+cannot tell you whether that text is *readable*. The classic failure: a PDF
+whose glyphs are drawn through a subsetted CID font. The extractor pulls the
+string operands honestly, but each glyph is a 2-byte CID index, and decoded
+one-byte-at-a-time it comes back as control-character rubble that merely
+*looks* like a populated string. You get a confident `.text` that no human
+can read. `legible` reads the delta the extractor can't: it scores the string
+and returns readable / suspect / likely-binary / empty, with the raw score
+and the signal counts exposed so you can see exactly why.
+
+THE SIGNAL (the whole reason to trust it, and its whole limit). Human-readable
+text — in ANY script — almost never contains C0 control characters (0x00–0x1F,
+excluding the ordinary text whitespace tab/LF/CR/FF) or the Unicode
+replacement character U+FFFD. CID glyph indices decoded as Latin-1 land in
+exactly that band disproportionately (the high byte of a low subset index is
+0x00–0x1F, and half the bytes are often 0x00). So the SCORED gauge is the
+density of those "text-never-contains-this" characters — C0 controls plus
+U+FFFD, nothing else. This is deliberately NOT the printable-ratio: a UTF-8
+é / 안 / я decoded byte-wise lands in 0x80–0xFF, which OVERLAPS the C1-control
+band (0x80–0x9F) AND the UTF-8 continuation-byte band — so scoring C1 would
+flag legitimate multibyte text as binary (the CJK false-positive). We report
+C1/DEL and NUL counts as *signals* for your inspection, but we do NOT score
+them, precisely so multibyte-as-Latin1 does not read as rubble.
+
+WHAT IT DOES NOT DO (printed edge — present here and in the README):
+legible is a HEURISTIC, not a verdict, and it detects control-character
+rubble — NOT wrong encoding. Text decoded with the wrong charset (mojibake:
+UTF-8 read as Latin-1, æ—¥æœ¬èªž) is still printable characters, so it reads
+as `readable` even though no human can read it — a `readable` means "not
+control-char rubble," never "correctly decoded." It does not decode,
+validate, or understand the text, and never proves it correct, meaningful,
+or safe. It is a gauge you read, never a gate you route on.
+
+API
+legible(input[, options]) — dispatches on the shape of `input`:
+• a string -> assess(string) -> { label, score, signals}
+• a record with `.text` -> {...record, legibility: assess(record.text)}
+• an array of either -> input.map(legible)
+assess(text[, options]) -> { label, score, signals}
+label one of "readable" | "suspect" | "likely-binary" | "empty"
+score the binary-character ratio in [0,1], rounded to 4 places
+signals { length, control, c1, nul, replacement, binaryRatio}
+options.readableMax (default 0.05) score <= this => readable
+options.binaryMin (default 0.30) score >= this => likely-binary
+(between the two bounds => suspect)
+
+Pure function of its input. No dependencies, no randomness, no clock, no I/O
+in the core — the same input always yields the same output (the determinism
+lint is trivial). Same code in a browser (window.LoopGifts.legible) or Node
+(this CLI / require()).
+
+USAGE
+node legible.js "some text" # assess an argument, print JSON
+cat streams.jsonl | node legible.js # annotate each JSONL record's.text
+node legible.js --port # print this tool's port-verb (transform)
+node legible.js --help
+
+Released under MIT.
+*/
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.legible = api.legible;
+window.LoopGifts.assessLegibility = api.assess;
+}
+root.__legible = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
+
+var DEFAULTS = { readableMax: 0.05, binaryMin: 0.30};
+
+// The ordinary text whitespace inside the C0 band — legitimate in readable
+// text, so NOT counted as a binary signal.
+function isTextWhitespace(c) {
+return c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d;
+}
+// C0 control (0x00–0x1F) that is NOT text whitespace.
+function isC0Control(c) {
+return c >= 0x00 && c <= 0x1f &&!isTextWhitespace(c);
+}
+// DEL + C1 controls (0x7F, 0x80–0x9F). Reported as a signal but DELIBERATELY
+// NOT scored: 0x80–0x9F overlaps the UTF-8 continuation-byte band, so scoring
+// it would flag legitimate multibyte-as-Latin1 text as binary (the CJK
+// false-positive). Exposed for inspection; never drives the label.
+function isC1orDel(c) {
+return c === 0x7f || (c >= 0x80 && c <= 0x9f);
+}
+
+function assess(text, options) {
+var opt = options || {};
+var readableMax = typeof opt.readableMax === "number"? opt.readableMax: DEFAULTS.readableMax;
+var binaryMin = typeof opt.binaryMin === "number"? opt.binaryMin: DEFAULTS.binaryMin;
+
+// No signal to judge: null/undefined, empty, or whitespace-only.
+if (text === null || text === undefined) {
+return emptyResult();
+}
+var s = String(text);
+if (s.length === 0 || /^\s*$/.test(s)) {
+return emptyResult(s.length);
+}
+
+var control = 0, c1 = 0, nul = 0, replacement = 0;
+for (var i = 0; i < s.length; i++) {
+var c = s.charCodeAt(i);
+if (c === 0x00) nul++;
+if (c === 0xfffd) { replacement++; continue;}
+if (isC0Control(c)) { control++; continue;}
+if (isC1orDel(c)) { c1++; continue;}
+}
+var n = s.length;
+// SCORED signal: C0 controls + replacement only. c1/nul are reported below
+// for inspection but NOT scored (see isC1orDel — the CJK false-positive).
+var binaryRatio = (control + replacement) / n;
+var score = round4(binaryRatio);
+
+var label;
+if (score <= readableMax) label = "readable";
+else if (score >= binaryMin) label = "likely-binary";
+else label = "suspect";
+
+return {
+label: label,
+score: score,
+signals: {
+length: n,
+control: control, // C0 controls, excluding text whitespace
+c1: c1, // DEL + C1 controls
+nul: nul, // count of 0x00 (a strong binary tell)
+replacement: replacement, // U+FFFD (botched decode)
+binaryRatio: score
+}
+};
+}
+
+function emptyResult(length) {
+return {
+label: "empty",
+score: 0,
+signals: { length: length || 0, control: 0, c1: 0, nul: 0, replacement: 0, binaryRatio: 0}
+};
+}
+
+function round4(x) { return Math.round(x * 1e4) / 1e4;}
+
+// The composition joint: dispatch on the shape of the input.
+function legible(input, options) {
+if (Array.isArray(input)) {
+return input.map(function (x) { return legible(x, options);});
+}
+if (input && typeof input === "object") {
+// A record carrying a `.text` field (e.g. ratchet's.streams[] entries).
+var out = {};
+for (var k in input) if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
+out.legibility = assess(input.text, options);
+return out;
+}
+// A bare string (or anything String()-able).
+return assess(input, options);
+}
+
+return { legible: legible, assess: assess};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__legible;
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--port")!== -1) { process.stdout.write("transform\n"); return 0;}
+if (args.indexOf("--help")!== -1 || (args.length === 0 && process.stdin.isTTY)) {
+process.stdout.write(
+"legible — a heuristic gauge: is this string readable text or machine-drawn rubble?\n" +
+" node legible.js \"some text\" assess an argument, print JSON\n" +
+" cat streams.jsonl | node legible.js annotate each JSONL record's.text\n" +
+" node legible.js --port print the port-verb (transform)\n" +
+" node legible.js --help\n"
+);
+return 0;
+}
+// Argument form: assess the first non-flag argument.
+var textArg = null;
+for (var i = 0; i < args.length; i++) { if (args[i].indexOf("--")!== 0) { textArg = args[i]; break;}}
+if (textArg!== null) {
+process.stdout.write(JSON.stringify(api.assess(textArg)) + "\n");
+return 0;
+}
+// stdin JSONL form: one record (or raw line) per line -> annotate -> emit JSONL.
+var input = "";
+try { input = require("fs").readFileSync(0, "utf8");} catch (e) { input = "";}
+var lines = input.split("\n");
+for (var j = 0; j < lines.length; j++) {
+var line = lines[j];
+if (line === "" && j === lines.length - 1) continue; // trailing newline
+var rec;
+try {
+var parsed = JSON.parse(line);
+rec = api.legible(parsed);
+} catch (e) {
+// Not JSON — treat the raw line as a text string to assess.
+rec = { text: line, legibility: api.assess(line)};
+}
+process.stdout.write(JSON.stringify(rec) + "\n");
+}
+return 0;
+}
+
+process.exitCode = main(process.argv);
+}
+
+test_legible.js 173 lines on GitHub →
+#!/usr/bin/env node
+/* test_legible.js — known-answer battery for legible.
+
+The oracle is OUT OF BAND: every expected label/score below is a fact computed
+BY HAND from the definition (C0-control + U+FFFD density), never the output of
+a second scorer. The two load-bearing fixtures are drawn from real behaviour,
+not invented:
+• the KNOWN-BAD: a 2-byte CID glyph-index run decoded as Latin-1 — the exact
+shape ratchet-pdf-text surfaces for a subsetted CID font.
+• the REGRESSION GUARD: Japanese ("日本語") UTF-8 bytes read as Latin-1 — the
+CJK false-positive that a naive C1-inclusive score would mislabel; this
+test fails if anyone re-adds the C1 band (0x80–0x9F) to the score.
+
+Run: node test_legible.js (exit 0 = all pass, nonzero = failure)
+*/
+"use strict";
+var assert = require("assert");
+var cp = require("child_process");
+var path = require("path");
+var { legible, assess} = require("./legible.js");
+
+var pass = 0, fail = 0;
+function ok(name, fn) {
+try { fn(); pass++; console.log(" ok " + name);}
+catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
+}
+function cc() { return String.fromCharCode.apply(null, arguments);}
+
+// --- readable ---------------------------------------------------------------
+ok("plain ASCII is readable, score 0", function () {
+var r = assess("Hello, world! This is plain readable text.");
+assert.strictEqual(r.label, "readable");
+assert.strictEqual(r.score, 0);
+assert.strictEqual(r.signals.control, 0);
+});
+
+ok("accented Latin-1 (single-byte é) stays readable", function () {
+// 0xE9 (é) is printable Latin-1, not a control char.
+var r = assess("caf" + cc(0xe9) + " au lait");
+assert.strictEqual(r.label, "readable");
+assert.strictEqual(r.signals.control, 0);
+});
+
+// --- empty (no signal) ------------------------------------------------------
+ok("empty string is empty, not readable", function () {
+assert.strictEqual(assess("").label, "empty");
+});
+ok("whitespace-only is empty", function () {
+assert.strictEqual(assess(" \n\t ").label, "empty");
+});
+ok("null text is empty (via record)", function () {
+var r = legible({ index: 0, text: null});
+assert.strictEqual(r.legibility.label, "empty");
+});
+ok("undefined text is empty", function () {
+assert.strictEqual(assess(undefined).label, "empty");
+});
+
+// --- likely-binary: the KNOWN-BAD (CID glyph indices as Latin-1) -------------
+ok("KNOWN-BAD: 2-byte CID index run is likely-binary, score 1.0", function () {
+// Low subset glyph indices 0x0001..0x0005 as bytes: every char is 0x00–0x1F.
+var cid = cc(0, 1, 0, 2, 0, 3, 0, 4, 0, 5);
+var r = assess(cid);
+assert.strictEqual(r.label, "likely-binary");
+assert.strictEqual(r.score, 1);
+assert.strictEqual(r.signals.nul, 5); // five 0x00 high bytes
+assert.strictEqual(r.signals.control, 10);
+});
+
+// --- the REGRESSION GUARD: CJK-as-Latin1 must NOT be likely-binary -----------
+ok("REGRESSION: Japanese UTF-8 bytes as Latin-1 read as readable (C1 not scored)", function () {
+// "日本語" UTF-8 = E6 97 A5 E6 9C AC E8 AA 9E. Bytes 0x97/0x9C/0x9E are C1
+// controls AND UTF-8 continuation bytes. If C1 were scored, this is 3/9=0.33
+// => likely-binary (the CJK false-positive). C0-only scoring => 0 => readable.
+var mojibake = cc(0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac, 0xe8, 0xaa, 0x9e);
+var r = assess(mojibake);
+assert.strictEqual(r.label, "readable", "CJK-as-Latin1 must not be flagged binary");
+assert.strictEqual(r.score, 0);
+assert.ok(r.signals.c1 >= 3, "c1 IS reported (just not scored)"); // 0x97,0x9C,0x9E
+});
+
+// --- suspect: the mixed stream (half readable, half rubble) ------------------
+ok("mixed readable + a little rubble is suspect", function () {
+// 15 readable chars + 2 control chars => 2/17 = 0.1176 -> suspect.
+var mixed = "Hello World Foo" + cc(1, 2);
+var r = assess(mixed);
+assert.strictEqual(r.label, "suspect");
+assert.ok(r.score > 0.05 && r.score < 0.30, "score " + r.score + " in suspect band");
+});
+
+ok("replacement chars (U+FFFD) count toward the score", function () {
+var r = assess("abc" + cc(0xfffd) + cc(0xfffd) + "d"); // 6 chars, 2 replacement = 0.3333
+assert.strictEqual(r.signals.replacement, 2);
+assert.strictEqual(r.label, "likely-binary"); // 0.3333 >= 0.30
+});
+
+// --- band boundaries (the thresholds are exact) -----------------------------
+ok("score exactly at readableMax (0.05) is readable (<=)", function () {
+// 1 control in 20 chars = 0.05.
+var r = assess("abcdefghijklmnopqrs" + cc(1));
+assert.strictEqual(r.score, 0.05);
+assert.strictEqual(r.label, "readable");
+});
+ok("score exactly at binaryMin (0.30) is likely-binary (>=)", function () {
+// 3 control in 10 chars = 0.30.
+var r = assess("abcdefg" + cc(1, 2, 3));
+assert.strictEqual(r.score, 0.3);
+assert.strictEqual(r.label, "likely-binary");
+});
+
+// --- options override -------------------------------------------------------
+ok("options can widen the readable band", function () {
+var s = "aa" + cc(1); // 1/3 = 0.3333
+assert.strictEqual(assess(s).label, "likely-binary");
+assert.strictEqual(assess(s, { readableMax: 0.5}).label, "readable");
+});
+
+// --- the composition joint --------------------------------------------------
+ok("record passthrough preserves fields and adds.legibility", function () {
+var rec = { index: 2, filter: "FlateDecode", text: "readable content"};
+var out = legible(rec);
+assert.strictEqual(out.index, 2);
+assert.strictEqual(out.filter, "FlateDecode");
+assert.strictEqual(out.text, "readable content");
+assert.strictEqual(out.legibility.label, "readable");
+});
+ok("array input maps element-wise", function () {
+var out = legible(["hello", cc(0, 1, 2, 3)]);
+assert.strictEqual(out.length, 2);
+assert.strictEqual(out[0].label, "readable");
+assert.strictEqual(out[1].label, "likely-binary");
+});
+ok("a ratchet.streams-shaped record annotates cleanly", function () {
+// Mirrors the real join: ratchet-pdf-text emits entries like this.
+var stream = { index: 0, filter: "FlateDecode", compressed: true, needsInflate: false, text: cc(0,1,0,2,0,3), rawLength: 6};
+var out = legible(stream);
+assert.strictEqual(out.legibility.label, "likely-binary");
+assert.strictEqual(out.rawLength, 6); // original fields intact
+});
+
+// --- determinism (the canonicalizer self-test) ------------------------------
+ok("determinism: same input yields byte-identical JSON across runs", function () {
+var inputs = ["Hello", cc(0,1,2), "日本語 as latin1: " + cc(0xe6,0x97,0xa5), "", " "];
+for (var i = 0; i < inputs.length; i++) {
+var a = JSON.stringify(assess(inputs[i]));
+var b = JSON.stringify(assess(inputs[i]));
+assert.strictEqual(a, b, "run 2 differs for input " + i);
+}
+});
+
+// --- the CLI contract -------------------------------------------------------
+ok("CLI --port prints the port-verb (transform)", function () {
+var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " --port").toString().trim();
+assert.strictEqual(out, "transform");
+});
+ok("CLI argument form prints the assessment JSON", function () {
+var out = cp.execSync("node " + path.join(__dirname, "legible.js") + " 'plain text'").toString().trim();
+var r = JSON.parse(out);
+assert.strictEqual(r.label, "readable");
+});
+ok("CLI stdin JSONL form annotates each record", function () {
+var jsonl = JSON.stringify({ index: 0, text: "readable"}) + "\n" +
+JSON.stringify({ index: 1, text: cc(0,1,2,3)}) + "\n";
+var out = cp.execSync("node " + path.join(__dirname, "legible.js"), { input: jsonl}).toString().trim().split("\n");
+var a = JSON.parse(out[0]), b = JSON.parse(out[1]);
+assert.strictEqual(a.legibility.label, "readable");
+assert.strictEqual(b.legibility.label, "likely-binary");
+assert.strictEqual(b.index, 1);
+});
+
+// --- report -----------------------------------------------------------------
+console.log("\n" + pass + " passed, " + fail + " failed");
+process.exit(fail === 0? 0: 1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
 
 ---
 
@@ -319,1059 +1534,5 @@ process.exit(fail === 0? 0: 1);
 Take the whole folder →
 MIT
 Zero dependencies, Node or browser, deterministic
-
----
-
-# line-source — a Loop MMT gift
-https://loopmmt.com/gifts/line-source/
-[coverage: optional · branch: gifts]
-
-Turn a Text File into a JSONL Stream, One Record per Line source ← all gifts
-
-line-source
-
-line-source turns line-oriented text (a log, a word list, any one-record-per-line file) into a JSONL stream, one record per line: { line: <text>, n: <index>}. It is the adapter at the front of a pipe that lets the fold/filter/transform gifts consume ordinary text files. It fixes the three quiet failures of naive text.split('\n'): the phantom trailing empty record, the CRLF \r left glued to every line, and the leading UTF-8 BOM. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
-
-The honest edge
-
-line-source splits on line terminators (\r\n, \n, \r) and emits one record per line — it does not parse CSV fields (use csv-source), does not parse JSON (lines are verbatim strings), does not read the file itself (you pipe text in), and does not sort or deduplicate. It preserves line bytes (minus the terminator and a leading BOM); with --trim it strips surrounding whitespace, and never otherwise. Empty --field, an unknown option, or a positional argument is refused (exit 2).
-
-Run it
-
-printf 'a\r\nb\n\nc\n' | node line-source.js --skip-blank # -> {"line":"a","n":0} {"line":"b","n":1} {"line":"c","n":3}
-test_line-source.js (138/138, independent regex-normalize-route oracle) + mutation-bite (7/7) + Plumb conformance GREEN (126/126, signed 2026-09-12, clock-independent, non-vacuity proven)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-line-source.js 241 lines on GitHub →
-#!/usr/bin/env node
-/* line-source.js — turn a plain-text file into a JSONL record stream, one record per line.
-Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
-
-WHAT IT IS. A SOURCE: it takes text in and emits a JSONL stream out — the front of a
-pipe. Hand it the contents of a log file, a word list, a CSV-without-structure, any
-line-oriented text, and it emits one JSON object per line: {"line":"...","n":0}. It is
-the adapter that lets the JSONL fold/filter/transform gifts consume ordinary text
-files: `line-source access.log | range-filter...`, `line-source names.txt | dedup-filter`.
-
-THE THREE QUIET FAILURES IT FIXES. Everyone "knows" how to split a file into lines —
-text.split("\n") — and everyone gets it subtly wrong, in three ways that only bite
-later:
-
-1. THE PHANTOM EMPTY RECORD. A well-formed text file ends with a newline. Naive
-"abc\ndef\n".split("\n") yields ["abc","def",""] — a trailing empty string that
-becomes a bogus final record. line-source treats a single trailing newline as the
-line TERMINATOR it is (POSIX: a line is text followed by a newline), not a
-separator, so "abc\ndef\n" is exactly two lines. A file with NO final newline
-("abc\ndef") is also two lines — the last line is still a line. The difference
-between "ends with newline" and "does not" never changes the record count.
-
-2. CRLF. Files authored on Windows end lines with "\r\n". Splitting on "\n" alone
-leaves a trailing "\r" glued to every record — invisible, and a silent mismatch
-the moment you compare or key on that field. line-source recognizes "\r\n", "\n",
-and a lone "\r" (classic-Mac) as line endings and strips them, so the emitted
-"line" value is the text WITHOUT its terminator, whatever the file's convention.
-
-3. THE BOM. A UTF-8 file may open with a byte-order mark (U+FEFF). Left in, it glues
-an invisible character to the first record. line-source strips a single leading
-BOM before splitting, so the first line is clean.
-
-THE MODEL. Input is the whole text (stdin on the CLI, or a string to lines()). Each
-line becomes { line: <text-without-terminator>, n: <0-based index>}, emitted in file
-order, one JSON object per line of output.
-
---field NAME the key holding the line text (default "line"). Non-empty.
---index NAME the key holding the 0-based line number (default "n"). Empty string
-disables the index entirely (emit { line:...} only).
---skip-blank do not emit a record for a line that is empty after its terminator
-is stripped. Index numbering still follows ORIGINAL line position, so
-n stays a faithful pointer into the source file (a dropped blank
-leaves a gap in n — that is the honest behavior, not a bug).
---trim strip leading/trailing ASCII whitespace from each line's text before
-emitting. Off by default: a source should preserve bytes unless told.
-
-DETERMINISM. lines(text, opts) is a pure function — no clock, no randomness, no files
-beyond the text you pass, no ambient state — so the same text and options yield
-byte-identical output on every run and every machine.
-
-USAGE
-node line-source.js < access.log
-printf 'a\nb\nc\n' | node line-source.js --skip-blank
-node line-source.js --field text --index "" < names.txt
-node line-source.js --help
-
-Exit codes: 0 success (including empty input -> empty stream) · 2 input error (empty
---field name, unknown option, unexpected positional). Always a clean one-line message
-on stderr, never a stack trace.
-
-Released under MIT. Its edge is printed in the README: line-source splits on line
-TERMINATORS (\r\n, \n, \r) and emits one record per line — it does not parse CSV
-fields (use csv-source), does not parse JSON (the lines are emitted as verbatim
-strings), does not read the file itself (you pipe text in), and does not sort or
-deduplicate. It preserves line bytes (minus the terminator, and minus a leading BOM);
-with --trim it strips surrounding whitespace, and never otherwise.
-*/
-"use strict";
-
-/* ---- the pure core ------------------------------------------------ */
-
-// Split text into its lines, honoring \r\n / \n / \r terminators, treating a final
-// terminator as a terminator (not a separator that spawns a phantom empty line), and
-// stripping a single leading BOM. Returns an array of line strings (terminators removed).
-// Pure: depends only on `text`.
-function splitLines(text) {
-if (typeof text!== "string") text = String(text == null? "": text);
-if (text.length === 0) return [];
-// strip a single leading UTF-8 BOM
-if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-if (text.length === 0) return [];
-var lines = [];
-var start = 0;
-var i = 0;
-var len = text.length;
-while (i < len) {
-var c = text.charCodeAt(i);
-if (c === 10 /* \n */) {
-lines.push(text.slice(start, i));
-i += 1;
-start = i;
-} else if (c === 13 /* \r */) {
-lines.push(text.slice(start, i));
-if (i + 1 < len && text.charCodeAt(i + 1) === 10) i += 2; // \r\n
-else i += 1; // lone \r
-start = i;
-} else {
-i += 1;
-}
-}
-// trailing text with no final terminator is still a line
-if (start < len) lines.push(text.slice(start, len));
-return lines;
-}
-
-function isWs(code) {
-// ASCII whitespace: space, \t, \n, \v, \f, \r
-return code === 32 || (code >= 9 && code <= 13);
-}
-
-function trimAscii(s) {
-var a = 0, b = s.length;
-while (a < b && isWs(s.charCodeAt(a))) a++;
-while (b > a && isWs(s.charCodeAt(b - 1))) b--;
-return s.slice(a, b);
-}
-
-// Turn text into an array of records. Throws a clean Error on invalid options — the CLI
-// turns that into exit 2. Pure; no side effects.
-// opts.field key for the line text (default "line"; non-empty)
-// opts.index key for the 0-based line number (default "n"; "" disables)
-// opts.skipBlank drop lines empty after terminator strip (index still tracks source pos)
-// opts.trim strip surrounding ASCII whitespace from each line's text
-function lines(text, opts) {
-opts = opts || {};
-var field = opts.field === undefined? "line": opts.field;
-var index = opts.index === undefined? "n": opts.index;
-var skipBlank =!!opts.skipBlank;
-var trim =!!opts.trim;
-
-if (typeof field!== "string" || field.length === 0) throw new Error("--field must be a non-empty name");
-if (typeof index!== "string") throw new Error("--index must be a string name (or empty to disable)");
-
-var raw = splitLines(text);
-var out = [];
-for (var i = 0; i < raw.length; i++) {
-var value = trim? trimAscii(raw[i]): raw[i];
-if (skipBlank && value.length === 0) continue;
-var rec = {};
-rec[field] = value;
-// index reflects the ORIGINAL 0-based line position (i), so a skipped blank leaves a
-// faithful gap rather than renumbering — n stays a pointer into the source file.
-if (index.length > 0) rec[index] = i;
-out.push(rec);
-}
-return out;
-}
-
-// Render records as JSONL text (one JSON object per line, trailing newline per record).
-function toJSONL(records) {
-var s = "";
-for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
-return s;
-}
-
-/* ---- exports (browser + Node) ------------------------------------ */
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.lineSource = { lines: lines, splitLines: splitLines, toJSONL: toJSONL};
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { lines: lines, splitLines: splitLines, toJSONL: toJSONL};
-}
-
-/* ---- CLI (runs only when invoked directly, never on require) ------ */
-
-function parseArgs(args) {
-var opts = {};
-var i = 0;
-while (i < args.length) {
-var a = args[i];
-if (a === "--field") {
-var f = args[i + 1];
-if (f === undefined) throw new Error("--field requires a name");
-opts.field = f;
-i += 2;
-} else if (a === "--index") {
-var x = args[i + 1];
-if (x === undefined) throw new Error("--index requires a name (or \"\" to disable)");
-opts.index = x;
-i += 2;
-} else if (a === "--skip-blank") {
-opts.skipBlank = true;
-i += 1;
-} else if (a === "--trim") {
-opts.trim = true;
-i += 1;
-} else if (a.charAt(0) === "-") {
-throw new Error("unknown option " + a);
-} else {
-throw new Error("unexpected argument " + JSON.stringify(a) + " (line-source reads text from stdin)");
-}
-}
-return opts;
-}
-
-function readStdin() {
-try {
-var fs = require("fs");
-return fs.readFileSync(0, "utf8");
-} catch (e) {
-return "";
-}
-}
-
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"line-source.js — turn a plain-text file into a JSONL record stream, one record per line.\n\n" +
-" node line-source.js < access.log\n" +
-" printf 'a\\nb\\nc\\n' | node line-source.js --skip-blank\n" +
-" node line-source.js --field text --index \"\" < names.txt\n" +
-" node line-source.js --help\n\n" +
-" --field NAME key holding the line text (default \"line\")\n" +
-" --index NAME key holding the 0-based line number (default \"n\"; \"\" disables)\n" +
-" --skip-blank drop lines empty after the terminator is stripped (n keeps source position)\n" +
-" --trim strip surrounding ASCII whitespace from each line's text\n\n" +
-"Reads text from stdin; emits one JSON object per line: { line: <text>, n: <index>}.\n" +
-"Splits on \\r\\n, \\n, or \\r; a final terminator is a terminator (no phantom empty\n" +
-"record); a leading UTF-8 BOM is stripped.\n\n" +
-"Edge: it splits on line terminators and emits one record per line. It does not parse\n" +
-"CSV fields (use csv-source), does not parse JSON (lines are verbatim strings), does\n" +
-"not read the file itself (pipe text in), and does not sort or deduplicate.\n"
-);
-return 0;
-}
-var opts;
-try { opts = parseArgs(args);}
-catch (e) { process.stderr.write("line-source: " + e.message + "\n"); return 2;}
-var text = readStdin();
-var records;
-try { records = lines(text, opts);}
-catch (e) { process.stderr.write("line-source: " + e.message + "\n"); return 2;}
-process.stdout.write(toJSONL(records));
-return 0;
-}
-
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
-
-test_line-source.js 155 lines on GitHub →
-#!/usr/bin/env node
-/* test_line-source.js — battery for the line-source gift.
-`node test_line-source.js` -> exit 0 PASS / non-zero FAIL.
-
-The oracle is INDEPENDENT and takes a DIFFERENT ROUTE than the gift: the gift scans
-char codes and slices; the oracle normalizes terminators with a regex then splits and
-drops one trailing empty. Two routes that share no code — agreement is evidence, not
-tautology. Plus frozen hand goldens for each of the three quiet-failure cases the gift
-exists to fix (phantom empty record, CRLF, BOM).
-*/
-"use strict";
-
-var G = require("./line-source.js");
-var assert = require("assert");
-
-var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;}
-else { fail++; console.error("FAIL: " + name);}
-}
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL: " + name + "\n got: " + g + "\n want: " + w);}
-}
-
-/* ---- independent oracle: regex-normalize route ------------------- */
-// Normalize every terminator to \n, strip a leading BOM, then split on \n and drop a
-// single trailing empty caused by a final terminator. A different route than the gift's
-// char-scan; shares no code with it.
-function oracleSplit(text) {
-if (typeof text!== "string") text = String(text == null? "": text);
-if (text.length === 0) return [];
-if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-if (text.length === 0) return [];
-var norm = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-var parts = norm.split("\n");
-// a trailing terminator produces a final "" — drop exactly one (terminator, not separator)
-if (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
-return parts;
-}
-function oracleTrim(s) { return s.replace(/^[\s]+|[\s]+$/g, "");}
-function oracleRecords(text, opts) {
-opts = opts || {};
-var field = opts.field === undefined? "line": opts.field;
-var index = opts.index === undefined? "n": opts.index;
-var raw = oracleSplit(text);
-var out = [];
-for (var i = 0; i < raw.length; i++) {
-var v = opts.trim? oracleTrim(raw[i]): raw[i];
-if (opts.skipBlank && v.length === 0) continue;
-var rec = {};
-rec[field] = v;
-if (index.length > 0) rec[index] = i;
-out.push(rec);
-}
-return out;
-}
-
-/* ---- grid: gift == oracle across many inputs --------------------- */
-var inputs = [
-"",
-"\n",
-"a\n",
-"a",
-"a\nb\nc\n",
-"a\nb\nc",
-"a\r\nb\r\nc\r\n", // CRLF
-"a\rb\rc\r", // classic-mac lone CR
-"a\r\nb\nc\r", // mixed
-"\ufeffhello\nworld\n", // BOM
-"line one\n\nline three\n", // blank in the middle
-" padded \n\ttabbed\t\n",
-"no-newline-at-all",
-"\n\n\n", // three blank lines (terminators only)
-"trailing space \nx",
-];
-var optsets = [
-{},
-{ field: "text"},
-{ index: ""},
-{ index: "row"},
-{ skipBlank: true},
-{ trim: true},
-{ skipBlank: true, trim: true},
-{ field: "L", index: "i", trim: true},
-];
-for (var a = 0; a < inputs.length; a++) {
-for (var b = 0; b < optsets.length; b++) {
-var got = G.lines(inputs[a], optsets[b]);
-var want = oracleRecords(inputs[a], optsets[b]);
-eq("grid input#" + a + " opts#" + b, got, want);
-}
-}
-
-/* ---- hand goldens: the three quiet failures ---------------------- */
-// 1. phantom empty record: a trailing newline is a terminator, not a separator
-eq("golden: trailing newline -> 2 records not 3",
-G.lines("abc\ndef\n"),
-[{ line: "abc", n: 0}, { line: "def", n: 1}]);
-eq("golden: no final newline -> still 2 records",
-G.lines("abc\ndef"),
-[{ line: "abc", n: 0}, { line: "def", n: 1}]);
-
-// 2. CRLF: terminator stripped, no trailing \r glued on
-eq("golden: CRLF stripped clean",
-G.lines("abc\r\ndef\r\n"),
-[{ line: "abc", n: 0}, { line: "def", n: 1}]);
-ok("golden: no lingering CR in CRLF line",
-G.lines("x\r\ny\r\n")[0].line.indexOf("\r") === -1);
-
-// 3. BOM stripped from first line
-eq("golden: leading BOM stripped",
-G.lines("\ufeffalpha\nbeta\n"),
-[{ line: "alpha", n: 0}, { line: "beta", n: 1}]);
-ok("golden: first line has no BOM char",
-G.lines("\ufeffalpha\n")[0].line.charCodeAt(0)!== 0xfeff);
-
-/* ---- feature goldens --------------------------------------------- */
-eq("empty input -> empty stream", G.lines(""), []);
-eq("single blank line (just a terminator)", G.lines("\n"), [{ line: "", n: 0}]);
-eq("--index disabled emits no index key",
-G.lines("a\nb\n", { index: ""}),
-[{ line: "a"}, { line: "b"}]);
-eq("--skip-blank drops blanks but n keeps source position",
-G.lines("a\n\nc\n", { skipBlank: true}),
-[{ line: "a", n: 0}, { line: "c", n: 2}]);
-eq("--trim strips surrounding whitespace",
-G.lines(" hi \n\tbye\t\n", { trim: true}),
-[{ line: "hi", n: 0}, { line: "bye", n: 1}]);
-eq("without --trim bytes are preserved",
-G.lines(" hi \n", {}),
-[{ line: " hi ", n: 0}]);
-eq("custom field + index names",
-G.lines("x\n", { field: "text", index: "row"}),
-[{ text: "x", row: 0}]);
-
-// JSONL rendering
-ok("toJSONL ends every record with newline",
-G.toJSONL([{ line: "a", n: 0}]) === '{"line":"a","n":0}\n');
-ok("toJSONL of empty is empty string", G.toJSONL([]) === "");
-
-/* ---- determinism ------------------------------------------------- */
-var d1 = G.toJSONL(G.lines("a\nb\r\nc\r", {}));
-var d2 = G.toJSONL(G.lines("a\nb\r\nc\r", {}));
-ok("deterministic across two runs", d1 === d2);
-
-/* ---- fail-closed edges ------------------------------------------- */
-function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
-ok("empty --field throws", throws(function () { G.lines("a\n", { field: ""});}));
-ok("non-string --index throws", throws(function () { G.lines("a\n", { index: 5});}));
-
-/* ---- report ------------------------------------------------------ */
-console.log("line-source battery: " + pass + " passed, " + fail + " failed");
-process.exitCode = fail === 0? 0: 1;
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# loop21:component-factory — a Loop MMT gift
-https://loopmmt.com/gifts/loop21-component-factory/
-[coverage: optional · branch: gifts]
-
-Logic Components as Composable Data source ← all gifts
-
-loop21:component-factory
-
-A factory for small logic components — a counter, a toggle, a clamp, an accumulator, a pattern-matcher — emitted not as live objects but as fully-specified JSONL specs one per line, so each component travels: you can pipe it, store it, diff it, hash it, or feed it to any consumer that knows the five built-in kinds. It is a source in the composition algebra (nothing in, JSONL out): the front door to a small, closed catalog of primitives. Every requested component is validated against its kind's parameter schema before a spec is emitted, so a missing required parameter, a bad type, or an out-of-range value is a reported error, never a silently emitted spec a downstream tool will choke on. Auto-generated names use a seeded counter, so --seed yields byte-identical JSONL on any machine, forever.
-
-The honest edge
-
-The factory declares components; it does not run them. An emitted spec is a validated description, not a live object — turning a spec into behavior is the consumer's job, and this tool makes no claim about whether any downstream runner implements a kind correctly. It guarantees the spec is well-formed and catalog-valid, not that anyone honors it.
-
-Run it
-
-python3 loop21-component-factory.py --demo
-test_loop21-component-factory.py (28 checks / 17 tests, mutation-bitten, pinned golden sha256 of a seeded batch)
-Python standard library only, deterministic under --seed, headless
-
-The code — every file that ships
-
-loop21-component-factory.py 408 lines on GitHub →
-#!/usr/bin/env python3
-"""loop21-component-factory — declare small logic components as composable data.
-
-A *source* in the composition algebra (∅ → JSONL): you name the logic
-primitives you want — a counter, a toggle, a clamp, an accumulator, a
-pattern-matcher — give each a small config, and the factory emits one
-fully-specified component **spec** per line of JSONL. Nothing is executed
-here; the factory's job is to *declare* components as portable data that a
-downstream transform, fold, or runner consumes.
-
-spec = {"component": "<kind>", "name": "<id>", "params": {...},
-"port": "transform"|"filter"|..., "spec_version": 1}
-
-WHY IT'S A FACTORY, NOT A LIBRARY
-
-A library hands you a function bound to the process that imported it. This
-hands you a *description* of a component — kind, name, parameters, and the
-composition port it fills — as a line of JSON. That description travels: you
-can pipe it, store it, diff it, hash it, or feed it to any consumer that
-knows the five built-in kinds. The factory is the front door to a small,
-closed catalog of logic primitives, emitted as a stream.
-
-WHY IT'S HONEST
-
-- **A closed, named catalog.** Five component kinds ship: `counter`,
-`toggle`, `clamp`, `accumulator`, `pattern-match`. Each has a declared
-parameter schema and a declared composition port. Ask for a kind that
-isn't in the catalog and the factory refuses loudly (it never emits a
-spec it can't stand behind).
-
-- **Deterministic by construction.** The emitted stream is a pure function
-of the requested specs. Auto-generated names use a seeded, reproducible
-counter, so `--seed 42` yields byte-identical JSONL on any machine,
-forever. Keys are sorted; there is no wall-clock, no RNG that isn't
-seeded, nothing that drifts between runs.
-
-- **Validated at the door.** Every requested component is checked against
-its kind's parameter schema *before* a spec is emitted. A missing
-required parameter, an out-of-range value, or an unknown parameter is a
-reported error (to stderr, non-zero exit) — never a silently emitted
-spec that a downstream consumer will choke on.
-
-- **The spec is the whole contract.** A consumer needs nothing from this
-tool but the JSONL. The `spec_version` field pins the shape so a consumer
-can reject a spec it doesn't understand rather than mis-read it.
-
-THE HONEST EDGE
-
-The factory *declares* components; it does not *run* them. An emitted spec
-is a validated description, not a live object — turning a spec into behavior
-is the consumer's job, and this tool makes no claim about whether any
-downstream runner implements a kind correctly. It guarantees the spec is
-well-formed and catalog-valid, not that anyone honors it.
-
-USAGE
-# one component from a kind + inline params
-python3 loop21-component-factory.py --make counter:start=0,step=2
-
-# several at once, one JSONL line each
-python3 loop21-component-factory.py \
---make counter:start=0 --make toggle:initial=false \
---make clamp:lo=0,hi=100
-
-# read a batch request from a JSON file ([{kind,name,params},...])
-python3 loop21-component-factory.py --batch request.json
-
-# list the catalog (kinds, params, ports) as JSONL and exit
-python3 loop21-component-factory.py --catalog
-
-# a short, reproducible demonstration
-python3 loop21-component-factory.py --demo
-
-MIT licensed. Python standard library only. Deterministic under --seed; headless.
-"""
-# SPDX-License-Identifier: MIT
-from __future__ import annotations
-
-import argparse
-import json
-import sys
-from typing import Any
-
-SPEC_VERSION = 1
-
-# ---------------------------------------------------------------------------
-# The catalog — a closed, named set of logic-component kinds.
-#
-# Each kind declares:
-# port: the composition port the component fills (source/transform/
-# filter/fold/sink) — this is what a MAP tool reads.
-# params: {name: schema} where schema is
-# {"type": "int"|"number"|"bool"|"string",
-# "required": bool,
-# "default": <value>, # when not required
-# "min": <n>, "max": <n>} # optional bounds (numeric)
-# summary: one line, human-facing.
-# ---------------------------------------------------------------------------
-CATALOG: dict[str, dict[str, Any]] = {
-"counter": {
-"port": "transform",
-"summary": "advances a running integer by a fixed step each item",
-"params": {
-"start": {"type": "int", "required": False, "default": 0},
-"step": {"type": "int", "required": False, "default": 1},
-},
-},
-"toggle": {
-"port": "transform",
-"summary": "flips a boolean on each item, starting from an initial state",
-"params": {
-"initial": {"type": "bool", "required": False, "default": False},
-},
-},
-"clamp": {
-"port": "transform",
-"summary": "constrains a numeric field to an inclusive [lo, hi] range",
-"params": {
-"lo": {"type": "number", "required": True},
-"hi": {"type": "number", "required": True},
-},
-},
-"accumulator": {
-"port": "fold",
-"summary": "reduces a stream to a single running total under an operation",
-"params": {
-"op": {
-"type": "string",
-"required": False,
-"default": "sum",
-"choices": ["sum", "product", "min", "max", "count"],
-},
-"seed": {"type": "number", "required": False, "default": 0},
-},
-},
-"pattern-match": {
-"port": "filter",
-"summary": "passes items whose field matches a fixed literal or set",
-"params": {
-"field": {"type": "string", "required": True},
-"equals": {"type": "string", "required": False, "default": None},
-"in": {"type": "string", "required": False, "default": None},
-},
-},
-}
-
-class FactoryError(Exception):
-"""A requested component could not be produced (unknown kind or bad params)."""
-
-# ---------------------------------------------------------------------------
-# Parameter parsing + coercion
-# ---------------------------------------------------------------------------
-def _coerce(kind: str, pname: str, raw: Any, schema: dict[str, Any]) -> Any:
-"""Coerce a raw parameter value to its declared type, or raise FactoryError."""
-t = schema["type"]
-try:
-if t == "int":
-val = int(raw)
-elif t == "number":
-val = float(raw)
-if val.is_integer():
-val = int(val) # canonical: 3.0 -> 3, keeps JSONL stable
-elif t == "bool":
-if isinstance(raw, bool):
-val = raw
-else:
-s = str(raw).strip().lower()
-if s in ("true", "1", "yes", "on"):
-val = True
-elif s in ("false", "0", "no", "off"):
-val = False
-else:
-raise ValueError(s)
-elif t == "string":
-val = str(raw)
-else: # pragma: no cover - guarded by catalog authorship
-raise FactoryError(f"{kind}.{pname}: unknown schema type {t!r}")
-except (ValueError, TypeError):
-raise FactoryError(
-f"{kind}.{pname}: value {raw!r} is not a valid {t}"
-)
-
-if "choices" in schema and val not in schema["choices"]:
-raise FactoryError(
-f"{kind}.{pname}: {val!r} not in {schema['choices']}"
-)
-for bound, cmp_ok in (("min", lambda v, b: v >= b), ("max", lambda v, b: v <= b)):
-if bound in schema and not cmp_ok(val, schema[bound]):
-raise FactoryError(
-f"{kind}.{pname}: {val!r} violates {bound}={schema[bound]}"
-)
-return val
-
-def build_spec(kind: str, name: str, params: dict[str, Any]) -> dict[str, Any]:
-"""Validate a request against the catalog and return a component spec dict.
-
-Raises FactoryError on an unknown kind, an unknown param, a missing
-required param, or a value that fails coercion/bounds.
-"""
-if kind not in CATALOG:
-raise FactoryError(
-f"unknown component kind {kind!r}; catalog: {', '.join(sorted(CATALOG))}"
-)
-entry = CATALOG[kind]
-schema = entry["params"]
-
-unknown = set(params) - set(schema)
-if unknown:
-raise FactoryError(
-f"{kind}: unknown param(s) {', '.join(sorted(unknown))}; "
-f"allowed: {', '.join(sorted(schema)) or '(none)'}"
-)
-
-resolved: dict[str, Any] = {}
-for pname, pschema in schema.items():
-if pname in params:
-resolved[pname] = _coerce(kind, pname, params[pname], pschema)
-elif pschema.get("required"):
-raise FactoryError(f"{kind}: missing required param {pname!r}")
-else:
-resolved[pname] = pschema.get("default")
-
-if kind == "pattern-match" and resolved.get("equals") is None and resolved.get("in") is None:
-raise FactoryError("pattern-match: exactly one of 'equals' or 'in' is required")
-if kind == "pattern-match" and resolved.get("equals") is not None and resolved.get("in") is not None:
-raise FactoryError("pattern-match: give only one of 'equals' or 'in', not both")
-
-return {
-"component": kind,
-"name": name,
-"params": resolved,
-"port": entry["port"],
-"spec_version": SPEC_VERSION,
-}
-
-# ---------------------------------------------------------------------------
-# Request parsing
-# ---------------------------------------------------------------------------
-def parse_make(expr: str) -> tuple[str, dict[str, Any]]:
-"""Parse a --make expression 'kind:k=v,k2=v2' -> (kind, {params})."""
-if ":" in expr:
-kind, _, param_str = expr.partition(":")
-else:
-kind, param_str = expr, ""
-kind = kind.strip()
-params: dict[str, Any] = {}
-if param_str.strip():
-for pair in param_str.split(","):
-if "=" not in pair:
-raise FactoryError(f"bad param {pair!r} in {expr!r} (want k=v)")
-k, _, v = pair.partition("=")
-params[k.strip()] = v.strip()
-return kind, params
-
-def _auto_name(kind: str, ordinal: int) -> str:
-"""Deterministic auto-name: kind + zero-padded seeded ordinal."""
-return f"{kind}-{ordinal:04d}"
-
-def produce(
-requests: list[dict[str, Any]],
-*,
-seed: int = 0,
-) -> list[dict[str, Any]]:
-"""Turn a list of {kind, name?, params} requests into validated specs.
-
-Auto-generated names are deterministic: they use a per-kind ordinal that
-starts from `seed` and increments in request order, so the same requests
-under the same seed yield byte-identical specs.
-"""
-specs: list[dict[str, Any]] = []
-counters: dict[str, int] = {}
-for req in requests:
-kind = req["kind"]
-params = req.get("params", {})
-name = req.get("name")
-if not name:
-ordinal = counters.get(kind, seed)
-counters[kind] = ordinal + 1
-name = _auto_name(kind, ordinal)
-specs.append(build_spec(kind, name, params))
-return specs
-
-def catalog_lines() -> list[dict[str, Any]]:
-"""The catalog itself, as JSONL-emittable dicts (one per kind)."""
-out = []
-for kind in sorted(CATALOG):
-entry = CATALOG[kind]
-out.append(
-{
-"component": kind,
-"port": entry["port"],
-"summary": entry["summary"],
-"params": {
-p: {k: v for k, v in schema.items()}
-for p, schema in entry["params"].items()
-},
-}
-)
-return out
-
-# ---------------------------------------------------------------------------
-# Emit
-# ---------------------------------------------------------------------------
-def emit(objs: list[dict[str, Any]], stream=None) -> None:
-"""Write objects as JSONL — one per line, keys sorted (deterministic)."""
-stream = sys.stdout if stream is None else stream
-for obj in objs:
-stream.write(json.dumps(obj, sort_keys=True, ensure_ascii=False) + "\n")
-
-def demo(*, seed: int = 42) -> str:
-"""A short reproducible demonstration — returns the JSONL block as a string."""
-reqs = [
-{"kind": "counter", "params": {"start": "0", "step": "2"}},
-{"kind": "toggle", "params": {"initial": "false"}},
-{"kind": "clamp", "params": {"lo": "0", "hi": "100"}},
-{"kind": "accumulator", "params": {"op": "sum"}},
-{"kind": "pattern-match", "params": {"field": "status", "equals": "open"}},
-]
-specs = produce(reqs, seed=seed)
-return "\n".join(
-json.dumps(s, sort_keys=True, ensure_ascii=False) for s in specs
-)
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def _build_arg_parser() -> argparse.ArgumentParser:
-p = argparse.ArgumentParser(
-prog="loop21-component-factory",
-description="Declare small logic components as composable JSONL specs.",
-)
-p.add_argument(
-"--make",
-action="append",
-default=[],
-metavar="KIND:k=v,...",
-help="a component to emit (repeatable)",
-)
-p.add_argument(
-"--batch",
-metavar="FILE",
-help="a JSON file: [{kind, name?, params?},...]",
-)
-p.add_argument("--catalog", action="store_true", help="emit the catalog as JSONL and exit")
-p.add_argument("--demo", action="store_true", help="print a short reproducible demonstration")
-p.add_argument("--seed", type=int, default=0, help="seed for deterministic auto-names")
-return p
-
-def main(argv: list[str] | None = None) -> int:
-parser = _build_arg_parser()
-args = parser.parse_args(argv)
-
-if args.catalog:
-emit(catalog_lines())
-return 0
-
-if args.demo:
-sys.stdout.write(demo() + "\n")
-return 0
-
-requests: list[dict[str, Any]] = []
-try:
-if args.batch:
-with open(args.batch, encoding="utf-8") as fh:
-loaded = json.load(fh)
-if not isinstance(loaded, list):
-raise FactoryError("--batch file must be a JSON array of requests")
-for item in loaded:
-if not isinstance(item, dict) or "kind" not in item:
-raise FactoryError("each --batch item needs a 'kind' field")
-requests.append(
-{
-"kind": item["kind"],
-"name": item.get("name"),
-"params": item.get("params", {}),
-}
-)
-for expr in args.make:
-kind, params = parse_make(expr)
-requests.append({"kind": kind, "params": params})
-
-if not requests:
-parser.error("nothing to make: give --make, --batch, --catalog, or --demo")
-
-specs = produce(requests, seed=args.seed)
-except FactoryError as exc:
-sys.stderr.write(f"loop21-component-factory: {exc}\n")
-return 2
-except (OSError, json.JSONDecodeError) as exc:
-sys.stderr.write(f"loop21-component-factory: {exc}\n")
-return 2
-
-emit(specs)
-return 0
-
-if __name__ == "__main__":
-raise SystemExit(main())
-
-test_loop21-component-factory.py 219 lines on GitHub →
-#!/usr/bin/env python3
-"""test_loop21-component-factory.py — the certifying properties of the factory gift.
-
-Run: python3 test_loop21-component-factory.py (exit 0 = all pass, 1 = failure)
-
-MUTATION-BITTEN: each test is here because a plausible mutation of the tool makes
-it fail loud. The determinism test pins a GOLDEN sha256 of a seeded batch rather
-than checking self-equality — a weak self-equality test passes benign reorders
-(the Loop MMT sudoku lesson), a pinned golden does not.
-"""
-import hashlib
-import importlib.util
-import io
-import json
-import os
-import sys
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location(
-"lcf", os.path.join(_HERE, "loop21-component-factory.py")
-)
-lcf = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lcf)
-
-# --- pinned goldens: regenerate ONLY on an intentional change ----------------
-DEMO_GOLDEN_SHA256 = "ba304b3fd40715875b8298b68dd6281d64844f641263bc7121ce27c35da00a08"
-BATCH_GOLDEN_SHA256 = "566171366bffaa9bcfd9001523666585fafe7547f11e3f2851b0cf36288680fe"
-CATALOG_KIND_COUNT = 5
-
-_FAILURES: list[str] = []
-_PASSES = 0
-
-def check(cond: bool, msg: str) -> None:
-global _PASSES
-if cond:
-_PASSES += 1
-else:
-_FAILURES.append(msg)
-
-def _sha(block: str) -> str:
-return hashlib.sha256(block.encode()).hexdigest()
-
-# --- determinism -------------------------------------------------------------
-def test_seeded_demo_reproduces_pinned_golden():
-"""The seeded demo output is byte-identical to a pinned sha256, forever."""
-block = lcf.demo(seed=42)
-check(_sha(block) == DEMO_GOLDEN_SHA256,
-f"demo golden drift: got {_sha(block)}")
-
-def test_seeded_batch_reproduces_pinned_golden():
-"""A seeded produce() batch is byte-identical to a pinned sha256."""
-reqs = [
-{"kind": "counter", "params": {"start": "5", "step": "3"}},
-{"kind": "accumulator", "params": {"op": "max", "seed": "0"}},
-{"kind": "clamp", "params": {"lo": "-10", "hi": "10"}},
-]
-specs = lcf.produce(reqs, seed=100)
-block = "\n".join(json.dumps(s, sort_keys=True, ensure_ascii=False) for s in specs)
-check(_sha(block) == BATCH_GOLDEN_SHA256,
-f"batch golden drift: got {_sha(block)}")
-
-def test_same_seed_twice_is_identical():
-"""Two runs with the same seed produce identical specs (self-consistency)."""
-reqs = [{"kind": "counter", "params": {}}, {"kind": "toggle", "params": {}}]
-a = lcf.produce(reqs, seed=7)
-b = lcf.produce(reqs, seed=7)
-check(a == b, "same-seed runs diverged")
-
-# --- catalog is a closed, named set ------------------------------------------
-def test_catalog_is_the_declared_five_kinds():
-"""The catalog holds exactly the five declared component kinds."""
-check(len(lcf.CATALOG) == CATALOG_KIND_COUNT,
-f"catalog size changed: {sorted(lcf.CATALOG)}")
-check(set(lcf.CATALOG) == {"counter", "toggle", "clamp", "accumulator", "pattern-match"},
-f"catalog kinds changed: {sorted(lcf.CATALOG)}")
-
-def test_every_catalog_kind_declares_a_valid_port():
-"""Every kind's port is one of the five composition-algebra verbs."""
-valid = {"source", "transform", "filter", "fold", "sink"}
-for kind, entry in lcf.CATALOG.items():
-check(entry["port"] in valid, f"{kind}: bad port {entry['port']!r}")
-
-# --- validation at the door --------------------------------------------------
-def test_unknown_kind_refuses():
-"""An unknown component kind raises FactoryError, never emits a spec."""
-try:
-lcf.build_spec("frobnicate", "x", {})
-check(False, "unknown kind did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_missing_required_param_refuses():
-"""A missing required param (clamp.hi) raises, never emits a spec."""
-try:
-lcf.build_spec("clamp", "c", {"lo": 0})
-check(False, "missing required param did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_unknown_param_refuses():
-"""An unknown param raises rather than being silently dropped or emitted."""
-try:
-lcf.build_spec("counter", "c", {"bogus": 5})
-check(False, "unknown param did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_bad_type_refuses():
-"""A non-int for an int param raises rather than coercing to garbage."""
-try:
-lcf.build_spec("counter", "c", {"step": "abc"})
-check(False, "bad-type param did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_out_of_choice_refuses():
-"""An accumulator op outside the declared choices raises."""
-try:
-lcf.build_spec("accumulator", "a", {"op": "divide"})
-check(False, "out-of-choice op did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-def test_pattern_match_requires_exactly_one_selector():
-"""pattern-match with neither equals nor in raises; with both raises."""
-try:
-lcf.build_spec("pattern-match", "p", {"field": "s"})
-check(False, "pattern-match with no selector did not raise")
-except lcf.FactoryError:
-check(True, "")
-try:
-lcf.build_spec("pattern-match", "p", {"field": "s", "equals": "a", "in": "b"})
-check(False, "pattern-match with both selectors did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-# --- spec shape --------------------------------------------------------------
-def test_spec_carries_version_and_port():
-"""Every emitted spec pins spec_version and declares its port."""
-s = lcf.build_spec("counter", "c", {"start": 0})
-check(s["spec_version"] == lcf.SPEC_VERSION, "spec_version missing/wrong")
-check(s["port"] == "transform", "counter port wrong")
-check(s["component"] == "counter", "component field wrong")
-
-def test_number_type_canonicalizes_integer_floats():
-"""A number param given as 3.0 canonicalizes to 3 so JSONL stays stable."""
-s = lcf.build_spec("clamp", "c", {"lo": "0.0", "hi": "100"})
-check(s["params"]["lo"] == 0 and isinstance(s["params"]["lo"], int),
-f"number did not canonicalize: {s['params']['lo']!r}")
-
-def test_bool_coercion_accepts_words_and_refuses_garbage():
-"""bool params accept true/false words; garbage raises."""
-s = lcf.build_spec("toggle", "t", {"initial": "true"})
-check(s["params"]["initial"] is True, "bool 'true' not coerced")
-try:
-lcf.build_spec("toggle", "t", {"initial": "maybe"})
-check(False, "garbage bool did not raise")
-except lcf.FactoryError:
-check(True, "")
-
-# --- CLI exit codes ----------------------------------------------------------
-def test_cli_bad_request_exits_2():
-"""The CLI returns 2 (not 0, not a traceback) on a bad request."""
-rc = lcf.main(["--make", "counter:step=abc"])
-check(rc == 2, f"bad CLI request returned {rc}, want 2")
-
-def test_cli_catalog_and_demo_exit_0():
-"""--catalog and --demo both succeed (exit 0)."""
-check(lcf.main(["--catalog"]) == 0, "--catalog did not exit 0")
-check(lcf.main(["--demo"]) == 0, "--demo did not exit 0")
-
-def test_auto_names_are_ordinal_and_seeded():
-"""Auto-generated names increment per-kind from the seed, deterministically."""
-specs = lcf.produce(
-[{"kind": "counter", "params": {}}, {"kind": "counter", "params": {}}],
-seed=10,
-)
-check(specs[0]["name"] == "counter-0010", f"first name {specs[0]['name']!r}")
-check(specs[1]["name"] == "counter-0011", f"second name {specs[1]['name']!r}")
-
-def _run() -> int:
-tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-for t in tests:
-try:
-t()
-except Exception as exc: # a test itself throwing is a failure
-_FAILURES.append(f"{t.__name__} raised {exc!r}")
-total = _PASSES + len(_FAILURES)
-if _FAILURES:
-print(f"FAIL — {_PASSES}/{total} checks passed; {len(_FAILURES)} failure(s):")
-for f in _FAILURES:
-print(f" ✗ {f}")
-return 1
-print(f"OK — {_PASSES}/{total} checks passed across {len(tests)} tests.")
-return 0
-
-if __name__ == "__main__":
-raise SystemExit(_run())
-
-Take the whole folder →
-MIT
-Python standard library only, deterministic under --seed, headless
 
 ---

@@ -1,1648 +1,1425 @@
-# Loop MMT — corpus shard 80/92
+# Loop MMT — corpus shard 80/95
 
-> Bundle 80 of 92 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 80 of 95 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/ratchet-inline-mime/, /gifts/ratchet-pdf-dict/, /gifts/ratchet-pdf-text/)
+Nodes in this shard: 3 (/gifts/parity/, /gifts/plausible/, /gifts/pluck/)
 
 ---
 
-# Inline MIME Parser — a Loop MMT gift
-https://loopmmt.com/gifts/ratchet-inline-mime/
+# Parity — a Loop MMT gift
+https://loopmmt.com/gifts/parity/
 [coverage: optional · branch: gifts]
 
-What's Actually Inside This Email? parse ← all gifts
+Parity Matrix, Gaps Surfaced fold ← all gifts
 
-Inline MIME Parser
+Parity
 
-Parse a raw MIME message — an.eml, a saved email, a multipart body — into a structured tree with zero dependencies. parseMime(raw) unfolds folded headers, parses the Content-Type and its parameters, decodes each leaf body per its Content-Transfer-Encoding (base64, quoted-printable, 7bit/8bit) and charset (utf-8, latin1), splits multipart/* on its boundary, and recurses to any depth. RFC 2047 encoded words in headers (=?utf-8?B?..?=) are decoded too. Node or browser, no DOM, no filesystem.
+Compare N sibling things against a shared checklist and see exactly where they disagree. Reads a small JSON description of your things and each one's declared marks, joins them on a normalized key so trivial spelling differences collapse to one row, and folds the whole thing into a HAS/LACKS grid: rows are the checklist (the self-building union of every mark any thing declares), columns are your things. The rows where they disagree fall out as the gap list — the whole reason you looked.
 
 The honest edge
 
-It parses, it does not validate — a message with a missing closing boundary or a header with no body is parsed as far as it reasonably can, never thrown at, so the tree reflects what was there rather than what should have been. Charset support is honest about its scope: utf-8 (full multibyte) and the byte-preserving ascii/iso-8859-1/windows-1252 family decode faithfully; ANY OTHER charset falls back to utf-8 rather than transcoding from native tables — exotic legacy charsets are the edge. An unknown Content-Transfer-Encoding is treated as identity. Header values are RFC-2047-decoded in the `headers` map only; `rawHeaders` keeps the ordered, undecoded originals for anything that must see the wire bytes.
+HAS means exactly one thing: a mark normalizing to this key was DECLARED for this thing — never that the feature works or behaves like the next column's. Parity is a presence fold, not a behavior test; every cell carries predicate 'declared-present', and any row where two or more things HAS a mark is flagged needs-behavior-check. It surfaces where declarations disagree; it does not verify the declarations are true.
 
 Run it
 
-node ratchet-inline-mime.js --demo
-test_ratchet-inline-mime.js (36/36: header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)
+python3 parity.py spec.json
+test_parity.py (33/33, mutation-bitten, pinned structural golden)
+Python stdlib only, deterministic
+
+The code — every file that ships
+
+parity.py 275 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""parity.py — compare N sibling things against a shared checklist.
+
+Give it several things that are *supposed* to match — three services that should
+all expose the same endpoints, four config files that should carry the same keys,
+five components that should each implement the same set of features — and parity
+folds them into one table: rows are the checklist items, columns are the things,
+each cell says HAS or LACKS. The rows where they *don't* all agree fall out for
+free as the gap list, which is the whole reason you ran it.
+
+WHAT IT IS, HONESTLY
+--------------------
+parity reads a small JSON description of your things and the marks each one
+declares, and it joins them on a **normalized key** so trivial spelling
+differences (``Compose`` / ``compose`` / ``compose-btn``) collapse to one row
+instead of three. The checklist is not hand-kept: it is the **union of every mark
+any thing declares**, so a capability that exists on even one thing becomes a row,
+and the things that lack it show up LACKS in that row. That is the gap you came
+for.
+
+THE ONE HONEST LIMIT, TYPED INTO THE OUTPUT
+-------------------------------------------
+HAS means exactly one thing: *a mark that normalizes to this key was declared for
+this thing.* It does **not** mean the feature works, or behaves the same as the
+next column's. parity is a **presence** fold, not a behavior test — every cell
+carries that in ``predicate: "declared-present"`` so a fact copied out of the
+table still says what it does and does not establish. A row where two or more
+things HAS is flagged ``needs-behavior-check`` — a *candidate* for you to verify,
+never a claim that they match.
+
+PURE FOLD
+---------
+Deterministic order, no wall-clock: fold twice, the bytes are identical
+(``--check``, exit 3 on drift). Rows sort by key, columns by declared order then
+name, so the table is stable across runs and machines.
+
+Exit codes (the fold-family contract):
+0 folded (and with --check, byte-identical to the input's own re-fold)
+2 usage / input error (bad path, malformed JSON, no things)
+3 --check drift (the output would not reproduce), or an empty checklist
+
+INPUT SHAPE (a small JSON file, or stdin with ``-``)
+----------------------------------------------------
+{
+"things": [
+{"name": "mail", "marks": ["compose", "search", "archive"]},
+{"name": "calendar", "marks": ["compose", "search"]},
+{"name": "contacts", "marks": ["search", "Compose"]}
+],
+"aliases": {"create": "compose", "new": "compose"}
+}
+
+``aliases`` is optional: it maps an alternate spelling to a canonical key BEFORE
+normalization, so genuine synonyms (``create`` → ``compose``) collapse too. An
+alias whose target is never declared by any thing is a dead alias and fails the
+non-vacuity gate (exit 3) — a checklist keyed on an invented item is worthless.
+"""
+import argparse
+import json
+import re
+import sys
+
+_WS = re.compile(r"[\s_-]+")
+
+def norm(mark):
+"""Collapse an INTRA-name variant to a comparison key.
+
+Lowercase, strip a trailing role suffix (``-btn`` / ``_button`` etc. via the
+separator split), and squeeze whitespace/underscore/hyphen runs to a single
+space. ``Compose`` / ``compose`` / ``compose-btn`` -> ``compose``. Deliberately
+dumb: it collapses spelling, never meaning (meaning is what ``aliases`` is for).
+"""
+s = str(mark).strip().lower()
+# drop a common trailing UI-role suffix so 'compose-btn' keys as 'compose'
+s = re.sub(r"[\s_-](btn|button|link|icon|field|input)$", "", s)
+s = _WS.sub(" ", s).strip()
+return s
+
+def _apply_aliases(key, alias_index):
+"""Map a canonical-key through the alias table (one hop, INTER-name synonyms)."""
+return alias_index.get(key, key)
+
+def fold(spec):
+"""The parity fold. spec -> a deterministic matrix dict. Pure; no I/O.
+
+Raises ValueError on an empty thing-set, a dead alias, or an empty checklist —
+each the caller turns into the right exit code.
+"""
+things = spec.get("things") or []
+if not things:
+raise ValueError("no things to compare (need >= 1 in 'things')")
+
+# aliases: alt-spelling -> canonical, both normalized. Dead-alias gate below.
+raw_aliases = spec.get("aliases") or {}
+alias_index = {norm(k): norm(v) for k, v in raw_aliases.items()}
+
+# Column order: declared order first (stable), name as the tiebreak.
+columns = []
+seen_cols = set()
+for t in things:
+name = str(t.get("name", "")).strip()
+if not name:
+raise ValueError("a thing has no 'name'")
+if name in seen_cols:
+raise ValueError("duplicate thing name: %r" % name)
+seen_cols.add(name)
+columns.append(name)
+
+# Build each thing's declared key-set, alias-mapped.
+declared = {} # name -> set(keys)
+all_keys = set()
+alias_targets_hit = set()
+for t in things:
+name = str(t.get("name", "")).strip()
+keys = set()
+for m in (t.get("marks") or []):
+k0 = norm(m)
+k = _apply_aliases(k0, alias_index)
+if k!= k0:
+alias_targets_hit.add(k0) # the alternate spelling was used
+keys.add(k)
+declared[name] = keys
+all_keys |= keys
+
+# Non-vacuity gate: every alias must have fired on some declared mark, and its
+# target must exist in the checklist. A dead alias means the checklist is keyed
+# on something nobody declared.
+for alt, target in alias_index.items():
+if alt not in alias_targets_hit:
+raise ValueError("dead alias %r: never matched any declared mark" % alt)
+if target not in all_keys:
+raise ValueError(
+"dead alias target %r: not declared by any thing" % target
+)
+
+if not all_keys:
+raise ValueError("empty checklist: no marks declared by any thing")
+
+# The checklist rows, sorted (deterministic).
+rows = []
+for key in sorted(all_keys):
+cells = []
+has_count = 0
+for name in columns:
+present = key in declared[name]
+if present:
+has_count += 1
+cells.append(
+{
+"thing": name,
+"state": "HAS" if present else "LACKS",
+# the honest predicate travels WITH the cell (findings discipline)
+"predicate": "declared-present",
+}
+)
+uniform = has_count == 0 or has_count == len(columns)
+row = {
+"key": key,
+"cells": cells,
+"has_count": has_count,
+"uniform": uniform,
+}
+# >=2 HAS on a non-uniform... actually behavior-check applies to ANY row
+# with >=2 HAS: they *look* shared but presence!= behavior.
+if has_count >= 2:
+row["flag"] = "needs-behavior-check"
+rows.append(row)
+
+gaps = [r["key"] for r in rows if not r["uniform"]]
+
+return {
+"columns": columns,
+"checklist_size": len(rows),
+"rows": rows,
+"gaps": gaps,
+"uniform_all": len(gaps) == 0,
+"note": "HAS = a mark declared for this thing normalizes to this key; "
+"it does NOT assert the capability works or matches across columns.",
+}
+
+def canonical(obj):
+"""Stable JSON text for --check twice-identical + --json emit."""
+return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+def render_human(matrix):
+"""A readable grid. Rows = checklist keys, columns = things. ✓ / · per cell."""
+cols = matrix["columns"]
+keywidth = max([len("capability")] + [len(r["key"]) for r in matrix["rows"]])
+colwidth = max([3] + [len(c) for c in cols])
+header = " ".join([f"{'capability':<{keywidth}}"] + [f"{c:<{colwidth}}" for c in cols])
+lines = [header, "-" * len(header)]
+for r in matrix["rows"]:
+marks = []
+for cell in r["cells"]:
+marks.append(f"{('✓' if cell['state']=='HAS' else '·'):<{colwidth}}")
+flag = " <- gap" if not r["uniform"] else ""
+lines.append(" ".join([f"{r['key']:<{keywidth}}"] + marks) + flag)
+lines.append("")
+if matrix["gaps"]:
+lines.append("gaps (things do not all agree): " + ", ".join(matrix["gaps"]))
+else:
+lines.append("no gaps: every thing declares every checklist item.")
+lines.append(matrix["note"])
+return "\n".join(lines) + "\n"
+
+def main(argv=None):
+ap = argparse.ArgumentParser(
+description="Compare N sibling things against a shared checklist -> a "
+"HAS/LACKS parity matrix. Presence fold, not a behavior test."
+)
+ap.add_argument("input", help="JSON spec file, or '-' for stdin")
+ap.add_argument("--json", action="store_true", help="emit the matrix as JSON")
+ap.add_argument(
+"--check",
+action="store_true",
+help="fold twice; exit 3 unless byte-identical (drift gate)",
+)
+ap.add_argument(
+"--gaps-only",
+action="store_true",
+help="print only the gap keys (rows where things disagree), one per line",
+)
+args = ap.parse_args(argv)
+
+try:
+if args.input == "-":
+spec = json.load(sys.stdin)
+else:
+with open(args.input, encoding="utf-8") as fh:
+spec = json.load(fh)
+except (OSError, json.JSONDecodeError) as e:
+sys.stderr.write("input error: %s\n" % e)
+return 2
+
+try:
+matrix = fold(spec)
+except ValueError as e:
+# empty checklist / dead alias -> fold-family exit 3; structural input
+# problems (no things, no name) -> exit 2.
+msg = str(e)
+if "checklist" in msg or "alias" in msg:
+sys.stderr.write("fold gate: %s\n" % msg)
+return 3
+sys.stderr.write("input error: %s\n" % msg)
+return 2
+
+if args.check:
+# A fold is a fold: re-fold the same spec, require byte-identical canonical.
+again = fold(spec)
+if canonical(again)!= canonical(matrix):
+sys.stderr.write("--check drift: the fold did not reproduce\n")
+return 3
+sys.stdout.write("check: OK (fold is twice-identical)\n")
+return 0
+
+if args.gaps_only:
+sys.stdout.write("".join(k + "\n" for k in matrix["gaps"]))
+return 0
+
+if args.json:
+sys.stdout.write(canonical(matrix))
+else:
+sys.stdout.write(render_human(matrix))
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_parity.py 223 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""test_parity.py — mutation-bitten tests for parity.py.
+
+Run: python3 test_parity.py (exit 0 = all pass; nonzero = a failure)
+
+The suite is written to have TEETH: each test asserts a specific, load-bearing
+property of the fold, so that a plausible mutation to parity.py breaks a named
+count. Proven mutation kills (see README's "Teeth proven" line):
+- remove the row sort -> golden shape breaks (order) -> 15/17
+- flip HAS/LACKS predicate -> cell-state tests break -> 13/17
+- drop the dead-alias gate -> alias non-vacuity test breaks -> 16/17
+- drop the >=2-HAS behavior flag -> behavior-check test breaks -> 16/17
+- count uniform as gap (invert) -> gap-list tests break -> 14/17
+"""
+import sys
+
+import parity
+
+_pass = 0
+_fail = 0
+
+def check(name, cond):
+global _pass, _fail
+if cond:
+_pass += 1
+else:
+_fail += 1
+sys.stderr.write("FAIL: %s\n" % name)
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+SPEC = {
+"things": [
+{"name": "mail", "marks": ["compose", "search", "archive"]},
+{"name": "calendar", "marks": ["compose", "search"]},
+{"name": "contacts", "marks": ["search", "Compose"]}, # Compose -> compose
+]
+}
+
+def test_norm():
+# 1 intra-name variants collapse
+check("norm-case", parity.norm("Compose") == "compose")
+check("norm-suffix", parity.norm("compose-btn") == "compose")
+check("norm-underscore", parity.norm("archive_button") == "archive")
+check("norm-space", parity.norm(" Search ") == "search")
+
+def test_checklist_is_union():
+m = parity.fold(SPEC)
+keys = [r["key"] for r in m["rows"]]
+# 2 checklist = union of all declared marks, normalized, sorted
+check("checklist-union", keys == ["archive", "compose", "search"])
+check("checklist-size", m["checklist_size"] == 3)
+
+def test_cell_states():
+m = parity.fold(SPEC)
+by_key = {r["key"]: r for r in m["rows"]}
+# 3 HAS/LACKS is correct per declared presence
+compose = {c["thing"]: c["state"] for c in by_key["compose"]["cells"]}
+check("compose-mail-has", compose["mail"] == "HAS")
+check("compose-calendar-has", compose["calendar"] == "HAS")
+check("compose-contacts-has", compose["contacts"] == "HAS") # via norm(Compose)
+archive = {c["thing"]: c["state"] for c in by_key["archive"]["cells"]}
+check("archive-mail-has", archive["mail"] == "HAS")
+check("archive-calendar-lacks", archive["calendar"] == "LACKS")
+check("archive-contacts-lacks", archive["contacts"] == "LACKS")
+
+def test_predicate_travels():
+m = parity.fold(SPEC)
+# 4 the honest predicate rides EVERY cell (findings discipline at cell grain)
+all_have_pred = all(
+c["predicate"] == "declared-present" for r in m["rows"] for c in r["cells"]
+)
+check("predicate-per-cell", all_have_pred)
+
+def test_gaps():
+m = parity.fold(SPEC)
+# 5 gap = a row where things disagree; 'archive' is the only gap here
+check("gaps-is-archive", m["gaps"] == ["archive"])
+check("uniform-all-false", m["uniform_all"] is False)
+# compose & search are uniform (all three HAS) -> not gaps
+by_key = {r["key"]: r for r in m["rows"]}
+check("compose-uniform", by_key["compose"]["uniform"] is True)
+check("search-uniform", by_key["search"]["uniform"] is True)
+check("archive-not-uniform", by_key["archive"]["uniform"] is False)
+
+def test_behavior_check_flag():
+m = parity.fold(SPEC)
+by_key = {r["key"]: r for r in m["rows"]}
+# 6 rows with >=2 HAS carry needs-behavior-check; a <2 row does NOT
+check("compose-flagged", by_key["compose"].get("flag") == "needs-behavior-check")
+check("archive-not-flagged", by_key["archive"].get("flag") is None) # 1 HAS
+
+def test_aliases():
+spec = {
+"things": [
+{"name": "a", "marks": ["create", "search"]}, # create -> compose
+{"name": "b", "marks": ["compose", "search"]},
+],
+"aliases": {"create": "compose"},
+}
+m = parity.fold(spec)
+keys = [r["key"] for r in m["rows"]]
+# 7 inter-name synonyms collapse via aliases
+check("alias-collapses", keys == ["compose", "search"])
+by_key = {r["key"]: r for r in m["rows"]}
+compose = {c["thing"]: c["state"] for c in by_key["compose"]["cells"]}
+check("alias-a-has-compose", compose["a"] == "HAS")
+
+def test_dead_alias_gate():
+# 8 a dead alias (never matched AND target undeclared) is rejected
+spec = {
+"things": [{"name": "a", "marks": ["search"]}],
+"aliases": {"create": "compose"}, # 'create' never declared -> dead
+}
+raised = False
+try:
+parity.fold(spec)
+except ValueError as e:
+raised = "alias" in str(e)
+check("dead-alias-rejected", raised)
+
+def test_dead_alias_never_matched_isolated():
+# 8b ISOLATE the 'never matched' gate: alias TARGET is declared (so the
+# 'target not in checklist' gate would NOT fire) but the alt-spelling is never
+# used by any thing. Only the 'never matched' gate can catch this — so a
+# mutation that disables that gate specifically is caught HERE.
+spec = {
+"things": [
+{"name": "a", "marks": ["compose", "search"]}, # 'compose' declared
+{"name": "b", "marks": ["search"]},
+],
+"aliases": {"create": "compose"}, # target 'compose' EXISTS; 'create' unused
+}
+raised = False
+try:
+parity.fold(spec)
+except ValueError as e:
+raised = "never matched" in str(e)
+check("dead-alias-never-matched-isolated", raised)
+
+def test_empty_and_errors():
+# 9 no things -> ValueError (structural)
+raised = False
+try:
+parity.fold({"things": []})
+except ValueError:
+raised = True
+check("empty-things-rejected", raised)
+
+def test_determinism_check_flag():
+# 10 --check is twice-identical: canonical(fold) == canonical(fold)
+a = parity.canonical(parity.fold(SPEC))
+b = parity.canonical(parity.fold(SPEC))
+check("fold-twice-identical", a == b)
+
+def test_structural_golden():
+"""A PINNED STRUCTURAL golden — pins the SHAPE (keys, order, states, gaps),
+which is env-stable (no hashes, no clocks). This is the primary anti-drift
+tooth: a mutation that changes the fold's visible structure breaks here."""
+m = parity.fold(SPEC)
+golden = {
+"columns": ["mail", "calendar", "contacts"],
+"checklist_size": 3,
+"keys_in_order": ["archive", "compose", "search"],
+"states": {
+"archive": ["HAS", "LACKS", "LACKS"],
+"compose": ["HAS", "HAS", "HAS"],
+"search": ["HAS", "HAS", "HAS"],
+},
+"gaps": ["archive"],
+"uniform_all": False,
+"flags": {"compose": "needs-behavior-check", "search": "needs-behavior-check"},
+}
+got_keys = [r["key"] for r in m["rows"]]
+got_states = {
+r["key"]: [c["state"] for c in r["cells"]] for r in m["rows"]
+}
+got_flags = {r["key"]: r.get("flag") for r in m["rows"] if r.get("flag")}
+check("golden-columns", m["columns"] == golden["columns"])
+check("golden-size", m["checklist_size"] == golden["checklist_size"])
+check("golden-keys-order", got_keys == golden["keys_in_order"])
+check("golden-states", got_states == golden["states"])
+check("golden-gaps", m["gaps"] == golden["gaps"])
+check("golden-uniform-all", m["uniform_all"] == golden["uniform_all"])
+check("golden-flags", got_flags == golden["flags"])
+
+def main():
+test_norm()
+test_checklist_is_union()
+test_cell_states()
+test_predicate_travels()
+test_gaps()
+test_behavior_check_flag()
+test_aliases()
+test_dead_alias_gate()
+test_dead_alias_never_matched_isolated()
+test_empty_and_errors()
+test_determinism_check_flag()
+test_structural_golden()
+total = _pass + _fail
+sys.stdout.write("parity tests: %d/%d passed\n" % (_pass, total))
+return 1 if _fail else 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+Take the whole folder →
+MIT
+Python stdlib only, deterministic
+
+---
+
+# Text Plausibility Gauge — a Loop MMT gift
+https://loopmmt.com/gifts/plausible/
+[coverage: optional · branch: gifts]
+
+Plausible Language, or Clean-but-Wrong? gauge ← all gifts
+
+Text Plausibility Gauge
+
+Guess whether a string looks like plausible natural-language text or clean-but-wrong output, and say how sure you are. The orthogonal sibling of legible: legible detects control-char rubble (byte garbage); plausible detects clean, fully-printable output that is still wrong — mojibake (Müller -> MÃ¼ller), missing word boundaries (thewordsallruntogether), hyphenation artifacts. assess(text) returns a label (prose / suspect / garbled / empty) with the raw score and signal counts exposed. It SCORES only structural language-agnostic signals — the mojibake fingerprint (dominant, Latin-1 + Windows-1252), script-gated space/word-boundary density, trailing-hyphen rate — and EXPOSES-never-scores the language-specific ones (English-referenced letter-frequency deviation, mean word length), so it will NOT call spaceless Japanese or non-English prose garbled. The load-bearing rule, one axis over from legible's C1 report-not-score: the honesty of a language gauge is what it REFUSES to score.
+
+The honest edge
+
+plausible is a HEURISTIC, not a verdict. "Implausible as prose" is not "wrong extraction": code, tables, log lines, base64, URLs, poetry, and non-spaced scripts all read implausible and can be perfectly correct — it flags a smell, you read it. It is language-agnostic BY DESIGN (deliberately weaker than a per-language model), reads SHAPE not intent (plausible prose can still be a prompt injection), and never decodes, corrects, or understands the text. It is a gauge you read, never a gate you route on.
+
+Run it
+
+node plausible.js "some text"
+test_plausible.js (24/24, hand-oracle drift-check + mojibake known-bad + spaceless-CJK regression guard + non-English-plausible guard)
 Node / browser, no dependencies
 
 The code — every file that ships
 
-ratchet-inline-mime.js 297 lines on GitHub →
+plausible.js 328 lines on GitHub →
 #!/usr/bin/env node
-// SPDX-License-Identifier: MIT
-"use strict";
-/* ratchet-inline-mime.js — a zero-dependency MIME message parser.
+/* plausible.js — a pure, dependency-free, HONEST gauge that guesses whether a
+string looks like plausible natural-language text, or clean-but-wrong output,
+and says how sure it is. The sibling of `legible`, on the orthogonal axis.
 
-Hand it a raw RFC 822 / MIME message (an.eml, a saved email, a raw HTTP
-multipart body) and it returns a structured tree: unfolded headers, a parsed
-Content-Type with its parameters, and — for each leaf — a body decoded per its
-Content-Transfer-Encoding (base64 / quoted-printable / 7bit / 8bit / binary)
-and charset (utf-8 / ascii / latin1). multipart/* bodies are split on their
-boundary and each part parsed recursively, to any depth. RFC 2047 encoded
-words in header values (=?utf-8?B?..?= / =?..?Q?..?=) are decoded too.
+WHY THIS EXISTS. `legible` detects control-character rubble: a string is
+`readable` when it is NOT byte-level garbage. But there is a whole class of
+extraction failure that produces clean, fully printable output and is still
+wrong — and legible reads every one of them as `readable`, because none of
+them touch the C0/U+FFFD band:
+• mojibake — the wrong charset, so "Müller" arrives as "MÃ¼ller"
+• custom glyph-to-ASCII encodings with no ToUnicode CMap
+• missing word boundaries — glyphs positioned without spaces, so
+thewordsallruntogether
+• hyphenation artifacts at PDF line breaks
+`plausible` reads the delta legible can't: does this look like language at
+all? It returns prose / suspect / garbled / empty with the raw score and the
+signal counts exposed, so you can see exactly why.
 
-Pure functions, no dependencies, no filesystem, no DOM — the same code runs in
-Node (module.exports) or a browser (window.LoopGifts.parseMime). It parses a
-message you already hold as text; it does not fetch, connect, or read files. */
+THE LOAD-BEARING RULE (the same move legible makes with the C1 band, one axis
+over). legible REPORTS the C1 band but refuses to SCORE it, because scoring it
+would false-positive on Cyrillic/CJK decoded as Latin-1. `plausible` makes the
+identical cut, and the line is LANGUAGE-DEPENDENCE:
+• SCORED — structural, language-agnostic signals only:
+- the mojibake fingerprint (a byte-structural decode artifact, not a
+language stat — the strongest signal, and it carries the label),
+- space / word-boundary density, SCRIPT-GATED (suppressed and merely
+exposed when the string is a non-spaced script — CJK, Thai — which
+legitimately has no spaces; it will NOT call Japanese garbled),
+- trailing-hyphen-before-linebreak rate.
+• EXPOSED, NEVER SCORED — language-specific signals:
+- letter-frequency deviation from English (`letterFreqDevEn`),
+- mean word length (`meanWordLength`).
+Scoring these would punish every language that is not the reference one
+(Finnish, Turkish, Welsh). They are surfaced raw so a caller who knows
+their language can weigh them; they never drive the label.
 
-// ---- base64 (pure; tolerates whitespace and missing padding) ---------------
-var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-function decodeBase64(str) {
-var lut = decodeBase64._lut;
-if (!lut) { lut = decodeBase64._lut = {}; for (var i = 0; i < B64.length; i++) lut[B64.charAt(i)] = i;}
-var out = [], buffer = 0, bits = 0;
-for (var j = 0; j < str.length; j++) {
-var c = str.charAt(j);
-if (c === "=") break;
-var v = lut[c];
-if (v === undefined) continue; // skip newlines/whitespace/stray chars
-buffer = (buffer << 6) | v; bits += 6;
-if (bits >= 8) { bits -= 8; out.push((buffer >> bits) & 0xff);}
-}
-return out;
-}
+WHAT IT DOES NOT DO (printed edge — present here and in the README):
+plausible is a HEURISTIC, not a verdict. "Implausible as prose" is NOT
+"wrong extraction": code, tables, log lines, base64, URLs, poetry, and
+non-spaced scripts all read implausible and can be perfectly correct — it
+flags a smell, you read it. It is language-agnostic BY DESIGN, so
+deliberately weaker than a real per-language model — the price of not lying
+about languages it does not know. The mojibake fingerprint targets the two
+common confusions (UTF-8 shown as Latin-1 and as Windows-1252); it will not
+catch every charset mixup. It reads SHAPE, not intent — plausible prose can
+still be a well-formed prompt injection. It never decodes, corrects, or
+understands the text. It is a gauge you read, never a gate you route on.
 
-// ---- quoted-printable (=XX bytes, soft line breaks) ------------------------
-function decodeQuotedPrintable(str) {
-var out = [];
-for (var i = 0; i < str.length; i++) {
-var c = str.charAt(i);
-if (c === "=") {
-if (str.charAt(i + 1) === "\r" && str.charAt(i + 2) === "\n") { i += 2; continue;} // soft break
-if (str.charAt(i + 1) === "\n") { i += 1; continue;} // soft break (LF)
-var hex = str.substr(i + 1, 2);
-if (/^[0-9A-Fa-f]{2}$/.test(hex)) { out.push(parseInt(hex, 16)); i += 2; continue;}
-out.push(0x3d); // stray '=' kept literal
-} else {
-out.push(c.charCodeAt(0) & 0xff);
-}
-}
-return out;
-}
+API
+plausible(input[, options]) — dispatches on the shape of `input`:
+• a string -> assess(string) -> { label, score, signals}
+• a record with `.text` -> {...record, plausibility: assess(record.text)}
+• an array of either -> input.map(plausible)
+assess(text[, options]) -> { label, score, signals}
+label one of "prose" | "suspect" | "garbled" | "empty"
+score the implausibility ratio in [0,1], rounded to 4 places
+signals { length, mojibake, mojibakeRatio, spaceRate, spaceScored,
+boundaryPenalty, lines, hyphenLines, hyphenRate,
+nonSpacedFraction, letterFreqDevEn, meanWordLength,
+implausibility}
+options.proseMax (default 0.05) score <= this => prose
+options.garbledMin (default 0.30) score >= this => garbled
+(between the two bounds => suspect)
+Only the mojibake fingerprint can drive the label to `garbled` on its own;
+the boundary and hyphen signals are bounded so they reach `suspect`, not
+`garbled` — the label leans where it is grounded.
 
-// ---- bytes -> string, honest about the charsets it actually decodes ---------
-function utf8Decode(bytes) {
-var out = "", i = 0, n = bytes.length;
-while (i < n) {
-var b = bytes[i++];
-if (b < 0x80) { out += String.fromCharCode(b);}
-else if (b >= 0xc0 && b < 0xe0) { out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));}
-else if (b >= 0xe0 && b < 0xf0) { var c1 = bytes[i++] & 0x3f, c2 = bytes[i++] & 0x3f; out += String.fromCharCode(((b & 0x0f) << 12) | (c1 << 6) | c2);}
-else if (b >= 0xf0) {
-var d1 = bytes[i++] & 0x3f, d2 = bytes[i++] & 0x3f, d3 = bytes[i++] & 0x3f;
-var cp = (((b & 0x07) << 18) | (d1 << 12) | (d2 << 6) | d3) - 0x10000;
-out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-} else { out += "\ufffd";}
-}
-return out;
-}
-function bytesToString(bytes, charset) {
-charset = (charset || "utf-8").toLowerCase();
-if (charset === "us-ascii" || charset === "ascii" || charset === "latin1" ||
-charset === "iso-8859-1" || charset === "iso8859-1" ||
-charset === "windows-1252" || charset === "cp1252") {
-var s = "";
-for (var k = 0; k < bytes.length; k++) s += String.fromCharCode(bytes[k]); // byte-preserving
-return s;
-}
-return utf8Decode(bytes); // default and any unknown charset: utf-8 (see README edge)
-}
+Pure function of its input. No dependencies, no randomness, no clock, no I/O
+in the core — the same input always yields the same output (the determinism
+lint is trivial). Same code in a browser (window.LoopGifts.plausible) or Node
+(this CLI / require()).
 
-// ---- structured header values ("text/plain; charset=utf-8; name=\"a b\"") ---
-function splitSemicolons(s) {
-var out = [], cur = "", inq = false;
-for (var i = 0; i < s.length; i++) {
-var c = s.charAt(i);
-if (c === '"') { inq =!inq; cur += c;}
-else if (c === ";" &&!inq) { out.push(cur); cur = "";}
-else cur += c;
-}
-out.push(cur);
-return out;
-}
-function unquote(v) {
-v = v.replace(/^[ \t]+|[ \t]+$/g, "");
-if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') {
-return v.substring(1, v.length - 1).replace(/\\(.)/g, "$1");
-}
-return v;
-}
-function parseStructured(value) {
-var parts = splitSemicolons(value);
-var main = (parts.shift() || "").replace(/^[ \t]+|[ \t]+$/g, "");
-var params = {};
-for (var i = 0; i < parts.length; i++) {
-var eq = parts[i].indexOf("=");
-if (eq === -1) continue;
-var k = parts[i].substring(0, eq).replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
-if (k) params[k] = unquote(parts[i].substring(eq + 1));
-}
-return { value: main, params: params};
-}
+USAGE
+node plausible.js "some text" # assess an argument, print JSON
+cat streams.jsonl | node plausible.js # annotate each JSONL record's.text
+node plausible.js --port # print this tool's port-verb (transform)
+node plausible.js --help
 
-// ---- RFC 2047 encoded words in header text ---------------------------------
-function decodeEncodedWords(str) {
-return str.replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, function (m, charset, enc, text) {
-var bytes = (enc === "B" || enc === "b")
-? decodeBase64(text)
-: decodeQuotedPrintable(text.replace(/_/g, " ")); // Q: '_' is space
-return bytesToString(bytes, charset);
-});
-}
-
-// ---- headers ---------------------------------------------------------------
-function splitHeadersBody(raw) {
-var norm = String(raw).replace(/\r\n/g, "\n");
-var idx = norm.indexOf("\n\n");
-if (idx === -1) return { headerBlock: norm, body: ""};
-return { headerBlock: norm.substring(0, idx), body: norm.substring(idx + 2)};
-}
-function unfoldHeaders(headerBlock) {
-var lines = headerBlock.split("\n"), headers = [];
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i];
-if (line === "") continue;
-if ((line.charAt(0) === " " || line.charAt(0) === "\t") && headers.length) {
-headers[headers.length - 1][1] += " " + line.replace(/^[ \t]+/, ""); // unfold
-} else {
-var ci = line.indexOf(":");
-if (ci === -1) continue; // not a header line — skip
-headers.push([line.substring(0, ci).replace(/[ \t]+$/, ""), line.substring(ci + 1).replace(/^[ \t]+/, "")]);
-}
-}
-return headers;
-}
-function getRawHeader(rawHeaders, name) {
-name = name.toLowerCase();
-for (var i = 0; i < rawHeaders.length; i++) {
-if (rawHeaders[i][0].toLowerCase() === name) return rawHeaders[i][1];
-}
-return null;
-}
-
-// ---- multipart split -------------------------------------------------------
-function splitMultipart(body, boundary) {
-var delim = "--" + boundary, close = delim + "--";
-var lines = body.split("\n"), parts = [], cur = null;
-for (var i = 0; i < lines.length; i++) {
-var t = lines[i].replace(/\r$/, "");
-if (t === delim) { if (cur!== null) parts.push(cur.join("\n")); cur = [];}
-else if (t === close) { if (cur!== null) parts.push(cur.join("\n")); cur = null; break;}
-else if (cur!== null) cur.push(lines[i]);
-// lines before the first delim are the preamble (cur === null) — ignored
-}
-if (cur!== null) parts.push(cur.join("\n")); // unterminated: keep what we have
-return parts;
-}
-
-// ---- body decode -----------------------------------------------------------
-function decodeBody(body, cte, charset) {
-var bytes;
-if (cte === "base64") bytes = decodeBase64(body);
-else if (cte === "quoted-printable") bytes = decodeQuotedPrintable(body);
-else { bytes = []; for (var i = 0; i < body.length; i++) bytes.push(body.charCodeAt(i) & 0xff);}
-return bytesToString(bytes, charset);
-}
-
-// ---- the parser ------------------------------------------------------------
-function parseMime(raw) {
-var sb = splitHeadersBody(raw);
-var rawHeaders = unfoldHeaders(sb.headerBlock);
-var headers = {};
-for (var i = 0; i < rawHeaders.length; i++) {
-var name = rawHeaders[i][0].toLowerCase();
-if (headers[name] === undefined) headers[name] = decodeEncodedWords(rawHeaders[i][1]); // last raw kept; first decoded value wins for the map
-}
-var ct = parseStructured(getRawHeader(rawHeaders, "content-type") || "text/plain");
-var cte = (getRawHeader(rawHeaders, "content-transfer-encoding") || "7bit").replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
-var node = {
-headers: headers,
-rawHeaders: rawHeaders,
-contentType: ct.value.toLowerCase(),
-contentTypeParams: ct.params,
-encoding: cte,
-isMultipart: false
-};
-if (node.contentType.indexOf("multipart/") === 0 && ct.params.boundary) {
-node.isMultipart = true;
-node.parts = [];
-var raws = splitMultipart(sb.body, ct.params.boundary);
-for (var p = 0; p < raws.length; p++) node.parts.push(parseMime(raws[p]));
-} else {
-node.bodyRaw = sb.body;
-node.body = decodeBody(sb.body, cte, ct.params.charset);
-}
-return node;
-}
-
-// ---- a small human summary for the CLI -------------------------------------
-function summarize(node, depth) {
-depth = depth || 0;
-var pad = new Array(depth + 1).join(" ");
-var line = pad + node.contentType + (node.encoding && node.encoding!== "7bit"? " [" + node.encoding + "]": "");
-var lines = [line];
-if (depth === 0) {
-var interesting = ["from", "to", "subject", "date"];
-for (var i = 0; i < interesting.length; i++) {
-if (node.headers[interesting[i]]!== undefined) lines.push(pad + " " + interesting[i] + ": " + node.headers[interesting[i]]);
-}
-}
-if (node.isMultipart) {
-for (var p = 0; p < node.parts.length; p++) lines = lines.concat(summarize(node.parts[p], depth + 1));
-} else {
-var body = node.body || "";
-var preview = body.length > 200? body.substring(0, 200) + "\u2026": body;
-lines.push(pad + " body(" + body.length + "): " + JSON.stringify(preview));
-}
-return lines;
-}
-
-// ---- dual-runtime export ---------------------------------------------------
+Released under MIT.
+*/
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
 if (typeof window!== "undefined") {
 window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.parseMime = parseMime;
-window.LoopGifts.decodeEncodedWords = decodeEncodedWords;
+window.LoopGifts.plausible = api.plausible;
+window.LoopGifts.assessPlausibility = api.assess;
+}
+root.__plausible = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
+"use strict";
+
+var DEFAULTS = { proseMax: 0.05, garbledMin: 0.30};
+
+// --- the SCORED signals (structural, language-agnostic) -------------------
+
+// Mojibake fingerprint. When UTF-8 bytes are decoded through a single-byte
+// codec, a multibyte sequence renders as a LEAD char immediately followed by
+// a CONTINUATION char. The lead is a UTF-8 lead byte shown as Latin-1
+// (0xC2–0xF4). The continuation is either the raw Latin-1 range (0x80–0xBF)
+// OR — the common real-world case — a Windows-1252 remap of the 0x80–0x9F
+// band (curly quotes, dashes, €, ™, …). We count both so the fingerprint
+// catches both the Latin-1 and the CP1252 confusion, not only the textbook one.
+function isUtf8LeadAsLatin1(c) { return c >= 0xc2 && c <= 0xf4;}
+// CP1252's printable remaps of bytes 0x80–0x9F (the 27 codepoints it defines).
+var CP1252_C1 = {};
+[0x20ac,0x201a,0x0192,0x201e,0x2026,0x2020,0x2021,0x02c6,0x2030,0x0160,
+0x2039,0x0152,0x017d,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,
+0x02dc,0x2122,0x0161,0x203a,0x0153,0x017e,0x0178].forEach(function (cp) { CP1252_C1[cp] = 1;});
+function isMojibakeCont(c) {
+return (c >= 0x80 && c <= 0xbf) || CP1252_C1[c] === 1;
+}
+
+// Non-spaced scripts: scripts that legitimately write without spaces between
+// words. When a string is substantially one of these, the space signal is a
+// false tell, so we GATE it out of the score (exposed, never scored). Korean
+// (Hangul) is DELIBERATELY not here — Korean uses spaces, so its boundary
+// signal is meaningful.
+function isNonSpacedScript(c) {
+return (c >= 0x4e00 && c <= 0x9fff) // CJK Unified Ideographs (Chinese, Kanji)
+|| (c >= 0x3040 && c <= 0x30ff) // Hiragana + Katakana (Japanese)
+|| (c >= 0x3400 && c <= 0x4dbf) // CJK Extension A
+|| (c >= 0xf900 && c <= 0xfaff) // CJK Compatibility Ideographs
+|| (c >= 0x0e00 && c <= 0x0e7f) // Thai
+|| (c >= 0x0e80 && c <= 0x0eff) // Lao
+|| (c >= 0x1780 && c <= 0x17ff) // Khmer
+|| (c >= 0x1000 && c <= 0x109f); // Myanmar
+}
+
+function isAsciiLetter(c) {
+return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
+}
+
+// --- the EXPOSED-not-scored signals (language-specific) -------------------
+
+// English letter frequencies (%). Used ONLY to expose a raw deviation number;
+// NEVER folded into the score — that would malign every non-English language.
+var EN_FREQ = {
+a:8.2,b:1.5,c:2.8,d:4.3,e:12.7,f:2.2,g:2.0,h:6.1,i:7.0,j:0.15,k:0.77,
+l:4.0,m:2.4,n:6.7,o:7.5,p:1.9,q:0.095,r:6.0,s:6.3,t:9.1,u:2.8,v:0.98,
+w:2.4,x:0.15,y:2.0,z:0.074
+};
+
+function assess(text, options) {
+var opt = options || {};
+var proseMax = typeof opt.proseMax === "number"? opt.proseMax: DEFAULTS.proseMax;
+var garbledMin = typeof opt.garbledMin === "number"? opt.garbledMin: DEFAULTS.garbledMin;
+
+if (text === null || text === undefined) return emptyResult();
+var s = String(text);
+if (s.length === 0 || /^\s*$/.test(s)) return emptyResult(s.length);
+
+var n = s.length;
+var mojibake = 0, spaces = 0, nonSpaced = 0, asciiLetters = 0;
+var freq = {};
+for (var i = 0; i < n; i++) {
+var c = s.charCodeAt(i);
+if (c === 0x20 || c === 0x09) spaces++;
+if (isNonSpacedScript(c)) nonSpaced++;
+if (isAsciiLetter(c)) {
+asciiLetters++;
+var ch = String.fromCharCode(c | 0x20); // lowercase
+freq[ch] = (freq[ch] || 0) + 1;
+}
+if (i + 1 < n && isUtf8LeadAsLatin1(c) && isMojibakeCont(s.charCodeAt(i + 1))) {
+mojibake++;
+}
+}
+
+var mojibakeRatio = round4(mojibake / Math.max(1, n - 1));
+var spaceRate = round4(spaces / n);
+var nonSpacedFraction = round4(nonSpaced / n);
+
+// Script-gate: only score the space signal when the string is NOT mostly a
+// non-spaced script AND there is enough Latin content for missing boundaries
+// to be meaningful.
+var spaceScored = nonSpacedFraction < 0.15 && n >= 24 && (asciiLetters / n) > 0.5;
+// Boundary penalty: how far below a generous prose space-floor we are.
+var SPACE_FLOOR = 0.08; // prose runs ~0.12–0.18; below the floor = boundaries missing
+var boundaryPenalty = spaceScored
+? round4(clamp((SPACE_FLOOR - spaceRate) / SPACE_FLOOR, 0, 1))
+: 0;
+
+// Trailing-hyphen-before-linebreak rate. Only meaningful across several
+// lines — a single trailing hyphen is nothing; PDF hyphenation shows as many.
+var lines = s.split("\n");
+var totalLines = lines.length;
+var hyphenLines = 0;
+for (var j = 0; j < totalLines; j++) {
+if (/[-\u00ad]\s*$/.test(lines[j]) && /\w/.test(lines[j])) hyphenLines++;
+}
+var hyphenRate = totalLines >= 3? round4(hyphenLines / totalLines): 0;
+
+// The score: mojibake dominant (can reach garbled alone); boundary and
+// hyphen bounded so they reach suspect, not garbled — the label leans on
+// the byte-structural signal.
+var implausibility = round4(clamp(
+mojibakeRatio * 1.0 +
+boundaryPenalty * 0.25 +
+hyphenRate * 0.20,
+0, 1));
+
+var label;
+if (implausibility <= proseMax) label = "prose";
+else if (implausibility >= garbledMin) label = "garbled";
+else label = "suspect";
+
+// EXPOSED-not-scored language stats.
+var letterFreqDevEn = asciiLetters >= 20? englishDeviation(freq, asciiLetters): null;
+var meanWordLength = meanWord(s);
+
+return {
+label: label,
+score: implausibility,
+signals: {
+length: n,
+mojibake: mojibake, // count of mojibake bigrams
+mojibakeRatio: mojibakeRatio, // SCORED (dominant)
+spaceRate: spaceRate,
+spaceScored: spaceScored, // was the space signal scored, or script-gated out?
+boundaryPenalty: boundaryPenalty, // SCORED when spaceScored, else 0
+lines: totalLines,
+hyphenLines: hyphenLines,
+hyphenRate: hyphenRate, // SCORED when >= 3 lines, else 0
+nonSpacedFraction: nonSpacedFraction,
+letterFreqDevEn: letterFreqDevEn, // EXPOSED, never scored (English-referenced)
+meanWordLength: meanWordLength, // EXPOSED, never scored
+implausibility: implausibility
+}
+};
+}
+
+// Sum of absolute deviations (percentage points) of a-z frequency from
+// English. English-referenced by construction — a raw signal, never scored.
+function englishDeviation(freq, letters) {
+var dev = 0;
+for (var k in EN_FREQ) {
+var obs = ((freq[k] || 0) / letters) * 100;
+dev += Math.abs(obs - EN_FREQ[k]);
+}
+return round4(dev);
+}
+
+function meanWord(s) {
+var words = s.split(/\s+/).filter(function (w) { return w.length > 0;});
+if (words.length === 0) return 0;
+var total = 0;
+for (var i = 0; i < words.length; i++) total += words[i].length;
+return round4(total / words.length);
+}
+
+function emptyResult(length) {
+return {
+label: "empty",
+score: 0,
+signals: {
+length: length || 0, mojibake: 0, mojibakeRatio: 0, spaceRate: 0,
+spaceScored: false, boundaryPenalty: 0, lines: 0, hyphenLines: 0,
+hyphenRate: 0, nonSpacedFraction: 0, letterFreqDevEn: null,
+meanWordLength: 0, implausibility: 0
+}
+};
+}
+
+function clamp(x, lo, hi) { return x < lo? lo: x > hi? hi: x;}
+function round4(x) { return Math.round(x * 1e4) / 1e4;}
+
+// The composition joint: dispatch on the shape of the input (mirrors legible).
+function plausible(input, options) {
+if (Array.isArray(input)) {
+return input.map(function (x) { return plausible(x, options);});
+}
+if (input && typeof input === "object") {
+var out = {};
+for (var k in input) if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
+out.plausibility = assess(input.text, options);
+return out;
+}
+return assess(input, options);
+}
+
+return { plausible: plausible, assess: assess};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__plausible;
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--port")!== -1) { process.stdout.write("transform\n"); return 0;}
+if (args.indexOf("--help")!== -1 || (args.length === 0 && process.stdin.isTTY)) {
+process.stdout.write(
+"plausible — a heuristic gauge: does this string look like plausible natural-language text?\n" +
+" node plausible.js \"some text\" assess an argument, print JSON\n" +
+" cat streams.jsonl | node plausible.js annotate each JSONL record's.text\n" +
+" node plausible.js --port print the port-verb (transform)\n" +
+" node plausible.js --help\n"
+);
+return 0;
+}
+var textArg = null;
+for (var i = 0; i < args.length; i++) { if (args[i].indexOf("--")!== 0) { textArg = args[i]; break;}}
+if (textArg!== null) {
+process.stdout.write(JSON.stringify(api.assess(textArg)) + "\n");
+return 0;
+}
+var input = "";
+try { input = require("fs").readFileSync(0, "utf8");} catch (e) { input = "";}
+var lines = input.split("\n");
+for (var j = 0; j < lines.length; j++) {
+var line = lines[j];
+if (line === "" && j === lines.length - 1) continue;
+var rec;
+try {
+var parsed = JSON.parse(line);
+rec = api.plausible(parsed);
+} catch (e) {
+rec = { text: line, plausibility: api.assess(line)};
+}
+process.stdout.write(JSON.stringify(rec) + "\n");
+}
+return 0;
+}
+
+process.exitCode = main(process.argv);
+}
+
+test_plausible.js 98 lines on GitHub →
+#!/usr/bin/env node
+/* test_plausible.js — drift-check battery for the plausible gauge.
+Each case is an out-of-band expectation (a label a human assigns by reading
+the string), not a value the gauge produced. Run: node test_plausible.js
+
+The load-bearing cases, called out:
+• MOJIBAKE POSITIVE — the whole reason the gift exists; must not read prose.
+• CJK REGRESSION GUARD — real spaceless Japanese must NOT read garbled
+(the script-gate; the equity false-positive the design refuses to make).
+• BOUNDARY case — run-together Latin flags via the space signal.
+• LEAN CHECK — mojibake can reach `garbled` alone; boundary/hyphen
+are bounded to `suspect`. The label leans on the byte-structural signal.
+*/
+"use strict";
+var P = require("./plausible.js");
+var assess = P.assess, plausible = P.plausible;
+
+var pass = 0, fail = 0, failures = [];
+function check(name, cond, detail) {
+if (cond) { pass++;}
+else { fail++; failures.push(name + (detail? " [" + detail + "]": ""));}
+}
+function labelOf(t, opts) { return assess(t, opts).label;}
+
+// 1. clean English prose -> prose
+check("clean-english-prose", labelOf("The quick brown fox jumps over the lazy dog and the rain falls softly.") === "prose");
+
+// 2. clean prose, different content -> prose (not English-frequency-dependent)
+check("clean-prose-varied", labelOf("She sold seventeen blue kites at the market before noon on a windy Tuesday.") === "prose");
+
+// 3. MOJIBAKE POSITIVE (Latin-1): scattered mojibake in clean text -> not prose, mojibake signal present
+var m1 = assess("MÃ¼ller went to the cafÃ© and ordered a piÃ±a colada.");
+check("mojibake-latin1-not-prose", m1.label!== "prose", "label=" + m1.label);
+check("mojibake-latin1-signal", m1.signals.mojibake >= 3, "mojibake=" + m1.signals.mojibake);
+
+// 4. MOJIBAKE POSITIVE (dense, CJK-as-latin1) -> garbled
+var m2 = assess("æ—¥æœ¬èªžã®ãƒ†ã‚­ã‚¹ãƒˆ");
+check("mojibake-dense-garbled", m2.label === "garbled", "label=" + m2.label + " ratio=" + m2.signals.mojibakeRatio);
+
+// 5. MOJIBAKE POSITIVE (CP1252 remap: em-dash/curly-quote family) -> mojibake signal present
+var m3 = assess("theâ€œsmartâ€\u009d quotes and emâ€”dashes are Ã¡ll wrong here now");
+check("mojibake-cp1252-signal", m3.signals.mojibake >= 2, "mojibake=" + m3.signals.mojibake);
+
+// 6. CJK REGRESSION GUARD: real, correctly-decoded spaceless Japanese -> NOT garbled
+var jp = assess("日本語のテキストです。これは正しくデコードされた文章。");
+check("cjk-regression-not-garbled", jp.label!== "garbled", "label=" + jp.label);
+check("cjk-regression-space-gated", jp.signals.spaceScored === false, "spaceScored=" + jp.signals.spaceScored);
+check("cjk-regression-no-mojibake", jp.signals.mojibake === 0, "mojibake=" + jp.signals.mojibake);
+
+// 7. Chinese (spaceless) regression guard -> NOT garbled
+var zh = assess("这是一段正确解码的中文文本用来测试脚本门控是否正常工作。");
+check("chinese-regression-not-garbled", zh.label!== "garbled", "label=" + zh.label);
+
+// 8. BOUNDARY case: run-together Latin (no spaces) -> flagged (suspect+), boundaryPenalty fires
+var rt = assess("thequickbrownfoxjumpsoverthelazydogandtherainfallssoftlyonthefields");
+check("runtogether-flagged", rt.label!== "prose", "label=" + rt.label);
+check("runtogether-boundary", rt.signals.boundaryPenalty > 0, "bp=" + rt.signals.boundaryPenalty);
+
+// 9. LEAN CHECK: boundary alone is bounded to suspect, never garbled (higher false-positive surface)
+check("boundary-bounded-to-suspect", rt.label === "suspect", "label=" + rt.label);
+
+// 10. HYPHENATION: several lines ending in hyphens -> hyphen signal fires, exposed
+var hy = assess("this is a para-\ngraph that has been hy-\nphenated at every line-\nbreak by a pdf ex-\ntractor here now");
+check("hyphenation-signal", hy.signals.hyphenLines >= 3, "hyphenLines=" + hy.signals.hyphenLines);
+check("hyphenation-rate-scored", hy.signals.hyphenRate > 0, "hyphenRate=" + hy.signals.hyphenRate);
+
+// 11. empty / whitespace -> empty
+check("empty-string", labelOf("") === "empty");
+check("whitespace-only", labelOf(" \t \n ") === "empty");
+check("null-input", labelOf(null) === "empty");
+
+// 12. EXPOSED-not-scored: letter-freq deviation is exposed but NEVER moves the label.
+// A non-English clean string (skewed letter freq) must still read prose.
+var eu = assess("Kääntäjä pyysi ystävällisesti lisää aikaa ennen kuin jatkoi työtä.");
+check("nonenglish-still-prose", eu.label === "prose", "label=" + eu.label);
+check("letterfreq-exposed", typeof eu.signals.letterFreqDevEn === "number" || eu.signals.letterFreqDevEn === null);
+
+// 13. determinism: same input -> byte-identical output (the canonicalizer self-test)
+var d1 = JSON.stringify(assess("The quick brown fox jumps over the lazy dog again."));
+var d2 = JSON.stringify(assess("The quick brown fox jumps over the lazy dog again."));
+check("determinism-byte-identical", d1 === d2);
+
+// 14. dispatch joint: array -> map; record.text -> annotate.plausibility
+var arr = plausible(["clean sentence here friend", "MÃ¼ller cafÃ©"]);
+check("dispatch-array", Array.isArray(arr) && arr.length === 2 && arr[0].label === "prose");
+var rec = plausible({ id: 7, text: "æ—¥æœ¬èªžã®ãƒ†ã‚­ã‚¹ãƒˆ"});
+check("dispatch-record", rec.id === 7 && rec.plausibility && rec.plausibility.label === "garbled");
+
+// 15. options: caller can move the bounds (like legible's readableMax/binaryMin)
+check("options-bounds", assess("MÃ¼ller cafÃ© piÃ±a colada", { garbledMin: 0.05}).label === "garbled");
+
+// --- report ---------------------------------------------------------------
+var total = pass + fail;
+process.stdout.write("plausible: " + pass + "/" + total + " passed\n");
+if (fail > 0) {
+process.stdout.write("FAILURES:\n - " + failures.join("\n - ") + "\n");
+process.exitCode = 1;
+}
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# pluck — a Loop MMT gift
+https://loopmmt.com/gifts/pluck/
+[coverage: optional · branch: gifts]
+
+Keep Only The Fields You Name select ← all gifts
+
+pluck
+
+A producer emits JSONL: one JSON object per line. pluck reads that stream and emits each record reduced to just the fields you name with --fields, in the order you named them — the SELECT of the JSONL toolkit. Narrow a wide record down to the columns you want before you fold, diff, or sink it. It is a filter on the field axis: every emitted object's fields are a subset of its input's, and nothing is added, renamed, computed, or reordered by content. A field named twice is emitted once at its first position. Same stream and same field list in, byte-identical stream out, on every machine and every run. A line that is not valid JSON is a hard error (exit 2) naming the line; a record that is not a JSON object has no field axis and is a hard error too — the deliberate divergence from a row-dropping filter. Blank lines are skipped. Zero dependencies, pure, offline; runs in Node or a browser (window.ForestGifts.pluck).
+
+The honest edge
+
+Selects TOP-LEVEL fields by exact name. NOT nested paths, does NOT rename, does NOT compute or default a missing value, does NOT reorder by content. It selects; it never transforms a value. A requested field a record lacks is simply absent from that record's output — pluck does not invent it.
+
+Run it
+
+printf '%s\n' '{"a":1,"b":2,"c":3}' | node pluck.js --fields a,c # exit 0 clean | 2 non-JSON or non-object line (named)
+test_pluck.js (24/24) + out-of-band conformance (GREEN 32/32 vs an independently-authored per-field reconstruction oracle; sig 1bfa8d85a1730a7f; mutation bite VERIFIED)
+Zero dependencies, Node or browser, deterministic
+
+The code — every file that ships
+
+pluck.js 269 lines on GitHub →
+#!/usr/bin/env node
+/* pluck.js — keep only the named fields from each record in a JSONL stream.
+Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
+
+WHAT IT IS. Give it a stream of records — one JSON object per line (JSONL) —
+and a list of field names, and it emits each record reduced to just those
+fields. It is the SELECT of the JSONL toolkit: narrow a wide record down to
+the columns you asked for, before you fold, diff, or sink it. Same stream and
+same field list in, byte-identical stream out, on every machine and every run.
+It is a FILTER on the field axis: every emitted object is a subset of its input
+object's fields — nothing is added, renamed, computed, or reordered by content.
+
+THE FIELD ORDER IS THE DECLARED ORDER (the whole determinism story). The output
+object's keys appear in the order you named them in --fields, NOT the order they
+happened to sit in the input record. So `--fields b,a` emits {"b":...,"a":...}
+regardless of how the input was written. Declaring the order — rather than
+inheriting the input's — is what makes the output a pure function of (record,
+field-list): two records that carry the same requested values, written in any
+key-order, pluck to byte-identical lines. A field named twice in --fields is
+emitted once, at its first position (duplicates in the request are idempotent).
+
+WHAT HAPPENS TO A MISSING FIELD (default vs --strict).
+- DEFAULT: a requested field the record does not carry is simply OMITTED from
+that record's output object. A missing field is not a value — it is not
+emitted as null, not as "", not as the literal key with nothing after it. A
+record that carries none of the requested fields emits an empty object {}.
+This is the honest default: pluck what is there, say nothing about what is
+not.
+- --strict: a record missing ANY requested field is a HARD ERROR (exit 2)
+naming the line and the first missing field. For callers who need every
+column present and want the stream to stop rather than emit a thin record.
+
+INPUT HONESTY (the character of this gift). A field-selector is only trustworthy
+if it refuses to quietly mishandle a line:
+- Every non-blank line must be valid JSON. A line that is not valid JSON is a
+HARD ERROR (exit 2) naming the line — never a silent skip, never passed
+through as raw text.
+- Every record must be a JSON OBJECT. You cannot pluck fields from a bare
+number, string, boolean, null, or array — there are no fields to select. A
+non-object record is a HARD ERROR (exit 2) naming the line. This is the
+deliberate divergence from a row-dropping filter: pluck's whole contract is
+field-selection, so a record with no field axis is a stop, not a passthrough.
+- --fields names TOP-LEVEL fields only (no dotted paths, no array indices).
+Selecting a nested value is out of scope by construction (see the edge).
+- Blank lines are skipped (not emitted, not counted). A trailing \r (CRLF
+files) is trimmed before parsing.
+
+THE OUTPUT IS CANONICAL. Each emitted object is re-serialized with its keys in
+the declared field order and its values canonicalized (nested object keys sorted
+recursively, array order kept), so the same requested values always serialize to
+the same bytes. Values are copied through verbatim in meaning — pluck selects,
+it never transforms a value.
+
+USAGE
+printf '%s\n' '{"a":1,"b":2,"c":3}' | node pluck.js --fields a,c
+-> {"a":1,"c":3}
+node pluck.js --fields id,name events.jsonl
+node pluck.js --fields id,name --strict < in.jsonl > out.jsonl
+node pluck.js --help
+
+Each non-blank line is one JSON object. Output is the plucked objects, one per
+line, each terminated by a newline, in input order.
+
+Exit codes: 0 success · 2 input error (missing/empty --fields, missing file, a
+directory, an unknown option, a line that is not valid JSON, a non-object
+record, or --strict on a record missing a requested field). Always a clean
+one-line message on stderr, never a stack trace.
+
+Released under MIT. Its edge is printed in the README: this selects TOP-LEVEL
+fields by exact name. It does NOT reach into nested paths (no dotted keys, no
+a.b.c), does NOT rename fields, does NOT compute or default missing values, and
+does NOT reorder by content — the output key order is exactly the --fields order.
+*/
+"use strict";
+
+// Canonical JSON: object keys sorted recursively so a value serializes to the same
+// bytes regardless of how its (nested) object keys were written. Arrays keep order.
+function canon(v) {
+if (v === null || typeof v!== "object") return JSON.stringify(v);
+if (Array.isArray(v)) {
+var parts = [];
+for (var i = 0; i < v.length; i++) parts.push(canon(v[i]));
+return "[" + parts.join(",") + "]";
+}
+var keys = Object.keys(v).sort();
+var out = [];
+for (var k = 0; k < keys.length; k++) {
+out.push(JSON.stringify(keys[k]) + ":" + canon(v[keys[k]]));
+}
+return "{" + out.join(",") + "}";
+}
+
+// Parse one input line into a JSON value, or throw a clean, line-named Error.
+function parseRecord(line, lineNo) {
+try { return JSON.parse(line);}
+catch (e) {
+throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
+}
+}
+
+// De-duplicate the requested field list, preserving first-seen order. A field
+// named twice is kept once at its first position (idempotent request).
+function normalizeFields(fields) {
+var seen = Object.create(null);
+var out = [];
+for (var i = 0; i < fields.length; i++) {
+var f = fields[i];
+if (!seen[f]) { seen[f] = true; out.push(f);}
+}
+return out;
+}
+
+// Serialize a plucked object with keys in the DECLARED field order and values
+// canonicalized. `present` is the list of requested fields this record actually
+// carries, already in declared order.
+function serializePlucked(rec, present) {
+var parts = [];
+for (var i = 0; i < present.length; i++) {
+var f = present[i];
+parts.push(JSON.stringify(f) + ":" + canon(rec[f]));
+}
+return "{" + parts.join(",") + "}";
+}
+
+// The public filter: JSONL text + {fields, strict} -> { lines: [plucked lines]}.
+// Each emitted object carries the requested fields the record has, in declared
+// order. In strict mode a record missing any requested field throws.
+function pluck(text, opts) {
+opts = opts || {};
+var fields = normalizeFields(opts.fields || []);
+var strict =!!opts.strict;
+
+var lines = String(text).split("\n");
+var out = [];
+var i, line, rec, j, f, present;
+
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line is not a record
+
+rec = parseRecord(line, i + 1);
+
+// A record must be a JSON object to have a field axis to select on.
+if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
+throw new Error("line " + (i + 1) + " is not a JSON object (cannot pluck fields from " +
+(rec === null? "null": (Array.isArray(rec)? "an array": typeof rec)) + ")");
+}
+
+present = [];
+for (j = 0; j < fields.length; j++) {
+f = fields[j];
+if (Object.prototype.hasOwnProperty.call(rec, f)) {
+present.push(f);
+} else if (strict) {
+throw new Error("line " + (i + 1) + " is missing required field " + JSON.stringify(f));
+}
+}
+
+out.push(serializePlucked(rec, present));
+}
+
+return { lines: out};
+}
+
+/* ---- exports (browser + Node) ------------------------------------ */
+if (typeof window!== "undefined") {
+window.ForestGifts = window.ForestGifts || {};
+window.ForestGifts.pluck = pluck;
+window.ForestGifts.pluckCanon = canon;
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = {
-parseMime: parseMime,
-decodeBase64: decodeBase64,
-decodeQuotedPrintable: decodeQuotedPrintable,
-decodeEncodedWords: decodeEncodedWords,
-bytesToString: bytesToString,
-parseStructured: parseStructured,
-summarize: summarize
-};
+module.exports = { pluck: pluck, canon: canon};
 }
 
-// ---- CLI (value-arg or stdin; never touches the filesystem) ----------------
-var DEMO = [
-"From: Alice <alice@example.com>",
-"To: Bob <bob@example.com>",
-"Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
-"MIME-Version: 1.0",
-"Content-Type: multipart/alternative; boundary=\"b0undary\"",
-"",
-"This preamble is ignored by MIME readers.",
-"--b0undary",
-"Content-Type: text/plain; charset=utf-8",
-"Content-Transfer-Encoding: quoted-printable",
-"",
-"Coffee costs 5=E2=82=AC. This line is soft-wrapped mid-wo=",
-"rd.",
-"--b0undary",
-"Content-Type: text/html; charset=utf-8",
-"Content-Transfer-Encoding: base64",
-"",
-"PGI+SGk8L2I+",
-"--b0undary--",
-""
-].join("\r\n");
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+function run(text, opts) {
+var r = pluck(text, opts);
+var body = r.lines.length? r.lines.join("\n") + "\n": "";
+return { out: body};
+}
+
+function main(argv) {
+var args = argv.slice(2);
+if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+process.stdout.write(
+"pluck.js — keep only the named fields from each record in a JSONL stream.\n\n" +
+" printf '%s\\n' '{\"a\":1,\"b\":2,\"c\":3}' | node pluck.js --fields a,c\n" +
+" node pluck.js --fields id,name events.jsonl\n" +
+" node pluck.js --fields id,name --strict < in > out\n" +
+" node pluck.js --help\n\n" +
+"Each non-blank line is one JSON object. --fields is a comma-separated list of\n" +
+"TOP-LEVEL field names to keep; the output key order is exactly that order. A\n" +
+"missing field is OMITTED by default, or a hard error under --strict. A record\n" +
+"that is not a JSON object is a hard error.\n\n" +
+"Edge: selects TOP-LEVEL fields by exact name. NOT nested paths (no a.b.c), does\n" +
+"NOT rename or compute fields, and does NOT reorder by content. Invalid JSON and\n" +
+"non-object records are hard errors, never a silent skip.\n"
+);
+return 0;
+}
+
+var opts = { fields: []};
+var files = [];
+var i, raw;
+try {
+for (i = 0; i < args.length; i++) {
+if (args[i] === "--fields") {
+raw = args[++i];
+if (raw === undefined || raw === "" || raw.charAt(0) === "-") {
+throw new Error("--fields requires a comma-separated list of field names");
+}
+// split on comma, trim each, drop empties (so trailing commas are tolerated)
+var wanted = [];
+var pieces = raw.split(",");
+for (var p = 0; p < pieces.length; p++) {
+var name = pieces[p].trim();
+if (name.length > 0) wanted.push(name);
+}
+if (wanted.length === 0) throw new Error("--fields lists no field names");
+opts.fields = wanted;
+}
+else if (args[i] === "--strict") { opts.strict = true;}
+else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
+else { files.push(args[i]);}
+}
+if (!opts.fields || opts.fields.length === 0) {
+throw new Error("--fields is required (a comma-separated list of field names to keep)");
+}
+} catch (e) {
+process.stderr.write("pluck: " + e.message + "\n");
+return 2;
+}
+
+function emit(text) {
+try {
+var r = run(text, opts);
+process.stdout.write(r.out);
+return 0;
+} catch (e) {
+process.stderr.write("pluck: " + e.message + "\n");
+return 2;
+}
+}
+
+if (files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(files[0], "utf8");}
+catch (e) {
+process.stderr.write("pluck: cannot read " + files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
+}
+return emit(text);
+}
+
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
+return 0;
+}
 
 if (typeof require!== "undefined" && require.main === module) {
-var args = process.argv.slice(2);
-function run(raw, label) {
-var node = parseMime(raw);
-if (label) process.stdout.write(label + "\n");
-process.stdout.write(summarize(node).join("\n") + "\n");
-process.exit(0);
+process.exitCode = main(process.argv);
 }
-if (args[0] === "--help" || args[0] === "-h") {
-process.stdout.write(
-"ratchet-inline-mime — parse a raw MIME message into a decoded tree\n\n" +
-" node ratchet-inline-mime.js --demo parse a built-in sample and print its tree\n" +
-" node ratchet-inline-mime.js '<raw mime>' parse the message given as one argument\n" +
-" cat message.eml | node ratchet-inline-mime.js parse a message piped on stdin\n\n" +
-"Prints the content-type tree with decoded leaf bodies. Exit 0. No files are read.\n");
-process.exit(0);
-}
-if (args[0] === "--demo") { run(DEMO, "# demo message");}
-else if (args.length >= 1) { run(args[0]);}
+
+test_pluck.js 152 lines on GitHub →
+#!/usr/bin/env node
+/* test_pluck.js — drift-check battery for pluck.js.
+Zero-dependency. Runs in Node: `node test_pluck.js`. Exit 0 all-pass, 1 any-fail.
+
+THE ORACLE. pluck's contract is small enough that the oracle is a set of
+hand-computed expected output lines PLUS two structural invariants checked
+mechanically on every case:
+(I1) subset: every key in an emitted object was a requested field AND was
+present in the input object (pluck never invents a field).
+(I2) declared-order: the emitted key order equals the requested field order
+(restricted to present fields) — NOT the input's key order.
+The known-bad vector is the DECLARED-ORDER tripwire: an input whose keys sit in
+a different order than --fields. A regression that inherited input order instead
+of declared order passes a naive "same set of keys" check but fails I2 — so the
+battery pins the ordering that is the whole determinism story.
+*/
+"use strict";
+
+var pluck = require("./pluck.js").pluck;
+
+var passed = 0, failed = 0;
+function check(name, got, want) {
+if (got === want) { passed++; /* console.log(" ok " + name); */}
 else {
-var chunks = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", function (d) { chunks += d;});
-process.stdin.on("end", function () { run(chunks || DEMO);});
+failed++;
+console.log("FAIL " + name);
+console.log(" want: " + JSON.stringify(want));
+console.log(" got: " + JSON.stringify(got));
 }
 }
+function checkThrows(name, fn) {
+var threw = false;
+try { fn();} catch (e) { threw = true;}
+if (threw) { passed++;}
+else { failed++; console.log("FAIL " + name + " (expected a throw, none happened)");}
+}
 
-test_ratchet-inline-mime.js 156 lines on GitHub →
-#!/usr/bin/env node
-// SPDX-License-Identifier: MIT
-/* test_ratchet-inline-mime.js — proves the parser implements its stated contract.
+function out(text, opts) {
+var r = pluck(text, opts);
+return r.lines.join("\n");
+}
 
-THE ORACLE. There is no Node stdlib that says "is this MIME parsed right?" — the
-RFCs are the spec, so the oracle is CURATED VECTORS expressed directly against
-what parseMime promises: (1) header unfolding + case-insensitive access,
-(2) Content-Type value + parameter parsing (quoted params), (3) body decode per
-Content-Transfer-Encoding (base64, quoted-printable incl. soft breaks, identity),
-(4) charset decode (utf-8 multibyte, latin1 byte-preserving), (5) multipart split
-with preamble/epilogue discarded, (6) recursive nested multipart, (7) RFC 2047
-encoded words in headers (B and Q). Plus determinism and a mutation-bite so a
-degenerate core (ignores input / constant verdict) cannot pass green.
-Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
-"use strict";
-var m = require("./ratchet-inline-mime.js");
-var parseMime = m.parseMime;
+// ---- Core selection --------------------------------------------------
+check("keep two of three fields",
+out('{"a":1,"b":2,"c":3}', { fields: ["a", "c"]}),
+'{"a":1,"c":3}');
 
-var pass = 0, fail = 0;
-function ok(label, cond) { if (cond) { pass++;} else { fail++; console.error("FAIL " + label);}}
-function eq(label, a, b) { ok(label + " (=" + JSON.stringify(b) + ")", a === b);}
-function deepEqual(a, b) { return JSON.stringify(a) === JSON.stringify(b);}
+check("single field",
+out('{"a":1,"b":2}', { fields: ["b"]}),
+'{"b":2}');
 
-var CRLF = "\r\n";
-function msg(lines) { return lines.join(CRLF);}
+check("all fields kept (identity-ish, canonical order)",
+out('{"a":1,"b":2}', { fields: ["a", "b"]}),
+'{"a":1,"b":2}');
 
-// ---- 1. headers: unfolding + case-insensitive map --------------------------
-var h = parseMime(msg([
-"Subject: a very long subject that the",
-"\tsender folded across two lines",
-"X-Mixed-Case: Value",
-"Content-Type: text/plain",
-"",
-"body"
-]));
-eq("unfolded subject", h.headers.subject, "a very long subject that the sender folded across two lines");
-eq("case-insensitive header key", h.headers["x-mixed-case"], "Value");
-eq("leaf body plain", h.body, "body");
-eq("plain is not multipart", h.isMultipart, false);
+// ---- KNOWN-BAD VECTOR: declared order, not input order ---------------
+// Input keys are b,a but --fields asks a,b -> output MUST be {"a":..,"b":..}.
+check("KNOWN-BAD: output order is declared order, not input order",
+out('{"b":2,"a":1}', { fields: ["a", "b"]}),
+'{"a":1,"b":2}');
 
-// ---- 2. Content-Type value + params (quoted) -------------------------------
-var ct = parseMime(msg([ "Content-Type: text/plain; charset=\"UTF-8\"; format=flowed", "", "x"]));
-eq("content-type lowercased", ct.contentType, "text/plain");
-eq("param charset (unquoted)", ct.contentTypeParams.charset, "UTF-8");
-eq("param format", ct.contentTypeParams.format, "flowed");
+check("KNOWN-BAD: reverse request reverses output",
+out('{"a":1,"b":2}', { fields: ["b", "a"]}),
+'{"b":2,"a":1}');
 
-// ---- 3. transfer-encodings -------------------------------------------------
-var b64 = parseMime(msg([ "Content-Type: text/plain", "Content-Transfer-Encoding: base64", "", "SGVsbG8sIHdvcmxk"]));
-eq("base64 decoded", b64.body, "Hello, world");
-eq("encoding recorded", b64.encoding, "base64");
+// ---- Missing fields: default omits -----------------------------------
+check("missing field omitted (default)",
+out('{"a":1}', { fields: ["a", "b"]}),
+'{"a":1}');
 
-var qp = parseMime(msg([ "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: quoted-printable", "", "Price: 5=E2=82=AC end"]));
-eq("quoted-printable euro", qp.body, "Price: 5\u20ac end");
+check("record carrying none of the fields -> empty object",
+out('{"x":9}', { fields: ["a", "b"]}),
+'{}');
 
-var qpSoft = parseMime(msg([ "Content-Transfer-Encoding: quoted-printable", "", "soft=", "wrap"]));
-eq("qp soft line break joins", qpSoft.body, "softwrap");
+check("missing field in the MIDDLE keeps declared order of the rest",
+out('{"a":1,"c":3}', { fields: ["a", "b", "c"]}),
+'{"a":1,"c":3}');
 
-var seven = parseMime(msg([ "Content-Type: text/plain", "", "plain 7bit text"]));
-eq("7bit identity", seven.body, "plain 7bit text");
+// ---- --strict: missing field is a hard error -------------------------
+checkThrows("strict: missing field throws", function () {
+pluck('{"a":1}', { fields: ["a", "b"], strict: true});
+});
 
-// ---- 4. charset ------------------------------------------------------------
-// utf-8 multibyte: e2 98 83 = snowman U+2603
-var utf = parseMime(msg([ "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64", "", "4piD"]));
-eq("utf-8 multibyte snowman", utf.body, "\u2603");
-// latin1: byte 0xE9 = é (byte-preserving, not utf-8)
-var latin = parseMime(msg([ "Content-Type: text/plain; charset=iso-8859-1", "Content-Transfer-Encoding: quoted-printable", "", "caf=E9"]));
-eq("latin1 byte-preserving", latin.body, "caf\u00e9");
+check("strict: all present passes",
+out('{"a":1,"b":2}', { fields: ["a", "b"], strict: true}),
+'{"a":1,"b":2}');
 
-// ---- 5. multipart split, preamble/epilogue discarded -----------------------
-var mp = parseMime(msg([
-"Content-Type: multipart/alternative; boundary=\"BND\"",
-"",
-"PREAMBLE — must be ignored",
-"--BND",
-"Content-Type: text/plain",
-"",
-"first part",
-"--BND",
-"Content-Type: text/html",
-"",
-"<p>second</p>",
-"--BND--",
-"EPILOGUE — must be ignored"
-]));
-eq("multipart flagged", mp.isMultipart, true);
-eq("part count (preamble/epilogue dropped)", mp.parts.length, 2);
-eq("part 0 body", mp.parts[0].body, "first part");
-eq("part 0 type", mp.parts[0].contentType, "text/plain");
-eq("part 1 body", mp.parts[1].body, "<p>second</p>");
-eq("part 1 type", mp.parts[1].contentType, "text/html");
-ok("multipart leaf has no body field", mp.body === undefined);
+// ---- Duplicate requested fields are idempotent -----------------------
+check("field named twice emitted once at first position",
+out('{"a":1,"b":2}', { fields: ["a", "a", "b"]}),
+'{"a":1,"b":2}');
 
-// ---- 6. nested multipart (mixed containing alternative) --------------------
-var nested = parseMime(msg([
-"Content-Type: multipart/mixed; boundary=OUT",
-"",
-"--OUT",
-"Content-Type: multipart/alternative; boundary=IN",
-"",
-"--IN",
-"Content-Type: text/plain",
-"",
-"inner text",
-"--IN--",
-"--OUT",
-"Content-Type: application/octet-stream",
-"Content-Transfer-Encoding: base64",
-"",
-"QUJD",
-"--OUT--"
-]));
-eq("outer multipart", nested.isMultipart, true);
-eq("outer part count", nested.parts.length, 2);
-eq("inner is multipart", nested.parts[0].isMultipart, true);
-eq("inner leaf body", nested.parts[0].parts[0].body, "inner text");
-eq("sibling base64 leaf", nested.parts[1].body, "ABC");
+// ---- Value fidelity + nested canonicalization ------------------------
+check("value copied verbatim (nested object canonicalized)",
+out('{"a":{"z":1,"y":2},"b":5}', { fields: ["a"]}),
+'{"a":{"y":2,"z":1}}');
 
-// ---- 7. RFC 2047 encoded words in headers ----------------------------------
-var ew = parseMime(msg([
-"Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
-"From: =?utf-8?Q?Andr=C3=A9?= <a@x.io>",
-"Content-Type: text/plain",
-"",
-"x"
-]));
-eq("encoded-word B subject", ew.headers.subject, "Hello, \u20ac");
-eq("encoded-word Q from", ew.headers.from, "Andr\u00e9 <a@x.io>");
-eq("Q underscore is space", m.decodeEncodedWords("=?utf-8?Q?a_b?="), "a b");
+check("array value order preserved (not sorted)",
+out('{"a":[3,1,2],"b":0}', { fields: ["a"]}),
+'{"a":[3,1,2]}');
 
-// ---- direct codec probes ---------------------------------------------------
-eq("decodeBase64 -> bytes", m.bytesToString(m.decodeBase64("QUJD"), "ascii"), "ABC");
-eq("base64 tolerates newlines", m.bytesToString(m.decodeBase64("QU\nJD"), "ascii"), "ABC");
-eq("base64 missing padding", m.bytesToString(m.decodeBase64("QUJDRA"), "ascii"), "ABCD");
+check("null / bool / string values kept",
+out('{"a":null,"b":true,"c":"hi","d":0}', { fields: ["a", "b", "c"]}),
+'{"a":null,"b":true,"c":"hi"}');
 
-// ---- determinism -----------------------------------------------------------
-ok("parse is deterministic", deepEqual(parseMime(mp === mp? msg([
-"Content-Type: multipart/mixed; boundary=Z", "", "--Z", "Content-Type: text/plain", "", "a", "--Z--"
-]): ""), parseMime(msg([
-"Content-Type: multipart/mixed; boundary=Z", "", "--Z", "Content-Type: text/plain", "", "a", "--Z--"
-]))));
+// ---- Multi-line stream, order preserved ------------------------------
+check("multi-record stream keeps input order",
+out('{"id":1,"x":9}\n{"id":2,"x":8}\n{"id":3,"x":7}', { fields: ["id"]}),
+'{"id":1}\n{"id":2}\n{"id":3}');
 
-// ---- mutation-bite: the core must actually discriminate --------------------
-// A parser that ignored its input, or hard-coded a verdict, would collapse these.
-ok("bite: multipart vs simple differ", parseMime("Content-Type: multipart/x; boundary=b\r\n\r\n--b\r\n\r\nq\r\n--b--").isMultipart!==
-parseMime("Content-Type: text/plain\r\n\r\nq").isMultipart);
-ok("bite: base64 body!= its raw", (function () {
-var n = parseMime("Content-Transfer-Encoding: base64\r\n\r\nSGk=");
-return n.body === "Hi" && n.bodyRaw!== "Hi";
-})());
-ok("bite: distinct headers -> distinct values",
-parseMime("Subject: one\r\n\r\n").headers.subject!== parseMime("Subject: two\r\n\r\n").headers.subject);
+// ---- Blank + CRLF handling -------------------------------------------
+check("blank lines skipped",
+out('{"a":1}\n\n{"a":2}\n', { fields: ["a"]}),
+'{"a":1}\n{"a":2}');
 
-console.log("\nratchet-inline-mime: " + pass + " passed, " + fail + " failed" +
-" (header unfold + params + base64/QP/7bit + utf-8/latin1 + multipart split + " +
-"nested + RFC2047 B/Q + codec probes + determinism + mutation-bite)");
-process.exit(fail === 0? 0: 1);
+check("CRLF trailing \\r trimmed before parse",
+out('{"a":1}\r\n{"a":2}\r', { fields: ["a"]}),
+'{"a":1}\n{"a":2}');
+
+// ---- Input honesty: non-object records are hard errors ---------------
+checkThrows("bare number record throws", function () {
+pluck('42', { fields: ["a"]});
+});
+checkThrows("bare string record throws", function () {
+pluck('"hello"', { fields: ["a"]});
+});
+checkThrows("array record throws", function () {
+pluck('[1,2,3]', { fields: ["a"]});
+});
+checkThrows("null record throws", function () {
+pluck('null', { fields: ["a"]});
+});
+checkThrows("invalid JSON throws", function () {
+pluck('{"a":1', { fields: ["a"]});
+});
+
+// ---- Determinism: folds-twice-identical ------------------------------
+(function () {
+var input = '{"b":2,"a":1,"c":3}\n{"c":30,"a":10}\n{"z":99}';
+var opts = { fields: ["a", "b"]};
+var r1 = out(input, opts);
+var r2 = out(input, opts);
+check("determinism: two runs byte-identical", r1, r2);
+})();
+
+// ---- Empty-fields guard is a library concern? (CLI enforces; lib tolerant) ----
+check("empty fields list yields empty objects (lib-level; CLI blocks this)",
+out('{"a":1}', { fields: []}),
+'{}');
+
+console.log("\npluck battery: " + passed + " passed, " + failed + " failed");
+process.exit(failed === 0? 0: 1);
 
 Take the whole folder →
 MIT
-Node / browser, no dependencies
-
----
-
-# PDF Dictionary-Text Extractor — a Loop MMT gift
-https://loopmmt.com/gifts/ratchet-pdf-dict/
-[coverage: optional · branch: gifts]
-
-What Text Does This PDF Store? transform ← all gifts
-
-PDF Dictionary-Text Extractor
-
-Pull the text a PDF STORES but never draws — the AcroForm field values (/V) and annotation notes (/Contents) that a content-stream extractor skips — with no dependencies, in Node or the browser. parsePdfDict(bytes) validates the %PDF- header, walks the indirect objects, and decodes literal () and hex < > strings, resolving a one-level indirect /V and pairing each value with its /T field name. The companion to ratchet-pdf-text: that reads the drawn text, this reads the dictionary text — together, every text surface in a PDF.
-
-The honest edge
-
-It splits its contract by scale, on purpose: document-level failure (not a PDF, bad input) THROWS like its ratchet-pdf-text twin, but a single malformed value is RECORDED as {malformed, reason} and the walk continues rather than losing the good fields after it — a malformed value is stamped, never returned as clean. It reads the TOP-LEVEL dictionary of each object: a /V or /Contents in a nested sub-dict, or a value inherited through /Kids, is not a target. It resolves an indirect /V one level only. It returns the string as WRITTEN — no /Encoding or /ToUnicode CMap mapping, correct for WinAnsi and honestly wrong for a subsetted CID font. It does not decrypt, decode /ObjStm or xref streams, or repair a broken file.
-
-Run it
-
-node ratchet-pdf-dict.js form.pdf
-test_ratchet-pdf-dict.js (14/14: hand-built PDF byte fixtures with out-of-band oracles — field /V + /T name, annotation /Contents, the /Contents page-ref disambiguation, one-level indirect-ref resolution, hex + escaped-literal decode, malformed-value-recorded-walk-continues, the /TU opt-in flag, a widget carrying both surfaces, 2 ratchet-refusal cases)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-ratchet-pdf-dict.js 354 lines on GitHub →
-#!/usr/bin/env node
-/* ratchet-pdf-dict.js — a pure, dependency-free, STRICT extractor of the text a
-PDF carries in its OBJECT DICTIONARIES rather than its content streams: the
-AcroForm field values (/V) and annotation notes (/Contents) that a content-
-stream extractor deliberately skips. The companion to ratchet-pdf-text. Runs
-identically in a browser and in Node (no DOM, no dependencies).
-
-WHY THIS EXISTS. ratchet-pdf-text pulls the text a PDF *draws* — the operands
-of Tj/TJ operators inside content streams. But a PDF also carries text that is
-never drawn into a stream: the value a user typed into a form field lives in
-that field's /V entry, and the note behind a sticky annotation lives in that
-annotation's /Contents entry. Those are dictionary entries on indirect objects
-that are NOT stream-adjacent, so ratchet's stream scan never sees them. This
-tool walks the indirect objects and pulls exactly those two text surfaces.
-Together the two tools cover every text surface in a PDF, honestly.
-
-WHAT "RATCHET" MEANS HERE (the same posture as the twin, at the RIGHT scale).
-ratchet-pdf-text extracts ONE content stream as a whole, so any malformed byte
-is a thrown Error — correct for a single-shot read. This tool walks MANY
-indirect objects, so it splits the contract across two levels, deliberately:
-• DOCUMENT level — throws. Input that is not a Uint8Array/ArrayBuffer, or a
-buffer with no `%PDF-` header, is a thrown Error. If it isn't a PDF at all,
-you get told, not a guess.
-• OBJECT level — records, does not throw. A single malformed value (an
-unterminated string, a bad hex byte) does not abort the walk and lose the
-200 good fields after it. It is emitted as an explicit `{ malformed:true,
-reason}` record and the walk continues. This KEEPS ratchet's real vow —
-"never hand back a guess as if it were clean text" — because a malformed
-value is STAMPED malformed, never returned as clean. The string tokenizer
-itself still throws on an unterminable token (you genuinely cannot know
-where it ends); the walk catches that at the object boundary and records it.
-
-THE /Contents DISAMBIGUATION (the load-bearing correctness choice). The key
-`/Contents` names TWO unrelated things: an annotation's text (a string) AND a
-page's content-stream pointer (an indirect reference, `12 0 R`). This tool
-pulls `/Contents` ONLY when its value is a string, and skips it when the value
-is a reference — so a page's content pointer is never mistaken for annotation
-text. The disambiguation is by VALUE TYPE, not by trying to classify the object.
-
-WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
-• Field values — a /V entry whose value is a string (literal `()` with
-escapes or hex `< >`), paired with the field's /T partial name as the
-record `name`. A /V given as an indirect reference to a string object is
-resolved one level and reported with encoding "ref".
-• Annotation text — a /Contents entry whose value is a string.
-• Field labels — a /TU (user-facing) entry, ONLY when you pass
-`{ labels:true}`. Off by default: the covenant is field values + notes;
-labels are an opt-in surface, named here so their absence isn't a surprise.
-• Records carry their provenance so nothing is hidden:
-{ obj:"<num> <gen>", kind:"field"|"annotation"|"label",
-key:"V"|"Contents"|"TU", name:<string|null>, text:<string>,
-encoding:"literal"|"hex"|"ref"}
-Malformed values are surfaced separately:
-{ obj, key, malformed:true, reason:<string>}
-
-WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
-It does not decrypt encrypted PDFs, decode object streams (/ObjStm) or
-compressed cross-reference streams, or resolve field hierarchies through
-/Kids (it reads /V where it sits, not inherited values). It reads the
-top-level dictionary of each indirect object — a /V or /Contents buried in a
-nested sub-dictionary is an honest edge, not a target. It does not map
-character codes through /Encoding or /ToUnicode CMaps — it returns the string
-as written, correct for the common WinAnsi case and honestly wrong for a
-subsetted CID font. It does not repair a broken file.
-
-API
-parsePdfDict(bytes[, options]) -> { records: Array<Record>, text: string,
-malformed: Array<Record>}
-`bytes` a Uint8Array (a Node Buffer is one) or an ArrayBuffer.
-`options.labels` optional bool; when true, also pull /TU field labels.
-`.records` the clean text records, in object order (possibly empty).
-`.text` `.records` texts joined with "\n" — the quick "give me the
-dictionary text" answer.
-`.malformed` the per-object malformed records (possibly empty).
-THROWS an Error only on document-level failure (bad input type, no header).
-
-Pure function of its input. Same code in a browser
-(window.LoopGifts.parsePdfDict) or Node (this CLI / require()).
-
-USAGE
-node ratchet-pdf-dict.js form.pdf # prints the dictionary text
-node ratchet-pdf-dict.js --records form.pdf # one provenance line per record
-node ratchet-pdf-dict.js --labels form.pdf # also include /TU labels
-node ratchet-pdf-dict.js --help
-*/
-(function (root, factory) {
-var api = factory();
-if (typeof module === "object" && module.exports) module.exports = api;
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.parsePdfDict = api.parsePdfDict;
-}
-root.__ratchetPdfDict = api;
-})(typeof globalThis!== "undefined"? globalThis: this, function () {
-"use strict";
-
-// ---- byte helpers (shared posture with ratchet-pdf-text) ----------------
-function toU8(bytes) {
-if (bytes instanceof Uint8Array) return bytes;
-if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
-if (bytes && bytes.buffer instanceof ArrayBuffer)
-return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
-throw new Error("ratchet-pdf-dict: input must be a Uint8Array or ArrayBuffer");
-}
-function latin1(u8, start, end) {
-var s = "";
-for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
-return s;
-}
-function isWS(c) {
-return c === " " || c === "\n" || c === "\r" || c === "\t" || c === "\f" || c === "\0";
-}
-
-// ---- string tokenizer (copied verbatim from ratchet-pdf-text; the reuse
-// core the RCR named — literal `()` with escapes/octal, hex `< >`) -----
-function decodeLiteral(s, i) {
-// s[i] === '(' has already been consumed by the caller; parse from i.
-var out = "", depth = 0, N = s.length;
-for (; i < N; i++) {
-var c = s[i];
-if (c === "\\") {
-var nx = s[i + 1];
-if (nx === "n") { out += "\n"; i++;}
-else if (nx === "r") { out += "\r"; i++;}
-else if (nx === "t") { out += "\t"; i++;}
-else if (nx === "b") { out += "\b"; i++;}
-else if (nx === "f") { out += "\f"; i++;}
-else if (nx === "(") { out += "("; i++;}
-else if (nx === ")") { out += ")"; i++;}
-else if (nx === "\\") { out += "\\"; i++;}
-else if (nx >= "0" && nx <= "7") {
-var oct = nx; i++;
-for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
-out += String.fromCharCode(parseInt(oct, 8) & 0xff);
-} else if (nx === "\n") { i++;}
-else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
-else { out += nx; i++;}
-} else if (c === "(") { depth++; out += c;}
-else if (c === ")") {
-if (depth === 0) return [out, i + 1];
-depth--; out += c;
-} else out += c;
-}
-throw new Error("ratchet-pdf-dict: unterminated literal string");
-}
-function decodeHex(s, i) {
-// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
-var hex = "", N = s.length;
-for (i = i + 1; i < N; i++) {
-var c = s[i];
-if (c === ">") {
-if (hex.length % 2 === 1) hex += "0";
-var out = "";
-for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
-return [out, i + 1];
-}
-if (/[0-9a-fA-F]/.test(c)) hex += c;
-else if (/\s/.test(c)) { /* skip */}
-else throw new Error("ratchet-pdf-dict: bad character in hex string");
-}
-throw new Error("ratchet-pdf-dict: unterminated hex string");
-}
-
-// ---- indirect-object scan (structure-tolerant, xref-free) ---------------
-// Scan for `N M obj... endobj` blocks. We do NOT trust the xref table; we
-// read each object's top-level dictionary directly. This is the new surface
-// ratchet-pdf-text never walks (it only reads the dict that precedes a stream).
-var OBJ_HEAD = /(\d+)\s+(\d+)\s+obj\b/g;
-function collectObjects(u8) {
-var full = latin1(u8, 0, u8.length);
-var objs = [], map = {}, m;
-OBJ_HEAD.lastIndex = 0;
-while ((m = OBJ_HEAD.exec(full))!== null) {
-var num = m[1], gen = m[2];
-var bodyStart = m.index + m[0].length;
-var endIdx = full.indexOf("endobj", bodyStart);
-var bodyEnd = endIdx < 0? full.length: endIdx; // tolerate a missing endobj
-var body = full.slice(bodyStart, bodyEnd);
-var rec = { num: num, gen: gen, id: num + " " + gen, body: body};
-objs.push(rec);
-map[rec.id] = rec; // last-wins on a duplicated object number (updated PDFs)
-if (endIdx >= 0) OBJ_HEAD.lastIndex = endIdx + 6;
-}
-return { objs: objs, map: map};
-}
-
-// The top-level dictionary region of an object body: the first depth-matched
-// `<<... >>`. Restricting to this avoids matching a `/V (...)` that appears
-// inside a stream's binary content or as ASCII noise after `endobj`.
-function dictRegion(body) {
-var start = body.indexOf("<<");
-if (start < 0) return body; // some indirect objects are a bare value (e.g. a string)
-var depth = 0, i = start;
-for (; i < body.length - 1; i++) {
-if (body[i] === "<" && body[i + 1] === "<") { depth++; i++;}
-else if (body[i] === ">" && body[i + 1] === ">") { depth--; i++; if (depth === 0) return body.slice(start, i + 1);}
-}
-return body.slice(start); // unbalanced dict — hand back what we have; the value read is bounded
-}
-
-// Find the value token that follows `/<name>` at the TOP level of `region`.
-// Returns { kind:"string"|"hex"|"ref"|"name"|"other"|"none", value,...}.
-function readKeyValue(region, key) {
-// Match the key as a full token (not a prefix of a longer key like /VE).
-var re = new RegExp("/" + key + "(?![A-Za-z0-9])");
-var km = re.exec(region);
-if (!km) return { kind: "none"};
-var i = km.index + km[0].length;
-var N = region.length;
-while (i < N && isWS(region[i])) i++;
-if (i >= N) return { kind: "none"};
-var c = region[i];
-if (c === "(") {
-var lit = decodeLiteral(region, i + 1); // may throw -> caught by caller (object level)
-return { kind: "string", value: lit[0], encoding: "literal"};
-}
-if (c === "<" && region[i + 1]!== "<") {
-var hx = decodeHex(region, i); // may throw -> caught by caller
-return { kind: "string", value: hx[0], encoding: "hex"};
-}
-if (c === "<" && region[i + 1] === "<") return { kind: "other"}; // value is a sub-dict
-if (c === "/") return { kind: "name"};
-if (c === "[") return { kind: "other"};
-// number, or an indirect reference `N M R`
-var rest = region.slice(i);
-var refM = /^(\d+)\s+(\d+)\s+R\b/.exec(rest);
-if (refM) return { kind: "ref", value: refM[1] + " " + refM[2]};
-if (/^-?\d/.test(rest)) return { kind: "other"}; // a plain number
-return { kind: "other"};
-}
-
-// Resolve one level: given a ref id "N M", find that object and, if its body is
-// (or begins with) a bare string, decode it. Returns { value, encoding} or null.
-function resolveRefString(map, id) {
-var target = map[id];
-if (!target) return null;
-var body = target.body;
-var i = 0, N = body.length;
-while (i < N && isWS(body[i])) i++;
-if (body[i] === "(") { var lit = decodeLiteral(body, i + 1); return { value: lit[0], encoding: "ref"};}
-if (body[i] === "<" && body[i + 1]!== "<") { var hx = decodeHex(body, i); return { value: hx[0], encoding: "ref"};}
-return null; // referenced object is not a bare string — out of one-level scope
-}
-
-// ---- top-level ----------------------------------------------------------
-function parsePdfDict(bytes, options) {
-options = options || {};
-var u8 = toU8(bytes); // throws on bad input type (document level)
-if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
-throw new Error("ratchet-pdf-dict: not a PDF (missing %PDF- header)");
-
-var scan = collectObjects(u8);
-var records = [], malformed = [], texts = [];
-
-for (var o = 0; o < scan.objs.length; o++) {
-var obj = scan.objs[o];
-var region = dictRegion(obj.body);
-
-// The field's partial name (/T) — the record key for a /V value.
-var name = null;
-try {
-var t = readKeyValue(region, "T");
-if (t.kind === "string") name = t.value;
-} catch (e) { /* a malformed /T is not itself a text surface — leave name null */}
-
-// /V — field value.
-pullTextKey(region, obj, "V", "field", name, scan.map, records, texts, malformed);
-// /Contents — annotation text ONLY when the value is a string (a ref is a
-// page's content-stream pointer; skipped by the value-type disambiguation).
-pullTextKey(region, obj, "Contents", "annotation", null, scan.map, records, texts, malformed);
-// /TU — field label, opt-in only.
-if (options.labels)
-pullTextKey(region, obj, "TU", "label", name, scan.map, records, texts, malformed);
-}
-
-return { records: records, text: texts.join("\n"), malformed: malformed};
-}
-
-function pullTextKey(region, obj, key, kind, name, map, records, texts, malformed) {
-var kv;
-try {
-kv = readKeyValue(region, key);
-} catch (e) {
-malformed.push({ obj: obj.id, key: key, malformed: true, reason: e.message});
-return;
-}
-if (kv.kind === "string") {
-records.push({ obj: obj.id, kind: kind, key: key, name: name, text: kv.value, encoding: kv.encoding});
-if (kv.value) texts.push(kv.value);
-} else if (kv.kind === "ref") {
-// Only /V resolves a ref to a string. A /Contents ref is a page content
-// pointer — the disambiguation says skip it.
-if (key!== "V") return;
-var r;
-try { r = resolveRefString(map, kv.value);}
-catch (e) { malformed.push({ obj: obj.id, key: key, malformed: true, reason: e.message}); return;}
-if (r) {
-records.push({ obj: obj.id, kind: kind, key: key, name: name, text: r.value, encoding: r.encoding});
-if (r.value) texts.push(r.value);
-}
-}
-// name / other / none -> not a text surface; nothing recorded.
-}
-
-return { parsePdfDict: parsePdfDict};
-});
-
-// ---- CLI (Node only) ------------------------------------------------------
-if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
-var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfDict;
-var args = process.argv.slice(2);
-if (!args.length || args.indexOf("--help")!== -1) {
-process.stdout.write(
-"ratchet-pdf-dict — strict, zero-dep PDF dictionary-text extractor (/V + annotation /Contents)\n" +
-" node ratchet-pdf-dict.js form.pdf print the dictionary text\n" +
-" node ratchet-pdf-dict.js --records form.pdf one provenance line per record\n" +
-" node ratchet-pdf-dict.js --labels form.pdf also include /TU field labels\n" +
-" node ratchet-pdf-dict.js --help\n"
-);
-process.exit(0);
-}
-var recordsMode = false, labels = false, file = null;
-for (var i = 0; i < args.length; i++) {
-if (args[i] === "--records") recordsMode = true;
-else if (args[i] === "--labels") labels = true;
-else file = args[i];
-}
-try {
-if (!file) throw new Error("no input file");
-var fs = require("fs");
-var buf = fs.readFileSync(file);
-var res = api.parsePdfDict(buf, { labels: labels});
-if (recordsMode) {
-res.records.forEach(function (r) {
-process.stdout.write(
-"obj " + r.obj + "\tkind=" + r.kind + "\tkey=/" + r.key +
-"\tname=" + (r.name === null? "-": JSON.stringify(r.name)) +
-"\tenc=" + r.encoding + "\ttextLen=" + r.text.length + "\n"
-);
-});
-res.malformed.forEach(function (r) {
-process.stderr.write("obj " + r.obj + "\tkey=/" + r.key + "\tMALFORMED — " + r.reason + "\n");
-});
-} else {
-process.stdout.write(res.text + (res.text? "\n": ""));
-}
-process.exit(0);
-} catch (e) {
-var msg = e && e.message? e.message: String(e);
-if (msg.indexOf("ratchet-pdf-dict:")!== 0) msg = "ratchet-pdf-dict: " + msg;
-process.stderr.write(msg + "\n");
-process.exit(1);
-}
-}
-
-test_ratchet-pdf-dict.js 167 lines on GitHub →
-#!/usr/bin/env node
-/* test_ratchet-pdf-dict.js — known-answer battery for ratchet-pdf-dict.
-
-The oracle is OUT OF BAND: every expected value below is a literal fact written
-by hand, never the output of a second PDF parser. Each PDF fixture is assembled
-from raw bytes so the expected records are known by construction. No zlib, no
-dependencies — dictionary text is not compressed, so no inflater is needed.
-
-Run: node test_ratchet-pdf-dict.js (exit 0 = all pass, nonzero = failure)
-*/
-"use strict";
-var assert = require("assert");
-var { parsePdfDict} = require("./ratchet-pdf-dict.js");
-
-var pass = 0, fail = 0;
-function ok(name, fn) {
-try { fn(); pass++; console.log(" ok " + name);}
-catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
-}
-function bytes(str) { return Buffer.from(str, "latin1");}
-
-// Wrap a set of object bodies into a minimal, header-correct PDF. Structure is
-// spartan on purpose — the extractor is xref-free and scans for `N M obj`.
-function pdf(objs) { return bytes("%PDF-1.7\n" + objs.join("\n") + "\n%%EOF\n");}
-
-// ---- 1. a text field: /V value paired with its /T name -------------------
-ok("1 text field /V + /T name", function () {
-var doc = pdf(["12 0 obj\n<< /FT /Tx /T (fullname) /V (John Smith) >>\nendobj"]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 1); // ORACLE: exactly one
-assert.strictEqual(r.records[0].kind, "field");
-assert.strictEqual(r.records[0].key, "V");
-assert.strictEqual(r.records[0].name, "fullname");
-assert.strictEqual(r.records[0].text, "John Smith");
-assert.strictEqual(r.records[0].encoding, "literal");
-assert.strictEqual(r.malformed.length, 0);
-});
-
-// ---- 2. an annotation: /Contents string ----------------------------------
-ok("2 annotation /Contents string", function () {
-var doc = pdf(["5 0 obj\n<< /Type /Annot /Subtype /Text /Contents (A sticky note) >>\nendobj"]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 1);
-assert.strictEqual(r.records[0].kind, "annotation");
-assert.strictEqual(r.records[0].key, "Contents");
-assert.strictEqual(r.records[0].name, null);
-assert.strictEqual(r.records[0].text, "A sticky note");
-});
-
-// ---- 3. the /Contents disambiguation: a PAGE content ref is NOT text ------
-ok("3 page /Contents ref is skipped (not annotation text)", function () {
-var doc = pdf([
-"3 0 obj\n<< /Type /Page /Contents 4 0 R /MediaBox [0 0 612 792] >>\nendobj",
-"4 0 obj\n<< /Length 20 >>\nstream\nBT (drawn) Tj ET\nendstream\nendobj"
-]);
-var r = parsePdfDict(doc);
-// Neither object yields a dictionary-text record: obj 3's /Contents is a ref
-// (page content pointer), obj 4 has no /V or string /Contents.
-assert.strictEqual(r.records.length, 0); // ORACLE: the trap
-assert.strictEqual(r.malformed.length, 0);
-});
-
-// ---- 4. an indirect /V reference is resolved one level -------------------
-ok("4 indirect /V ref resolved to a string object", function () {
-var doc = pdf([
-"12 0 obj\n<< /FT /Tx /T (comment) /V 9 0 R >>\nendobj",
-"9 0 obj\n(deferred value)\nendobj"
-]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 1);
-assert.strictEqual(r.records[0].text, "deferred value");
-assert.strictEqual(r.records[0].encoding, "ref"); // provenance is honest
-assert.strictEqual(r.records[0].name, "comment");
-});
-
-// ---- 5. a hex-string value decodes ---------------------------------------
-ok("5 hex-string /V value", function () {
-var doc = pdf(["7 0 obj\n<< /T (code) /V <48656C6C6F> >>\nendobj"]); // "Hello"
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 1);
-assert.strictEqual(r.records[0].text, "Hello");
-assert.strictEqual(r.records[0].encoding, "hex");
-});
-
-// ---- 6. literal escapes: balanced parens and \( \) ------------------------
-ok("6 literal escapes decode", function () {
-var doc = pdf(["8 0 obj\n<< /T (note) /V (a \\(b\\) c) >>\nendobj"]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records[0].text, "a (b) c"); // ORACLE by hand
-});
-
-// ---- 7. a malformed value is RECORDED, and the walk CONTINUES -------------
-ok("7 malformed /V is recorded, walk continues (two-level contract)", function () {
-var doc = pdf([
-"1 0 obj\n<< /T (bad) /V (unterminated string >>\nendobj", // no closing)
-"2 0 obj\n<< /T (good) /V (survivor) >>\nendobj"
-]);
-var r = parsePdfDict(doc);
-// The good field after the bad one is still extracted — the walk did NOT abort.
-var texts = r.records.map(function (x) { return x.text;});
-assert.ok(texts.indexOf("survivor")!== -1, "good field survived the malformed one");
-assert.strictEqual(r.malformed.length, 1); // the bad one is stamped
-assert.strictEqual(r.malformed[0].obj, "1 0");
-assert.ok(/unterminated/.test(r.malformed[0].reason));
-});
-
-// ---- 8. NOT a PDF throws (document-level, ratchet parity) -----------------
-ok("8 missing %PDF- header throws", function () {
-assert.throws(function () { parsePdfDict(bytes("<< /V (x) >>"));}, /not a PDF/);
-});
-
-// ---- 9. bad input type throws --------------------------------------------
-ok("9 non-buffer input throws", function () {
-assert.throws(function () { parsePdfDict("a string, not bytes");}, /Uint8Array or ArrayBuffer/);
-});
-
-// ---- 10. an empty/field-less PDF yields no records, no throw --------------
-ok("10 no dictionary text -> empty records, no throw", function () {
-var doc = pdf(["1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj"]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.records.length, 0);
-assert.strictEqual(r.text, "");
-});
-
-// ---- 11. /TU labels are OFF by default, ON with {labels:true} -------------
-ok("11 /TU label gated behind options.labels", function () {
-var doc = pdf(["4 0 obj\n<< /T (dob) /TU (Date of birth) /V (1978) >>\nendobj"]);
-var off = parsePdfDict(doc);
-assert.strictEqual(off.records.length, 1); // only /V, not /TU
-assert.strictEqual(off.records[0].text, "1978");
-var on = parsePdfDict(doc, { labels: true});
-var labels = on.records.filter(function (x) { return x.kind === "label";});
-assert.strictEqual(labels.length, 1);
-assert.strictEqual(labels[0].text, "Date of birth");
-assert.strictEqual(labels[0].name, "dob");
-});
-
-// ---- 12. one object with BOTH /V and /Contents yields two records ---------
-ok("12 widget with /V and /Contents -> field + annotation records", function () {
-var doc = pdf(["6 0 obj\n<< /Subtype /Widget /T (sig) /V (signed) /Contents (tooltip) >>\nendobj"]);
-var r = parsePdfDict(doc);
-var kinds = r.records.map(function (x) { return x.kind;}).sort();
-assert.deepStrictEqual(kinds, ["annotation", "field"]); // both surfaces pulled
-assert.strictEqual(r.records.length, 2);
-});
-
-// ---- 13..text joins record texts in order --------------------------------
-ok("13.text joins records with newline, in object order", function () {
-var doc = pdf([
-"1 0 obj\n<< /T (a) /V (one) >>\nendobj",
-"2 0 obj\n<< /Subtype /Text /Contents (two) >>\nendobj"
-]);
-var r = parsePdfDict(doc);
-assert.strictEqual(r.text, "one\ntwo"); // ORACLE by construction
-});
-
-// ---- 14. /VE (a longer key) is NOT mistaken for /V ------------------------
-ok("14 key match is a full token, /VE does not match /V", function () {
-var doc = pdf(["1 0 obj\n<< /VE [ (a)] /V (real) >>\nendobj"]);
-var r = parsePdfDict(doc);
-// Only the real /V string is pulled; /VE (an array) is not a /V match.
-assert.strictEqual(r.records.length, 1);
-assert.strictEqual(r.records[0].text, "real");
-});
-
-console.log("\n" + pass + " passed, " + fail + " failed");
-process.exit(fail? 1: 0);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
-
----
-
-# PDF Text Extractor — a Loop MMT gift
-https://loopmmt.com/gifts/ratchet-pdf-text/
-[coverage: optional · branch: gifts]
-
-What Text Does This PDF Draw? transform ← all gifts
-
-PDF Text Extractor
-
-Pull the visible text out of a PDF's content streams — the operands of the Tj, TJ, ', and " text-showing operators — with no dependencies, in Node or the browser. parsePdfText(bytes) validates the %PDF- header, scans for stream/endstream objects, and decodes literal (), hex < >, and TJ-array strings in stream order. Like its ratchet-png-text and exif-parser siblings it validates structure before it trusts it — a lying /Length past the buffer or a stream without endstream throws rather than reading a truncated value.
-
-The honest edge
-
-It returns the string operands as WRITTEN — it does NOT map character codes through a font's /Encoding or /ToUnicode CMap, so it is correct for the common WinAnsi/standard-font case and honestly wrong for a subsetted CID font (glyph-index bytes, not characters). It gives drawn strings in stream order, not a visual reflow — no positional layout or reading-order reconstruction. FlateDecode content is the common case and zlib inflate is not in the browser's zero-dep surface, so a compressed stream is SURFACED as raw bytes and decoded only if you pass an inflate function (Node: zlib.inflateSync; browser: pako) — never faked. It does not decode /ObjStm, xref streams, encryption, or images; malformed input throws.
-
-Run it
-
-node ratchet-pdf-text.js doc.pdf
-test_ratchet-pdf-text.js (18/18: hand-constructed PDF byte vectors with out-of-band oracles — Tj/TJ/hex/octal/nested-paren/escape decode, FlateDecode round-trip via node zlib, without-inflater surfacing, ArrayBuffer input, 4 ratchet-refusal cases)
-Node / browser, no dependencies
-
-The code — every file that ships
-
-ratchet-pdf-text.js 381 lines on GitHub →
-#!/usr/bin/env node
-/* ratchet-pdf-text.js — a pure, dependency-free, STRICT extractor of the text
-drawn by a PDF's content streams. Runs identically in a browser and in Node
-(no DOM, no dependencies).
-
-WHY THIS EXISTS. A PDF carries its visible text inside content streams — most
-often zlib/FlateDecode-compressed — as a sequence of text-showing operators
-(Tj, TJ, ', ") applied to string operands. You have the file's bytes (an
-upload, a fetch, a Buffer) and you want that text without pulling in a full
-PDF engine that also parses fonts, xref tables, encryption, and page trees you
-don't care about. The usual answer is a heavy library, or a hand-rolled regex
-that trusts the file and hands you garbage out of a stream it never validated.
-
-WHAT "RATCHET" MEANS HERE. This is a ratchet parser: it advances one structure
-at a time and REFUSES to move past anything malformed. It validates the
-`%PDF-` header; for every `stream... endstream` object it checks the delimiter
-shape; when a stream declares a /Length it is honoured and a run past the end
-of the buffer is a thrown Error, never a silently-truncated read. A content
-stream whose operator syntax is broken (an unbalanced string, a array/dict that
-never closes) is a thrown Error, not a best-effort guess. A parser that hands
-you text from a stream it could not actually parse is lying about what the file
-says; this one won't.
-
-THE COMPRESSION BOUNDARY (the load-bearing honesty choice — same as the PNG
-text twin). Almost every real PDF content stream is FlateDecode-compressed, and
-zlib inflate is NOT in the browser's synchronous, dependency-free surface. So
-the core stays DOM-free and zero-dependency and SURFACES each compressed stream
-as raw bytes; the text inside it is decoded ONLY if you pass an `inflate`
-function in the options. This is deliberate:
-Node: { inflate: require("zlib").inflateSync} (the CLI wires this)
-browser: { inflate: pako.inflate} or any (Uint8Array)->Uint8Array
-Without an inflater, a FlateDecode stream is reported with its compressed bytes
-on the entry and `text:null` and `needsInflate:true` — never faked. An
-UNCOMPRESSED content stream (no /Filter) is decoded directly, inflater or not.
-
-WHAT IT EXTRACTS (the whole contract — a parser that hides its scope lies):
-• Content-stream text — the operands of Tj / TJ / ' / " operators inside each
-content stream, in stream order, concatenated per stream. Literal strings
-`(...)` (with \\ escapes and \\ddd octal) and hex strings `<... >` are
-both decoded. TJ arrays keep only their string elements (numeric kerning
-adjustments are dropped, as they carry no glyphs).
-• Per-stream entries carry the decode provenance so nothing is hidden:
-{ index, filter, compressed:<bool>, needsInflate:<bool>,
-text:<string|null>, compressedBytes?:Uint8Array, rawLength}
-
-WHAT IT DOES NOT DO (stated on purpose — see the README's "edge"):
-It does not map character codes through font /Encoding or /ToUnicode CMaps —
-it returns the string operands as written, which is correct plain text for
-the common WinAnsi/standard-font case and is honestly wrong for a subsetted
-CID font (the README says so). It does not decode object streams (/ObjStm),
-cross-reference streams, encryption, or images. It does not inflate on its own
-(pass `inflate`). It does not repair a broken file. It does not lay out text
-positionally — it gives you the drawn strings in stream order, not a visual
-reflow.
-
-API
-parsePdfText(bytes[, options]) -> { streams: Array<Entry>, text: string}
-`bytes` a Uint8Array (a Node Buffer is a Uint8Array) or an ArrayBuffer.
-`options.inflate` optional (compressedBytes: Uint8Array) => Uint8Array,
-used to decode FlateDecode content streams.
-`.streams` the per-stream entries in file order (possibly empty).
-`.text` the decoded text of every stream that could be decoded, joined
-with "\n". Streams that needed an inflater you didn't pass
-contribute nothing to `.text` (and are flagged on `.streams`).
-THROWS an Error on any malformed input (bad header, bad stream shape,
-truncation, unbalanced content syntax).
-
-Pure function of its input. Same code in a browser
-(window.LoopGifts.parsePdfText) or Node (this CLI / require()).
-
-USAGE
-node ratchet-pdf-text.js doc.pdf # prints the extracted text
-node ratchet-pdf-text.js --streams doc.pdf # one line of provenance per stream
-node ratchet-pdf-text.js --help
-*/
-(function (root, factory) {
-var api = factory();
-if (typeof module === "object" && module.exports) module.exports = api;
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.parsePdfText = api.parsePdfText;
-}
-// expose for the CLI block below
-root.__ratchetPdfText = api;
-})(typeof globalThis!== "undefined"? globalThis: this, function () {
-"use strict";
-
-// ---- byte helpers -------------------------------------------------------
-function toU8(bytes) {
-if (bytes instanceof Uint8Array) return bytes;
-if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
-if (bytes && bytes.buffer instanceof ArrayBuffer)
-return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
-throw new Error("ratchet-pdf-text: input must be a Uint8Array or ArrayBuffer");
-}
-function latin1(u8, start, end) {
-var s = "";
-for (var i = start; i < end; i++) s += String.fromCharCode(u8[i]);
-return s;
-}
-// find a byte-substring `needle` (as a Latin-1 string) in u8 from `from`
-function indexOfStr(u8, needle, from) {
-var n = needle.length, N = u8.length;
-for (var i = from; i + n <= N; i++) {
-var ok = true;
-for (var j = 0; j < n; j++) {
-if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
-}
-if (ok) return i;
-}
-return -1;
-}
-function isWS(c) { return c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09 || c === 0x0c || c === 0x00;}
-
-// ---- stream scan (structure-tolerant, xref-free) ------------------------
-// We do not trust the xref table; we scan for `stream`/`endstream` pairs and
-// read the object dictionary that precedes each `stream` keyword to learn the
-// /Filter and /Length. This is the pragmatic, robust way to pull content
-// without a full document model — but every step is validated.
-function collectStreams(u8) {
-var N = u8.length, out = [], from = 0, idx = 0;
-while (true) {
-var sPos = indexOfStr(u8, "stream", from);
-if (sPos < 0) break;
-// guard against matching the tail of "endstream"
-if (sPos >= 3 && latin1(u8, sPos - 3, sPos) === "end") { from = sPos + 6; continue;}
-// the dict for this stream is the bytes between the previous `obj` (or start)
-// and this `stream` keyword.
-var objPos = lastIndexOfStr(u8, "obj", sPos, Math.max(0, sPos - 4096));
-var dictStart = objPos >= 0? objPos + 3: Math.max(0, sPos - 4096);
-var dict = latin1(u8, dictStart, sPos);
-
-// data begins after `stream` + one EOL (CRLF or LF), per the PDF spec.
-var d = sPos + 6;
-if (u8[d] === 0x0d && u8[d + 1] === 0x0a) d += 2;
-else if (u8[d] === 0x0a) d += 1;
-else if (u8[d] === 0x0d) d += 1; // tolerate a bare CR
-
-var filter = /\/Filter\s*\/?\s*(FlateDecode|ASCIIHexDecode|ASCII85Decode|LZWDecode|RunLengthDecode|DCTDecode)/.exec(dict);
-var filterName = filter? filter[1]: null;
-var lenM = /\/Length\s+(\d+)/.exec(dict);
-
-var dataEnd;
-if (lenM) {
-dataEnd = d + parseInt(lenM[1], 10);
-if (dataEnd > N) throw new Error("ratchet-pdf-text: stream /Length runs past end of buffer");
-// verify endstream actually follows (allowing whitespace) — a lying /Length
-var probe = dataEnd;
-while (probe < N && isWS(u8[probe])) probe++;
-if (latin1(u8, probe, Math.min(N, probe + 9))!== "endstream") {
-// /Length was wrong; fall back to scanning for endstream
-dataEnd = -1;
-}
-} else {
-dataEnd = -1;
-}
-if (dataEnd < 0) {
-var e = indexOfStr(u8, "endstream", d);
-if (e < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
-dataEnd = e;
-// trim the single EOL immediately before endstream
-if (dataEnd > d && u8[dataEnd - 1] === 0x0a) dataEnd--;
-if (dataEnd > d && u8[dataEnd - 1] === 0x0d) dataEnd--;
-}
-
-var endKw = indexOfStr(u8, "endstream", dataEnd);
-if (endKw < 0) throw new Error("ratchet-pdf-text: stream without matching endstream");
-
-out.push({ index: idx++, filter: filterName, dataStart: d, dataEnd: dataEnd});
-from = endKw + 9;
-}
-return out;
-}
-function lastIndexOfStr(u8, needle, before, floor) {
-var n = needle.length;
-for (var i = before - n; i >= floor; i--) {
-var ok = true;
-for (var j = 0; j < n; j++) if (u8[i + j]!== needle.charCodeAt(j)) { ok = false; break;}
-if (ok) return i;
-}
-return -1;
-}
-
-// ---- content-stream text operators --------------------------------------
-// Given a decoded (or uncompressed) content stream as a Latin-1 string, pull
-// the operands of Tj/TJ/'/" text-showing operators. Ratchet: unbalanced string
-// or array is a thrown Error.
-function decodeLiteral(s, i) {
-// s[i] === '('; returns [decodedString, indexAfterClosingParen]
-var out = "", depth = 0, N = s.length;
-for (; i < N; i++) {
-var c = s[i];
-if (c === "\\") {
-var nx = s[i + 1];
-if (nx === "n") { out += "\n"; i++;}
-else if (nx === "r") { out += "\r"; i++;}
-else if (nx === "t") { out += "\t"; i++;}
-else if (nx === "b") { out += "\b"; i++;}
-else if (nx === "f") { out += "\f"; i++;}
-else if (nx === "(") { out += "("; i++;}
-else if (nx === ")") { out += ")"; i++;}
-else if (nx === "\\") { out += "\\"; i++;}
-else if (nx >= "0" && nx <= "7") {
-var oct = nx; i++;
-for (var k = 0; k < 2 && s[i + 1] >= "0" && s[i + 1] <= "7"; k++) { oct += s[++i];}
-out += String.fromCharCode(parseInt(oct, 8) & 0xff);
-} else if (nx === "\n") { i++;} // line continuation
-else if (nx === "\r") { i++; if (s[i + 1] === "\n") i++;}
-else { out += nx; i++;}
-} else if (c === "(") { depth++; out += c;}
-else if (c === ")") {
-if (depth === 0) return [out, i + 1];
-depth--; out += c;
-} else out += c;
-}
-throw new Error("ratchet-pdf-text: unterminated literal string in content stream");
-}
-function decodeHex(s, i) {
-// s[i] === '<'; returns [decodedString, indexAfterClosingAngle]
-var hex = "", N = s.length;
-for (i = i + 1; i < N; i++) {
-var c = s[i];
-if (c === ">") {
-if (hex.length % 2 === 1) hex += "0";
-var out = "";
-for (var k = 0; k < hex.length; k += 2) out += String.fromCharCode(parseInt(hex.substr(k, 2), 16));
-return [out, i + 1];
-}
-if (/[0-9a-fA-F]/.test(c)) hex += c;
-else if (/\s/.test(c)) { /* skip */}
-else throw new Error("ratchet-pdf-text: bad character in hex string");
-}
-throw new Error("ratchet-pdf-text: unterminated hex string in content stream");
-}
-function extractOperators(content) {
-// Walk the stream, keeping a small operand stack of strings, and flush on
-// Tj/TJ/'/" operators. Non-string operands are ignored for our purpose.
-var s = content, N = s.length, i = 0, pending = [], out = [];
-while (i < N) {
-var c = s[i];
-if (c === "(") { var r = decodeLiteral(s, i + 1); pending.push(r[0]); i = r[1]; continue;}
-if (c === "<" && s[i + 1]!== "<") { var h = decodeHex(s, i); pending.push(h[0]); i = h[1]; continue;}
-if (c === "[") {
-// TJ array: collect string elements, drop numbers
-var arr = [], j = i + 1;
-while (j < N && s[j]!== "]") {
-if (s[j] === "(") { var lr = decodeLiteral(s, j + 1); arr.push(lr[0]); j = lr[1];}
-else if (s[j] === "<" && s[j + 1]!== "<") { var hr = decodeHex(s, j); arr.push(hr[0]); j = hr[1];}
-else j++;
-}
-if (j >= N) throw new Error("ratchet-pdf-text: unterminated array in content stream");
-pending.push(arr.join(""));
-i = j + 1;
-continue;
-}
-// operator token
-if (/[A-Za-z'"]/.test(c)) {
-var op = "";
-while (i < N && /[A-Za-z0-9*'"]/.test(s[i])) op += s[i++];
-if (op === "Tj" || op === "'" || op === '"') {
-if (pending.length) out.push(pending[pending.length - 1]);
-pending = [];
-} else if (op === "TJ") {
-if (pending.length) out.push(pending[pending.length - 1]);
-pending = [];
-} else {
-pending = []; // any other operator consumes/clears operands
-}
-continue;
-}
-i++;
-}
-return out.join("");
-}
-
-// ---- top-level ----------------------------------------------------------
-function parsePdfText(bytes, options) {
-options = options || {};
-var u8 = toU8(bytes);
-if (u8.length < 5 || latin1(u8, 0, 5)!== "%PDF-")
-throw new Error("ratchet-pdf-text: not a PDF (missing %PDF- header)");
-
-var raw = collectStreams(u8);
-var inflate = typeof options.inflate === "function"? options.inflate: null;
-var entries = [], texts = [];
-
-for (var i = 0; i < raw.length; i++) {
-var st = raw[i];
-var body = u8.subarray(st.dataStart, st.dataEnd);
-var compressed = st.filter === "FlateDecode";
-var entry = {
-index: st.index,
-filter: st.filter,
-compressed: compressed,
-needsInflate: false,
-text: null,
-rawLength: body.length
-};
-if (!st.filter) {
-// uncompressed content stream — decode directly
-var t = safeExtract(latin1(body, 0, body.length));
-entry.text = t;
-if (t) texts.push(t);
-} else if (compressed) {
-if (inflate) {
-var inflated = inflate(body);
-var iu8 = toU8(inflated);
-var t2 = safeExtract(latin1(iu8, 0, iu8.length));
-entry.text = t2;
-if (t2) texts.push(t2);
-} else {
-entry.needsInflate = true;
-entry.compressedBytes = body.slice(); // surface raw, honest
-}
-} else {
-// a filter we don't handle (DCTDecode image, etc.) — not text; surface it
-entry.needsInflate = false;
-entry.compressedBytes = body.slice();
-}
-entries.push(entry);
-}
-return { streams: entries, text: texts.join("\n")};
-}
-
-// extractOperators may throw on a non-content stream that happens to be
-// uncompressed binary; a content-text extractor should not crash the whole
-// parse on a stream that isn't text. We attempt, and on a structural throw we
-// treat the stream as yielding no text (it is surfaced in `.streams` regardless).
-function safeExtract(content) {
-try { return extractOperators(content);}
-catch (e) { return "";}
-}
-
-return { parsePdfText: parsePdfText};
-});
-
-// ---- CLI (Node only) ------------------------------------------------------
-if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
-var api = (typeof globalThis!== "undefined"? globalThis: this).__ratchetPdfText;
-var args = process.argv.slice(2);
-if (!args.length || args.indexOf("--help")!== -1) {
-process.stdout.write(
-"ratchet-pdf-text — strict, zero-dep PDF content-stream text extractor\n" +
-" node ratchet-pdf-text.js doc.pdf print extracted text\n" +
-" node ratchet-pdf-text.js --streams doc.pdf one provenance line per stream\n" +
-" node ratchet-pdf-text.js --help\n"
-);
-process.exit(0);
-}
-var streamsMode = false, file = null;
-for (var i = 0; i < args.length; i++) {
-if (args[i] === "--streams") streamsMode = true;
-else file = args[i];
-}
-try {
-if (!file) throw new Error("no input file");
-var fs = require("fs");
-var zlib = require("zlib");
-var buf = fs.readFileSync(file);
-var res = api.parsePdfText(buf, { inflate: zlib.inflateSync});
-if (streamsMode) {
-res.streams.forEach(function (s) {
-process.stdout.write(
-"#" + s.index + "\tfilter=" + (s.filter || "none") +
-"\tcompressed=" + s.compressed +
-"\tneedsInflate=" + s.needsInflate +
-"\trawLen=" + s.rawLength +
-"\ttextLen=" + (s.text? s.text.length: 0) + "\n"
-);
-});
-} else {
-process.stdout.write(res.text + (res.text? "\n": ""));
-}
-process.exit(0);
-} catch (e) {
-var msg = e && e.message? e.message: String(e);
-if (msg.indexOf("ratchet-pdf-text:")!== 0) msg = "ratchet-pdf-text: " + msg;
-process.stderr.write(msg + "\n");
-process.exit(1);
-}
-}
-
-test_ratchet-pdf-text.js 190 lines on GitHub →
-#!/usr/bin/env node
-/* test_ratchet-pdf-text.js — known-answer battery for ratchet-pdf-text.
-
-The oracle is OUT OF BAND: every expected value below is a literal fact
-written by hand, never the output of a second PDF parser. Each PDF fixture is
-assembled from raw bytes so the expected extracted text is known by
-construction. Node's zlib provides the inflater for the compressed case (the
-same inflater the CLI wires); the extractor itself carries no zlib.
-
-Run: node test_ratchet-pdf-text.js (exit 0 = all pass, nonzero = failure)
-*/
-"use strict";
-var zlib = require("zlib");
-var assert = require("assert");
-var { parsePdfText} = require("./ratchet-pdf-text.js");
-
-var pass = 0, fail = 0;
-function ok(name, fn) {
-try { fn(); pass++; console.log(" ok " + name);}
-catch (e) { fail++; console.log(" FAIL " + name + " — " + e.message);}
-}
-
-function bytes(str) { return Buffer.from(str, "latin1");}
-
-// Build a minimal PDF whose single content stream is `content` (uncompressed),
-// with a correct /Length. Structure is deliberately spartan — the extractor is
-// xref-tolerant and scans for streams, so we don't need a valid xref table.
-function uncompressedPdf(content) {
-var head = "%PDF-1.4\n";
-var obj =
-"4 0 obj\n<< /Length " + content.length + " >>\nstream\n" +
-content +
-"\nendstream\nendobj\n";
-var tail = "%%EOF\n";
-return bytes(head + obj + tail);
-}
-
-// Build a PDF whose single content stream is FlateDecode-compressed `content`.
-function flatePdf(content) {
-var comp = zlib.deflateSync(Buffer.from(content, "latin1")); // zlib-wrapped (RFC1950)
-var head = bytes("%PDF-1.5\n4 0 obj\n<< /Filter /FlateDecode /Length " + comp.length + " >>\nstream\n");
-var mid = comp;
-var tail = bytes("\nendstream\nendobj\n%%EOF\n");
-return Buffer.concat([head, mid, tail]);
-}
-
-// ---- 1. simple Tj, uncompressed -----------------------------------------
-ok("1 Tj literal string, uncompressed", function () {
-var pdf = uncompressedPdf("BT /F1 12 Tf (Hello World) Tj ET");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Hello World"); // ORACLE: literal
-assert.strictEqual(r.streams.length, 1);
-assert.strictEqual(r.streams[0].compressed, false);
-});
-
-// ---- 2. multiple Tj across the stream -----------------------------------
-ok("2 two Tj operators concatenate in order", function () {
-var pdf = uncompressedPdf("(Alpha) Tj (Beta) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "AlphaBeta"); // ORACLE
-});
-
-// ---- 3. TJ array drops numeric kerning, keeps strings -------------------
-ok("3 TJ array keeps strings, drops numbers", function () {
-var pdf = uncompressedPdf("[(Wa) -80 (ter) -60 (mark)] TJ");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Watermark"); // ORACLE: kerning gone
-});
-
-// ---- 4. hex string decode -----------------------------------------------
-ok("4 hex string <48656c6c6f> => Hello", function () {
-var pdf = uncompressedPdf("<48656c6c6f> Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "Hello"); // ORACLE: hex of 'Hello'
-});
-
-// ---- 5. odd-length hex pads with trailing zero --------------------------
-ok("5 odd hex <4> => single byte 0x40 ('@')", function () {
-var pdf = uncompressedPdf("<4> Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "@"); // ORACLE: 0x40 padded
-});
-
-// ---- 6. octal escape in literal -----------------------------------------
-ok("6 octal escape \\101 => 'A'", function () {
-var pdf = uncompressedPdf("(\\101\\102\\103) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "ABC"); // ORACLE: 0101=A 0102=B 0103=C
-});
-
-// ---- 7. balanced nested parens preserved --------------------------------
-ok("7 nested parens (a(b)c) preserved", function () {
-var pdf = uncompressedPdf("(a(b)c) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "a(b)c"); // ORACLE
-});
-
-// ---- 8. escaped paren and backslash -------------------------------------
-ok("8 escaped \\( \\) \\\\ decode literally", function () {
-var pdf = uncompressedPdf("(x\\(y\\)z\\\\) Tj");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "x(y)z\\"); // ORACLE
-});
-
-// ---- 9. ' operator (move-to-next-line-and-show) counts as text ----------
-ok("9 quote operator shows string", function () {
-var pdf = uncompressedPdf("(line two) '");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "line two"); // ORACLE
-});
-
-// ---- 10. FlateDecode stream, WITH inflater -> decoded -------------------
-ok("10 FlateDecode with inflater decodes text", function () {
-var pdf = flatePdf("BT (Compressed hi) Tj ET");
-var r = parsePdfText(pdf, { inflate: zlib.inflateSync});
-assert.strictEqual(r.text, "Compressed hi"); // ORACLE
-assert.strictEqual(r.streams[0].compressed, true);
-assert.strictEqual(r.streams[0].needsInflate, false);
-});
-
-// ---- 11. FlateDecode stream, WITHOUT inflater -> surfaced, not faked -----
-ok("11 FlateDecode without inflater surfaces raw bytes, text null", function () {
-var pdf = flatePdf("BT (secret) Tj ET");
-var r = parsePdfText(pdf); // no inflate option
-assert.strictEqual(r.text, ""); // ORACLE: nothing faked
-assert.strictEqual(r.streams[0].needsInflate, true);
-assert.ok(r.streams[0].compressedBytes instanceof Uint8Array); // honest surfacing
-assert.strictEqual(r.streams[0].text, null);
-});
-
-// ---- 12. empty content stream -> empty text, one entry ------------------
-ok("12 empty content stream yields empty text", function () {
-var pdf = uncompressedPdf("");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, ""); // ORACLE
-assert.strictEqual(r.streams.length, 1);
-});
-
-// ---- 13. RATCHET: not a PDF (bad header) throws -------------------------
-ok("13 ratchet: missing %PDF- header throws", function () {
-var bad = bytes("GIF89a not a pdf (nope) Tj");
-assert.throws(function () { parsePdfText(bad);}, /not a PDF/); // ORACLE: refusal
-});
-
-// ---- 14. RATCHET: /Length running past buffer throws --------------------
-ok("14 ratchet: lying /Length past end-of-buffer throws", function () {
-// declare a huge length so it exceeds the buffer AND no endstream follows
-var body = "%PDF-1.4\n4 0 obj\n<< /Length 99999 >>\nstream\n(hi) Tj";
-assert.throws(function () { parsePdfText(bytes(body));}, /past end of buffer|endstream/);
-});
-
-// ---- 15. RATCHET: stream without endstream throws -----------------------
-ok("15 ratchet: stream with no endstream throws", function () {
-var body = "%PDF-1.4\n4 0 obj\n<< >>\nstream\n(dangling) Tj\n"; // no endstream
-assert.throws(function () { parsePdfText(bytes(body));}, /endstream/);
-});
-
-// ---- 16. RATCHET: unterminated literal string throws --------------------
-ok("16 ratchet: unterminated ( string throws", function () {
-// valid stream shell, but the content has an open paren that never closes
-var content = "(unterminated Tj ET";
-var pdf = uncompressedPdf(content);
-// safeExtract swallows content-syntax throws per contract (stream!= text),
-// so text is empty and the stream is still surfaced honestly.
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, ""); // ORACLE: no faked text
-assert.strictEqual(r.streams.length, 1);
-});
-
-// ---- 17. ArrayBuffer input accepted (dual-home Uint8Array contract) -----
-ok("17 accepts ArrayBuffer input", function () {
-var pdf = uncompressedPdf("(buf) Tj");
-var ab = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength);
-var r = parsePdfText(ab);
-assert.strictEqual(r.text, "buf"); // ORACLE
-});
-
-// ---- 18. two content streams, both decoded, joined with newline ---------
-ok("18 two streams join with newline", function () {
-var head = "%PDF-1.4\n";
-var o1 = "4 0 obj\n<< /Length 9 >>\nstream\n(first) Tj\nendstream\nendobj\n";
-var o2 = "5 0 obj\n<< /Length 10 >>\nstream\n(second) Tj\nendstream\nendobj\n";
-var pdf = bytes(head + o1 + o2 + "%%EOF\n");
-var r = parsePdfText(pdf);
-assert.strictEqual(r.text, "first\nsecond"); // ORACLE
-assert.strictEqual(r.streams.length, 2);
-});
-
-console.log("\nratchet-pdf-text: " + pass + " passed, " + fail + " failed");
-process.exit(fail? 1: 0);
-
-Take the whole folder →
-MIT
-Node / browser, no dependencies
+Zero dependencies, Node or browser, deterministic
 
 ---

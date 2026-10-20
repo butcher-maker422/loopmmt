@@ -163,9 +163,11 @@ def t_edge_is_present_and_printed():
     """The printed edge exists in the artifact and prints on demand."""
     d = _scratch()
     src = open(GIFT).read()
-    rc, out, _ = _run(d, "--edge", "--build-cmd", "x", "--derived", "y")
-    check("printed edge present in source AND on --edge",
-          "STALENESS" in src and "not CORRECTNESS" in src and "STALENESS" in out)
+    rc, out, _ = _run(d, "--edge")
+    check("printed edge present in source AND on --edge ALONE (no other flags needed)",
+          "STALENESS" in src and "not CORRECTNESS" in src and "STALENESS" in out and rc == CURRENT)
+    rc, _, _ = _run(d, "--derived", "y")
+    check("a check run without --build-cmd is USAGE (exit 2)", rc == USAGE)
 
 
 def t_diff_summary_names_the_difference():

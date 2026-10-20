@@ -1,0 +1,4104 @@
+#!/usr/bin/env node
+/* SPDX-License-Identifier: MIT */
+// Loop Contact — single-file canonical people registry for Loop MMT.
+// Per AGENTS-contact.md (Loop Contact Build Brief, Build #29).
+// Five Rules: single file, one command, no dependencies (node:* only),
+// SQLite storage, append-only proof chain. Phase Next-A tool — the
+// universal infrastructure layer between the Five Rules core and the
+// domain-specific constellation tools. Every contact is a first-class
+// graph node — one person, every constellation, every connection.
+
+'use strict';
+
+const http = require('node:http');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const urlModule = require('node:url');
+const { DatabaseSync } = require('node:sqlite');
+
+// ── Constants ─────────────────────────────────────────────────────────
+
+const TOOL_NAME = 'loop-contact';
+const TOOL_VERSION = '1.0.0';
+
+const HTTP_STATUS_PORT = 1328;
+const DEFAULT_HTTP_PORT = HTTP_STATUS_PORT;
+// Data lives under ~/.loop/data like the Loop apps that already follow it (S18.0947: './contact.db' put the store in
+// whatever directory the app was started from — outside its data directory, and shared by two instances started from
+// one place). A config written by an earlier first run pins its own `database` value, so existing installs keep it.
+const DEFAULT_DATABASE_PATH = path.join(os.homedir(), '.loop', 'data', 'contact.db');
+const DEFAULT_CONFIG_FILENAME = 'loop-contact.json';
+const DEFAULT_BIND_HOST = '127.0.0.1';
+const HEALTH_ENDPOINT_PATH = '/status';
+
+const CONTACTS_PER_PAGE_DEFAULT = 50;
+const DEFAULT_COUNTRY = 'US';
+
+const ALLOWED_STATUSES = ['active', 'inactive', 'merged', 'deceased'];
+const ALLOWED_CONFIDENCES = ['confirmed', 'suggested'];
+const DEFAULT_EMAIL_LABEL = 'personal';
+const DEFAULT_PHONE_LABEL = 'mobile';
+const DEFAULT_ADDRESS_LABEL = 'home';
+
+const LEVENSHTEIN_THRESHOLD = 2;
+const MINIMUM_NAME_LENGTH_FOR_FUZZY = 5;
+const FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 5;
+
+const VCARD_BEGIN = 'BEGIN:VCARD';
+const VCARD_END = 'END:VCARD';
+const VCARD_VERSION_LINE = 'VERSION:4.0';
+
+// CSV import/export — flat column schema (header row drives the round-trip).
+// Order is significant: it is the column order written on export.
+const CSV_COLUMNS = [
+  'display_name', 'given_name', 'family_name', 'organization',
+  'title', 'email', 'phone', 'notes', 'starred',
+];
+
+// Cross-tool discovery: foreign tool table layouts (read-only).
+const FOREIGN_TOOL_TABLE_MAP = {
+  'loop-lens': { table: 'people', idField: 'id', nameField: 'name',
+    linkPrefix: 'loop-lens:people' },
+  'loop-ring': { table: 'identities', idField: 'fingerprint',
+    nameField: 'display_name', linkPrefix: 'loop-ring:identity' },
+  'loop-wire': { table: 'conversations', idField: 'peer_fingerprint',
+    nameField: 'peer_display_name', linkPrefix: 'loop-wire:peer' },
+  'loop-scribe': { table: 'graph_nodes', idField: 'id',
+    nameField: 'metadata', linkPrefix: 'loop-scribe:author',
+    filter: "type='person'" },
+};
+
+// ── Utilities ─────────────────────────────────────────────────────────
+
+function sha256Hex(input) {
+  return crypto.createHash('sha256').update(input).digest('hex');
+}
+
+// Compute SHA-256 of this tool's own .js file at startup (P-005).
+const TOOL_FILE_HASH = (() => {
+  try { return sha256Hex(fs.readFileSync(__filename)); }
+  catch (_readError) { return sha256Hex(`${TOOL_NAME}:${TOOL_VERSION}`); }
+})();
+
+function ensureDirectory(directoryPath) {
+  fs.mkdirSync(directoryPath, { recursive: true, mode: 0o700 });
+}
+
+function newId() { return crypto.randomUUID(); }
+function nowIso() { return new Date().toISOString(); }
+
+// Best-effort stdout write (P-033 — never crash on broken pipe).
+function safeStdoutWrite(line) {
+  try { process.stdout.write(line); }
+  catch (_writeError) { /* downstream pipe is closed */ }
+}
+
+// Normalize an email for dedup comparison (lowercase, trimmed).
+function normalizeEmailForHash(email) {
+  if (typeof email !== 'string') return '';
+  return email.trim().toLowerCase();
+}
+
+// Normalize a phone for dedup comparison (digits only).
+function normalizePhoneForHash(phone) {
+  if (typeof phone !== 'string') return '';
+  return phone.replace(/[^0-9]/g, '');
+}
+
+// Normalize a name for dedup comparison (trim collapse whitespace).
+function normalizeNameForHash(name) {
+  if (typeof name !== 'string') return '';
+  return name.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+// Compute the three-field content hash: name + primary email + primary phone.
+// Documented in §"Content hash computation" — minimum viable identity signal.
+function computeContentHash(displayName, primaryEmail, primaryPhone) {
+  const parts = [
+    normalizeNameForHash(displayName),
+    normalizeEmailForHash(primaryEmail),
+    normalizePhoneForHash(primaryPhone),
+  ];
+  return sha256Hex(parts.join('|'));
+}
+
+// Levenshtein edit distance — used for fuzzy name match in suggest-merges.
+function levenshteinDistance(stringA, stringB) {
+  if (stringA === stringB) return 0;
+  const lengthA = stringA.length;
+  const lengthB = stringB.length;
+  if (lengthA === 0) return lengthB;
+  if (lengthB === 0) return lengthA;
+  const previousRow = new Array(lengthB + 1);
+  const currentRow = new Array(lengthB + 1);
+  for (let columnIndex = 0; columnIndex <= lengthB; columnIndex += 1) {
+    previousRow[columnIndex] = columnIndex;
+  }
+  for (let rowIndex = 1; rowIndex <= lengthA; rowIndex += 1) {
+    currentRow[0] = rowIndex;
+    for (let columnIndex = 1; columnIndex <= lengthB; columnIndex += 1) {
+      const cost = stringA[rowIndex - 1] === stringB[columnIndex - 1] ? 0 : 1;
+      currentRow[columnIndex] = Math.min(
+        currentRow[columnIndex - 1] + 1,
+        previousRow[columnIndex] + 1,
+        previousRow[columnIndex - 1] + cost,
+      );
+    }
+    for (let columnIndex = 0; columnIndex <= lengthB; columnIndex += 1) {
+      previousRow[columnIndex] = currentRow[columnIndex];
+    }
+  }
+  return currentRow[lengthB];
+}
+
+// Idempotent edge id: hash(source + target + relationship) per FBD-DERIVE-IDEM.
+function computeEdgeId(sourceId, targetId, relationship) {
+  return sha256Hex(`${sourceId}|${targetId}|${relationship}`);
+}
+
+// ── Dashboard (read-only HTML) ────────────────────────────────────────
+
+function loadSkin() {
+  const SKIN_PATH = path.join(os.homedir(), '.loop', 'config', 'skin.json');
+  const HEX_PATTERN = /^#[0-9a-fA-F]{3,8}$/;
+  try {
+    const raw = fs.readFileSync(SKIN_PATH, 'utf8');
+    const skin = JSON.parse(raw);
+    if (!skin.colors || typeof skin.colors !== 'object') return '';
+    const declarations = [];
+    for (const [key, value] of Object.entries(skin.colors)) {
+      if (typeof value === 'string' && HEX_PATTERN.test(value)) {
+        declarations.push(`--${key}: ${value};`);
+      }
+    }
+    if (skin.font && typeof skin.font === 'string' && !skin.font.includes('url(')) {
+      declarations.push(`--font: ${skin.font};`);
+    }
+    if (skin.font_mono && typeof skin.font_mono === 'string' && !skin.font_mono.includes('url(')) {
+      declarations.push(`--font-mono: ${skin.font_mono};`);
+    }
+    return declarations.length > 0 ? `:root { ${declarations.join(' ')} }` : '';
+  } catch {
+    return '';
+  }
+}
+
+function escapeHtml(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+const DASHBOARD_STYLESHEET = `
+  :root {
+    --bg: #e8eef4; --panel: #ffffff; --fg: #1a1a2e;
+    --accent: #4a90d9; --muted: #6b7b8d; --border: #d0d7de;
+    --font: 'Segoe UI', system-ui, sans-serif;
+    --font-mono: 'SF Mono', 'Consolas', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font); background: var(--bg); color: var(--fg);
+         max-width: 960px; margin: 0 auto; padding: 1.5rem; }
+  header { display: flex; align-items: baseline; gap: 0.75rem;
+           padding: 1rem 0; border-bottom: 2px solid var(--accent);
+           margin-bottom: 1.5rem; }
+  .brand { font-size: 1.4rem; font-weight: 700; }
+  .version { font-size: 0.85rem; color: var(--muted); }
+  .card { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 6px; padding: 1.25rem; margin-bottom: 1rem; }
+  .card h2 { font-size: 1rem; margin-bottom: 0.75rem; color: var(--accent); }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+               gap: 0.75rem; margin-bottom: 1rem; }
+  .stat { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 6px; padding: 1rem; text-align: center; }
+  .stat .value { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+  .stat .label { font-size: 0.8rem; color: var(--muted); margin-top: 0.25rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { padding: 0.5rem 0.75rem; text-align: left;
+           border-bottom: 1px solid var(--border); }
+  th { font-weight: 600; color: var(--muted); font-size: 0.8rem;
+       text-transform: uppercase; letter-spacing: 0.03em; }
+  code { font-family: var(--font-mono); font-size: 0.85em;
+         background: var(--bg); padding: 0.15em 0.4em; border-radius: 3px; }
+  .endpoint-list { list-style: none; }
+  .endpoint-list li { padding: 0.4rem 0; border-bottom: 1px solid var(--border); }
+  .endpoint-list li:last-child { border-bottom: none; }
+  .method { display: inline-block; width: 4em; font-weight: 700;
+            font-family: var(--font-mono); font-size: 0.85rem; }
+  .method.get { color: #2e7d32; }
+  .method.post { color: #1565c0; }
+  .method.delete { color: #c62828; }
+`;
+
+function renderDashboardPage(toolName, toolVersion, bodyHtml) {
+  const skinOverrides = loadSkin();
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(toolName)}</title>
+  <style>${DASHBOARD_STYLESHEET}</style>
+  ${skinOverrides ? `<style>${skinOverrides}</style>` : ''}
+</head>
+<body>
+  <header>
+    <span class="brand">${escapeHtml(toolName)}</span>
+    <span class="version">v${escapeHtml(toolVersion)}</span>
+  </header>
+  <main>${bodyHtml}</main>
+</body>
+</html>`;
+}
+
+function renderDashboard(database) {
+  const countOf = (sql) => {
+    try { return database.prepare(sql).get().n; }
+    catch { return 0; }
+  };
+  const totalContacts = countOf('SELECT COUNT(*) AS n FROM contacts');
+  const activeContacts = countOf(
+    "SELECT COUNT(*) AS n FROM contacts WHERE status = 'active'");
+  const inactiveContacts = totalContacts - activeContacts;
+  const mergeCount = countOf('SELECT COUNT(*) AS n FROM merge_history');
+  const proofEntries = countOf('SELECT COUNT(*) AS n FROM proof_chain');
+
+  let recentRows = [];
+  try {
+    recentRows = database.prepare(
+      'SELECT display_name, primary_email, created_at FROM contacts '
+      + 'ORDER BY rowid DESC LIMIT 10'
+    ).all();
+  } catch { recentRows = []; }
+
+  const recentBody = recentRows.length > 0
+    ? recentRows.map((row) => `<tr>
+        <td>${escapeHtml(row.display_name)}</td>
+        <td>${escapeHtml(row.primary_email) || '<span style="color:var(--muted)">—</span>'}</td>
+        <td><code>${escapeHtml(row.created_at)}</code></td>
+      </tr>`).join('')
+    : '<tr><td colspan="3" style="color:var(--muted)">No contacts yet.</td></tr>';
+
+  const endpoints = [
+    { method: 'GET', path: '/', desc: 'This read-only HTML dashboard.' },
+    { method: 'GET', path: '/status',
+      desc: 'JSON health summary with aggregate contact counts.' },
+  ];
+  const endpointBody = endpoints.map((e) => `<li>
+      <span class="method ${e.method.toLowerCase()}">${escapeHtml(e.method)}</span>
+      <code>${escapeHtml(e.path)}</code> — ${escapeHtml(e.desc)}
+    </li>`).join('');
+
+  const body = `
+  <div class="stat-grid">
+    <div class="stat"><div class="value">${escapeHtml(totalContacts)}</div>
+      <div class="label">Total Contacts</div></div>
+    <div class="stat"><div class="value">${escapeHtml(activeContacts)}</div>
+      <div class="label">Active</div></div>
+    <div class="stat"><div class="value">${escapeHtml(inactiveContacts)}</div>
+      <div class="label">Inactive / Merged</div></div>
+    <div class="stat"><div class="value">${escapeHtml(mergeCount)}</div>
+      <div class="label">Merges Logged</div></div>
+    <div class="stat"><div class="value">${escapeHtml(proofEntries)}</div>
+      <div class="label">Proof Chain Entries</div></div>
+  </div>
+  <div class="card">
+    <h2>Recent Contacts</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Email</th><th>Created</th></tr></thead>
+      <tbody>${recentBody}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>API Endpoints</h2>
+    <ul class="endpoint-list">${endpointBody}</ul>
+  </div>`;
+
+  return renderDashboardPage(TOOL_NAME, TOOL_VERSION, body);
+}
+
+// ── Configuration ─────────────────────────────────────────────────────
+
+function makeDefaultConfiguration() {
+  return {
+    httpPort: DEFAULT_HTTP_PORT,
+    database: DEFAULT_DATABASE_PATH,
+    mode: 'sovereign',
+    log_level: 'info',
+    contact: {
+      contactsPerPage: CONTACTS_PER_PAGE_DEFAULT,
+      defaultCountry: DEFAULT_COUNTRY,
+      bind_host: DEFAULT_BIND_HOST,
+      allowed_origins: [],          // origins besides loopback that may call the API (S19.1111)
+      exportDirectory: path.join(os.homedir(), '.loop', 'contact', 'exports'),
+    },
+  };
+}
+
+// Load (and on first run, create) the config at ~/.loop/config/loop-contact.json.
+function loadConfiguration(overridePath) {
+  const configPath = overridePath
+    ? path.resolve(overridePath)
+    : path.join(os.homedir(), '.loop', 'config', DEFAULT_CONFIG_FILENAME);
+  const defaultConfig = makeDefaultConfiguration();
+  if (!fs.existsSync(configPath)) {
+    ensureDirectory(path.dirname(configPath));
+    fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2),
+      { mode: 0o600 });
+    return { configPath, configuration: defaultConfig, firstRun: true };
+  }
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(configPath, 'utf8')); }
+  catch (parseError) {
+    throw new Error(
+      `Configuration file at ${configPath} is not valid JSON: ${parseError.message}`);
+  }
+  const merged = { ...defaultConfig, ...parsed };
+  merged.contact = { ...defaultConfig.contact, ...(parsed.contact ?? {}) };
+  return { configPath, configuration: merged, firstRun: false };
+}
+
+// ── Registration lifecycle (P-002) ───────────────────────────────────
+
+function registryPathFor(name) {
+  return path.join(os.homedir(), '.loop', 'tools', `${name}.json`);
+}
+
+function writeRegistration(configuration, databasePath, pid) {
+  const target = registryPathFor(TOOL_NAME);
+  ensureDirectory(path.dirname(target));
+  const payload = {
+    name: TOOL_NAME, version: TOOL_VERSION,
+    pid: pid ?? process.pid,
+    port: configuration.httpPort,
+    httpPort: configuration.httpPort,
+    database_path: path.resolve(databasePath),
+    started_at: nowIso(),
+    write_access: ['contact.db'],
+    read_access: ['~/.loop/tools/*.json', '<each-tool>.db (read-only)'],
+    capabilities: [
+      'contact-crud', 'multi-value-fields', 'custom-fields',
+      'fts5-search', 'vcard-import', 'vcard-export',
+      'cross-tool-discovery', 'merge-dedup', 'graph-nodes',
+    ],
+  };
+  fs.writeFileSync(target, JSON.stringify(payload, null, 2), { mode: 0o600 });
+  return { target, payload };
+}
+
+function removeRegistration() {
+  const target = registryPathFor(TOOL_NAME);
+  try { fs.unlinkSync(target); } catch (_unlinkError) { /* fine */ }
+}
+
+// ── Schema ────────────────────────────────────────────────────────────
+
+function openDatabase(databasePath) {
+  ensureDirectory(path.dirname(path.resolve(databasePath)));
+  const database = new DatabaseSync(databasePath);
+  database.exec('PRAGMA journal_mode = WAL;');
+  database.exec('PRAGMA foreign_keys = ON;');
+  applySchema(database);
+  migrateContactSchema(database);
+  return database;
+}
+
+// P1/R01 (Forest Sovereignty). The People Soil had no column-migration path before this: applySchema
+// is CREATE TABLE IF NOT EXISTS only, so a column added to the schema above never reaches an EXISTING
+// contact.db, and the next INSERT naming it throws `no such column`. This adds the seam the calendar's
+// calendar tool's own migrateSchema() already proves — a PRAGMA-guarded, additive, idempotent ALTER.
+// Guarded on the column's absence so a second run is a no-op; the `contacts` table always exists here
+// (applySchema created it immediately above). Legacy rows keep their place and read NULL origin (the
+// closed default) until a re-sync stamps them. First migration in this file; keep it additive-only.
+function migrateContactSchema(database) {
+  const cols = database.prepare('PRAGMA table_info(contacts)').all().map((c) => c.name);
+  if (!cols.includes('origin')) {
+    database.exec('ALTER TABLE contacts ADD COLUMN origin TEXT;');
+  }
+  // B2-02 (privileged-material partition, arch-v1 §5 R-05) — Block B, the contacts twin of the
+  // loopcalendar events.owner_tag column (Block A, S24.0032). owner_tag is the per-contact OWNERSHIP
+  // stamp: store(T) = { o : o.owner_tag == T }, the departure cut's oracle, pinning
+  // owner_tag(authorship) == member_id(departure). Same additive, idempotent, PRAGMA-guarded ADD as
+  // origin, and the same fail-closed default: an UNSTAMPED contact (NULL) is never read as
+  // member-owned — the departure withholds it. It diverges from origin in ONE way: origin is
+  // re-stampable, owner_tag is WRITE-ONCE (fill-once: NULL -> T, never T -> T'). The guard lives at the
+  // write paths (createContact / updateContact). Non-key: NOT part of content_hash.
+  if (!cols.includes('owner_tag')) {
+    database.exec('ALTER TABLE contacts ADD COLUMN owner_tag TEXT;');
+  }
+}
+
+function applySchema(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      id TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      given_name TEXT,
+      family_name TEXT,
+      organization TEXT,
+      title TEXT,
+      primary_email TEXT,
+      primary_phone TEXT,
+      notes TEXT,
+      starred INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      merged_into TEXT,
+      content_hash TEXT NOT NULL,
+      -- P1/R01 (Forest Sovereignty). origin (life-origin: gmail-archive | loopmmt-live) is
+      -- added on existing DBs by migrateContactSchema() (guarded, idempotent). NULL = unstamped
+      -- = the closed default; a legacy contact is never silently read as loopmmt-live until a
+      -- re-sync stamps it. Same additive shape the calendar's events.origin proves.
+      origin TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (merged_into) REFERENCES contacts(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_contacts_status ON contacts(status);
+    CREATE INDEX IF NOT EXISTS idx_contacts_starred ON contacts(starred);
+    CREATE INDEX IF NOT EXISTS idx_contacts_content_hash ON contacts(content_hash);
+    CREATE INDEX IF NOT EXISTS idx_contacts_primary_email ON contacts(primary_email);
+    CREATE INDEX IF NOT EXISTS idx_contacts_primary_phone ON contacts(primary_phone);
+
+    CREATE TABLE IF NOT EXISTS contact_emails (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      label TEXT NOT NULL DEFAULT 'personal',
+      is_primary INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_emails_contact
+      ON contact_emails(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_contact_emails_email
+      ON contact_emails(email);
+
+    CREATE TABLE IF NOT EXISTS contact_phones (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      label TEXT NOT NULL DEFAULT 'mobile',
+      is_primary INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_phones_contact
+      ON contact_phones(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_contact_phones_phone
+      ON contact_phones(phone);
+
+    CREATE TABLE IF NOT EXISTS contact_addresses (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      street TEXT,
+      city TEXT,
+      state TEXT,
+      postal_code TEXT,
+      country TEXT,
+      label TEXT NOT NULL DEFAULT 'home',
+      is_primary INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_addresses_contact
+      ON contact_addresses(contact_id);
+
+    CREATE TABLE IF NOT EXISTS contact_fields (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      field_name TEXT NOT NULL,
+      field_value TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE,
+      UNIQUE (contact_id, field_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_fields_contact
+      ON contact_fields(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_contact_fields_name
+      ON contact_fields(field_name);
+
+    CREATE TABLE IF NOT EXISTS merge_history (
+      id TEXT PRIMARY KEY,
+      survivor_id TEXT NOT NULL,
+      merged_id TEXT NOT NULL,
+      merge_reason TEXT,
+      field_choices TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (survivor_id) REFERENCES contacts(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_merge_history_survivor
+      ON merge_history(survivor_id);
+    CREATE INDEX IF NOT EXISTS idx_merge_history_merged
+      ON merge_history(merged_id);
+
+    CREATE TABLE IF NOT EXISTS entity_links (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      source_tool TEXT NOT NULL,
+      foreign_table TEXT,
+      foreign_id TEXT NOT NULL,
+      confidence TEXT NOT NULL DEFAULT 'confirmed',
+      linked_at TEXT NOT NULL,
+      linked_by TEXT NOT NULL DEFAULT 'user',
+      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_entity_links_contact
+      ON entity_links(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_entity_links_source
+      ON entity_links(source_tool, foreign_id);
+
+    CREATE TABLE IF NOT EXISTS contact_labels (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      color TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE,
+      UNIQUE (contact_id, label)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_labels_contact
+      ON contact_labels(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_contact_labels_label
+      ON contact_labels(label);
+
+    CREATE TABLE IF NOT EXISTS contact_notes (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      note_text TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_notes_contact
+      ON contact_notes(contact_id);
+
+    CREATE TABLE IF NOT EXISTS follow_ups (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      note TEXT,
+      due_date TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_follow_ups_contact
+      ON follow_ups(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_follow_ups_due
+      ON follow_ups(due_date);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS contacts_fts USING fts5(
+      display_name, organization, notes, primary_email, primary_phone,
+      content='contacts', content_rowid='rowid'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS contacts_fts_insert
+      AFTER INSERT ON contacts
+      BEGIN
+        INSERT INTO contacts_fts (rowid, display_name, organization, notes,
+          primary_email, primary_phone)
+        VALUES (NEW.rowid, NEW.display_name, NEW.organization, NEW.notes,
+          NEW.primary_email, NEW.primary_phone);
+      END;
+
+    CREATE TRIGGER IF NOT EXISTS contacts_fts_delete
+      AFTER DELETE ON contacts
+      BEGIN
+        INSERT INTO contacts_fts (contacts_fts, rowid, display_name,
+          organization, notes, primary_email, primary_phone)
+        VALUES ('delete', OLD.rowid, OLD.display_name, OLD.organization,
+          OLD.notes, OLD.primary_email, OLD.primary_phone);
+      END;
+
+    CREATE TRIGGER IF NOT EXISTS contacts_fts_update
+      AFTER UPDATE ON contacts
+      BEGIN
+        INSERT INTO contacts_fts (contacts_fts, rowid, display_name,
+          organization, notes, primary_email, primary_phone)
+        VALUES ('delete', OLD.rowid, OLD.display_name, OLD.organization,
+          OLD.notes, OLD.primary_email, OLD.primary_phone);
+        INSERT INTO contacts_fts (rowid, display_name, organization, notes,
+          primary_email, primary_phone)
+        VALUES (NEW.rowid, NEW.display_name, NEW.organization, NEW.notes,
+          NEW.primary_email, NEW.primary_phone);
+      END;
+
+    CREATE TABLE IF NOT EXISTS proof_chain (
+      hash TEXT PRIMARY KEY,
+      previous_hash TEXT,
+      parents TEXT NOT NULL DEFAULT '[]',
+      timestamp TEXT NOT NULL,
+      tool_hash TEXT NOT NULL,
+      content_hash TEXT,
+      event_type TEXT NOT NULL,
+      detail TEXT DEFAULT '{}',
+      vector_clock TEXT NOT NULL DEFAULT '{}',
+      cascade_depth INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TRIGGER IF NOT EXISTS proof_chain_no_delete
+      BEFORE DELETE ON proof_chain
+      BEGIN SELECT RAISE(ABORT, 'proof chain is append-only'); END;
+
+    CREATE TRIGGER IF NOT EXISTS proof_chain_no_update
+      BEFORE UPDATE ON proof_chain
+      BEGIN SELECT RAISE(ABORT, 'proof chain is append-only'); END;
+
+    CREATE TRIGGER IF NOT EXISTS proof_chain_no_future
+      BEFORE INSERT ON proof_chain
+      BEGIN
+        SELECT RAISE(ABORT, 'future timestamp')
+        WHERE NEW.timestamp > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+5 seconds');
+      END;
+
+    CREATE TABLE IF NOT EXISTS graph_nodes (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      source_tool TEXT NOT NULL DEFAULT 'loop-contact',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      content_hash TEXT,
+      metadata TEXT,
+      suppress_from_ambient INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS graph_edges (
+      id TEXT PRIMARY KEY,
+      source_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      relationship TEXT NOT NULL,
+      source_tool TEXT NOT NULL DEFAULT 'loop-contact',
+      created_at TEXT NOT NULL,
+      weight REAL NOT NULL DEFAULT 1.0,
+      derived INTEGER NOT NULL DEFAULT 0,
+      reason TEXT,
+      metadata TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_id);
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_id);
+  `);
+}
+
+function ensureGenesisEntry(database) {
+  const row = database.prepare('SELECT COUNT(*) AS count FROM proof_chain').get();
+  if (row.count > 0) return;
+  writeProofChainEntry(database, 'tool.started',
+    sha256Hex(`${TOOL_NAME}:genesis`),
+    { tool: TOOL_NAME, version: TOOL_VERSION });
+}
+
+// ── Proof chain (P-004, canonical 9-field hash) ──────────────────────
+
+function computeProofEntryHash(entry) {
+  const fieldOrder = [
+    'previous_hash', 'parents', 'timestamp', 'tool_hash', 'content_hash',
+    'event_type', 'detail', 'vector_clock', 'cascade_depth',
+  ];
+  const serialized = fieldOrder
+    .map((field) => `${field}=${entry[field] === null ? '' : String(entry[field])}`)
+    .join('|');
+  return sha256Hex(serialized);
+}
+
+function readVectorClock(database) {
+  const row = database.prepare(
+    'SELECT vector_clock FROM proof_chain ORDER BY timestamp DESC, rowid DESC LIMIT 1'
+  ).get();
+  if (!row || !row.vector_clock) return { [TOOL_NAME]: 0 };
+  try {
+    const parsed = JSON.parse(row.vector_clock);
+    if (typeof parsed[TOOL_NAME] !== 'number') parsed[TOOL_NAME] = 0;
+    return parsed;
+  } catch (_parseError) { return { [TOOL_NAME]: 0 }; }
+}
+
+function bumpVectorClock(database) {
+  const current = readVectorClock(database);
+  current[TOOL_NAME] = (current[TOOL_NAME] ?? 0) + 1;
+  return current;
+}
+
+function writeProofChainEntry(database, eventType, contentHash, detail) {
+  const previousRow = database.prepare(
+    'SELECT hash FROM proof_chain ORDER BY timestamp DESC, rowid DESC LIMIT 1'
+  ).get();
+  const previousHash = previousRow ? previousRow.hash : null;
+  const parents = previousRow ? [previousRow.hash] : [];
+  const timestamp = nowIso();
+  const detailJson = JSON.stringify(detail ?? {});
+  const vectorClock = bumpVectorClock(database);
+  const vectorClockJson = JSON.stringify(vectorClock);
+  const entryForHashing = {
+    previous_hash: previousHash,
+    parents: JSON.stringify(parents),
+    timestamp,
+    tool_hash: TOOL_FILE_HASH,
+    content_hash: contentHash ?? null,
+    event_type: eventType,
+    detail: detailJson,
+    vector_clock: vectorClockJson,
+    cascade_depth: 0,
+  };
+  const entryHash = computeProofEntryHash(entryForHashing);
+  database.prepare(`
+    INSERT INTO proof_chain
+      (hash, previous_hash, parents, timestamp, tool_hash, content_hash,
+       event_type, detail, vector_clock, cascade_depth)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    entryHash, previousHash, entryForHashing.parents, timestamp,
+    TOOL_FILE_HASH, contentHash ?? null, eventType, detailJson,
+    vectorClockJson, 0,
+  );
+  return { hash: entryHash, vector_clock: vectorClock };
+}
+
+function verifyProofChain(database) {
+  const rows = database.prepare(
+    'SELECT * FROM proof_chain ORDER BY timestamp ASC, rowid ASC'
+  ).all();
+  let previousHash = null;
+  for (const row of rows) {
+    if (row.previous_hash !== previousHash) {
+      return { valid: false, entries_checked: rows.length,
+        failure_point: `previous_hash mismatch at hash=${row.hash}` };
+    }
+    const recomputed = computeProofEntryHash({
+      previous_hash: row.previous_hash, parents: row.parents,
+      timestamp: row.timestamp, tool_hash: row.tool_hash,
+      content_hash: row.content_hash, event_type: row.event_type,
+      detail: row.detail, vector_clock: row.vector_clock,
+      cascade_depth: row.cascade_depth,
+    });
+    if (recomputed !== row.hash) {
+      return { valid: false, entries_checked: rows.length,
+        failure_point: `hash mismatch at hash=${row.hash}` };
+    }
+    previousHash = row.hash;
+  }
+  return { valid: true, entries_checked: rows.length, failure_point: null };
+}
+
+// ── Structured stdout events (P-006, IMC Spec §2) ────────────────────
+
+function buildEvent(type, detail, vectorClock, proofHash) {
+  return {
+    type, tool: TOOL_NAME, version: TOOL_VERSION,
+    timestamp: nowIso(), detail, vector_clock: vectorClock,
+    proof_hash: proofHash,
+  };
+}
+
+function emitStructuredEvent(event, quiet) {
+  if (quiet) return;
+  safeStdoutWrite(JSON.stringify(event) + '\n');
+}
+
+// ── Graph node / edge helpers (P-009) ────────────────────────────────
+
+// Upsert a person graph node for a contact. Metadata is JSON; deceased
+// contacts get suppress_from_ambient = 1 (per FBD-GRIEF1).
+function upsertPersonGraphNode(database, contact) {
+  const nodeId = `contact:${contact.id}`;
+  const metadata = JSON.stringify({
+    display_name: contact.display_name,
+    organization: contact.organization ?? null,
+    contact_id: contact.id,
+  });
+  const suppress = contact.status === 'deceased' ? 1 : 0;
+  const existing = database.prepare(
+    'SELECT id FROM graph_nodes WHERE id = ?'
+  ).get(nodeId);
+  const now = nowIso();
+  if (existing) {
+    database.prepare(`
+      UPDATE graph_nodes
+      SET content_hash = ?, metadata = ?, updated_at = ?,
+          suppress_from_ambient = ?
+      WHERE id = ?
+    `).run(contact.content_hash, metadata, now, suppress, nodeId);
+  } else {
+    database.prepare(`
+      INSERT INTO graph_nodes (id, type, source_tool, created_at, updated_at,
+        content_hash, metadata, suppress_from_ambient)
+      VALUES (?, 'person', 'loop-contact', ?, ?, ?, ?, ?)
+    `).run(nodeId, contact.created_at ?? now, now,
+      contact.content_hash, metadata, suppress);
+  }
+  return nodeId;
+}
+
+// Insert a graph edge (idempotent — uses computed edge id).
+function insertGraphEdge(database, sourceId, targetId, relationship, reason,
+    metadata) {
+  const edgeId = computeEdgeId(sourceId, targetId, relationship);
+  const existing = database.prepare(
+    'SELECT id FROM graph_edges WHERE id = ?'
+  ).get(edgeId);
+  if (existing) return edgeId;
+  database.prepare(`
+    INSERT INTO graph_edges (id, source_id, target_id, relationship,
+      source_tool, created_at, weight, derived, reason, metadata)
+    VALUES (?, ?, ?, ?, 'loop-contact', ?, 1.0, 0, ?, ?)
+  `).run(edgeId, sourceId, targetId, relationship, nowIso(),
+    reason ?? null, metadata ? JSON.stringify(metadata) : null);
+  return edgeId;
+}
+
+// Remove a graph edge by (source, target, relationship) — idempotent.
+function removeGraphEdge(database, sourceId, targetId, relationship) {
+  const edgeId = computeEdgeId(sourceId, targetId, relationship);
+  database.prepare('DELETE FROM graph_edges WHERE id = ?').run(edgeId);
+  return edgeId;
+}
+
+// Redirect all edges referencing a merged contact's node to the survivor.
+function redirectGraphEdges(database, mergedNodeId, survivorNodeId) {
+  // Edges with the merged contact as source.
+  const sourceEdges = database.prepare(
+    'SELECT * FROM graph_edges WHERE source_id = ?'
+  ).all(mergedNodeId);
+  for (const edge of sourceEdges) {
+    const newId = computeEdgeId(survivorNodeId, edge.target_id, edge.relationship);
+    if (newId === edge.id) continue;
+    database.prepare('DELETE FROM graph_edges WHERE id = ?').run(edge.id);
+    const exists = database.prepare(
+      'SELECT id FROM graph_edges WHERE id = ?'
+    ).get(newId);
+    if (!exists) {
+      database.prepare(`
+        INSERT INTO graph_edges (id, source_id, target_id, relationship,
+          source_tool, created_at, weight, derived, reason, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(newId, survivorNodeId, edge.target_id, edge.relationship,
+        edge.source_tool, edge.created_at, edge.weight, edge.derived,
+        edge.reason, edge.metadata);
+    }
+  }
+  // Edges with the merged contact as target.
+  const targetEdges = database.prepare(
+    'SELECT * FROM graph_edges WHERE target_id = ?'
+  ).all(mergedNodeId);
+  for (const edge of targetEdges) {
+    const newId = computeEdgeId(edge.source_id, survivorNodeId, edge.relationship);
+    if (newId === edge.id) continue;
+    database.prepare('DELETE FROM graph_edges WHERE id = ?').run(edge.id);
+    const exists = database.prepare(
+      'SELECT id FROM graph_edges WHERE id = ?'
+    ).get(newId);
+    if (!exists) {
+      database.prepare(`
+        INSERT INTO graph_edges (id, source_id, target_id, relationship,
+          source_tool, created_at, weight, derived, reason, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(newId, edge.source_id, survivorNodeId, edge.relationship,
+        edge.source_tool, edge.created_at, edge.weight, edge.derived,
+        edge.reason, edge.metadata);
+    }
+  }
+}
+
+// ── Contact CRUD ──────────────────────────────────────────────────────
+
+// Create a contact — display_name required, all other fields optional.
+// B2-02 / Block B: a usable owner_tag is a non-empty trimmed string; anything else is NULL.
+function cleanOwnerTag(value) {
+  return (typeof value === 'string' && value.trim()) ? value.trim() : null;
+}
+
+function createContact(database, runtimeState, options) {
+  if (!options.displayName || typeof options.displayName !== 'string'
+      || options.displayName.trim().length === 0) {
+    throw new Error('display_name required');
+  }
+  const id = options.id ?? newId();
+  const now = nowIso();
+  const displayName = options.displayName.trim();
+  const primaryEmail = options.email ?? options.primaryEmail ?? null;
+  const primaryPhone = options.phone ?? options.primaryPhone ?? null;
+  const contentHash = computeContentHash(displayName, primaryEmail, primaryPhone);
+  const status = options.status ?? 'active';
+  if (!ALLOWED_STATUSES.includes(status)) {
+    throw new Error(`status must be one of: ${ALLOWED_STATUSES.join(', ')}`);
+  }
+  // origin (P1/R01): life-origin of this contact record — gmail-archive | loopmmt-live | NULL.
+  // Non-key, NOT part of content_hash (it is provenance metadata, not identity — a contact
+  // imported and the same contact live-synced are the same person). Unset => NULL (closed default).
+  const origin = options.origin ?? null;
+  // B2-02 / Block B: owner_tag, the authorship-time ownership stamp. Precedence (the loopcalendar
+  // createEvent twin, Block E1): explicit options.owner_tag (a connector's declared ingest owner) >
+  // runtimeState.ownerTag (the acting session — the runtime seam injects the session's tenant) > NULL
+  // (fail-closed: withheld at departure, never fabricated). A runtimeState with no ownerTag (CLI,
+  // tests, an import path that did not opt in) behaves exactly as before.
+  const owner_tag = cleanOwnerTag(options.owner_tag) ?? cleanOwnerTag(runtimeState && runtimeState.ownerTag);
+  database.prepare(`
+    INSERT INTO contacts (id, display_name, given_name, family_name,
+      organization, title, primary_email, primary_phone, notes,
+      starred, status, merged_into, content_hash, origin, owner_tag, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+  `).run(id, displayName,
+    options.givenName ?? null, options.familyName ?? null,
+    options.organization ?? null, options.title ?? null,
+    primaryEmail, primaryPhone, options.notes ?? null,
+    options.starred ? 1 : 0, status, contentHash, origin, owner_tag, now, now);
+  const contact = getContactRow(database, id);
+  upsertPersonGraphNode(database, contact);
+  writeProofChainEntry(database, 'contact.created', contentHash, {
+    contact_id: id,
+    has_email: !!primaryEmail,
+    has_phone: !!primaryPhone,
+    has_org: !!options.organization,
+  });
+  emitStructuredEvent(buildEvent('contact.created',
+    { contact_id: id, content_hash: contentHash,
+      has_email: !!primaryEmail, has_phone: !!primaryPhone,
+      has_org: !!options.organization },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return getContact(database, id);
+}
+
+// Fetch the raw contact row (no joins).
+function getContactRow(database, contactId) {
+  return database.prepare(
+    'SELECT * FROM contacts WHERE id = ?'
+  ).get(contactId);
+}
+
+// Fetch a full contact with emails, phones, addresses, fields, links, edges.
+function getContact(database, contactId) {
+  const contact = getContactRow(database, contactId);
+  if (!contact) return null;
+  contact.emails = database.prepare(`
+    SELECT id, email, label, is_primary, created_at
+    FROM contact_emails WHERE contact_id = ?
+    ORDER BY is_primary DESC, created_at ASC
+  `).all(contactId);
+  contact.phones = database.prepare(`
+    SELECT id, phone, label, is_primary, created_at
+    FROM contact_phones WHERE contact_id = ?
+    ORDER BY is_primary DESC, created_at ASC
+  `).all(contactId);
+  contact.addresses = database.prepare(`
+    SELECT id, street, city, state, postal_code, country, label,
+           is_primary, created_at
+    FROM contact_addresses WHERE contact_id = ?
+    ORDER BY is_primary DESC, created_at ASC
+  `).all(contactId);
+  contact.fields = database.prepare(`
+    SELECT id, field_name, field_value, created_at
+    FROM contact_fields WHERE contact_id = ?
+    ORDER BY field_name ASC
+  `).all(contactId);
+  // P-064: explicit table.column qualification after join.
+  // P-065: enum-like ORDER BY uses CASE to give a deterministic order.
+  contact.entity_links = database.prepare(`
+    SELECT entity_links.id, entity_links.source_tool,
+           entity_links.foreign_table, entity_links.foreign_id,
+           entity_links.confidence, entity_links.linked_at,
+           entity_links.linked_by
+    FROM entity_links
+    WHERE entity_links.contact_id = ?
+    ORDER BY CASE entity_links.confidence
+        WHEN 'confirmed' THEN 0 WHEN 'suggested' THEN 1 ELSE 99 END,
+      entity_links.source_tool ASC
+  `).all(contactId);
+  contact.relationships = database.prepare(`
+    SELECT id, source_id, target_id, relationship, created_at, reason
+    FROM graph_edges
+    WHERE (source_id = ? OR target_id = ?)
+      AND source_tool = 'loop-contact'
+      AND relationship NOT IN ('entity_link')
+    ORDER BY relationship ASC, created_at ASC
+  `).all(`contact:${contactId}`, `contact:${contactId}`);
+  contact.labels = database.prepare(`
+    SELECT id, label, color, created_at
+    FROM contact_labels WHERE contact_id = ?
+    ORDER BY label COLLATE NOCASE ASC
+  `).all(contactId);
+  contact.notes_log = database.prepare(`
+    SELECT id, note_text, created_at
+    FROM contact_notes WHERE contact_id = ?
+    ORDER BY created_at DESC
+  `).all(contactId);
+  return contact;
+}
+
+// Update a contact's mutable fields. Empty patch is a no-op.
+function updateContact(database, runtimeState, contactId, patch) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  if (existing.status === 'merged') {
+    return { error: 'cannot update a merged contact' };
+  }
+  const next = {
+    display_name: patch.displayName ?? existing.display_name,
+    given_name: patch.givenName === undefined ? existing.given_name : patch.givenName,
+    family_name: patch.familyName === undefined ? existing.family_name : patch.familyName,
+    organization: patch.organization === undefined ? existing.organization : patch.organization,
+    title: patch.title === undefined ? existing.title : patch.title,
+    primary_email: patch.email === undefined
+      ? (patch.primaryEmail === undefined ? existing.primary_email : patch.primaryEmail)
+      : patch.email,
+    primary_phone: patch.phone === undefined
+      ? (patch.primaryPhone === undefined ? existing.primary_phone : patch.primaryPhone)
+      : patch.phone,
+    notes: patch.notes === undefined ? existing.notes : patch.notes,
+    status: patch.status === undefined ? existing.status : patch.status,
+    // origin (P1/R01): mutable, non-key. undefined patch preserves existing (a re-sync that
+    // does not carry origin never wipes a stamped one); an explicit value re-stamps in place.
+    origin: patch.origin === undefined ? existing.origin : patch.origin,
+    // B2-02 §4b / Block B: owner_tag is WRITE-ONCE — the one predicate is
+    //   existing.owner_tag != NULL  =>  next.owner_tag == existing.owner_tag
+    // A set stamp is preserved whatever the patch carries (a re-sync under another tenant cannot
+    // steal authorship); only a NULL is fillable, and only by a usable patch value. Twin of
+    // loopcalendar updateEvent (same guarantee soil.js gives via COALESCE + WHERE owner_tag IS NULL).
+    owner_tag: existing.owner_tag != null ? existing.owner_tag : cleanOwnerTag(patch.owner_tag),
+  };
+  if (!ALLOWED_STATUSES.includes(next.status)) {
+    return { error: `status must be one of: ${ALLOWED_STATUSES.join(', ')}` };
+  }
+  const contentHash = computeContentHash(
+    next.display_name, next.primary_email, next.primary_phone);
+  const changedFields = [];
+  for (const field of [
+    'display_name', 'given_name', 'family_name', 'organization', 'title',
+    'primary_email', 'primary_phone', 'notes', 'status', 'origin', 'owner_tag',
+  ]) {
+    if (next[field] !== existing[field]) changedFields.push(field);
+  }
+  if (contentHash !== existing.content_hash) changedFields.push('content_hash');
+  if (changedFields.length === 0) {
+    return { updated: false, contact: getContact(database, contactId) };
+  }
+  const now = nowIso();
+  database.prepare(`
+    UPDATE contacts SET display_name = ?, given_name = ?, family_name = ?,
+      organization = ?, title = ?, primary_email = ?, primary_phone = ?,
+      notes = ?, status = ?, origin = ?, owner_tag = ?, content_hash = ?, updated_at = ?
+    WHERE id = ?
+  `).run(next.display_name, next.given_name, next.family_name,
+    next.organization, next.title, next.primary_email, next.primary_phone,
+    next.notes, next.status, next.origin, next.owner_tag, contentHash, now, contactId);
+  const updated = getContactRow(database, contactId);
+  upsertPersonGraphNode(database, updated);
+  writeProofChainEntry(database, 'contact.updated', contentHash, {
+    contact_id: contactId,
+    changed_fields: changedFields,
+    old_content_hash: existing.content_hash,
+    new_content_hash: contentHash,
+  });
+  emitStructuredEvent(buildEvent('contact.updated',
+    { contact_id: contactId, changed_fields: changedFields,
+      content_hash: contentHash },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return { updated: true, contact: getContact(database, contactId) };
+}
+
+// Soft delete (status='inactive') or hard delete (purge with cascade).
+function deleteContact(database, runtimeState, contactId, options) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  const purge = options?.purge === true;
+  if (purge && !options?.confirm) {
+    return { error: '--purge requires --confirm' };
+  }
+  const now = nowIso();
+  if (purge) {
+    // Cascade FK delete removes emails/phones/addresses/fields/entity_links.
+    database.prepare('DELETE FROM contacts WHERE id = ?').run(contactId);
+    // Remove graph node and edges.
+    const nodeId = `contact:${contactId}`;
+    database.prepare('DELETE FROM graph_nodes WHERE id = ?').run(nodeId);
+    database.prepare(
+      'DELETE FROM graph_edges WHERE source_id = ? OR target_id = ?'
+    ).run(nodeId, nodeId);
+    writeProofChainEntry(database, 'contact.purged', existing.content_hash, {
+      contact_id: contactId,
+    });
+    emitStructuredEvent(buildEvent('contact.purged',
+      { contact_id: contactId, content_hash: existing.content_hash },
+      readVectorClock(database), null), runtimeState?.quiet);
+    return { purged: true };
+  }
+  database.prepare(`
+    UPDATE contacts SET status = 'inactive', updated_at = ? WHERE id = ?
+  `).run(now, contactId);
+  writeProofChainEntry(database, 'contact.deleted', existing.content_hash, {
+    contact_id: contactId,
+  });
+  emitStructuredEvent(buildEvent('contact.deleted',
+    { contact_id: contactId, content_hash: existing.content_hash },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return { deleted: true };
+}
+
+// List contacts — active only unless includeAll/status filter present.
+// P-065: explicit CASE for status sorting deterministically.
+// K6-A (S12.2135): the `label` option closes the write-only label loop — labels were
+// attachable (contact_labels + BULK_ACTIONS 'label') and enumerable (listAllLabels)
+// but never FILTERABLE, so nothing could read them back out as a query. The subquery
+// rides the existing idx_contact_labels_label index and cannot duplicate rows the way
+// a bare JOIN would. Additive: no option => byte-identical SQL to before.
+function listContacts(database, options) {
+  const where = [];
+  const params = [];
+  if (options?.starred) { where.push('starred = 1'); }
+  if (options?.label) {
+    where.push('id IN (SELECT contact_id FROM contact_labels WHERE label = ?)');
+    params.push(options.label);
+  }
+  if (options?.status) { where.push('status = ?'); params.push(options.status); }
+  else if (!options?.includeAll) { where.push("status = 'active'"); }
+  const limit = options?.limit ?? CONTACTS_PER_PAGE_DEFAULT;
+  const offset = options?.offset ?? 0;
+  const sql = `
+    SELECT id, display_name, given_name, family_name, organization, title,
+           primary_email, primary_phone, starred, status, content_hash,
+           created_at, updated_at
+    FROM contacts
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY starred DESC,
+      CASE status WHEN 'active' THEN 0 WHEN 'inactive' THEN 1
+        WHEN 'merged' THEN 2 WHEN 'deceased' THEN 3 ELSE 99 END ASC,
+      display_name COLLATE NOCASE ASC
+    LIMIT ${Number.parseInt(limit, 10)} OFFSET ${Number.parseInt(offset, 10)}
+  `;
+  return database.prepare(sql).all(...params);
+}
+
+// Star/unstar — no proof chain (UI preference, not a data event per C5).
+function setStarred(database, contactId, starred) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  database.prepare(
+    'UPDATE contacts SET starred = ?, updated_at = ? WHERE id = ?'
+  ).run(starred ? 1 : 0, nowIso(), contactId);
+  return { starred: starred ? 1 : 0 };
+}
+
+// ── Bulk actions ──────────────────────────────────────────────────────
+
+const BULK_ACTIONS = ['label', 'status', 'delete'];
+
+// Apply one action to many contacts in a single transaction. Reuses the
+// single-contact handlers (addLabel / updateContact / deleteContact) so the
+// per-contact effects — proof-chain entries, graph-node upserts, cascade
+// deletes — match the one-at-a-time flows exactly. Missing or invalid
+// contacts are skipped (not fatal) so one bad id can't sink the batch.
+// Returns the affected rows (label/status) or the deleted ids (delete).
+function bulkContactAction(database, runtimeState, ids, action, value) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return { error: 'ids must be a non-empty array' };
+  }
+  if (!BULK_ACTIONS.includes(action)) {
+    return { error: `action must be one of: ${BULK_ACTIONS.join(', ')}` };
+  }
+  if (action === 'status' && !ALLOWED_STATUSES.includes(value)) {
+    return { error: `status must be one of: ${ALLOWED_STATUSES.join(', ')}` };
+  }
+  if (action === 'label' && (typeof value !== 'string' || !value.trim())) {
+    return { error: 'label value required' };
+  }
+
+  // De-dupe ids while preserving the caller's order.
+  const uniqueIds = [...new Set(ids)];
+  const affected = [];
+  const deleted = [];
+  const skipped = [];
+
+  database.exec('BEGIN');
+  try {
+    for (const id of uniqueIds) {
+      const existing = getContactRow(database, id);
+      if (!existing) { skipped.push({ id, reason: 'contact not found' }); continue; }
+      if (action === 'label') {
+        const result = addLabel(database, id, value, null);
+        // "already has this label" is a no-op for a bulk apply — keep the
+        // operation idempotent rather than reporting it as a failure.
+        if (result.error && !result.error.includes('already has')) {
+          skipped.push({ id, reason: result.error });
+          continue;
+        }
+        affected.push(getContact(database, id));
+      } else if (action === 'status') {
+        const result = updateContact(database, runtimeState, id, { status: value });
+        if (result.error) { skipped.push({ id, reason: result.error }); continue; }
+        affected.push(result.contact);
+      } else { // delete — hard purge, mirroring the single-contact DELETE route.
+        deleteContact(database, runtimeState, id, { purge: true, confirm: true });
+        deleted.push(id);
+      }
+    }
+    // One summary entry for the batch itself (the per-contact handlers above
+    // already wrote their own granular proof entries where applicable).
+    writeProofChainEntry(database, 'contacts.bulk', null, {
+      action,
+      value: action === 'delete' ? null : value,
+      requested: uniqueIds.length,
+      affected: action === 'delete' ? deleted.length : affected.length,
+      skipped: skipped.length,
+    });
+    database.exec('COMMIT');
+  } catch (bulkError) {
+    database.exec('ROLLBACK');
+    return { error: bulkError.message ?? 'bulk action failed' };
+  }
+
+  emitStructuredEvent(buildEvent('contacts.bulk',
+    { action, count: action === 'delete' ? deleted.length : affected.length },
+    readVectorClock(database), null), runtimeState?.quiet);
+
+  if (action === 'delete') {
+    return { action, deleted, skipped, count: deleted.length };
+  }
+  return { action, value, contacts: affected, skipped, count: affected.length };
+}
+
+// ── Multi-value fields: emails, phones, addresses ────────────────────
+
+function addEmail(database, runtimeState, contactId, email, label, isPrimary) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  if (!email || typeof email !== 'string') return { error: 'email required' };
+  const emailId = newId();
+  const now = nowIso();
+  if (isPrimary) {
+    database.prepare(
+      'UPDATE contact_emails SET is_primary = 0 WHERE contact_id = ?'
+    ).run(contactId);
+  }
+  database.prepare(`
+    INSERT INTO contact_emails (id, contact_id, email, label, is_primary, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(emailId, contactId, email, label ?? DEFAULT_EMAIL_LABEL,
+    isPrimary ? 1 : 0, now);
+  // If contact has no primary_email yet (or this is explicitly primary),
+  // copy onto contacts.primary_email so the content hash and search index
+  // reflect the new state.
+  if (isPrimary || !existing.primary_email) {
+    const newPrimary = isPrimary ? email : (existing.primary_email ?? email);
+    updateContact(database, runtimeState, contactId,
+      { primaryEmail: newPrimary });
+  }
+  return { id: emailId };
+}
+
+function removeEmail(database, runtimeState, contactId, emailId) {
+  const row = database.prepare(
+    'SELECT * FROM contact_emails WHERE id = ? AND contact_id = ?'
+  ).get(emailId, contactId);
+  if (!row) return { error: 'email not found' };
+  database.prepare('DELETE FROM contact_emails WHERE id = ?').run(emailId);
+  if (row.is_primary === 1) {
+    const fallback = database.prepare(`
+      SELECT email FROM contact_emails WHERE contact_id = ?
+      ORDER BY created_at ASC LIMIT 1
+    `).get(contactId);
+    updateContact(database, runtimeState, contactId,
+      { primaryEmail: fallback?.email ?? null });
+  }
+  return { removed: true };
+}
+
+function addPhone(database, runtimeState, contactId, phone, label, isPrimary) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  if (!phone || typeof phone !== 'string') return { error: 'phone required' };
+  const phoneId = newId();
+  const now = nowIso();
+  if (isPrimary) {
+    database.prepare(
+      'UPDATE contact_phones SET is_primary = 0 WHERE contact_id = ?'
+    ).run(contactId);
+  }
+  database.prepare(`
+    INSERT INTO contact_phones (id, contact_id, phone, label, is_primary, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(phoneId, contactId, phone, label ?? DEFAULT_PHONE_LABEL,
+    isPrimary ? 1 : 0, now);
+  if (isPrimary || !existing.primary_phone) {
+    const newPrimary = isPrimary ? phone : (existing.primary_phone ?? phone);
+    updateContact(database, runtimeState, contactId,
+      { primaryPhone: newPrimary });
+  }
+  return { id: phoneId };
+}
+
+function removePhone(database, runtimeState, contactId, phoneId) {
+  const row = database.prepare(
+    'SELECT * FROM contact_phones WHERE id = ? AND contact_id = ?'
+  ).get(phoneId, contactId);
+  if (!row) return { error: 'phone not found' };
+  database.prepare('DELETE FROM contact_phones WHERE id = ?').run(phoneId);
+  if (row.is_primary === 1) {
+    const fallback = database.prepare(`
+      SELECT phone FROM contact_phones WHERE contact_id = ?
+      ORDER BY created_at ASC LIMIT 1
+    `).get(contactId);
+    updateContact(database, runtimeState, contactId,
+      { primaryPhone: fallback?.phone ?? null });
+  }
+  return { removed: true };
+}
+
+function addAddress(database, runtimeState, contactId, parts) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  const addressId = newId();
+  const now = nowIso();
+  if (parts.isPrimary) {
+    database.prepare(
+      'UPDATE contact_addresses SET is_primary = 0 WHERE contact_id = ?'
+    ).run(contactId);
+  }
+  database.prepare(`
+    INSERT INTO contact_addresses (id, contact_id, street, city, state,
+      postal_code, country, label, is_primary, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(addressId, contactId,
+    parts.street ?? null, parts.city ?? null, parts.state ?? null,
+    parts.postalCode ?? null, parts.country ?? null,
+    parts.label ?? DEFAULT_ADDRESS_LABEL,
+    parts.isPrimary ? 1 : 0, now);
+  return { id: addressId };
+}
+
+function removeAddress(database, _runtimeState, contactId, addressId) {
+  const row = database.prepare(
+    'SELECT id FROM contact_addresses WHERE id = ? AND contact_id = ?'
+  ).get(addressId, contactId);
+  if (!row) return { error: 'address not found' };
+  database.prepare('DELETE FROM contact_addresses WHERE id = ?').run(addressId);
+  return { removed: true };
+}
+
+// ── Custom fields (key/value pairs on a contact) ─────────────────────
+
+function setField(database, _runtimeState, contactId, fieldName, fieldValue) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  if (!fieldName || typeof fieldName !== 'string') {
+    return { error: 'field_name required' };
+  }
+  const now = nowIso();
+  const row = database.prepare(`
+    SELECT id FROM contact_fields WHERE contact_id = ? AND field_name = ?
+  `).get(contactId, fieldName);
+  if (row) {
+    database.prepare(
+      'UPDATE contact_fields SET field_value = ? WHERE id = ?'
+    ).run(fieldValue, row.id);
+    return { id: row.id, updated: true };
+  }
+  const fieldId = newId();
+  database.prepare(`
+    INSERT INTO contact_fields (id, contact_id, field_name, field_value, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(fieldId, contactId, fieldName, fieldValue, now);
+  return { id: fieldId, created: true };
+}
+
+function removeField(database, _runtimeState, contactId, fieldName) {
+  const row = database.prepare(`
+    SELECT id FROM contact_fields WHERE contact_id = ? AND field_name = ?
+  `).get(contactId, fieldName);
+  if (!row) return { error: 'field not found' };
+  database.prepare('DELETE FROM contact_fields WHERE id = ?').run(row.id);
+  return { removed: true };
+}
+
+// ── Labels (contact grouping) ────────────────────────────────────────
+
+// Add a label to a contact. Labels are many-to-many via the join table.
+function addLabel(database, contactId, label, color) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  if (!label || typeof label !== 'string') return { error: 'label required' };
+  const trimmedLabel = label.trim();
+  if (!trimmedLabel) return { error: 'label required' };
+  const labelId = newId();
+  const now = nowIso();
+  try {
+    database.prepare(`
+      INSERT INTO contact_labels (id, contact_id, label, color, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(labelId, contactId, trimmedLabel, color ?? null, now);
+  } catch (insertError) {
+    if (insertError.message && insertError.message.includes('UNIQUE')) {
+      return { error: 'contact already has this label' };
+    }
+    throw insertError;
+  }
+  return { id: labelId, label: trimmedLabel };
+}
+
+// Remove a label from a contact by label text.
+function removeLabel(database, contactId, label) {
+  const row = database.prepare(`
+    SELECT id FROM contact_labels WHERE contact_id = ? AND label = ?
+  `).get(contactId, label);
+  if (!row) return { error: 'label not found on this contact' };
+  database.prepare('DELETE FROM contact_labels WHERE id = ?').run(row.id);
+  return { removed: true };
+}
+
+// List all distinct labels across all contacts with counts.
+// K6-A: `active_count` rides alongside `contact_count` because the two answer
+// different questions and a UI that confuses them lies. `contact_count` is the
+// vocabulary fact (how many contacts carry this label, ANY status).
+// `active_count` is what a label FILTER actually delivers, since listContacts()
+// defaults to active-only — so a rail chip built on contact_count would print
+// "5" above three rows. LEFT JOIN, so contact_count stays byte-identical to
+// before even if a label row ever outlived its contact.
+function listAllLabels(database) {
+  const rows = database.prepare(`
+    SELECT cl.label, cl.color, COUNT(*) AS contact_count,
+           SUM(CASE WHEN c.status = 'active' THEN 1 ELSE 0 END) AS active_count
+    FROM contact_labels cl
+    LEFT JOIN contacts c ON c.id = cl.contact_id
+    GROUP BY cl.label
+    ORDER BY cl.label COLLATE NOCASE ASC
+  `).all();
+  return rows;
+}
+
+// Get all labels for a specific contact.
+function getContactLabels(database, contactId) {
+  return database.prepare(`
+    SELECT id, label, color, created_at
+    FROM contact_labels WHERE contact_id = ?
+    ORDER BY label COLLATE NOCASE ASC
+  `).all(contactId);
+}
+
+// ── Notes (timestamped note log) ─────────────────────────────────────
+
+// Add a timestamped note to a contact.
+function addNote(database, contactId, noteText) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  if (!noteText || typeof noteText !== 'string' || !noteText.trim()) {
+    return { error: 'note text required' };
+  }
+  const noteId = newId();
+  const now = nowIso();
+  database.prepare(`
+    INSERT INTO contact_notes (id, contact_id, note_text, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(noteId, contactId, noteText.trim(), now);
+  return { id: noteId, created_at: now };
+}
+
+// List all notes for a contact, most recent first.
+function listNotes(database, contactId) {
+  return database.prepare(`
+    SELECT id, note_text, created_at
+    FROM contact_notes WHERE contact_id = ?
+    ORDER BY created_at DESC
+  `).all(contactId);
+}
+
+// Remove a specific note by ID.
+function removeNote(database, contactId, noteId) {
+  const row = database.prepare(`
+    SELECT id FROM contact_notes WHERE id = ? AND contact_id = ?
+  `).get(noteId, contactId);
+  if (!row) return { error: 'note not found' };
+  database.prepare('DELETE FROM contact_notes WHERE id = ?').run(noteId);
+  return { removed: true };
+}
+
+// ── Follow-ups (per-contact reminders) ───────────────────────────────
+// A follow-up is a note + optional due date that prompts later action. The
+// followup.* proof-chain entries carry contact_id in their detail so the
+// activity timeline picks them up with no extra wiring (soft signal —
+// failures here are non-blocking for the parent flow).
+
+// Fetch a single follow-up row (no joins).
+function getFollowUpRow(database, followUpId) {
+  return database.prepare(`
+    SELECT id, contact_id, note, due_date, completed_at, created_at
+    FROM follow_ups WHERE id = ?
+  `).get(followUpId);
+}
+
+// List a contact's follow-ups — open ones first, then by due date, with
+// undated trailing and newest-created breaking ties.
+function listFollowUps(database, contactId) {
+  return database.prepare(`
+    SELECT id, contact_id, note, due_date, completed_at, created_at
+    FROM follow_ups WHERE contact_id = ?
+    ORDER BY CASE WHEN completed_at IS NULL THEN 0 ELSE 1 END ASC,
+      CASE WHEN due_date IS NULL THEN 1 ELSE 0 END ASC,
+      due_date ASC, created_at DESC
+  `).all(contactId);
+}
+
+// Open follow-ups due on or before `dueDate` across all active contacts,
+// joined with the contact's display name. Powers GET /api/followups?due=.
+function listDueFollowUps(database, dueDate) {
+  return database.prepare(`
+    SELECT follow_ups.id, follow_ups.contact_id, follow_ups.note,
+           follow_ups.due_date, follow_ups.completed_at, follow_ups.created_at,
+           contacts.display_name AS contact_name
+    FROM follow_ups
+    JOIN contacts ON contacts.id = follow_ups.contact_id
+    WHERE follow_ups.completed_at IS NULL
+      AND follow_ups.due_date IS NOT NULL
+      AND follow_ups.due_date <= ?
+      AND contacts.status = 'active'
+    ORDER BY follow_ups.due_date ASC, follow_ups.created_at ASC
+  `).all(dueDate);
+}
+
+// Add a follow-up to a contact. Requires a note or a due date (or both).
+function addFollowUp(database, runtimeState, contactId, options) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  const note = typeof options.note === 'string' ? options.note.trim() : '';
+  const dueDate = options.dueDate ? String(options.dueDate).trim() : null;
+  if (!note && !dueDate) return { error: 'note or due_date required' };
+  const id = newId();
+  const now = nowIso();
+  database.prepare(`
+    INSERT INTO follow_ups (id, contact_id, note, due_date, completed_at, created_at)
+    VALUES (?, ?, ?, ?, NULL, ?)
+  `).run(id, contactId, note || null, dueDate, now);
+  writeProofChainEntry(database, 'followup.created', null, {
+    contact_id: contactId, followup_id: id, due_date: dueDate,
+  });
+  emitStructuredEvent(buildEvent('followup.created',
+    { contact_id: contactId, followup_id: id, due_date: dueDate },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return getFollowUpRow(database, id);
+}
+
+// Update a follow-up: edit note/due date and/or toggle completion. Marking
+// complete emits followup.completed; other edits emit followup.updated.
+function updateFollowUp(database, runtimeState, contactId, followUpId, patch) {
+  const row = database.prepare(
+    'SELECT * FROM follow_ups WHERE id = ? AND contact_id = ?'
+  ).get(followUpId, contactId);
+  if (!row) return { error: 'follow-up not found' };
+  const next = {
+    note: patch.note === undefined
+      ? row.note : (patch.note ? String(patch.note).trim() : null),
+    due_date: patch.dueDate === undefined
+      ? row.due_date : (patch.dueDate ? String(patch.dueDate).trim() : null),
+    completed_at: row.completed_at,
+  };
+  let eventType = 'followup.updated';
+  if (patch.completed !== undefined) {
+    if (patch.completed && !row.completed_at) {
+      next.completed_at = nowIso();
+      eventType = 'followup.completed';
+    } else if (!patch.completed) {
+      next.completed_at = null;
+    }
+  }
+  database.prepare(`
+    UPDATE follow_ups SET note = ?, due_date = ?, completed_at = ? WHERE id = ?
+  `).run(next.note, next.due_date, next.completed_at, followUpId);
+  writeProofChainEntry(database, eventType, null, {
+    contact_id: contactId, followup_id: followUpId, due_date: next.due_date,
+  });
+  emitStructuredEvent(buildEvent(eventType,
+    { contact_id: contactId, followup_id: followUpId, due_date: next.due_date },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return getFollowUpRow(database, followUpId);
+}
+
+// Remove a follow-up by ID.
+function removeFollowUp(database, runtimeState, contactId, followUpId) {
+  const row = database.prepare(
+    'SELECT id FROM follow_ups WHERE id = ? AND contact_id = ?'
+  ).get(followUpId, contactId);
+  if (!row) return { error: 'follow-up not found' };
+  database.prepare('DELETE FROM follow_ups WHERE id = ?').run(followUpId);
+  writeProofChainEntry(database, 'followup.deleted', null, {
+    contact_id: contactId, followup_id: followUpId,
+  });
+  emitStructuredEvent(buildEvent('followup.deleted',
+    { contact_id: contactId, followup_id: followUpId },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return { removed: true };
+}
+
+// ── Full-text search (FTS5) ──────────────────────────────────────────
+
+function searchContacts(database, query, options) {
+  if (typeof query !== 'string' || query.trim().length === 0) {
+    return { results: [], error: 'empty query' };
+  }
+  const limit = Number.parseInt(options?.limit ?? CONTACTS_PER_PAGE_DEFAULT, 10);
+  try {
+    const rows = database.prepare(`
+      SELECT contacts.id, contacts.display_name, contacts.organization,
+             contacts.primary_email, contacts.primary_phone,
+             contacts.starred, contacts.status, contacts.content_hash,
+             snippet(contacts_fts, 0, '«', '»', '…', 12) AS snippet
+      FROM contacts_fts
+      JOIN contacts ON contacts.rowid = contacts_fts.rowid
+      WHERE contacts_fts MATCH ?
+        AND contacts.status = 'active'
+      ORDER BY rank
+      LIMIT ${limit}
+    `).all(query);
+    return { results: rows, error: null };
+  } catch (searchError) {
+    return { results: [], error: searchError.message };
+  }
+}
+
+// ── Relationship links (contact ↔ contact graph edges) ───────────────
+
+function linkContacts(database, runtimeState, contactIdA, contactIdB,
+    relationship, options) {
+  const rowA = getContactRow(database, contactIdA);
+  const rowB = getContactRow(database, contactIdB);
+  if (!rowA || !rowB) return { error: 'contact not found' };
+  if (!relationship || typeof relationship !== 'string') {
+    return { error: 'relationship required' };
+  }
+  const nodeA = `contact:${contactIdA}`;
+  const nodeB = `contact:${contactIdB}`;
+  const reason = options?.reason ?? 'user-declared relationship';
+  const edgeA = insertGraphEdge(database, nodeA, nodeB, relationship, reason);
+  let edgeB = null;
+  if (!options?.oneWay) {
+    edgeB = insertGraphEdge(database, nodeB, nodeA, relationship, reason);
+  }
+  writeProofChainEntry(database, 'relationship.created',
+    sha256Hex(`${nodeA}|${nodeB}|${relationship}`),
+    {
+      source_contact: contactIdA, target_contact: contactIdB,
+      relationship, one_way: !!options?.oneWay,
+    });
+  emitStructuredEvent(buildEvent('relationship.created',
+    { source_contact: contactIdA, target_contact: contactIdB,
+      relationship, one_way: !!options?.oneWay },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return { edge_ids: edgeB ? [edgeA, edgeB] : [edgeA] };
+}
+
+function unlinkContacts(database, runtimeState, contactIdA, contactIdB,
+    relationship, options) {
+  if (!relationship || typeof relationship !== 'string') {
+    return { error: 'relationship required' };
+  }
+  const nodeA = `contact:${contactIdA}`;
+  const nodeB = `contact:${contactIdB}`;
+  removeGraphEdge(database, nodeA, nodeB, relationship);
+  if (!options?.oneWay) {
+    removeGraphEdge(database, nodeB, nodeA, relationship);
+  }
+  writeProofChainEntry(database, 'relationship.removed',
+    sha256Hex(`${nodeA}|${nodeB}|${relationship}`),
+    { source_contact: contactIdA, target_contact: contactIdB, relationship });
+  emitStructuredEvent(buildEvent('relationship.removed',
+    { source_contact: contactIdA, target_contact: contactIdB, relationship },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return { removed: true };
+}
+
+// Read a contact's relationship links for the dossier panel (graph read).
+// Resolves each edge's counterpart node to the other contact's id + display
+// name so the UI can render names/orgs rather than raw "contact:<id>" nodes.
+// Skips non-contact nodes (e.g. entity links to foreign tools).
+function getContactRelationships(database, contactId) {
+  const node = `contact:${contactId}`;
+  const edges = database.prepare(`
+    SELECT id, source_id, target_id, relationship, created_at, reason
+    FROM graph_edges
+    WHERE (source_id = ? OR target_id = ?)
+      AND source_tool = 'loop-contact'
+      AND relationship NOT IN ('entity_link')
+    ORDER BY relationship ASC, created_at ASC
+  `).all(node, node);
+  // A two-way link stores reciprocal edges (A→B and B→A). Collapse each
+  // (counterpart, relationship) pair into a single entry so the panel shows
+  // one row marked 'mutual' rather than a duplicated outgoing/incoming pair.
+  const byPair = new Map();
+  const order = [];
+  for (const edge of edges) {
+    const outgoing = edge.source_id === node;
+    const otherNode = outgoing ? edge.target_id : edge.source_id;
+    if (typeof otherNode !== 'string' || !otherNode.startsWith('contact:')) continue;
+    const otherId = otherNode.slice('contact:'.length);
+    const key = `${otherId}\u0000${edge.relationship}`;
+    const existing = byPair.get(key);
+    if (existing) {
+      existing.direction = 'mutual';
+      continue;
+    }
+    const otherRow = getContactRow(database, otherId);
+    const link = {
+      edge_id: edge.id,
+      contact_id: otherId,
+      display_name: otherRow?.display_name ?? null,
+      organization: otherRow?.organization ?? null,
+      relationship: edge.relationship,
+      direction: outgoing ? 'outgoing' : 'incoming',
+      reason: edge.reason ?? null,
+      created_at: edge.created_at,
+    };
+    byPair.set(key, link);
+    order.push(key);
+  }
+  const links = order.map((key) => byPair.get(key));
+  return { contact_id: contactId, links };
+}
+
+// ── Activity timeline (read-only) ────────────────────────────────────
+
+// True when a proof-chain entry's detail references this contact by id.
+// Matching is by id presence (any string field or string array element),
+// not a fixed event-type list — so any current or future event family that
+// records the contact id (relationship.*, followup.*, …) is picked up
+// without a code change.
+function proofDetailReferencesContact(detail, contactId) {
+  if (!detail || typeof detail !== 'object') return false;
+  for (const value of Object.values(detail)) {
+    if (typeof value === 'string' && value === contactId) return true;
+    if (Array.isArray(value) && value.includes(contactId)) return true;
+  }
+  return false;
+}
+
+// Merged proof-chain + event records for one contact, newest-first. Pure
+// read over the append-only proof chain — no writes, no new tables.
+function getContactTimeline(database, contactId) {
+  const rows = database.prepare(`
+    SELECT hash, timestamp, event_type, content_hash, detail
+    FROM proof_chain
+    ORDER BY timestamp DESC, rowid DESC
+  `).all();
+  const entries = [];
+  for (const row of rows) {
+    let detail = {};
+    try { detail = JSON.parse(row.detail ?? '{}'); }
+    catch (_parseError) { detail = {}; }
+    if (!proofDetailReferencesContact(detail, contactId)) continue;
+    entries.push({
+      hash: row.hash,
+      event_type: row.event_type,
+      timestamp: row.timestamp,
+      content_hash: row.content_hash ?? null,
+      detail,
+    });
+  }
+  return entries;
+}
+
+// ── vCard parsing (RFC 6350 — vCard 4.0) ─────────────────────────────
+
+// Unfold long vCard lines per RFC 6350 §3.2 (continuation by leading space/tab).
+function unfoldVCardLines(rawText) {
+  const rawLines = rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const folded = [];
+  for (const line of rawLines) {
+    if ((line.startsWith(' ') || line.startsWith('\t')) && folded.length > 0) {
+      folded[folded.length - 1] += line.slice(1);
+    } else {
+      folded.push(line);
+    }
+  }
+  return folded;
+}
+
+// Parse a single vCard property line ("EMAIL;TYPE=work:x@example.com").
+function parseVCardLine(line) {
+  if (typeof line !== 'string' || line.length === 0) return null;
+  const colonIndex = line.indexOf(':');
+  if (colonIndex < 0) return null;
+  const left = line.slice(0, colonIndex);
+  const right = line.slice(colonIndex + 1);
+  const semiIndex = left.indexOf(';');
+  const propertyName = semiIndex >= 0 ? left.slice(0, semiIndex) : left;
+  const paramSegments = semiIndex >= 0 ? left.slice(semiIndex + 1).split(';') : [];
+  const params = {};
+  for (const segment of paramSegments) {
+    const equalsIndex = segment.indexOf('=');
+    if (equalsIndex < 0) continue;
+    const key = segment.slice(0, equalsIndex).toUpperCase();
+    const value = segment.slice(equalsIndex + 1);
+    params[key] = value;
+  }
+  return { property: propertyName.toUpperCase(), params, value: right };
+}
+
+// Unescape vCard text values per RFC 6350 §3.4.
+function unescapeVCardValue(value) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/\\n/gi, '\n')
+    .replace(/\\,/g, ',')
+    .replace(/\\;/g, ';')
+    .replace(/\\\\/g, '\\');
+}
+
+// Split into multiple vCard blocks (each BEGIN..END pair).
+function splitVCardBlocks(rawText) {
+  const lines = unfoldVCardLines(rawText);
+  const blocks = [];
+  let current = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === VCARD_BEGIN) { current = []; continue; }
+    if (trimmed === VCARD_END) {
+      if (current) blocks.push(current);
+      current = null;
+      continue;
+    }
+    if (current) current.push(line);
+  }
+  return blocks;
+}
+
+// Parse one vCard block's properties into a structured contact object.
+function parseVCardBlock(blockLines) {
+  const result = {
+    displayName: null, givenName: null, familyName: null,
+    organization: null, title: null, notes: null,
+    emails: [], phones: [], addresses: [], otherFields: [],
+  };
+  for (const line of blockLines) {
+    const parsed = parseVCardLine(line);
+    if (!parsed) continue;
+    const { property, params, value } = parsed;
+    if (property === 'VERSION') continue;
+    if (property === 'FN') {
+      result.displayName = unescapeVCardValue(value);
+    } else if (property === 'N') {
+      const parts = value.split(';');
+      result.familyName = unescapeVCardValue(parts[0] ?? '') || null;
+      result.givenName = unescapeVCardValue(parts[1] ?? '') || null;
+    } else if (property === 'ORG') {
+      result.organization = unescapeVCardValue(value.split(';')[0] ?? '');
+    } else if (property === 'TITLE') {
+      result.title = unescapeVCardValue(value);
+    } else if (property === 'NOTE') {
+      result.notes = unescapeVCardValue(value);
+    } else if (property === 'EMAIL') {
+      const label = (params.TYPE ?? DEFAULT_EMAIL_LABEL).toLowerCase().split(',')[0];
+      result.emails.push({ email: unescapeVCardValue(value), label,
+        isPrimary: result.emails.length === 0 });
+    } else if (property === 'TEL') {
+      const label = (params.TYPE ?? DEFAULT_PHONE_LABEL).toLowerCase().split(',')[0];
+      result.phones.push({ phone: unescapeVCardValue(value), label,
+        isPrimary: result.phones.length === 0 });
+    } else if (property === 'ADR') {
+      const parts = value.split(';');
+      result.addresses.push({
+        street: unescapeVCardValue(parts[2] ?? '') || null,
+        city: unescapeVCardValue(parts[3] ?? '') || null,
+        state: unescapeVCardValue(parts[4] ?? '') || null,
+        postalCode: unescapeVCardValue(parts[5] ?? '') || null,
+        country: unescapeVCardValue(parts[6] ?? '') || null,
+        label: (params.TYPE ?? DEFAULT_ADDRESS_LABEL).toLowerCase().split(',')[0],
+        isPrimary: result.addresses.length === 0,
+      });
+    } else {
+      result.otherFields.push({
+        name: `vcard:${property.toLowerCase()}`,
+        value: unescapeVCardValue(value),
+      });
+    }
+  }
+  // Synthesize a display name if FN is missing — fallback to N or ORG.
+  if (!result.displayName) {
+    const constructed = [result.givenName, result.familyName].filter(Boolean).join(' ').trim();
+    result.displayName = constructed || result.organization || 'Unknown';
+  }
+  return result;
+}
+
+// Import a vCard file — creates contacts, returns import summary.
+function importVCardFile(database, runtimeState, filePath) {
+  const rawText = fs.readFileSync(filePath, 'utf8');
+  return importVCardText(database, runtimeState, rawText);
+}
+
+// Import vCard text (one or many blocks).
+function importVCardText(database, runtimeState, rawText) {
+  const blocks = splitVCardBlocks(rawText);
+  const created = [];
+  // Atomicity: the whole import is ONE transaction. A throw part-way through the
+  // loop must leave ZERO rows written. node:sqlite DatabaseSync has no
+  // .transaction() helper (that is better-sqlite3) — BEGIN/COMMIT/ROLLBACK via
+  // exec(), the same idiom bulkContactAction() already uses in this file.
+  // NESTING: bulkContactAction() is the only other transaction here, and neither
+  // import calls it (nor it them), so a bare BEGIN cannot nest.
+  // The proof-chain entries are written inside the loop to the same db and roll
+  // back with the rows, which is correct: a rolled-back import must leave no
+  // proof of an import that did not happen.
+  // NOTE: the loop body below is deliberately NOT re-indented — a narrow diff in
+  // a byte-frozen golden tree is what keeps a re-bless officiatable.
+  database.exec('BEGIN');
+  try {
+  for (const block of blocks) {
+    const parsed = parseVCardBlock(block);
+    const primaryEmail = parsed.emails[0]?.email ?? null;
+    const primaryPhone = parsed.phones[0]?.phone ?? null;
+    const contact = createContact(database, runtimeState, {
+      displayName: parsed.displayName,
+      givenName: parsed.givenName,
+      familyName: parsed.familyName,
+      organization: parsed.organization,
+      title: parsed.title,
+      primaryEmail, primaryPhone,
+      notes: parsed.notes,
+    });
+    for (const email of parsed.emails) {
+      database.prepare(`
+        INSERT INTO contact_emails (id, contact_id, email, label, is_primary, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(newId(), contact.id, email.email, email.label,
+        email.isPrimary ? 1 : 0, nowIso());
+    }
+    for (const phone of parsed.phones) {
+      database.prepare(`
+        INSERT INTO contact_phones (id, contact_id, phone, label, is_primary, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(newId(), contact.id, phone.phone, phone.label,
+        phone.isPrimary ? 1 : 0, nowIso());
+    }
+    for (const address of parsed.addresses) {
+      database.prepare(`
+        INSERT INTO contact_addresses (id, contact_id, street, city, state,
+          postal_code, country, label, is_primary, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(newId(), contact.id, address.street, address.city, address.state,
+        address.postalCode, address.country, address.label,
+        address.isPrimary ? 1 : 0, nowIso());
+    }
+    for (const field of parsed.otherFields) {
+      setField(database, runtimeState, contact.id, field.name, field.value);
+    }
+    writeProofChainEntry(database, 'contact.imported',
+      contact.content_hash, {
+        contact_id: contact.id,
+        source: 'vcard',
+        has_email: !!primaryEmail,
+        has_phone: !!primaryPhone,
+      });
+    created.push(contact);
+  }
+  database.exec('COMMIT');
+  } catch (err) {
+    try { database.exec('ROLLBACK'); } catch (_) { /* nothing to roll back */ }
+    return { error: `import failed, nothing was written: ${err.message}`,
+      imported: 0, contact_ids: [], merge_candidates: 0, candidates: [] };
+  }
+  // After import, automatically surface merge candidates (C11).
+  // A READ — runs AFTER the commit, outside the transaction.
+  const candidates = suggestMerges(database);
+  return { imported: created.length, contact_ids: created.map((c) => c.id),
+    merge_candidates: candidates.length, candidates };
+}
+
+// ── vCard export (RFC 6350) ──────────────────────────────────────────
+
+// Escape a value for vCard output per RFC 6350 §3.4.
+function escapeVCardValue(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/\n/g, '\\n')
+    .replace(/,/g, '\\,')
+    .replace(/;/g, '\\;');
+}
+
+// Fold a long line to ≤75 octets per RFC 6350 §3.2 (line folding).
+function foldVCardLine(line) {
+  if (line.length <= 75) return line;
+  const segments = [];
+  let remaining = line;
+  segments.push(remaining.slice(0, 75));
+  remaining = remaining.slice(75);
+  while (remaining.length > 74) {
+    segments.push(' ' + remaining.slice(0, 74));
+    remaining = remaining.slice(74);
+  }
+  if (remaining.length > 0) segments.push(' ' + remaining);
+  return segments.join('\r\n');
+}
+
+// Serialize one contact as a single vCard block.
+function serializeContactAsVCard(contact) {
+  const lines = [VCARD_BEGIN, VCARD_VERSION_LINE];
+  lines.push(`FN:${escapeVCardValue(contact.display_name)}`);
+  if (contact.family_name || contact.given_name) {
+    lines.push(`N:${escapeVCardValue(contact.family_name ?? '')};${escapeVCardValue(contact.given_name ?? '')};;;`);
+  }
+  if (contact.organization) {
+    lines.push(`ORG:${escapeVCardValue(contact.organization)}`);
+  }
+  if (contact.title) {
+    lines.push(`TITLE:${escapeVCardValue(contact.title)}`);
+  }
+  for (const email of contact.emails ?? []) {
+    const typeParam = email.label ? `;TYPE=${email.label}` : '';
+    lines.push(`EMAIL${typeParam}:${escapeVCardValue(email.email)}`);
+  }
+  for (const phone of contact.phones ?? []) {
+    const typeParam = phone.label ? `;TYPE=${phone.label}` : '';
+    lines.push(`TEL${typeParam}:${escapeVCardValue(phone.phone)}`);
+  }
+  for (const address of contact.addresses ?? []) {
+    const typeParam = address.label ? `;TYPE=${address.label}` : '';
+    const adr = [
+      '', '',
+      escapeVCardValue(address.street ?? ''),
+      escapeVCardValue(address.city ?? ''),
+      escapeVCardValue(address.state ?? ''),
+      escapeVCardValue(address.postal_code ?? ''),
+      escapeVCardValue(address.country ?? ''),
+    ].join(';');
+    lines.push(`ADR${typeParam}:${adr}`);
+  }
+  if (contact.notes) {
+    lines.push(`NOTE:${escapeVCardValue(contact.notes)}`);
+  }
+  // Round-trip preservation: emit any contact_fields beginning "vcard:" as
+  // their original property name (best-effort round-trip).
+  for (const field of contact.fields ?? []) {
+    if (typeof field.field_name === 'string'
+        && field.field_name.startsWith('vcard:')) {
+      const propertyName = field.field_name.slice('vcard:'.length).toUpperCase();
+      lines.push(`${propertyName}:${escapeVCardValue(field.field_value)}`);
+    }
+  }
+  lines.push(VCARD_END);
+  return lines.map(foldVCardLine).join('\r\n');
+}
+
+// Select the contacts an export targets. Filters: id, starred, or all active.
+// Shared by the vCard and CSV exporters so both honor the same query options.
+function selectContactsForExport(database, options) {
+  if (options?.id) {
+    const contact = getContact(database, options.id);
+    return contact ? [contact] : [];
+  }
+  if (options?.starred) {
+    const ids = database.prepare(`
+      SELECT id FROM contacts WHERE starred = 1 AND status = 'active'
+    `).all();
+    return ids.map((row) => getContact(database, row.id));
+  }
+  const ids = database.prepare(`
+    SELECT id FROM contacts WHERE status = 'active'
+    ORDER BY display_name COLLATE NOCASE ASC
+  `).all();
+  return ids.map((row) => getContact(database, row.id));
+}
+
+// Export contacts as concatenated vCard text.
+function exportContactsToVCard(database, options) {
+  const rows = selectContactsForExport(database, options);
+  return rows.map((row) => serializeContactAsVCard(row)).join('\r\n');
+}
+
+// ── CSV import/export (RFC 4180) ─────────────────────────────────────
+
+// Escape a single CSV field per RFC 4180 §2: quote when it contains a
+// quote, comma, or newline; double any embedded quotes.
+function escapeCsvField(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (/["\r\n,]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+// Pick a contact's primary email/phone, tolerating either the flat
+// primary_* column or the joined emails/phones arrays from getContact.
+function primaryEmailOf(contact) {
+  return contact.primary_email
+    ?? contact.emails?.find((e) => e.is_primary)?.email
+    ?? contact.emails?.[0]?.email
+    ?? '';
+}
+function primaryPhoneOf(contact) {
+  return contact.primary_phone
+    ?? contact.phones?.find((p) => p.is_primary)?.phone
+    ?? contact.phones?.[0]?.phone
+    ?? '';
+}
+
+// Serialize contacts to CSV text (header row + one row per contact).
+function serializeContactsToCsv(contacts) {
+  const lines = [CSV_COLUMNS.join(',')];
+  for (const contact of contacts) {
+    const row = [
+      contact.display_name,
+      contact.given_name,
+      contact.family_name,
+      contact.organization,
+      contact.title,
+      primaryEmailOf(contact),
+      primaryPhoneOf(contact),
+      contact.notes,
+      contact.starred ? '1' : '0',
+    ];
+    lines.push(row.map(escapeCsvField).join(','));
+  }
+  return lines.join('\r\n');
+}
+
+// Tokenize CSV text into an array of rows (each an array of cell strings),
+// honoring RFC 4180 quoting (embedded commas/newlines, doubled quotes).
+function parseCsvRows(text) {
+  const source = String(text ?? '');
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  let i = 0;
+  while (i < source.length) {
+    const ch = source[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (source[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i += 1; continue;
+      }
+      field += ch; i += 1; continue;
+    }
+    if (ch === '"') { inQuotes = true; i += 1; continue; }
+    if (ch === ',') { row.push(field); field = ''; i += 1; continue; }
+    if (ch === '\r' || ch === '\n') {
+      if (ch === '\r' && source[i + 1] === '\n') i += 1;
+      row.push(field); field = ''; rows.push(row); row = []; i += 1; continue;
+    }
+    field += ch; i += 1;
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Parse CSV text into record objects keyed by the (lower-cased) header row.
+function parseCsvText(text) {
+  const rows = parseCsvRows(text);
+  if (rows.length === 0) return [];
+  const header = rows[0].map((cell) => cell.trim().toLowerCase());
+  const records = [];
+  for (let r = 1; r < rows.length; r += 1) {
+    const cells = rows[r];
+    // Skip blank lines (a single empty trailing cell).
+    if (cells.length === 1 && cells[0] === '') continue;
+    const record = {};
+    header.forEach((key, idx) => { record[key] = cells[idx] ?? ''; });
+    records.push(record);
+  }
+  return records;
+}
+
+// Export contacts as CSV text.
+function exportContactsToCsv(database, options) {
+  const rows = selectContactsForExport(database, options);
+  return serializeContactsToCsv(rows);
+}
+
+// Import CSV text — creates one contact per data row, returns import summary
+// in the same shape as importVCardText (so callers stay format-agnostic).
+function importCsvText(database, runtimeState, csvText) {
+  const records = parseCsvText(csvText);
+  const created = [];
+  // Atomicity: one transaction for the whole import — see importVCardText above.
+  // The loop body is deliberately NOT re-indented (narrow golden diff).
+  database.exec('BEGIN');
+  try {
+  for (const record of records) {
+    const givenName = (record.given_name || '').trim() || null;
+    const familyName = (record.family_name || '').trim() || null;
+    const organization = (record.organization || '').trim() || null;
+    const displayName = (record.display_name || record.name || '').trim()
+      || [givenName, familyName].filter(Boolean).join(' ').trim()
+      || organization
+      || 'Unknown';
+    const primaryEmail = (record.email || '').trim() || null;
+    const primaryPhone = (record.phone || '').trim() || null;
+    const starredValue = (record.starred || '').trim().toLowerCase();
+    const contact = createContact(database, runtimeState, {
+      displayName,
+      givenName,
+      familyName,
+      organization,
+      title: (record.title || '').trim() || null,
+      primaryEmail, primaryPhone,
+      notes: (record.notes || '').trim() || null,
+      starred: starredValue === '1' || starredValue === 'true',
+    });
+    if (primaryEmail) {
+      database.prepare(`
+        INSERT INTO contact_emails (id, contact_id, email, label, is_primary, created_at)
+        VALUES (?, ?, ?, ?, 1, ?)
+      `).run(newId(), contact.id, primaryEmail, DEFAULT_EMAIL_LABEL, nowIso());
+    }
+    if (primaryPhone) {
+      database.prepare(`
+        INSERT INTO contact_phones (id, contact_id, phone, label, is_primary, created_at)
+        VALUES (?, ?, ?, ?, 1, ?)
+      `).run(newId(), contact.id, primaryPhone, DEFAULT_PHONE_LABEL, nowIso());
+    }
+    writeProofChainEntry(database, 'contact.imported',
+      contact.content_hash, {
+        contact_id: contact.id,
+        source: 'csv',
+        has_email: !!primaryEmail,
+        has_phone: !!primaryPhone,
+      });
+    created.push(contact);
+  }
+  database.exec('COMMIT');
+  } catch (err) {
+    try { database.exec('ROLLBACK'); } catch (_) { /* nothing to roll back */ }
+    return { error: `import failed, nothing was written: ${err.message}`,
+      imported: 0, contact_ids: [], merge_candidates: 0, candidates: [] };
+  }
+  // After import, automatically surface merge candidates (C11), matching
+  // the vCard import path. A READ — runs AFTER the commit.
+  const candidates = suggestMerges(database);
+  return { imported: created.length, contact_ids: created.map((c) => c.id),
+    merge_candidates: candidates.length, candidates };
+}
+
+// ── Entity links (cross-tool resolution) ─────────────────────────────
+
+// Parse an entity link identifier "loop-lens:people:abc123" → parts.
+function parseEntityLinkIdentifier(linkIdentifier) {
+  if (typeof linkIdentifier !== 'string') return null;
+  const parts = linkIdentifier.split(':');
+  if (parts.length < 3) return null;
+  const sourceTool = parts[0];
+  const foreignTable = parts[1];
+  const foreignId = parts.slice(2).join(':');
+  return { sourceTool, foreignTable, foreignId };
+}
+
+function createEntityLink(database, runtimeState, contactId, linkIdentifier,
+    confidence) {
+  const existing = getContactRow(database, contactId);
+  if (!existing) return { error: 'contact not found' };
+  const parts = parseEntityLinkIdentifier(linkIdentifier);
+  if (!parts) return { error: 'malformed link identifier' };
+  const useConfidence = confidence ?? 'confirmed';
+  if (!ALLOWED_CONFIDENCES.includes(useConfidence)) {
+    return { error: `confidence must be one of: ${ALLOWED_CONFIDENCES.join(', ')}` };
+  }
+  const linkId = newId();
+  const now = nowIso();
+  database.prepare(`
+    INSERT INTO entity_links (id, contact_id, source_tool, foreign_table,
+      foreign_id, confidence, linked_at, linked_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'user')
+  `).run(linkId, contactId, parts.sourceTool, parts.foreignTable,
+    parts.foreignId, useConfidence, now);
+  // Graph edge: contact node → foreign node id (per the link prefix).
+  const foreignNodeId = `${parts.sourceTool}:${parts.foreignTable}:${parts.foreignId}`;
+  insertGraphEdge(database, `contact:${contactId}`, foreignNodeId,
+    'entity_link', 'cross-tool entity resolution',
+    { source_tool: parts.sourceTool, foreign_table: parts.foreignTable });
+  writeProofChainEntry(database, 'entity.linked',
+    sha256Hex(`${contactId}|${linkIdentifier}`),
+    { contact_id: contactId, source_tool: parts.sourceTool,
+      foreign_table: parts.foreignTable, foreign_id: parts.foreignId,
+      confidence: useConfidence });
+  emitStructuredEvent(buildEvent('entity.linked',
+    { contact_id: contactId, source_tool: parts.sourceTool,
+      foreign_id: parts.foreignId, confidence: useConfidence },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return { id: linkId };
+}
+
+function removeEntityLink(database, runtimeState, contactId, linkId) {
+  const row = database.prepare(
+    'SELECT * FROM entity_links WHERE id = ? AND contact_id = ?'
+  ).get(linkId, contactId);
+  if (!row) return { error: 'entity link not found' };
+  database.prepare('DELETE FROM entity_links WHERE id = ?').run(linkId);
+  const foreignNodeId = `${row.source_tool}:${row.foreign_table}:${row.foreign_id}`;
+  removeGraphEdge(database, `contact:${contactId}`, foreignNodeId, 'entity_link');
+  writeProofChainEntry(database, 'entity.unlinked',
+    sha256Hex(`${contactId}|${row.source_tool}:${row.foreign_id}`),
+    { contact_id: contactId, source_tool: row.source_tool,
+      foreign_id: row.foreign_id });
+  emitStructuredEvent(buildEvent('entity.unlinked',
+    { contact_id: contactId, source_tool: row.source_tool,
+      foreign_id: row.foreign_id },
+    readVectorClock(database), null), runtimeState?.quiet);
+  return { removed: true };
+}
+
+// ── Cross-tool discovery (P-022, P-063) ──────────────────────────────
+
+// List all registered loop tools by scanning ~/.loop/tools/*.json.
+function listRegisteredTools(homeDir) {
+  const toolsDirectory = path.join(homeDir ?? os.homedir(), '.loop', 'tools');
+  if (!fs.existsSync(toolsDirectory)) return [];
+  const entries = fs.readdirSync(toolsDirectory)
+    .filter((name) => name.endsWith('.json'));
+  const tools = [];
+  for (const name of entries) {
+    const filePath = path.join(toolsDirectory, name);
+    try {
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (parsed?.name && parsed.name !== TOOL_NAME) {
+        tools.push({
+          name: parsed.name,
+          database_path: parsed.database_path ?? null,
+          registry_file: filePath,
+        });
+      }
+    } catch (_parseError) { /* skip malformed registry */ }
+  }
+  return tools;
+}
+
+// Open a foreign tool's DB read-only with the P-063 integrity probe.
+function openForeignDatabaseReadOnly(databasePath) {
+  if (!databasePath || !fs.existsSync(databasePath)) {
+    return { database: null, error: 'database not found' };
+  }
+  let database;
+  try { database = new DatabaseSync(databasePath, { readOnly: true }); }
+  catch (openError) {
+    return { database: null, error: `open failed: ${openError.message}` };
+  }
+  try { database.exec('PRAGMA query_only = ON;'); }
+  catch (_pragmaError) { /* readOnly already enforces */ }
+  try {
+    database.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' LIMIT 1"
+    ).all();
+  } catch (probeError) {
+    try { database.close(); } catch (_e) { /* fine */ }
+    return { database: null,
+      error: `foreign DB integrity probe failed: ${probeError.message}` };
+  }
+  return { database, error: null };
+}
+
+// Check if a table exists in a foreign DB.
+function foreignTableExists(database, tableName) {
+  const row = database.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name = ?"
+  ).get(tableName);
+  return !!row;
+}
+
+// Discover unlinked people in a single foreign tool.
+function discoverForeignPeople(database, toolEntry) {
+  const map = FOREIGN_TOOL_TABLE_MAP[toolEntry.name];
+  // Try mapped table first, then fall back to generic graph_nodes(type='person').
+  const { database: foreignDb, error } =
+    openForeignDatabaseReadOnly(toolEntry.database_path);
+  if (error) {
+    return { tool: toolEntry.name, error, candidates: [] };
+  }
+  const candidates = [];
+  try {
+    if (map && foreignTableExists(foreignDb, map.table)) {
+      let rows;
+      try {
+        const whereClause = map.filter ? `WHERE ${map.filter}` : '';
+        rows = foreignDb.prepare(
+          `SELECT * FROM ${map.table} ${whereClause}`
+        ).all();
+      } catch (queryError) {
+        return { tool: toolEntry.name,
+          error: `query failed: ${queryError.message}`,
+          candidates: [] };
+      }
+      for (const row of rows) {
+        const foreignId = String(row[map.idField] ?? '');
+        if (!foreignId) continue;
+        // Extract display name: for graph_nodes (Scribe), the name lives
+        // inside the metadata JSON blob.
+        let displayName;
+        if (map.nameField === 'metadata' && typeof row.metadata === 'string') {
+          try {
+            const meta = JSON.parse(row.metadata);
+            displayName = meta?.display_name ?? null;
+          } catch (_metaError) { displayName = null; }
+        } else {
+          displayName = row[map.nameField] ?? null;
+        }
+        const linkIdentifier = `${map.linkPrefix}:${foreignId}`;
+        if (isAlreadyLinked(database, toolEntry.name, foreignId, map.table)) continue;
+        candidates.push({
+          source_tool: toolEntry.name,
+          foreign_table: map.table,
+          foreign_id: foreignId,
+          display_name: displayName,
+          link_identifier: linkIdentifier,
+        });
+      }
+    } else if (foreignTableExists(foreignDb, 'graph_nodes')) {
+      // Generic discovery path: graph_nodes WHERE type='person'.
+      const rows = foreignDb.prepare(`
+        SELECT id, metadata FROM graph_nodes WHERE type = 'person'
+      `).all();
+      for (const row of rows) {
+        const foreignId = String(row.id ?? '');
+        if (!foreignId) continue;
+        let displayName = null;
+        try {
+          const meta = JSON.parse(row.metadata ?? '{}');
+          displayName = meta?.display_name ?? null;
+        } catch (_metaError) { /* ignore */ }
+        const linkIdentifier = `${toolEntry.name}:person:${foreignId}`;
+        if (isAlreadyLinked(database, toolEntry.name, foreignId, 'graph_nodes')) continue;
+        candidates.push({
+          source_tool: toolEntry.name,
+          foreign_table: 'graph_nodes',
+          foreign_id: foreignId,
+          display_name: displayName,
+          link_identifier: linkIdentifier,
+        });
+      }
+    }
+  } finally {
+    try { foreignDb.close(); } catch (_closeError) { /* fine */ }
+  }
+  return { tool: toolEntry.name, error: null, candidates };
+}
+
+// Has this contact (any contact) already linked the given foreign id?
+function isAlreadyLinked(database, sourceTool, foreignId, foreignTable) {
+  const row = database.prepare(`
+    SELECT id FROM entity_links
+    WHERE source_tool = ? AND foreign_id = ? AND foreign_table = ?
+    LIMIT 1
+  `).get(sourceTool, foreignId, foreignTable);
+  return !!row;
+}
+
+// Run discovery across every registered tool.
+function discoverEntities(database, homeDir) {
+  const tools = listRegisteredTools(homeDir);
+  const reports = [];
+  for (const tool of tools) {
+    reports.push(discoverForeignPeople(database, tool));
+  }
+  const allCandidates = reports.flatMap((report) => report.candidates);
+  return { tools_scanned: tools.length, reports, candidates: allCandidates };
+}
+
+// ── Merge engine ─────────────────────────────────────────────────────
+
+// Every merge a contact took part in, as survivor or as the merged side,
+// newest first. The query GET /api/contacts/:id/merge-history answers, lifted
+// out of the route into a named function so the grove's machine door can call
+// the tool's own code instead of restating its SQL (S13.2149, slot 05 W1;
+// owed contacts-mergehistory-serve-or-rule). The route calls this; the answer
+// is unchanged.
+function listMergeHistory(database, contactId) {
+  return database.prepare(`
+    SELECT id, survivor_id, merged_id, merge_reason, field_choices, created_at
+    FROM merge_history
+    WHERE survivor_id = ? OR merged_id = ?
+    ORDER BY created_at DESC
+  `).all(contactId, contactId);
+}
+
+// Choose default survivor: contact with more non-null fields wins.
+function pickSurvivor(contactA, contactB) {
+  const countNonNull = (contact) => {
+    let count = 0;
+    for (const field of ['given_name', 'family_name', 'organization', 'title',
+      'primary_email', 'primary_phone', 'notes']) {
+      if (contact[field]) count += 1;
+    }
+    count += (contact.emails ?? []).length;
+    count += (contact.phones ?? []).length;
+    count += (contact.addresses ?? []).length;
+    count += (contact.fields ?? []).length;
+    count += (contact.entity_links ?? []).length;
+    return count;
+  };
+  return countNonNull(contactA) >= countNonNull(contactB) ? contactA : contactB;
+}
+
+// Merge two contacts. Survivor inherits non-null fields when only one source
+// has a value; conflicts resolved by `fieldChoices` (auto picks the survivor's).
+function mergeContacts(database, runtimeState, contactIdA, contactIdB, options) {
+  if (contactIdA === contactIdB) return { error: 'cannot merge a contact with itself' };
+  const contactA = getContact(database, contactIdA);
+  const contactB = getContact(database, contactIdB);
+  if (!contactA || !contactB) return { error: 'contact not found' };
+  if (contactA.status === 'merged' || contactB.status === 'merged') {
+    return { error: 'cannot merge a contact that is already merged' };
+  }
+  // Choose survivor.
+  let survivor; let merged;
+  if (options?.survivorId) {
+    if (options.survivorId === contactIdA) { survivor = contactA; merged = contactB; }
+    else if (options.survivorId === contactIdB) { survivor = contactB; merged = contactA; }
+    else return { error: 'survivor id must be one of the two contacts' };
+  } else {
+    survivor = pickSurvivor(contactA, contactB);
+    merged = survivor.id === contactA.id ? contactB : contactA;
+  }
+  const fieldChoices = options?.fieldChoices ?? {};
+  // Per-field resolution: survivor's value wins unless explicit choice or
+  // survivor's value is empty and merged has one.
+  const scalarFields = ['display_name', 'given_name', 'family_name',
+    'organization', 'title', 'primary_email', 'primary_phone', 'notes'];
+  const next = {};
+  const recordedChoices = {};
+  for (const field of scalarFields) {
+    let chosen;
+    if (Object.prototype.hasOwnProperty.call(fieldChoices, field)) {
+      chosen = fieldChoices[field];
+      recordedChoices[field] = chosen === survivor[field] ? 'survivor' : 'merged';
+    } else if (survivor[field]) {
+      chosen = survivor[field];
+      recordedChoices[field] = 'survivor';
+    } else if (merged[field]) {
+      chosen = merged[field];
+      recordedChoices[field] = 'merged';
+    } else {
+      chosen = null;
+      recordedChoices[field] = 'survivor';
+    }
+    next[field] = chosen;
+  }
+  const now = nowIso();
+  const newContentHash = computeContentHash(
+    next.display_name, next.primary_email, next.primary_phone);
+  // Update survivor's fields.
+  database.prepare(`
+    UPDATE contacts SET display_name = ?, given_name = ?, family_name = ?,
+      organization = ?, title = ?, primary_email = ?, primary_phone = ?,
+      notes = ?, content_hash = ?, updated_at = ?
+    WHERE id = ?
+  `).run(next.display_name, next.given_name, next.family_name,
+    next.organization, next.title, next.primary_email, next.primary_phone,
+    next.notes, newContentHash, now, survivor.id);
+
+  // Reassign multi-value rows from merged → survivor.
+  database.prepare(
+    'UPDATE contact_emails SET contact_id = ?, is_primary = 0 WHERE contact_id = ?'
+  ).run(survivor.id, merged.id);
+  database.prepare(
+    'UPDATE contact_phones SET contact_id = ?, is_primary = 0 WHERE contact_id = ?'
+  ).run(survivor.id, merged.id);
+  database.prepare(
+    'UPDATE contact_addresses SET contact_id = ?, is_primary = 0 WHERE contact_id = ?'
+  ).run(survivor.id, merged.id);
+  // Reassign custom fields — when both have the same key, drop merged's copy.
+  const mergedFields = database.prepare(
+    'SELECT id, field_name FROM contact_fields WHERE contact_id = ?'
+  ).all(merged.id);
+  for (const mergedField of mergedFields) {
+    const conflict = database.prepare(`
+      SELECT id FROM contact_fields WHERE contact_id = ? AND field_name = ?
+    `).get(survivor.id, mergedField.field_name);
+    if (conflict) {
+      database.prepare('DELETE FROM contact_fields WHERE id = ?').run(mergedField.id);
+    } else {
+      database.prepare(
+        'UPDATE contact_fields SET contact_id = ? WHERE id = ?'
+      ).run(survivor.id, mergedField.id);
+    }
+  }
+  // Reassign entity links — guard against duplicates.
+  const mergedLinks = database.prepare(
+    'SELECT id, source_tool, foreign_table, foreign_id FROM entity_links WHERE contact_id = ?'
+  ).all(merged.id);
+  for (const link of mergedLinks) {
+    const duplicate = database.prepare(`
+      SELECT id FROM entity_links
+      WHERE contact_id = ? AND source_tool = ? AND foreign_id = ?
+        AND (foreign_table = ? OR (foreign_table IS NULL AND ? IS NULL))
+    `).get(survivor.id, link.source_tool, link.foreign_id,
+      link.foreign_table, link.foreign_table);
+    if (duplicate) {
+      database.prepare('DELETE FROM entity_links WHERE id = ?').run(link.id);
+    } else {
+      database.prepare(
+        'UPDATE entity_links SET contact_id = ? WHERE id = ?'
+      ).run(survivor.id, link.id);
+    }
+  }
+
+  // Re-elect a primary email/phone/address on the survivor if none flagged.
+  for (const subTable of ['contact_emails', 'contact_phones', 'contact_addresses']) {
+    const primaryExists = database.prepare(`
+      SELECT id FROM ${subTable} WHERE contact_id = ? AND is_primary = 1 LIMIT 1
+    `).get(survivor.id);
+    if (!primaryExists) {
+      const earliest = database.prepare(`
+        SELECT id FROM ${subTable} WHERE contact_id = ?
+        ORDER BY created_at ASC LIMIT 1
+      `).get(survivor.id);
+      if (earliest) {
+        database.prepare(
+          `UPDATE ${subTable} SET is_primary = 1 WHERE id = ?`
+        ).run(earliest.id);
+      }
+    }
+  }
+
+  // Redirect graph edges from merged's node → survivor's node.
+  const mergedNodeId = `contact:${merged.id}`;
+  const survivorNodeId = `contact:${survivor.id}`;
+  redirectGraphEdges(database, mergedNodeId, survivorNodeId);
+
+  // Mark merged contact's status, point merged_into at survivor.
+  database.prepare(`
+    UPDATE contacts SET status = 'merged', merged_into = ?, updated_at = ?
+    WHERE id = ?
+  `).run(survivor.id, now, merged.id);
+
+  // Record merge history.
+  const historyId = newId();
+  database.prepare(`
+    INSERT INTO merge_history (id, survivor_id, merged_id, merge_reason,
+      field_choices, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(historyId, survivor.id, merged.id, options?.reason ?? null,
+    JSON.stringify(recordedChoices), now);
+
+  // Refresh survivor graph node metadata.
+  const survivorRow = getContactRow(database, survivor.id);
+  upsertPersonGraphNode(database, survivorRow);
+
+  writeProofChainEntry(database, 'contact.merged', newContentHash, {
+    survivor_id: survivor.id, merged_id: merged.id,
+    field_choices: recordedChoices,
+    reason: options?.reason ?? null,
+  });
+  emitStructuredEvent(buildEvent('contact.merged',
+    { survivor_id: survivor.id, merged_id: merged.id,
+      field_choices: recordedChoices,
+      content_hash: newContentHash },
+    readVectorClock(database), null), runtimeState?.quiet);
+
+  return {
+    merged: true,
+    survivor_id: survivor.id,
+    merged_id: merged.id,
+    field_choices: recordedChoices,
+  };
+}
+
+// ── Suggest-merges (dedup candidate surfacing) ───────────────────────
+
+// Surface merge candidates by content hash, shared email, shared phone,
+// and fuzzy display-name match (Levenshtein ≤ 2 for names ≥ 5 chars).
+function suggestMerges(database) {
+  const candidates = new Map();
+  const addCandidate = (idA, idB, reason) => {
+    if (!idA || !idB || idA === idB) return;
+    const key = idA < idB ? `${idA}|${idB}` : `${idB}|${idA}`;
+    const existing = candidates.get(key);
+    if (existing) {
+      if (!existing.reasons.includes(reason)) existing.reasons.push(reason);
+    } else {
+      candidates.set(key, {
+        contact_a: idA < idB ? idA : idB,
+        contact_b: idA < idB ? idB : idA,
+        reasons: [reason],
+      });
+    }
+  };
+
+  // 1. Identical content hash.
+  const hashRows = database.prepare(`
+    SELECT content_hash, GROUP_CONCAT(id) AS ids, COUNT(*) AS c
+    FROM contacts WHERE status = 'active'
+    GROUP BY content_hash HAVING c > 1
+  `).all();
+  for (const hashRow of hashRows) {
+    const ids = hashRow.ids.split(',');
+    for (let indexA = 0; indexA < ids.length; indexA += 1) {
+      for (let indexB = indexA + 1; indexB < ids.length; indexB += 1) {
+        addCandidate(ids[indexA], ids[indexB], 'content_hash');
+      }
+    }
+  }
+
+  // 2. Shared email (any address in contact_emails table or primary_email).
+  // P-064: explicit table-qualified columns in the join.
+  const emailRows = database.prepare(`
+    SELECT lower(contact_emails.email) AS norm_email,
+           GROUP_CONCAT(DISTINCT contact_emails.contact_id) AS ids,
+           COUNT(DISTINCT contact_emails.contact_id) AS c
+    FROM contact_emails
+    JOIN contacts ON contacts.id = contact_emails.contact_id
+    WHERE contacts.status = 'active' AND contact_emails.email IS NOT NULL
+    GROUP BY lower(contact_emails.email)
+    HAVING c > 1
+  `).all();
+  for (const row of emailRows) {
+    const ids = row.ids.split(',');
+    for (let indexA = 0; indexA < ids.length; indexA += 1) {
+      for (let indexB = indexA + 1; indexB < ids.length; indexB += 1) {
+        addCandidate(ids[indexA], ids[indexB], 'shared_email');
+      }
+    }
+  }
+  // Also catch primary_email-only matches (not yet in contact_emails table).
+  const primaryEmailRows = database.prepare(`
+    SELECT lower(primary_email) AS norm_email,
+           GROUP_CONCAT(id) AS ids, COUNT(*) AS c
+    FROM contacts WHERE status = 'active' AND primary_email IS NOT NULL
+    GROUP BY lower(primary_email) HAVING c > 1
+  `).all();
+  for (const row of primaryEmailRows) {
+    const ids = row.ids.split(',');
+    for (let indexA = 0; indexA < ids.length; indexA += 1) {
+      for (let indexB = indexA + 1; indexB < ids.length; indexB += 1) {
+        addCandidate(ids[indexA], ids[indexB], 'shared_email');
+      }
+    }
+  }
+
+  // 3. Shared phone (digits-only match).
+  const phoneRowsAll = database.prepare(`
+    SELECT contact_phones.contact_id AS contact_id, contact_phones.phone AS phone
+    FROM contact_phones
+    JOIN contacts ON contacts.id = contact_phones.contact_id
+    WHERE contacts.status = 'active' AND contact_phones.phone IS NOT NULL
+  `).all();
+  const phoneIndex = new Map();
+  for (const row of phoneRowsAll) {
+    const norm = normalizePhoneForHash(row.phone);
+    if (norm.length === 0) continue;
+    if (!phoneIndex.has(norm)) phoneIndex.set(norm, new Set());
+    phoneIndex.get(norm).add(row.contact_id);
+  }
+  const primaryPhoneRows = database.prepare(`
+    SELECT id, primary_phone FROM contacts
+    WHERE status = 'active' AND primary_phone IS NOT NULL
+  `).all();
+  for (const row of primaryPhoneRows) {
+    const norm = normalizePhoneForHash(row.primary_phone);
+    if (norm.length === 0) continue;
+    if (!phoneIndex.has(norm)) phoneIndex.set(norm, new Set());
+    phoneIndex.get(norm).add(row.id);
+  }
+  for (const ids of phoneIndex.values()) {
+    if (ids.size < 2) continue;
+    const list = [...ids];
+    for (let indexA = 0; indexA < list.length; indexA += 1) {
+      for (let indexB = indexA + 1; indexB < list.length; indexB += 1) {
+        addCandidate(list[indexA], list[indexB], 'shared_phone');
+      }
+    }
+  }
+
+  // 4. Fuzzy name match — Levenshtein ≤ 2 on names ≥ 5 chars.
+  const allActive = database.prepare(`
+    SELECT id, display_name FROM contacts WHERE status = 'active'
+  `).all();
+  for (let indexA = 0; indexA < allActive.length; indexA += 1) {
+    const normA = normalizeNameForHash(allActive[indexA].display_name);
+    if (normA.length < MINIMUM_NAME_LENGTH_FOR_FUZZY) continue;
+    for (let indexB = indexA + 1; indexB < allActive.length; indexB += 1) {
+      const normB = normalizeNameForHash(allActive[indexB].display_name);
+      if (normB.length < MINIMUM_NAME_LENGTH_FOR_FUZZY) continue;
+      if (Math.abs(normA.length - normB.length) > LEVENSHTEIN_THRESHOLD) continue;
+      const distance = levenshteinDistance(normA, normB);
+      if (distance <= LEVENSHTEIN_THRESHOLD && distance > 0) {
+        addCandidate(allActive[indexA].id, allActive[indexB].id, 'fuzzy_name');
+      }
+    }
+  }
+
+  return [...candidates.values()];
+}
+
+// ── HTTP /status (P-007) ─────────────────────────────────────────────
+
+function readBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+      catch (e) { reject(new Error('invalid JSON')); }
+    });
+    request.on('error', reject);
+  });
+}
+
+function sendApiJson(response, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  });
+  response.end(body);
+}
+
+async function handleApiRequest(runtimeState, request, response, pathname, query) {
+  const database = runtimeState.database;
+  const method = (request.method ?? 'GET').toUpperCase();
+
+  if (method === 'OPTIONS') {
+    response.writeHead(204, {
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    });
+    response.end();
+    return;
+  }
+
+  if (pathname === '/api/contacts' || pathname === '/api/contacts/') {
+    if (method === 'GET') {
+      const starred = query.starred === '1' || query.starred === 'true';
+      const statusFilter = query.status || null;
+      // K6-A: ?label=<name> filters the list by an attached label. The count below
+      // MUST carry the same predicate or a filtered page reports an unfiltered total —
+      // a paginator that lies. Clause order here mirrors listContacts() exactly so the
+      // positional params line up.
+      const labelFilter = query.label || null;
+      const limit = Math.max(1, parseInt(query.limit ?? '50', 10) || 50);
+      const offset = Math.max(0, parseInt(query.offset ?? '0', 10) || 0);
+      const listOptions = { limit, offset };
+      if (starred) listOptions.starred = true;
+      if (labelFilter) listOptions.label = labelFilter;
+      if (statusFilter) listOptions.status = statusFilter;
+      const contacts = listContacts(database, listOptions);
+      const cWhere = [];
+      const cParams = [];
+      if (starred) cWhere.push('starred = 1');
+      if (labelFilter) {
+        cWhere.push('id IN (SELECT contact_id FROM contact_labels WHERE label = ?)');
+        cParams.push(labelFilter);
+      }
+      if (statusFilter) { cWhere.push('status = ?'); cParams.push(statusFilter); }
+      else cWhere.push("status = 'active'");
+      const cSql = `SELECT COUNT(*) AS n FROM contacts${cWhere.length ? ' WHERE ' + cWhere.join(' AND ') : ''}`;
+      const total = database.prepare(cSql).get(...cParams).n;
+      sendApiJson(response, 200, { contacts, total });
+      return;
+    }
+    if (method === 'POST') {
+      const body = await readBody(request);
+      if (!body.display_name) {
+        sendApiJson(response, 400, { error: 'display_name required' });
+        return;
+      }
+      try {
+        const contact = createContact(database, runtimeState, {
+          displayName: body.display_name,
+          givenName: body.given_name ?? null,
+          familyName: body.family_name ?? null,
+          organization: body.organization ?? null,
+          title: body.title ?? null,
+          email: body.email ?? body.primary_email ?? null,
+          phone: body.phone ?? body.primary_phone ?? null,
+          notes: body.notes ?? null,
+          starred: body.starred ? 1 : 0,
+        });
+        sendApiJson(response, 201, contact);
+      } catch (err) {
+        sendApiJson(response, 400, { error: err.message });
+      }
+      return;
+    }
+    sendApiJson(response, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  if (pathname === '/api/contacts/search') {
+    if (method !== 'GET') {
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+    const q = query.q;
+    if (!q) {
+      sendApiJson(response, 400, { error: 'q required' });
+      return;
+    }
+    const limit = Math.max(1, parseInt(query.limit ?? '20', 10) || 20);
+    const result = searchContacts(database, q, { limit });
+    sendApiJson(response, 200, result);
+    return;
+  }
+
+  // ── Top-level collection routes (no contact ID) ──────────────────
+
+  // List all labels across all contacts with counts.
+  if (pathname === '/api/labels' || pathname === '/api/labels/') {
+    if (method !== 'GET') {
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+    const labels = listAllLabels(database);
+    sendApiJson(response, 200, { labels });
+    return;
+  }
+
+  // Open follow-ups due on or before ?due=<YYYY-MM-DD> (defaults to today),
+  // across all active contacts. Powers the ListView "due glow".
+  if (pathname === '/api/followups' || pathname === '/api/followups/') {
+    if (method !== 'GET') {
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+    const due = (typeof query.due === 'string' && query.due.trim())
+      ? query.due.trim() : nowIso().slice(0, 10);
+    const followups = listDueFollowUps(database, due);
+    sendApiJson(response, 200, { followups, due });
+    return;
+  }
+
+  // Surface merge candidates via content hash, shared email/phone, name similarity.
+  if (pathname === '/api/contacts/suggest-merges') {
+    if (method !== 'GET') {
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+    const candidates = suggestMerges(database);
+    sendApiJson(response, 200, { candidates });
+    return;
+  }
+
+  // Merge two contacts — survivor selection, field resolution, audit trail.
+  if (pathname === '/api/contacts/merge') {
+    if (method !== 'POST') {
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readBody(request);
+    if (!body.contact_a || !body.contact_b) {
+      sendApiJson(response, 400, { error: 'contact_a and contact_b required' });
+      return;
+    }
+    const mergeResult = mergeContacts(database, runtimeState,
+      body.contact_a, body.contact_b, {
+        survivorId: body.survivor_id ?? null,
+        fieldChoices: body.field_choices ?? {},
+        reason: body.reason ?? null,
+        auto: body.auto ?? false,
+      });
+    if (mergeResult.error) {
+      sendApiJson(response, 400, { error: mergeResult.error });
+      return;
+    }
+    sendApiJson(response, 200, mergeResult);
+    return;
+  }
+
+  // Import contacts from vCard text (POST body contains raw vCard content).
+  if (pathname === '/api/contacts/import') {
+    if (method !== 'POST') {
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readBody(request);
+    // CSV branch: explicit format=csv, or a csv_text body without vcard_text.
+    if (body.format === 'csv' || (!body.vcard_text && body.csv_text)) {
+      const csvText = body.csv_text ?? body.vcard_text;
+      if (!csvText) {
+        sendApiJson(response, 400, { error: 'csv_text required' });
+        return;
+      }
+      try {
+        const importResult = importCsvText(database, runtimeState, csvText);
+        sendApiJson(response, 200, importResult);
+      } catch (importError) {
+        sendApiJson(response, 400, { error: importError.message ?? 'import failed' });
+      }
+      return;
+    }
+    if (!body.vcard_text) {
+      sendApiJson(response, 400, { error: 'vcard_text required' });
+      return;
+    }
+    try {
+      const importResult = importVCardText(database, runtimeState, body.vcard_text);
+      sendApiJson(response, 200, importResult);
+    } catch (importError) {
+      sendApiJson(response, 400, { error: importError.message ?? 'import failed' });
+    }
+    return;
+  }
+
+  // Export contacts. Filters: ?id=, ?starred=1, or all active. Default format
+  // is vCard; ?format=csv returns CSV instead.
+  if (pathname === '/api/contacts/export') {
+    if (method !== 'GET') {
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+    const exportOptions = {};
+    if (query.id) exportOptions.id = query.id;
+    if (query.starred === '1' || query.starred === 'true') exportOptions.starred = true;
+    if (query.format === 'csv') {
+      const csvText = exportContactsToCsv(database, exportOptions);
+      sendApiJson(response, 200, { csv: csvText, format: 'csv' });
+      return;
+    }
+    const vcardText = exportContactsToVCard(database, exportOptions);
+    sendApiJson(response, 200, { vcard: vcardText });
+    return;
+  }
+
+  // Bulk actions — apply label / status / delete to many contacts in one
+  // round-trip. Body: { ids: [...], action: 'label'|'status'|'delete', value }.
+  // Declared above the generic /api/contacts/:id branch so 'bulk' is not
+  // mistaken for a contact id.
+  if (pathname === '/api/contacts/bulk') {
+    if (method !== 'POST') {
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readBody(request);
+    const result = bulkContactAction(database, runtimeState,
+      body.ids, body.action, body.value);
+    if (result.error) {
+      sendApiJson(response, 400, { error: result.error });
+      return;
+    }
+    sendApiJson(response, 200, result);
+    return;
+  }
+
+  if (pathname.startsWith('/api/contacts/')) {
+    const rest = pathname.slice('/api/contacts/'.length);
+    const parts = rest.split('/').filter(Boolean);
+    const contactId = parts[0];
+    const subResource = parts[1];
+
+    if (!contactId) {
+      sendApiJson(response, 404, { error: 'not found' });
+      return;
+    }
+
+    if (subResource === 'star' || subResource === 'unstar') {
+      if (method !== 'POST') {
+        sendApiJson(response, 405, { error: 'method not allowed' });
+        return;
+      }
+      const result = setStarred(database, contactId, subResource === 'star');
+      if (result.error) {
+        sendApiJson(response, 404, { error: result.error });
+        return;
+      }
+      sendApiJson(response, 200, result);
+      return;
+    }
+
+    // Relationship links (contact ↔ contact graph edges): GET to list the
+    // contact's links, POST to link, DELETE to unlink. Reuses the existing
+    // linkContacts/unlinkContacts edge store — relationship.* events fire there.
+    if (subResource === 'links') {
+      if (method === 'GET') {
+        const existing = getContactRow(database, contactId);
+        if (!existing) {
+          sendApiJson(response, 404, { error: 'contact not found' });
+          return;
+        }
+        sendApiJson(response, 200, getContactRelationships(database, contactId));
+        return;
+      }
+      if (method === 'POST') {
+        const body = await readBody(request);
+        const target = body.target_contact ?? body.contact_id ?? body.contact_b;
+        if (!target) {
+          sendApiJson(response, 400, { error: 'target_contact required' });
+          return;
+        }
+        const relationship = typeof body.relationship === 'string' && body.relationship.trim()
+          ? body.relationship.trim() : 'knows';
+        const result = linkContacts(database, runtimeState, contactId, target,
+          relationship, { oneWay: !!body.one_way });
+        if (result.error) {
+          const code = result.error.includes('not found') ? 404 : 400;
+          sendApiJson(response, code, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 201, result);
+        return;
+      }
+      if (method === 'DELETE') {
+        // DELETE may carry a JSON body; tolerate an empty one and fall back to
+        // query params so the route stays usable from either call style.
+        let body = {};
+        try { body = await readBody(request); } catch (_e) { body = {}; }
+        const target = body.target_contact ?? body.contact_id ?? body.contact_b
+          ?? query.target_contact ?? query.contact_id;
+        if (!target) {
+          sendApiJson(response, 400, { error: 'target_contact required' });
+          return;
+        }
+        const relationship = (typeof body.relationship === 'string' && body.relationship.trim())
+          ? body.relationship.trim() : (query.relationship || 'knows');
+        const result = unlinkContacts(database, runtimeState, contactId, target,
+          relationship, { oneWay: !!(body.one_way ?? query.one_way) });
+        if (result.error) {
+          sendApiJson(response, 400, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // ── Multi-value field sub-resources ───────────────────────────
+
+    // Emails: POST to add, DELETE with sub-ID to remove.
+    if (subResource === 'emails') {
+      const subId = parts[2];
+      if (method === 'POST') {
+        const body = await readBody(request);
+        const result = addEmail(database, runtimeState, contactId,
+          body.email, body.label ?? null, body.is_primary ?? false);
+        if (result.error) {
+          const code = result.error.includes('not found') ? 404 : 400;
+          sendApiJson(response, code, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 201, result);
+        return;
+      }
+      if (method === 'DELETE' && subId) {
+        const result = removeEmail(database, runtimeState, contactId, subId);
+        if (result.error) {
+          sendApiJson(response, 404, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // Phones: POST to add, DELETE with sub-ID to remove.
+    if (subResource === 'phones') {
+      const subId = parts[2];
+      if (method === 'POST') {
+        const body = await readBody(request);
+        const result = addPhone(database, runtimeState, contactId,
+          body.phone, body.label ?? null, body.is_primary ?? false);
+        if (result.error) {
+          const code = result.error.includes('not found') ? 404 : 400;
+          sendApiJson(response, code, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 201, result);
+        return;
+      }
+      if (method === 'DELETE' && subId) {
+        const result = removePhone(database, runtimeState, contactId, subId);
+        if (result.error) {
+          sendApiJson(response, 404, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // Addresses: POST to add, DELETE with sub-ID to remove.
+    if (subResource === 'addresses') {
+      const subId = parts[2];
+      if (method === 'POST') {
+        const body = await readBody(request);
+        const result = addAddress(database, runtimeState, contactId, {
+          street: body.street ?? null,
+          city: body.city ?? null,
+          state: body.state ?? null,
+          postalCode: body.postal_code ?? null,
+          country: body.country ?? null,
+          label: body.label ?? null,
+          isPrimary: body.is_primary ?? false,
+        });
+        if (result.error) {
+          const code = result.error.includes('not found') ? 404 : 400;
+          sendApiJson(response, code, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 201, result);
+        return;
+      }
+      if (method === 'DELETE' && subId) {
+        const result = removeAddress(database, runtimeState, contactId, subId);
+        if (result.error) {
+          sendApiJson(response, 404, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // Custom fields: POST to set (upsert), DELETE with field_name to remove.
+    if (subResource === 'fields') {
+      const fieldName = parts[2] ? decodeURIComponent(parts[2]) : null;
+      if (method === 'POST') {
+        const body = await readBody(request);
+        if (!body.field_name) {
+          sendApiJson(response, 400, { error: 'field_name required' });
+          return;
+        }
+        const result = setField(database, runtimeState, contactId,
+          body.field_name, body.field_value ?? null);
+        if (result.error) {
+          const code = result.error.includes('not found') ? 404 : 400;
+          sendApiJson(response, code, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      if (method === 'DELETE' && fieldName) {
+        const result = removeField(database, runtimeState, contactId, fieldName);
+        if (result.error) {
+          sendApiJson(response, 404, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // Labels: GET to list, POST to add, DELETE with label name to remove.
+    if (subResource === 'labels') {
+      const labelName = parts[2] ? decodeURIComponent(parts[2]) : null;
+      if (method === 'GET') {
+        const labels = getContactLabels(database, contactId);
+        sendApiJson(response, 200, { labels });
+        return;
+      }
+      if (method === 'POST') {
+        const body = await readBody(request);
+        if (!body.label) {
+          sendApiJson(response, 400, { error: 'label required' });
+          return;
+        }
+        const result = addLabel(database, contactId, body.label, body.color ?? null);
+        if (result.error) {
+          const code = result.error.includes('not found') ? 404 : 400;
+          sendApiJson(response, code, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 201, result);
+        return;
+      }
+      if (method === 'DELETE' && labelName) {
+        const result = removeLabel(database, contactId, labelName);
+        if (result.error) {
+          sendApiJson(response, 404, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // Notes: GET to list, POST to add, DELETE with note ID to remove.
+    if (subResource === 'notes') {
+      const noteId = parts[2];
+      if (method === 'GET') {
+        const notes = listNotes(database, contactId);
+        sendApiJson(response, 200, { notes });
+        return;
+      }
+      if (method === 'POST') {
+        const body = await readBody(request);
+        if (!body.text) {
+          sendApiJson(response, 400, { error: 'text required' });
+          return;
+        }
+        const result = addNote(database, contactId, body.text);
+        if (result.error) {
+          const code = result.error.includes('not found') ? 404 : 400;
+          sendApiJson(response, code, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 201, result);
+        return;
+      }
+      if (method === 'DELETE' && noteId) {
+        const result = removeNote(database, contactId, noteId);
+        if (result.error) {
+          sendApiJson(response, 404, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // Follow-ups: GET to list, POST to add, PUT with ID to edit/complete,
+    // DELETE with ID to remove. Emits followup.* events (picked up by the
+    // activity timeline).
+    if (subResource === 'followups') {
+      const followUpId = parts[2];
+      if (method === 'GET') {
+        const existing = getContactRow(database, contactId);
+        if (!existing) {
+          sendApiJson(response, 404, { error: 'contact not found' });
+          return;
+        }
+        const followups = listFollowUps(database, contactId);
+        sendApiJson(response, 200, { followups });
+        return;
+      }
+      if (method === 'POST') {
+        const body = await readBody(request);
+        const result = addFollowUp(database, runtimeState, contactId, {
+          note: body.note ?? null,
+          dueDate: body.due_date ?? body.dueDate ?? null,
+        });
+        if (result.error) {
+          const code = result.error.includes('not found') ? 404 : 400;
+          sendApiJson(response, code, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 201, result);
+        return;
+      }
+      if (method === 'PUT' && followUpId) {
+        const body = await readBody(request);
+        const patch = {};
+        if (body.note !== undefined) patch.note = body.note;
+        if (body.due_date !== undefined) patch.dueDate = body.due_date;
+        else if (body.dueDate !== undefined) patch.dueDate = body.dueDate;
+        if (body.completed !== undefined) patch.completed = !!body.completed;
+        const result = updateFollowUp(database, runtimeState, contactId,
+          followUpId, patch);
+        if (result.error) {
+          sendApiJson(response, 404, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      if (method === 'DELETE' && followUpId) {
+        const result = removeFollowUp(database, runtimeState, contactId, followUpId);
+        if (result.error) {
+          sendApiJson(response, 404, { error: result.error });
+          return;
+        }
+        sendApiJson(response, 200, result);
+        return;
+      }
+      sendApiJson(response, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // Merge history for a specific contact.
+    if (subResource === 'merge-history') {
+      if (method !== 'GET') {
+        sendApiJson(response, 405, { error: 'method not allowed' });
+        return;
+      }
+      sendApiJson(response, 200, { history: listMergeHistory(database, contactId) });
+      return;
+    }
+
+    // Activity timeline (read-only): merged proof-chain + event records for
+    // this contact, newest-first. Surfaces whatever event types exist at
+    // runtime (relationship.*, followup.*, …) — no fixed type list.
+    if (subResource === 'timeline') {
+      if (method !== 'GET') {
+        sendApiJson(response, 405, { error: 'method not allowed' });
+        return;
+      }
+      const existing = getContactRow(database, contactId);
+      if (!existing) {
+        sendApiJson(response, 404, { error: 'contact not found' });
+        return;
+      }
+      const timeline = getContactTimeline(database, contactId);
+      sendApiJson(response, 200, { timeline });
+      return;
+    }
+
+    // Unknown sub-resource — 404.
+    if (subResource) {
+      sendApiJson(response, 404, { error: 'not found' });
+      return;
+    }
+
+    if (method === 'GET') {
+      const contact = getContact(database, contactId);
+      if (!contact) {
+        sendApiJson(response, 404, { error: 'contact not found' });
+        return;
+      }
+      sendApiJson(response, 200, contact);
+      return;
+    }
+    if (method === 'PUT') {
+      const body = await readBody(request);
+      const result = updateContact(database, runtimeState, contactId, {
+        displayName: body.display_name,
+        givenName: body.given_name,
+        familyName: body.family_name,
+        organization: body.organization,
+        title: body.title,
+        email: body.email ?? body.primary_email,
+        phone: body.phone ?? body.primary_phone,
+        notes: body.notes,
+        status: body.status,
+        starred: body.starred,
+      });
+      if (result.error) {
+        const code = result.error.includes('not found') ? 404 : 400;
+        sendApiJson(response, code, { error: result.error });
+        return;
+      }
+      sendApiJson(response, 200, result.contact);
+      return;
+    }
+    if (method === 'DELETE') {
+      const existing = getContactRow(database, contactId);
+      if (!existing) {
+        sendApiJson(response, 404, { error: 'contact not found' });
+        return;
+      }
+      deleteContact(database, runtimeState, contactId, { purge: true, confirm: true });
+      sendApiJson(response, 200, { deleted: true, id: contactId });
+      return;
+    }
+    sendApiJson(response, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  sendApiJson(response, 404, { error: 'not found' });
+}
+
+function sendJson(response, status, payload) {
+  const body = JSON.stringify(payload);
+  response.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+  });
+  response.end(body);
+}
+
+// ── Who may talk to the local API (S19.1111) ──────────────────────────
+// The API has no login and holds a person's whole address book, so the gate is the browser: a web page on
+// any site can send requests to 127.0.0.1. Three rules, each decidable from the request headers alone:
+//   1. Host — when present it must name this machine (127.0.0.1, localhost, [::1], or the configured bind host).
+//      A DNS-rebinding page reaches 127.0.0.1 under its own name, and its Host header carries that name.
+//   2. Origin — when present it must be a loopback origin (any port: other Loop apps on this machine) or one
+//      listed in contact.allowed_origins. A foreign page's fetch or form post carries its own Origin.
+//   3. Sec-Fetch-Site: cross-site without an allowed Origin is refused (a browser that sends no Origin).
+// An allowed cross-port Origin is echoed in Access-Control-Allow-Origin; nothing is ever answered with `*`.
+// A request with no headers at all is an in-process call, not a socket, and passes.
+const LOOPBACK_HOSTNAMES = ['127.0.0.1', 'localhost', '[::1]', '::1'];
+
+function hostnameOf(hostHeader) {
+  const value = String(hostHeader).trim().toLowerCase();
+  if (value.startsWith('[')) {
+    const end = value.indexOf(']');
+    return end === -1 ? value : value.slice(0, end + 1);
+  }
+  const colon = value.lastIndexOf(':');
+  return colon === -1 ? value : value.slice(0, colon);
+}
+
+function isLoopbackOrigin(origin) {
+  let parsed;
+  try { parsed = new URL(origin); } catch (_e) { return false; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  return LOOPBACK_HOSTNAMES.includes(parsed.hostname.toLowerCase());
+}
+
+function checkRequestOrigin(headers, options = {}) {
+  if (!headers) return { allowed: true, allowOrigin: null };
+  const bindHost = String(options.bindHost ?? DEFAULT_BIND_HOST).toLowerCase();
+  const allowedOrigins = (options.allowedOrigins ?? []).map((o) => String(o).toLowerCase());
+  const host = headers.host;
+  if (host !== undefined && host !== '') {
+    const name = hostnameOf(host);
+    if (!LOOPBACK_HOSTNAMES.includes(name) && name !== bindHost) {
+      return { allowed: false, status: 403, reason: 'host not allowed' };
+    }
+  }
+  const origin = headers.origin;
+  if (origin !== undefined && origin !== '' && origin !== 'null') {
+    const lowered = String(origin).toLowerCase();
+    if (isLoopbackOrigin(lowered) || allowedOrigins.includes(lowered)) {
+      return { allowed: true, allowOrigin: String(origin) };
+    }
+    return { allowed: false, status: 403, reason: 'origin not allowed' };
+  }
+  if (origin === 'null') return { allowed: false, status: 403, reason: 'origin not allowed' };
+  if (String(headers['sec-fetch-site'] ?? '').toLowerCase() === 'cross-site') {
+    return { allowed: false, status: 403, reason: 'cross-site request' };
+  }
+  return { allowed: true, allowOrigin: null };
+}
+
+function buildStatusHandler(runtimeState) {
+  return function statusHandler(request, response) {
+    try {
+      const result = handleStatusRequest(runtimeState, request, response);
+      if (result && typeof result.then === 'function') {
+        result.catch((handlerError) => {
+          try { sendJson(response, 500,
+            { error: handlerError.message ?? 'internal error' }); }
+          catch (_writeError) { /* fine */ }
+        });
+      }
+    } catch (handlerError) {
+      try { sendJson(response, 500,
+        { error: handlerError.message ?? 'internal error' }); }
+      catch (_writeError) { /* fine */ }
+    }
+  };
+}
+
+function handleStatusRequest(runtimeState, request, response) {
+  const gate = checkRequestOrigin(request.headers, {
+    bindHost: runtimeState.bindHost, allowedOrigins: runtimeState.allowedOrigins });
+  if (!gate.allowed) {
+    sendJson(response, gate.status, { error: gate.reason });
+    return;
+  }
+  if (gate.allowOrigin && typeof response.setHeader === 'function') {
+    response.setHeader('Access-Control-Allow-Origin', gate.allowOrigin);
+    response.setHeader('Vary', 'Origin');
+  }
+  const parsed = urlModule.parse(request.url ?? '/', true);
+  const pathname = parsed.pathname ?? '/';
+  if (pathname.startsWith('/api/')) {
+    return handleApiRequest(runtimeState, request, response, pathname, parsed.query);
+  }
+  if ((request.method ?? 'GET') !== 'GET') {
+    sendJson(response, 405, { error: 'method not allowed' });
+    return;
+  }
+  if (pathname === '/') {
+    const html = renderDashboard(runtimeState.database);
+    response.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Length': Buffer.byteLength(html),
+      'Cache-Control': 'no-store',
+    });
+    response.end(html);
+    return;
+  }
+  if (pathname !== HEALTH_ENDPOINT_PATH) {
+    sendJson(response, 404, { error: 'not found' });
+    return;
+  }
+  const database = runtimeState.database;
+  // Aggregate counts only — no contact details, emails, phones, addresses.
+  const activeCount = database.prepare(
+    "SELECT COUNT(*) AS c FROM contacts WHERE status = 'active'"
+  ).get().c;
+  const totalCount = database.prepare(
+    'SELECT COUNT(*) AS c FROM contacts'
+  ).get().c;
+  const starredCount = database.prepare(
+    "SELECT COUNT(*) AS c FROM contacts WHERE status = 'active' AND starred = 1"
+  ).get().c;
+  const entityLinkCount = database.prepare(
+    'SELECT COUNT(*) AS c FROM entity_links'
+  ).get().c;
+  const uniqueFieldCount = database.prepare(
+    'SELECT COUNT(DISTINCT field_name) AS c FROM contact_fields'
+  ).get().c;
+  const mergeCount = database.prepare(
+    'SELECT COUNT(*) AS c FROM merge_history'
+  ).get().c;
+  const head = database.prepare(
+    'SELECT hash FROM proof_chain ORDER BY timestamp DESC, rowid DESC LIMIT 1'
+  ).get()?.hash ?? null;
+  sendJson(response, 200, {
+    tool: TOOL_NAME, version: TOOL_VERSION,
+    status: 'ok',
+    uptime: Math.floor((Date.now() - runtimeState.startedAtMs) / 1000),
+    contact_count: { active: activeCount, total: totalCount },
+    starred_count: starredCount,
+    entity_link_count: entityLinkCount,
+    unique_custom_field_names: uniqueFieldCount,
+    merge_count: mergeCount,
+    proof_chain_head: head,
+  });
+}
+
+// ── Daemon orchestration ─────────────────────────────────────────────
+
+async function runDaemon(flags) {
+  const { configuration } =
+    loadConfiguration(typeof flags.config === 'string' ? flags.config : null);
+  if (typeof flags['http-port'] === 'string') {
+    configuration.httpPort = Number.parseInt(flags['http-port'], 10);
+  }
+  if (typeof flags.database === 'string') configuration.database = flags.database;
+  const quiet = !!flags.quiet;
+  const database = openDatabase(configuration.database);
+  ensureGenesisEntry(database);
+  const startedAtMs = Date.now();
+  const runtimeState = { startedAtMs, database, configuration, quiet,
+    bindHost: configuration.contact.bind_host,
+    allowedOrigins: configuration.contact.allowed_origins ?? [] };
+
+  const httpServer = http.createServer(buildStatusHandler(runtimeState));
+  await new Promise((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(configuration.httpPort, configuration.contact.bind_host,
+      () => resolve());
+  });
+  writeRegistration(configuration, configuration.database);
+  emitStructuredEvent(buildEvent('tool.started',
+    { httpPort: configuration.httpPort },
+    readVectorClock(database), null), quiet);
+
+  const shutdown = (signal) => {
+    emitStructuredEvent(buildEvent('tool.stopped',
+      { signal }, readVectorClock(database), null), quiet);
+    try {
+      writeProofChainEntry(database, 'tool.stopped',
+        sha256Hex(`stop:${signal}`), { signal });
+    } catch (_writeError) { /* fine */ }
+    removeRegistration();
+    try { httpServer.close(); } catch (_e) { /* fine */ }
+    try { database.close(); } catch (_e) { /* fine */ }
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  return { runtimeState, httpServer };
+}
+
+// ── CLI argument parsing ─────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const flags = {};
+  const positional = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg.startsWith('--')) {
+      const equalsIndex = arg.indexOf('=');
+      if (equalsIndex >= 0) {
+        flags[arg.slice(2, equalsIndex)] = arg.slice(equalsIndex + 1);
+      } else if (argv[index + 1] !== undefined
+          && !argv[index + 1].startsWith('--')) {
+        flags[arg.slice(2)] = argv[index + 1];
+        index += 1;
+      } else {
+        flags[arg.slice(2)] = true;
+      }
+    } else {
+      positional.push(arg);
+    }
+  }
+  return { flags, positional };
+}
+
+function printHelp() {
+  const lines = [
+    'Loop Contact — canonical people registry (Phase 1)',
+    '',
+    'Usage: node loopcontact.js [command] [options]',
+    '',
+    'Commands:',
+    '  (no command)              Start daemon',
+    '  add <name>                Create a contact',
+    '  show <id>                 Display a contact',
+    '  list                      List contacts',
+    '  update <id>               Update fields',
+    '  delete <id>               Soft-delete (use --purge --confirm to hard-delete)',
+    '  search <query>            FTS5 search across name/org/notes',
+    '  star <id> | unstar <id>   Toggle starred',
+    '  add-email <id> <email>    Add an email address',
+    '  remove-email <id> <eid>   Remove an email',
+    '  add-phone <id> <phone>    Add a phone number',
+    '  remove-phone <id> <pid>   Remove a phone',
+    '  add-address <id> ...      Add an address',
+    '  remove-address <id> <aid> Remove an address',
+    '  set-field <id> <k> <v>    Set a custom field',
+    '  remove-field <id> <k>     Remove a custom field',
+    '  import <file.vcf>         Import vCards',
+    '  export                    Export vCards (--id, --all, --starred)',
+    '  discover                  Cross-tool entity discovery',
+    '  link-entity <id> <link>   Create entity link',
+    '  unlink-entity <id> <eid>  Remove entity link',
+    '  link <id1> <id2>          Link two contacts',
+    '  unlink <id1> <id2>        Unlink two contacts',
+    '  suggest-merges            Surface merge candidates',
+    '  merge <id1> <id2>         Merge two contacts',
+    '  status                    Print status summary',
+    '  verify                    Verify proof chain integrity',
+    '  help                      Print this help',
+    '',
+    'Options:',
+    '  --email <e>               Primary email',
+    '  --phone <p>               Primary phone',
+    '  --given-name <s>          Given name',
+    '  --family-name <s>         Family name',
+    '  --organization <s>        Organization',
+    '  --title <s>               Title',
+    '  --notes <s>               Notes',
+    '  --label <s>               Label (add-email/add-phone/add-address)',
+    '  --primary                 Mark added value as primary',
+    '  --street <s>              (add-address)',
+    '  --city <s>                (add-address)',
+    '  --state <s>               (add-address)',
+    '  --postal <s>              (add-address)',
+    '  --country <s>             (add-address)',
+    '  --starred                 (list/export) starred only',
+    '  --all                     (list) include inactive/merged',
+    '  --status <s>              (list) filter by status',
+    '  --limit <n>               Cap result count',
+    '  --offset <n>              List offset',
+    '  --confirm                 (delete --purge) confirm hard delete',
+    '  --purge                   (delete) hard delete with cascade',
+    '  --survivor <id>           (merge) pick survivor explicitly',
+    '  --auto                    (merge) auto-pick non-empty values',
+    '  --reason <s>              (merge) merge reason',
+    '  --relationship <s>        (link/unlink) edge name (default knows)',
+    '  --one-way                 (link/unlink) skip the reverse edge',
+    '  --confidence <c>          (link-entity) confidence (confirmed|suggested)',
+    '  --id <id>                 (export) single contact',
+    '  --file <p>                (import/export) file path (stdout if omitted)',
+    '  --json                    Machine-readable output',
+    '  --http-port <n>           HTTP status port (default 1328)',
+    '  --database <p>            Database path (default ~/.loop/data/contact.db)',
+    '  --config <p>              Config file path',
+    '  --quiet                   Suppress stdout events',
+    '',
+    'Contact: one node, every constellation, every connection.',
+  ];
+  safeStdoutWrite(lines.join('\n') + '\n');
+}
+
+// ── CLI dispatch ─────────────────────────────────────────────────────
+
+async function runCli(argv) {
+  const parsedArgs = parseArgs(argv);
+  const { flags, positional } = parsedArgs;
+  const [command, ...rest] = positional;
+  if (command === 'help' || flags.help) { printHelp(); return; }
+  const { configuration } = loadConfiguration(
+    typeof flags.config === 'string' ? flags.config : null);
+  if (typeof flags.database === 'string') configuration.database = flags.database;
+  if (command === undefined) { await runDaemon(flags); return; }
+  const database = openDatabase(configuration.database);
+  ensureGenesisEntry(database);
+  const runtimeState = {
+    database, configuration, quiet: !!flags.quiet,
+    startedAtMs: Date.now(),
+  };
+  try {
+    const result = await dispatchCommand(command, rest, flags, runtimeState);
+    if (result !== undefined) {
+      safeStdoutWrite(JSON.stringify(result, null, 2) + '\n');
+    }
+  } catch (commandError) {
+    safeStdoutWrite(JSON.stringify({
+      error: commandError.message ?? String(commandError),
+    }) + '\n');
+    process.exit(1);
+  } finally {
+    try { database.close(); } catch (_e) { /* fine */ }
+  }
+}
+
+// Dispatch the parsed positional command to its handler. Each branch
+// returns a JSON-ish object; the caller serializes to stdout.
+async function dispatchCommand(command, rest, flags, runtimeState) {
+  const database = runtimeState.database;
+  if (command === 'status') {
+    return statusSummary(database);
+  }
+  if (command === 'verify') {
+    return verifyProofChain(database);
+  }
+  if (command === 'add') {
+    const name = rest.join(' ').trim() || (typeof flags.name === 'string' ? flags.name : null);
+    if (!name) throw new Error('usage: contact add "<name>"');
+    const contact = createContact(database, runtimeState, {
+      displayName: name,
+      email: typeof flags.email === 'string' ? flags.email : undefined,
+      phone: typeof flags.phone === 'string' ? flags.phone : undefined,
+      givenName: typeof flags['given-name'] === 'string' ? flags['given-name'] : undefined,
+      familyName: typeof flags['family-name'] === 'string' ? flags['family-name'] : undefined,
+      organization: typeof flags.organization === 'string' ? flags.organization : undefined,
+      title: typeof flags.title === 'string' ? flags.title : undefined,
+      notes: typeof flags.notes === 'string' ? flags.notes : undefined,
+      starred: !!flags.starred,
+    });
+    return contact;
+  }
+  if (command === 'show') {
+    const [contactId] = rest;
+    if (!contactId) throw new Error('usage: contact show <id>');
+    const contact = getContact(database, contactId);
+    if (!contact) throw new Error('contact not found');
+    return contact;
+  }
+  if (command === 'list') {
+    return listContacts(database, {
+      starred: !!flags.starred,
+      status: typeof flags.status === 'string' ? flags.status : undefined,
+      includeAll: !!flags.all,
+      limit: typeof flags.limit === 'string'
+        ? Number.parseInt(flags.limit, 10) : undefined,
+      offset: typeof flags.offset === 'string'
+        ? Number.parseInt(flags.offset, 10) : undefined,
+    });
+  }
+  if (command === 'update') {
+    const [contactId] = rest;
+    if (!contactId) throw new Error('usage: contact update <id>');
+    const result = updateContact(database, runtimeState, contactId, {
+      displayName: typeof flags.name === 'string' ? flags.name : undefined,
+      email: typeof flags.email === 'string' ? flags.email : undefined,
+      phone: typeof flags.phone === 'string' ? flags.phone : undefined,
+      givenName: typeof flags['given-name'] === 'string' ? flags['given-name'] : undefined,
+      familyName: typeof flags['family-name'] === 'string' ? flags['family-name'] : undefined,
+      organization: typeof flags.organization === 'string' ? flags.organization : undefined,
+      title: typeof flags.title === 'string' ? flags.title : undefined,
+      notes: typeof flags.notes === 'string' ? flags.notes : undefined,
+      status: typeof flags.status === 'string' ? flags.status : undefined,
+    });
+    return result;
+  }
+  if (command === 'delete') {
+    const [contactId] = rest;
+    if (!contactId) throw new Error('usage: contact delete <id>');
+    return deleteContact(database, runtimeState, contactId,
+      { purge: !!flags.purge, confirm: !!flags.confirm });
+  }
+  if (command === 'search') {
+    const query = rest.join(' ').trim();
+    if (!query) throw new Error('usage: contact search "<query>"');
+    return searchContacts(database, query,
+      { limit: typeof flags.limit === 'string'
+        ? Number.parseInt(flags.limit, 10) : undefined });
+  }
+  if (command === 'star' || command === 'unstar') {
+    const [contactId] = rest;
+    if (!contactId) throw new Error(`usage: contact ${command} <id>`);
+    return setStarred(database, contactId, command === 'star');
+  }
+  if (command === 'add-email') {
+    const [contactId, email] = rest;
+    if (!contactId || !email) throw new Error('usage: contact add-email <id> <email>');
+    return addEmail(database, runtimeState, contactId, email,
+      typeof flags.label === 'string' ? flags.label : undefined,
+      !!flags.primary);
+  }
+  if (command === 'remove-email') {
+    const [contactId, emailId] = rest;
+    if (!contactId || !emailId) throw new Error('usage: contact remove-email <id> <eid>');
+    return removeEmail(database, runtimeState, contactId, emailId);
+  }
+  if (command === 'add-phone') {
+    const [contactId, phone] = rest;
+    if (!contactId || !phone) throw new Error('usage: contact add-phone <id> <phone>');
+    return addPhone(database, runtimeState, contactId, phone,
+      typeof flags.label === 'string' ? flags.label : undefined,
+      !!flags.primary);
+  }
+  if (command === 'remove-phone') {
+    const [contactId, phoneId] = rest;
+    if (!contactId || !phoneId) throw new Error('usage: contact remove-phone <id> <pid>');
+    return removePhone(database, runtimeState, contactId, phoneId);
+  }
+  if (command === 'add-address') {
+    const [contactId] = rest;
+    if (!contactId) throw new Error('usage: contact add-address <id> [--street ...]');
+    return addAddress(database, runtimeState, contactId, {
+      street: typeof flags.street === 'string' ? flags.street : null,
+      city: typeof flags.city === 'string' ? flags.city : null,
+      state: typeof flags.state === 'string' ? flags.state : null,
+      postalCode: typeof flags.postal === 'string' ? flags.postal : null,
+      country: typeof flags.country === 'string' ? flags.country : null,
+      label: typeof flags.label === 'string' ? flags.label : undefined,
+      isPrimary: !!flags.primary,
+    });
+  }
+  if (command === 'remove-address') {
+    const [contactId, addressId] = rest;
+    if (!contactId || !addressId) throw new Error('usage: contact remove-address <id> <aid>');
+    return removeAddress(database, runtimeState, contactId, addressId);
+  }
+  if (command === 'set-field') {
+    const [contactId, fieldName, ...valueParts] = rest;
+    if (!contactId || !fieldName) {
+      throw new Error('usage: contact set-field <id> <key> <value>');
+    }
+    return setField(database, runtimeState, contactId, fieldName, valueParts.join(' '));
+  }
+  if (command === 'remove-field') {
+    const [contactId, fieldName] = rest;
+    if (!contactId || !fieldName) {
+      throw new Error('usage: contact remove-field <id> <key>');
+    }
+    return removeField(database, runtimeState, contactId, fieldName);
+  }
+  if (command === 'import') {
+    const [filePath] = rest;
+    if (!filePath) throw new Error('usage: contact import <file.vcf>');
+    return importVCardFile(database, runtimeState, filePath);
+  }
+  if (command === 'export') {
+    const text = exportContactsToVCard(database, {
+      id: typeof flags.id === 'string' ? flags.id : undefined,
+      starred: !!flags.starred,
+    });
+    if (typeof flags.file === 'string') {
+      fs.writeFileSync(flags.file, text, { mode: 0o600 });
+      return { written: flags.file, bytes: Buffer.byteLength(text) };
+    }
+    safeStdoutWrite(text + '\n');
+    return undefined;
+  }
+  if (command === 'discover') {
+    return discoverEntities(database, os.homedir());
+  }
+  if (command === 'link-entity') {
+    const [contactId, linkIdentifier] = rest;
+    if (!contactId || !linkIdentifier) {
+      throw new Error('usage: contact link-entity <contact-id> <source-tool>:<table>:<id>');
+    }
+    return createEntityLink(database, runtimeState, contactId, linkIdentifier,
+      typeof flags.confidence === 'string' ? flags.confidence : undefined);
+  }
+  if (command === 'unlink-entity') {
+    const [contactId, linkId] = rest;
+    if (!contactId || !linkId) {
+      throw new Error('usage: contact unlink-entity <contact-id> <link-id>');
+    }
+    return removeEntityLink(database, runtimeState, contactId, linkId);
+  }
+  if (command === 'link') {
+    const [contactIdA, contactIdB] = rest;
+    if (!contactIdA || !contactIdB) {
+      throw new Error('usage: contact link <id1> <id2> [--relationship knows]');
+    }
+    const relationship = typeof flags.relationship === 'string'
+      ? flags.relationship : 'knows';
+    return linkContacts(database, runtimeState, contactIdA, contactIdB,
+      relationship, { oneWay: !!flags['one-way'] });
+  }
+  if (command === 'unlink') {
+    const [contactIdA, contactIdB] = rest;
+    if (!contactIdA || !contactIdB) {
+      throw new Error('usage: contact unlink <id1> <id2> [--relationship knows]');
+    }
+    const relationship = typeof flags.relationship === 'string'
+      ? flags.relationship : 'knows';
+    return unlinkContacts(database, runtimeState, contactIdA, contactIdB,
+      relationship, { oneWay: !!flags['one-way'] });
+  }
+  if (command === 'suggest-merges') {
+    return suggestMerges(database);
+  }
+  if (command === 'merge') {
+    const [contactIdA, contactIdB] = rest;
+    if (!contactIdA || !contactIdB) {
+      throw new Error('usage: contact merge <id1> <id2> [--survivor <id>]');
+    }
+    return mergeContacts(database, runtimeState, contactIdA, contactIdB, {
+      survivorId: typeof flags.survivor === 'string' ? flags.survivor : undefined,
+      reason: typeof flags.reason === 'string' ? flags.reason : undefined,
+    });
+  }
+  throw new Error(`unknown command: ${command}`);
+}
+
+// CLI-facing status summary (terse JSON), distinct from HTTP /status.
+function statusSummary(database) {
+  const activeCount = database.prepare(
+    "SELECT COUNT(*) AS c FROM contacts WHERE status = 'active'"
+  ).get().c;
+  const totalCount = database.prepare(
+    'SELECT COUNT(*) AS c FROM contacts'
+  ).get().c;
+  const starredCount = database.prepare(
+    "SELECT COUNT(*) AS c FROM contacts WHERE status = 'active' AND starred = 1"
+  ).get().c;
+  const head = database.prepare(
+    'SELECT hash FROM proof_chain ORDER BY timestamp DESC, rowid DESC LIMIT 1'
+  ).get()?.hash ?? null;
+  return {
+    tool: TOOL_NAME, version: TOOL_VERSION,
+    contact_count: { active: activeCount, total: totalCount },
+    starred_count: starredCount,
+    proof_chain_head: head,
+  };
+}
+
+// ── Entrypoint ───────────────────────────────────────────────────────
+
+if (require.main === module) {
+  runCli(process.argv.slice(2)).catch((startupError) => {
+    safeStdoutWrite(JSON.stringify({
+      type: 'tool.error', tool: TOOL_NAME,
+      error: startupError.message ?? String(startupError),
+    }) + '\n');
+    process.exit(1);
+  });
+}
+
+// ── Module exports (for tests + cross-tool callers) ──────────────────
+
+module.exports = {
+  TOOL_NAME, TOOL_VERSION, HTTP_STATUS_PORT,
+  ALLOWED_STATUSES, ALLOWED_CONFIDENCES,
+  DEFAULT_EMAIL_LABEL, DEFAULT_PHONE_LABEL, DEFAULT_ADDRESS_LABEL,
+  LEVENSHTEIN_THRESHOLD, MINIMUM_NAME_LENGTH_FOR_FUZZY,
+  CONTACTS_PER_PAGE_DEFAULT, DEFAULT_COUNTRY,
+  VCARD_BEGIN, VCARD_END, VCARD_VERSION_LINE,
+  FOREIGN_TOOL_TABLE_MAP,
+  sha256Hex, nowIso, newId,
+  normalizeEmailForHash, normalizePhoneForHash, normalizeNameForHash,
+  computeContentHash, computeEdgeId, levenshteinDistance,
+  safeStdoutWrite,
+  loadConfiguration, makeDefaultConfiguration,
+  registryPathFor, writeRegistration, removeRegistration,
+  openDatabase, applySchema, ensureGenesisEntry,
+  computeProofEntryHash, writeProofChainEntry, verifyProofChain,
+  buildEvent, emitStructuredEvent,
+  upsertPersonGraphNode, insertGraphEdge, removeGraphEdge, redirectGraphEdges,
+  createContact, getContact, getContactRow, updateContact, deleteContact,
+  cleanOwnerTag, listFollowUps,
+  listContacts, setStarred, bulkContactAction,
+  addEmail, removeEmail, addPhone, removePhone, addAddress, removeAddress,
+  setField, removeField,
+  searchContacts,
+  linkContacts, unlinkContacts, getContactRelationships,
+  proofDetailReferencesContact, getContactTimeline,
+  unfoldVCardLines, parseVCardLine, unescapeVCardValue, splitVCardBlocks,
+  parseVCardBlock, importVCardFile, importVCardText,
+  escapeVCardValue, foldVCardLine, serializeContactAsVCard,
+  selectContactsForExport, exportContactsToVCard,
+  CSV_COLUMNS, escapeCsvField, serializeContactsToCsv,
+  parseCsvRows, parseCsvText, exportContactsToCsv, importCsvText,
+  parseEntityLinkIdentifier, createEntityLink, removeEntityLink,
+  listRegisteredTools, openForeignDatabaseReadOnly, foreignTableExists,
+  discoverForeignPeople, discoverEntities, isAlreadyLinked,
+  pickSurvivor, mergeContacts, suggestMerges, listMergeHistory,
+  sendJson, buildStatusHandler, handleStatusRequest, checkRequestOrigin,
+  runDaemon, runCli, parseArgs, statusSummary, dispatchCommand,
+};

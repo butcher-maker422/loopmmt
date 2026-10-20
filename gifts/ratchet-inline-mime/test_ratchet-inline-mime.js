@@ -118,13 +118,13 @@ eq("sibling base64 leaf", nested.parts[1].body, "ABC");
 // ---- 7. RFC 2047 encoded words in headers ----------------------------------
 var ew = parseMime(msg([
   "Subject: =?utf-8?B?SGVsbG8sIOKCrA==?=",
-  "From: =?utf-8?Q?Andr=C3=A9?= <a@x.io>",
+  "From: =?utf-8?Q?Andr=C3=A9?= <a@example.org>",
   "Content-Type: text/plain",
   "",
   "x"
 ]));
 eq("encoded-word B subject", ew.headers.subject, "Hello, \u20ac");
-eq("encoded-word Q from", ew.headers.from, "Andr\u00e9 <a@x.io>");
+eq("encoded-word Q from", ew.headers.from, "Andr\u00e9 <a@example.org>");
 eq("Q underscore is space", m.decodeEncodedWords("=?utf-8?Q?a_b?="), "a b");
 
 // ---- direct codec probes ---------------------------------------------------
