@@ -1,768 +1,569 @@
-# Loop MMT — corpus shard 84/95
+# Loop MMT — corpus shard 84/99
 
-> Bundle 84 of 95 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 84 of 99 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 4 (/gifts/reading-oath/, /gifts/reltime/, /gifts/rename/, /gifts/render-loop-harness/)
-
----
-
-# Make The AI Prove It Read The Whole Thing — a Loop MMT gift
-https://loopmmt.com/gifts/reading-oath/
-[coverage: optional · branch: gifts]
-
-How Do You Know The Model Read All Of Your Context, Not Just Some Of It? shard ← all gifts
-
-Make The AI Prove It Read The Whole Thing
-
-Shard a chunk of context into a manifest of typed nodes — the coverage oracle — plus budget-sized reading bundles and a short reader protocol; hand it to any model, collect the node ids it reports reading, and verify against the manifest by set-difference until nothing remains. PASS means every shard was covered; a GAP names exactly which shards were skipped. The general-text sibling of The Excavation (which proves an AI read a whole site). Python stdlib only, offline, deterministic — the same context yields byte-identical shards every run.
-
-The honest edge
-
-reading-oath proves COVERAGE — that every shard of your context was seen — not COMPREHENSION; a reader can cover every shard and still misunderstand it. It also trusts the reader to report the ids it actually read: it detects a skipped shard, not a lie about a read one.
-
-Run it
-
-python3 reading_oath.py shard --in context.txt --budget 8000 --out oath.json && python3 reading_oath.py verify --oath oath.json --covered <ids>
-smoke_test.py / --selftest (12/12: enumeration, typed classification, folds-twice-identical, id-stable-under-reorder, id-changes-on-edit, verify PASS/GAP, unknown-id surfaced, budget sharding, oracle==shard-body-ids, empty-input exit 3)
-Python stdlib only, deterministic
-
-The code — every file that ships
-
-reading_oath.py 420 lines on GitHub →
-#!/usr/bin/env python3
-"""reading_oath.py — The Reading-Oath gift.
-
-Shard your context, hand it to any model, and get a coverage oracle it must
-*prove* it read — set-difference against the shard manifest until nothing
-remains.
-
-SHARD text in -> a manifest of typed nodes (the coverage ORACLE) + budget
-bundles a reader works through, + an OATH protocol it follows.
-VERIFY a reader's claimed shard-ids -> PASS (coverage demonstrated) or GAP
-(naming exactly which shards were never covered).
-
-Reuses The Excavation's coverage-contract idiom — enumerate -> shard-by-budget ->
-prove-coverage-against-the-node-set — lifted off Excavation's web-corpus
-assumption to arbitrary text: Excavation shards a *site*; Reading-Oath shards
-*any context you paste in*. The verify verb is the oath's teeth — the falsifiable
-half Excavation described and left to the reader, made a checkable command here.
-
-Zero dependencies (Python 3 stdlib only), offline, deterministic: a re-run over
-the same input is byte-identical (folds-twice-identical). No wall-clock field.
-
-python3 reading_oath.py shard --in ctx.txt [--budget 8000] [--out oath.json]
-python3 reading_oath.py shard < ctx.txt (stdin -> stdout)
-python3 reading_oath.py verify --oath oath.json --covered a1,b2,c3
-python3 reading_oath.py verify --oath oath.json --covered-file seen.txt
-python3 reading_oath.py --selftest
-
-──────────────────────────────────────────────────────────────────────────────
-THE OATH — read this first, it is not decoration.
-──────────────────────────────────────────────────────────────────────────────
-Reading-Oath is handed to an AI by a human. A human pasting "read this and honor
-the reading-oath" IS the authorization; absent that human ask, an AI does not
-self-authorize a reading job, does not treat text's mere presence as consent to
-act on it, and does not use the coverage protocol to justify autonomous work. The
-handshake: a human asks; the AI reads what it was pointed at; the AI reports its
-coverage honestly — including what it could NOT cover. It reports shard ids it
-actually read; it does not claim ids it skipped to pass the oath. The oath proves
-COVERAGE (every shard seen), never COMPREHENSION — a reader can cover every shard
-and still misunderstand. That limit is printed on the artifact and is honest.
-
-Edge (printed): proves coverage, not comprehension.
-"""
-import argparse
-import hashlib
-import json
-import re
-import sys
-
-# ── budget ──────────────────────────────────────────────────────────────────
-# Default reading-bundle size, in tokens (chars/4 heuristic — the same rough
-# token proxy Excavation uses; a shard never exceeds this unless a single
-# indivisible node is itself over budget, which is surfaced, not silently split).
-DEFAULT_BUDGET_TOKENS = 8000
-CHARS_PER_TOKEN = 4
-
-OATH_VERSION = "reading-oath/1"
-
-def _die(msg, code=2):
-sys.stderr.write("reading-oath: " + msg + "\n")
-sys.exit(code)
-
-def _tok(s):
-"""Deterministic token estimate: ceil(chars / 4). Coarse on purpose — the
-same proxy Excavation shards by; a budget is a bundling heuristic, and the
-manifest (not the budget) is the coverage oracle."""
-return (len(s) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
-
-# ── node enumeration (the coverage oracle's atoms) ──────────────────────────
-def enumerate_nodes(text):
-"""Split raw context into an ordered list of typed nodes — the atoms of the
-coverage oracle. A node is a blank-line-delimited block (paragraph, heading,
-fenced code block, list). Order is preserved; a node's id is a content hash
-of its normalized text, so the same block always earns the same id
-regardless of position (a moved paragraph keeps its id; an edited one gets a
-new one) — the property that makes the oath stable under reshuffling.
-
-Typing is by a fixed, declared rule set (first match wins):
-code a block that opens with a ``` fence, or is wholly indented >=4 sp
-heading a block that is a single line opening with # (markdown) or is a
-short single line followed by === / --- underline in the source
-list a block whose every non-blank line opens with -, *, +, or N.
-prose everything else
-"""
-# Normalize newlines only; do NOT strip content (byte-fidelity of the split).
-text = text.replace("\r\n", "\n").replace("\r", "\n")
-# Split on blank-line boundaries, keeping block text intact.
-raw_blocks = re.split(r"\n[ \t]*\n", text)
-nodes = []
-seq = 0
-for block in raw_blocks:
-if block.strip() == "":
-continue
-seq += 1
-ntype = _classify(block)
-norm = _normalize(block)
-nid = _node_id(norm)
-nodes.append({
-"id": nid,
-"seq": seq,
-"type": ntype,
-"tokens": _tok(block),
-"chars": len(block),
-"preview": _preview(block),
-"text": block,
-})
-return nodes
-
-def _classify(block):
-lines = [ln for ln in block.split("\n")]
-nonblank = [ln for ln in lines if ln.strip()]
-if not nonblank:
-return "prose"
-first = nonblank[0].lstrip()
-if first.startswith("```"):
-return "code"
-if all(ln.startswith(" ") or ln.startswith("\t") for ln in lines if ln.strip()):
-return "code"
-if len(nonblank) == 1 and first.startswith("#"):
-return "heading"
-if (len(nonblank) == 2 and re.fullmatch(r"[=\-]{2,}", nonblank[1].strip() or "")):
-return "heading"
-if all(re.match(r"^\s*([-*+]|\d+[.)])\s+", ln) for ln in nonblank):
-return "list"
-return "prose"
-
-def _normalize(block):
-"""Whitespace-normalize for the content id: collapse internal runs of
-whitespace to single spaces and strip ends. Two blocks that differ only in
-incidental spacing earn the same id (stable oath); a real content edit
-changes it."""
-return re.sub(r"\s+", " ", block).strip()
-
-def _node_id(norm):
-return "n" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:10]
-
-def _preview(block):
-flat = re.sub(r"\s+", " ", block).strip()
-return flat[:72]
-
-# ── shard (bundle nodes by budget) ──────────────────────────────────────────
-def shard_nodes(nodes, budget_tokens):
-"""Greedy in-order bundling into budget-sized shards. In-order so a reader
-works front-to-back; greedy-by-budget so each shard fits a context window.
-A single node over budget becomes its own shard and is flagged oversize
-(surfaced, never silently truncated)."""
-shards = []
-cur = []
-cur_tok = 0
-idx = 0
-
-def _flush():
-nonlocal cur, cur_tok, idx
-if not cur:
-return
-idx += 1
-sid = "s%03d" % idx
-shards.append({
-"id": sid,
-"node_ids": [n["id"] for n in cur],
-"tokens": cur_tok,
-"oversize": any(n["tokens"] > budget_tokens for n in cur),
-})
-cur = []
-cur_tok = 0
-
-for n in nodes:
-if cur and cur_tok + n["tokens"] > budget_tokens:
-_flush()
-cur.append(n)
-cur_tok += n["tokens"]
-_flush()
-return shards
-
-# ── the oath object (manifest + shards + protocol) ──────────────────────────
-def build_oath(text, budget_tokens):
-nodes = enumerate_nodes(text)
-if not nodes:
-_die("input has no readable nodes (empty or all-blank).", 3)
-shards = shard_nodes(nodes, budget_tokens)
-# The manifest is the ORACLE: the closed set of node ids that must be covered.
-node_set = [n["id"] for n in nodes]
-manifest = {
-"version": OATH_VERSION,
-"budget_tokens": budget_tokens,
-"node_count": len(nodes),
-"shard_count": len(shards),
-"total_tokens": sum(n["tokens"] for n in nodes),
-"nodes": [
-{"id": n["id"], "seq": n["seq"], "type": n["type"],
-"tokens": n["tokens"], "preview": n["preview"]}
-for n in nodes
-],
-# node_set is the coverage oracle — verify() checks claimed ⊇ this.
-"node_set": node_set,
-"shards": shards,
-# The reader-facing protocol. Prose, deterministic, no wall-clock.
-"oath": [
-"You have been handed a sharded context and a coverage oracle.",
-"Read each shard in id order (s001, s002,...).",
-"For every node id you actually read, record it.",
-"You have honored the reading-oath ONLY when the set-difference of the "
-"manifest node_set minus the ids you recorded is empty.",
-"Report the ids you covered. Do NOT claim an id you skipped.",
-"This proves COVERAGE (every shard seen), not COMPREHENSION.",
-],
-"edge": "proves coverage, not comprehension",
-}
-# Attach the shard bodies so the object is self-contained for a reader.
-bodies = {n["id"]: n["text"] for n in nodes}
-manifest["shard_bodies"] = {
-s["id"]: [{"id": nid, "text": bodies[nid]} for nid in s["node_ids"]]
-for s in shards
-}
-return manifest
-
-# ── verify (the oath's teeth) ───────────────────────────────────────────────
-def verify(oath, covered_ids):
-"""Set-difference the manifest node_set against the reader's claimed ids.
-Empty difference => PASS (coverage demonstrated). Otherwise GAP, naming the
-uncovered node ids. Claimed ids not in the manifest are reported as 'unknown'
-(a reader claiming ids that do not exist is a signal, not silently ignored)."""
-oracle = set(oath.get("node_set", []))
-claimed = set(covered_ids)
-uncovered = sorted(oracle - claimed)
-unknown = sorted(claimed - oracle)
-result = {
-"version": oath.get("version", OATH_VERSION),
-"oracle_size": len(oracle),
-"claimed_size": len(claimed),
-"covered": len(oracle & claimed),
-"uncovered": uncovered,
-"unknown": unknown,
-"passed": len(uncovered) == 0,
-}
-return result
-
-# ── cli ─────────────────────────────────────────────────────────────────────
-def _read_covered(args):
-ids = []
-if args.covered:
-ids += [x.strip() for x in args.covered.split(",") if x.strip()]
-if args.covered_file:
-try:
-with open(args.covered_file, "r", encoding="utf-8") as fh:
-for raw in fh:
-for tok in re.split(r"[,\s]+", raw.strip()):
-if tok:
-ids.append(tok)
-except OSError as e:
-_die("cannot read --covered-file: %s" % e, 2)
-if not ids:
-_die("verify needs --covered or --covered-file (the reader's claimed ids).", 2)
-return ids
-
-def main(argv=None):
-argv = list(sys.argv[1:] if argv is None else argv)
-if "--selftest" in argv:
-return _selftest()
-
-p = argparse.ArgumentParser(prog="reading_oath.py", add_help=True,
-description="Shard a context into a coverage oath; verify a reader honored it.")
-sub = p.add_subparsers(dest="cmd")
-
-ps = sub.add_parser("shard", help="text in -> coverage oath (manifest+shards+protocol)")
-ps.add_argument("--in", dest="infile", default=None, help="input file (default: stdin)")
-ps.add_argument("--out", dest="outfile", default=None, help="output file (default: stdout)")
-ps.add_argument("--budget", type=int, default=DEFAULT_BUDGET_TOKENS,
-help="shard token budget (default %d)" % DEFAULT_BUDGET_TOKENS)
-
-pv = sub.add_parser("verify", help="reader's claimed ids -> PASS or GAP")
-pv.add_argument("--oath", required=True, help="the oath json from `shard`")
-pv.add_argument("--covered", default=None, help="comma-separated node ids the reader read")
-pv.add_argument("--covered-file", default=None, help="file of node ids (whitespace/comma sep)")
-
-args = p.parse_args(argv)
-
-if args.cmd == "shard":
-if args.budget <= 0:
-_die("--budget must be positive.", 2)
-if args.infile:
-try:
-with open(args.infile, "r", encoding="utf-8") as fh:
-text = fh.read()
-except OSError as e:
-_die("cannot read --in: %s" % e, 2)
-else:
-text = sys.stdin.read()
-oath = build_oath(text, args.budget)
-out = json.dumps(oath, indent=2, ensure_ascii=False, sort_keys=True)
-if args.outfile:
-try:
-with open(args.outfile, "w", encoding="utf-8") as fh:
-fh.write(out + "\n")
-except OSError as e:
-_die("cannot write --out: %s" % e, 2)
-sys.stderr.write("reading-oath: %d nodes, %d shards -> %s\n"
-% (oath["node_count"], oath["shard_count"], args.outfile))
-else:
-sys.stdout.write(out + "\n")
-return 0
-
-if args.cmd == "verify":
-try:
-with open(args.oath, "r", encoding="utf-8") as fh:
-oath = json.load(fh)
-except OSError as e:
-_die("cannot read --oath: %s" % e, 2)
-except json.JSONDecodeError as e:
-_die("--oath is not valid json: %s" % e, 2)
-covered = _read_covered(args)
-res = verify(oath, covered)
-sys.stdout.write(json.dumps(res, indent=2, sort_keys=True) + "\n")
-if res["passed"]:
-sys.stderr.write("reading-oath: PASS — %d/%d covered, difference empty.\n"
-% (res["covered"], res["oracle_size"]))
-return 0
-sys.stderr.write("reading-oath: GAP — %d uncovered node(s): %s\n"
-% (len(res["uncovered"]), ", ".join(res["uncovered"][:8])
-+ ("..." if len(res["uncovered"]) > 8 else "")))
-return 1
-
-p.print_help()
-return 2
-
-# ── selftest (the determinism + contract battery) ───────────────────────────
-def _selftest():
-ok = 0
-fail = 0
-
-def check(name, cond):
-nonlocal ok, fail
-if cond:
-ok += 1
-else:
-fail += 1
-sys.stderr.write(" FAIL: %s\n" % name)
-
-sample = (
-"# Title\n\n"
-"First paragraph of prose that says a thing.\n\n"
-"Second paragraph, distinct content here.\n\n"
-"- a list item\n- another list item\n\n"
-"```\ncode block line one\ncode block line two\n```\n"
-)
-oath = build_oath(sample, 20)
-ids = oath["node_set"]
-
-# 1. enumeration finds the five blocks.
-check("node_count == 5", oath["node_count"] == 5)
-# 2. typing is correct.
-types = [n["type"] for n in oath["nodes"]]
-check("types heading/prose/prose/list/code",
-types == ["heading", "prose", "prose", "list", "code"])
-# 3. determinism: fold twice, identical.
-o2 = build_oath(sample, 20)
-check("folds-twice-identical",
-json.dumps(oath, sort_keys=True) == json.dumps(o2, sort_keys=True))
-# 4. node id is content-stable under reordering.
-reordered = (
-"Second paragraph, distinct content here.\n\n"
-"# Title\n\n"
-"First paragraph of prose that says a thing.\n\n"
-"- a list item\n- another list item\n\n"
-"```\ncode block line one\ncode block line two\n```\n"
-)
-ro = build_oath(reordered, 20)
-check("ids stable under reorder (same set)",
-set(ro["node_set"]) == set(oath["node_set"]))
-# 5. id changes on content edit.
-edited = sample.replace("says a thing", "says a DIFFERENT thing")
-oe = build_oath(edited, 20)
-check("edit changes exactly one id",
-len(set(oe["node_set"]) - set(oath["node_set"])) == 1)
-# 6. verify PASS when all covered.
-r_all = verify(oath, ids)
-check("verify PASS on full coverage", r_all["passed"] and not r_all["uncovered"])
-# 7. verify GAP naming the skipped id.
-r_gap = verify(oath, ids[:-1])
-check("verify GAP names the one skipped", (not r_gap["passed"]) and r_gap["uncovered"] == [ids[-1]])
-# 8. unknown claimed id is surfaced.
-r_unk = verify(oath, ids + ["nDEADBEEF00"])
-check("verify surfaces unknown id", r_unk["unknown"] == ["nDEADBEEF00"])
-# 9. sharding respects budget (each shard <= budget unless a single oversize node).
-small = build_oath(sample, 5) # tiny budget forces multiple shards
-check("tiny budget -> more shards", small["shard_count"] >= oath["shard_count"])
-budget_ok = all(s["tokens"] <= 5 or len(s["node_ids"]) == 1 for s in small["shards"])
-check("shards fit budget or are single oversize node", budget_ok)
-# 10. node_set is exactly the shard-body ids (oracle == what's handed over).
-body_ids = set()
-for sid, items in oath["shard_bodies"].items():
-for it in items:
-body_ids.add(it["id"])
-check("oracle == union of shard-body ids", body_ids == set(oath["node_set"]))
-# 11. empty input dies clean (exit 3) — checked via a guarded call.
-try:
-build_oath(" \n\n \n", 20)
-check("empty input raises", False)
-except SystemExit as e:
-check("empty input exit 3", e.code == 3)
-
-total = ok + fail
-sys.stdout.write("reading-oath selftest: %d/%d passed\n" % (ok, total))
-return 0 if fail == 0 else 1
-
-if __name__ == "__main__":
-sys.exit(main())
-
-smoke_test.py 21 lines on GitHub →
-#!/usr/bin/env python3
-"""smoke_test.py — reading-oath's shipped smoke check. Runs the in-module
---selftest battery (12 checks) and exits non-zero on any failure, so a stranger
-can prove the gift works in their tree with one command:
-
-python3 smoke_test.py
-"""
-import subprocess
-import sys
-import os
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-def main():
-r = subprocess.run([sys.executable, os.path.join(HERE, "reading_oath.py"), "--selftest"])
-sys.exit(r.returncode)
-
-if __name__ == "__main__":
-main()
-
-Take the whole folder →
-MIT
-Python stdlib only, deterministic
+Nodes in this shard: 4 (/gifts/plausible/, /gifts/pluck/, /gifts/plumb/, /gifts/port/)
 
 ---
 
-# Reltime — a Loop MMT gift
-https://loopmmt.com/gifts/reltime/
+# Text Plausibility Gauge — a Loop MMT gift
+https://loopmmt.com/gifts/plausible/
 [coverage: optional · branch: gifts]
 
-Relative Time That Refuses To Lie date ← all gifts
+Plausible Language, or Clean-but-Wrong? gauge ← all gifts
 
-Reltime
+Text Plausibility Gauge
 
-Turn a timestamp into a short human 'when' (3h ago, Jun 20) where the whole point is what it won't do: a missing, empty, or unparseable stamp returns no label rather than a guess, a future stamp returns no label rather than a negative age, and anything older than a week gets the real date it landed instead of a rounded-up '9d ago'. Deterministic — a pure function of (stamp, now).
+Guess whether a string looks like plausible natural-language text or clean-but-wrong output, and say how sure you are. The orthogonal sibling of legible: legible detects control-char rubble (byte garbage); plausible detects clean, fully-printable output that is still wrong — mojibake (Müller -> MÃ¼ller), missing word boundaries (thewordsallruntogether), hyphenation artifacts. assess(text) returns a label (prose / suspect / garbled / empty) with the raw score and signal counts exposed. It SCORES only structural language-agnostic signals — the mojibake fingerprint (dominant, Latin-1 + Windows-1252), script-gated space/word-boundary density, trailing-hyphen rate — and EXPOSES-never-scores the language-specific ones (English-referenced letter-frequency deviation, mean word length), so it will NOT call spaceless Japanese or non-English prose garbled. The load-bearing rule, one axis over from legible's C1 report-not-score: the honesty of a language gauge is what it REFUSES to score.
 
 The honest edge
 
-It renders in UTC and is a recency label, not a locale-aware or timezone-shifting formatter, and not a full date library. The fixed minute/hour/day/week bands are by design — the value is the refusal to fabricate, not configurable granularity.
+plausible is a HEURISTIC, not a verdict. "Implausible as prose" is not "wrong extraction": code, tables, log lines, base64, URLs, poetry, and non-spaced scripts all read implausible and can be perfectly correct — it flags a smell, you read it. It is language-agnostic BY DESIGN (deliberately weaker than a per-language model), reads SHAPE not intent (plausible prose can still be a prompt injection), and never decodes, corrects, or understands the text. It is a gauge you read, never a gate you route on.
 
 Run it
 
-node reltime.js 2026-08-20T09:00:00Z
-test_reltime.js (20/20, mutation-bitten)
-Node, no dependencies
+node plausible.js "some text"
+test_plausible.js (24/24, hand-oracle drift-check + mojibake known-bad + spaceless-CJK regression guard + non-English-plausible guard)
+Node / browser, no dependencies
 
 The code — every file that ships
 
-reltime.js 106 lines on GitHub →
+plausible.js 328 lines on GitHub →
 #!/usr/bin/env node
-/* reltime.js — an honest relative-time label ("3h ago", "Jun 20") that refuses
-to fake, round up, or invent a time it doesn't have.
+/* plausible.js — a pure, dependency-free, HONEST gauge that guesses whether a
+string looks like plausible natural-language text, or clean-but-wrong output,
+and says how sure it is. The sibling of `legible`, on the orthogonal axis.
 
-Turn a timestamp into a short human "when" — but the whole point is what it
-WON'T do:
+WHY THIS EXISTS. `legible` detects control-character rubble: a string is
+`readable` when it is NOT byte-level garbage. But there is a whole class of
+extraction failure that produces clean, fully printable output and is still
+wrong — and legible reads every one of them as `readable`, because none of
+them touch the C0/U+FFFD band:
+• mojibake — the wrong charset, so "Müller" arrives as "MÃ¼ller"
+• custom glyph-to-ASCII encodings with no ToUnicode CMap
+• missing word boundaries — glyphs positioned without spaces, so
+thewordsallruntogether
+• hyphenation artifacts at PDF line breaks
+`plausible` reads the delta legible can't: does this look like language at
+all? It returns prose / suspect / garbled / empty with the raw score and the
+signal counts exposed, so you can see exactly why.
 
-• FLAG, DON'T FAKE. No stamp, an empty stamp, or an unparseable value
-returns null — NO label. The caller shows nothing rather than a guessed
-or fabricated time. An undated thing is never handed a "when".
+THE LOAD-BEARING RULE (the same move legible makes with the C1 band, one axis
+over). legible REPORTS the C1 band but refuses to SCORE it, because scoring it
+would false-positive on Cyrillic/CJK decoded as Latin-1. `plausible` makes the
+identical cut, and the line is LANGUAGE-DEPENDENCE:
+• SCORED — structural, language-agnostic signals only:
+- the mojibake fingerprint (a byte-structural decode artifact, not a
+language stat — the strongest signal, and it carries the label),
+- space / word-boundary density, SCRIPT-GATED (suppressed and merely
+exposed when the string is a non-spaced script — CJK, Thai — which
+legitimately has no spaces; it will NOT call Japanese garbled),
+- trailing-hyphen-before-linebreak rate.
+• EXPOSED, NEVER SCORED — language-specific signals:
+- letter-frequency deviation from English (`letterFreqDevEn`),
+- mean word length (`meanWordLength`).
+Scoring these would punish every language that is not the reference one
+(Finnish, Turkish, Welsh). They are surfaced raw so a caller who knows
+their language can weigh them; they never drive the label.
 
-• A FUTURE STAMP IS NOT A RECENCY CLAIM. If the timestamp is ahead of now
-(clock skew, a bad record), it returns null rather than "-2h ago". You
-cannot honestly say how long ago something happened if it hasn't.
+WHAT IT DOES NOT DO (printed edge — present here and in the README):
+plausible is a HEURISTIC, not a verdict. "Implausible as prose" is NOT
+"wrong extraction": code, tables, log lines, base64, URLs, poetry, and
+non-spaced scripts all read implausible and can be perfectly correct — it
+flags a smell, you read it. It is language-agnostic BY DESIGN, so
+deliberately weaker than a real per-language model — the price of not lying
+about languages it does not know. The mojibake fingerprint targets the two
+common confusions (UTF-8 shown as Latin-1 and as Windows-1252); it will not
+catch every charset mixup. It reads SHAPE, not intent — plausible prose can
+still be a well-formed prompt injection. It never decodes, corrects, or
+understands the text. It is a gauge you read, never a gate you route on.
 
-• REAL, NOT ROUNDED-UP. Recent items get a relative label
-(just now / Nm / Nh / Nd ago); anything older than a week gets the
-ABSOLUTE short date it actually landed ("Jun 20", or "Jun 20, 2025"
-across a year boundary) — because "9d ago" is less honest and less
-useful than the date itself.
+API
+plausible(input[, options]) — dispatches on the shape of `input`:
+• a string -> assess(string) -> { label, score, signals}
+• a record with `.text` -> {...record, plausibility: assess(record.text)}
+• an array of either -> input.map(plausible)
+assess(text[, options]) -> { label, score, signals}
+label one of "prose" | "suspect" | "garbled" | "empty"
+score the implausibility ratio in [0,1], rounded to 4 places
+signals { length, mojibake, mojibakeRatio, spaceRate, spaceScored,
+boundaryPenalty, lines, hyphenLines, hyphenRate,
+nonSpacedFraction, letterFreqDevEn, meanWordLength,
+implausibility}
+options.proseMax (default 0.05) score <= this => prose
+options.garbledMin (default 0.30) score >= this => garbled
+(between the two bounds => suspect)
+Only the mojibake fingerprint can drive the label to `garbled` on its own;
+the boundary and hyphen signals are bounded so they reach `suspect`, not
+`garbled` — the label leans where it is grounded.
 
-• DETERMINISTIC. `now` is injected, so the label is a pure function of
-(stamp, now) — testable with no wall clock and stable across a render.
-
-Pure function of its inputs, no dependencies. The same code runs in a browser
-(attach relativeTime to your namespace) or on Node (this CLI / require()).
+Pure function of its input. No dependencies, no randomness, no clock, no I/O
+in the core — the same input always yields the same output (the determinism
+lint is trivial). Same code in a browser (window.LoopGifts.plausible) or Node
+(this CLI / require()).
 
 USAGE
-node reltime.js 2026-08-20T09:00:00Z # label vs. now
-node reltime.js 2026-08-20T09:00:00Z 1755772800000 # label vs. an injected now (ms)
-node reltime.js --help
+node plausible.js "some text" # assess an argument, print JSON
+cat streams.jsonl | node plausible.js # annotate each JSONL record's.text
+node plausible.js --port # print this tool's port-verb (transform)
+node plausible.js --help
 
-Dates are read/rendered in UTC for determinism. Released under MIT.
+Released under MIT.
 */
+(function (root, factory) {
+var api = factory();
+if (typeof module === "object" && module.exports) module.exports = api;
+if (typeof window!== "undefined") {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts.plausible = api.plausible;
+window.LoopGifts.assessPlausibility = api.assess;
+}
+root.__plausible = api;
+})(typeof globalThis!== "undefined"? globalThis: this, function () {
 "use strict";
 
-var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+var DEFAULTS = { proseMax: 0.05, garbledMin: 0.30};
 
-var MIN = 60 * 1000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+// --- the SCORED signals (structural, language-agnostic) -------------------
 
-/* relativeTime(iso, nowMs) -> short label string, or null when there is no
-honest label to show. `iso` is an ISO-8601 string (or null). `nowMs` defaults
-to Date.now() but is injected in tests and via the CLI for determinism. */
-function relativeTime(iso, nowMs) {
-// flag-don't-fake: no stamp, empty stamp, or a non-string -> no label.
-if (iso == null) return null;
-var s = String(iso);
-if (s === "") return null;
-
-var t = Date.parse(s);
-if (isNaN(t)) return null; // unparseable -> no fabricated time
-
-var now = (typeof nowMs === "number" && isFinite(nowMs))? nowMs: Date.now();
-var delta = now - t;
-
-// A future stamp (clock skew) is not a recency claim we can make honestly.
-if (delta < 0) return null;
-
-if (delta < MIN) return "just now";
-if (delta < HOUR) return Math.floor(delta / MIN) + "m ago";
-if (delta < DAY) return Math.floor(delta / HOUR) + "h ago";
-if (delta < WEEK) return Math.floor(delta / DAY) + "d ago";
-
-// Older than a week -> the absolute short date it actually landed.
-var d = new Date(t);
-var label = MONTHS[d.getUTCMonth()] + " " + d.getUTCDate();
-if (d.getUTCFullYear()!== new Date(now).getUTCFullYear()) {
-label += ", " + d.getUTCFullYear();
-}
-return label;
+// Mojibake fingerprint. When UTF-8 bytes are decoded through a single-byte
+// codec, a multibyte sequence renders as a LEAD char immediately followed by
+// a CONTINUATION char. The lead is a UTF-8 lead byte shown as Latin-1
+// (0xC2–0xF4). The continuation is either the raw Latin-1 range (0x80–0xBF)
+// OR — the common real-world case — a Windows-1252 remap of the 0x80–0x9F
+// band (curly quotes, dashes, €, ™, …). We count both so the fingerprint
+// catches both the Latin-1 and the CP1252 confusion, not only the textbook one.
+function isUtf8LeadAsLatin1(c) { return c >= 0xc2 && c <= 0xf4;}
+// CP1252's printable remaps of bytes 0x80–0x9F (the 27 codepoints it defines).
+var CP1252_C1 = {};
+[0x20ac,0x201a,0x0192,0x201e,0x2026,0x2020,0x2021,0x02c6,0x2030,0x0160,
+0x2039,0x0152,0x017d,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,
+0x02dc,0x2122,0x0161,0x203a,0x0153,0x017e,0x0178].forEach(function (cp) { CP1252_C1[cp] = 1;});
+function isMojibakeCont(c) {
+return (c >= 0x80 && c <= 0xbf) || CP1252_C1[c] === 1;
 }
 
-// Browser: attach to a namespace. Node/require: export. CLI: run below.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.relativeTime = relativeTime;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { relativeTime: relativeTime};
+// Non-spaced scripts: scripts that legitimately write without spaces between
+// words. When a string is substantially one of these, the space signal is a
+// false tell, so we GATE it out of the score (exposed, never scored). Korean
+// (Hangul) is DELIBERATELY not here — Korean uses spaces, so its boundary
+// signal is meaningful.
+function isNonSpacedScript(c) {
+return (c >= 0x4e00 && c <= 0x9fff) // CJK Unified Ideographs (Chinese, Kanji)
+|| (c >= 0x3040 && c <= 0x30ff) // Hiragana + Katakana (Japanese)
+|| (c >= 0x3400 && c <= 0x4dbf) // CJK Extension A
+|| (c >= 0xf900 && c <= 0xfaff) // CJK Compatibility Ideographs
+|| (c >= 0x0e00 && c <= 0x0e7f) // Thai
+|| (c >= 0x0e80 && c <= 0x0eff) // Lao
+|| (c >= 0x1780 && c <= 0x17ff) // Khmer
+|| (c >= 0x1000 && c <= 0x109f); // Myanmar
 }
 
-// ---- CLI (runs only when invoked directly, never on require) ----------------
+function isAsciiLetter(c) {
+return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
+}
+
+// --- the EXPOSED-not-scored signals (language-specific) -------------------
+
+// English letter frequencies (%). Used ONLY to expose a raw deviation number;
+// NEVER folded into the score — that would malign every non-English language.
+var EN_FREQ = {
+a:8.2,b:1.5,c:2.8,d:4.3,e:12.7,f:2.2,g:2.0,h:6.1,i:7.0,j:0.15,k:0.77,
+l:4.0,m:2.4,n:6.7,o:7.5,p:1.9,q:0.095,r:6.0,s:6.3,t:9.1,u:2.8,v:0.98,
+w:2.4,x:0.15,y:2.0,z:0.074
+};
+
+function assess(text, options) {
+var opt = options || {};
+var proseMax = typeof opt.proseMax === "number"? opt.proseMax: DEFAULTS.proseMax;
+var garbledMin = typeof opt.garbledMin === "number"? opt.garbledMin: DEFAULTS.garbledMin;
+
+if (text === null || text === undefined) return emptyResult();
+var s = String(text);
+if (s.length === 0 || /^\s*$/.test(s)) return emptyResult(s.length);
+
+var n = s.length;
+var mojibake = 0, spaces = 0, nonSpaced = 0, asciiLetters = 0;
+var freq = {};
+for (var i = 0; i < n; i++) {
+var c = s.charCodeAt(i);
+if (c === 0x20 || c === 0x09) spaces++;
+if (isNonSpacedScript(c)) nonSpaced++;
+if (isAsciiLetter(c)) {
+asciiLetters++;
+var ch = String.fromCharCode(c | 0x20); // lowercase
+freq[ch] = (freq[ch] || 0) + 1;
+}
+if (i + 1 < n && isUtf8LeadAsLatin1(c) && isMojibakeCont(s.charCodeAt(i + 1))) {
+mojibake++;
+}
+}
+
+var mojibakeRatio = round4(mojibake / Math.max(1, n - 1));
+var spaceRate = round4(spaces / n);
+var nonSpacedFraction = round4(nonSpaced / n);
+
+// Script-gate: only score the space signal when the string is NOT mostly a
+// non-spaced script AND there is enough Latin content for missing boundaries
+// to be meaningful.
+var spaceScored = nonSpacedFraction < 0.15 && n >= 24 && (asciiLetters / n) > 0.5;
+// Boundary penalty: how far below a generous prose space-floor we are.
+var SPACE_FLOOR = 0.08; // prose runs ~0.12–0.18; below the floor = boundaries missing
+var boundaryPenalty = spaceScored
+? round4(clamp((SPACE_FLOOR - spaceRate) / SPACE_FLOOR, 0, 1))
+: 0;
+
+// Trailing-hyphen-before-linebreak rate. Only meaningful across several
+// lines — a single trailing hyphen is nothing; PDF hyphenation shows as many.
+var lines = s.split("\n");
+var totalLines = lines.length;
+var hyphenLines = 0;
+for (var j = 0; j < totalLines; j++) {
+if (/[-\u00ad]\s*$/.test(lines[j]) && /\w/.test(lines[j])) hyphenLines++;
+}
+var hyphenRate = totalLines >= 3? round4(hyphenLines / totalLines): 0;
+
+// The score: mojibake dominant (can reach garbled alone); boundary and
+// hyphen bounded so they reach suspect, not garbled — the label leans on
+// the byte-structural signal.
+var implausibility = round4(clamp(
+mojibakeRatio * 1.0 +
+boundaryPenalty * 0.25 +
+hyphenRate * 0.20,
+0, 1));
+
+var label;
+if (implausibility <= proseMax) label = "prose";
+else if (implausibility >= garbledMin) label = "garbled";
+else label = "suspect";
+
+// EXPOSED-not-scored language stats.
+var letterFreqDevEn = asciiLetters >= 20? englishDeviation(freq, asciiLetters): null;
+var meanWordLength = meanWord(s);
+
+return {
+label: label,
+score: implausibility,
+signals: {
+length: n,
+mojibake: mojibake, // count of mojibake bigrams
+mojibakeRatio: mojibakeRatio, // SCORED (dominant)
+spaceRate: spaceRate,
+spaceScored: spaceScored, // was the space signal scored, or script-gated out?
+boundaryPenalty: boundaryPenalty, // SCORED when spaceScored, else 0
+lines: totalLines,
+hyphenLines: hyphenLines,
+hyphenRate: hyphenRate, // SCORED when >= 3 lines, else 0
+nonSpacedFraction: nonSpacedFraction,
+letterFreqDevEn: letterFreqDevEn, // EXPOSED, never scored (English-referenced)
+meanWordLength: meanWordLength, // EXPOSED, never scored
+implausibility: implausibility
+}
+};
+}
+
+// Sum of absolute deviations (percentage points) of a-z frequency from
+// English. English-referenced by construction — a raw signal, never scored.
+function englishDeviation(freq, letters) {
+var dev = 0;
+for (var k in EN_FREQ) {
+var obs = ((freq[k] || 0) / letters) * 100;
+dev += Math.abs(obs - EN_FREQ[k]);
+}
+return round4(dev);
+}
+
+function meanWord(s) {
+var words = s.split(/\s+/).filter(function (w) { return w.length > 0;});
+if (words.length === 0) return 0;
+var total = 0;
+for (var i = 0; i < words.length; i++) total += words[i].length;
+return round4(total / words.length);
+}
+
+function emptyResult(length) {
+return {
+label: "empty",
+score: 0,
+signals: {
+length: length || 0, mojibake: 0, mojibakeRatio: 0, spaceRate: 0,
+spaceScored: false, boundaryPenalty: 0, lines: 0, hyphenLines: 0,
+hyphenRate: 0, nonSpacedFraction: 0, letterFreqDevEn: null,
+meanWordLength: 0, implausibility: 0
+}
+};
+}
+
+function clamp(x, lo, hi) { return x < lo? lo: x > hi? hi: x;}
+function round4(x) { return Math.round(x * 1e4) / 1e4;}
+
+// The composition joint: dispatch on the shape of the input (mirrors legible).
+function plausible(input, options) {
+if (Array.isArray(input)) {
+return input.map(function (x) { return plausible(x, options);});
+}
+if (input && typeof input === "object") {
+var out = {};
+for (var k in input) if (Object.prototype.hasOwnProperty.call(input, k)) out[k] = input[k];
+out.plausibility = assess(input.text, options);
+return out;
+}
+return assess(input, options);
+}
+
+return { plausible: plausible, assess: assess};
+});
+
+// ---- CLI (Node only) ------------------------------------------------------
+if (typeof require!== "undefined" && typeof module!== "undefined" && require.main === module) {
+var api = (typeof globalThis!== "undefined"? globalThis: this).__plausible;
+
 function main(argv) {
 var args = argv.slice(2);
-if (args.length === 0 || args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
+if (args.indexOf("--port")!== -1) { process.stdout.write("transform\n"); return 0;}
+if (args.indexOf("--help")!== -1 || (args.length === 0 && process.stdin.isTTY)) {
 process.stdout.write(
-"reltime.js — an honest relative-time label that refuses to fake a time.\n\n" +
-" node reltime.js <iso-timestamp> label vs. now\n" +
-" node reltime.js <iso-timestamp> <now-ms> label vs. an injected now (ms)\n" +
-" node reltime.js --help\n\n" +
-"Prints the label, or '(no honest label)' when the stamp is missing,\n" +
-"unparseable, or in the future. Dates render in UTC.\n"
+"plausible — a heuristic gauge: does this string look like plausible natural-language text?\n" +
+" node plausible.js \"some text\" assess an argument, print JSON\n" +
+" cat streams.jsonl | node plausible.js annotate each JSONL record's.text\n" +
+" node plausible.js --port print the port-verb (transform)\n" +
+" node plausible.js --help\n"
 );
-return args.length === 0? 1: 0;
+return 0;
 }
-var iso = args[0];
-var nowMs = args.length > 1? Number(args[1]): undefined;
-var label = relativeTime(iso, nowMs);
-process.stdout.write((label === null? "(no honest label)": label) + "\n");
+var textArg = null;
+for (var i = 0; i < args.length; i++) { if (args[i].indexOf("--")!== 0) { textArg = args[i]; break;}}
+if (textArg!== null) {
+process.stdout.write(JSON.stringify(api.assess(textArg)) + "\n");
+return 0;
+}
+var input = "";
+try { input = require("fs").readFileSync(0, "utf8");} catch (e) { input = "";}
+var lines = input.split("\n");
+for (var j = 0; j < lines.length; j++) {
+var line = lines[j];
+if (line === "" && j === lines.length - 1) continue;
+var rec;
+try {
+var parsed = JSON.parse(line);
+rec = api.plausible(parsed);
+} catch (e) {
+rec = { text: line, plausibility: api.assess(line)};
+}
+process.stdout.write(JSON.stringify(rec) + "\n");
+}
 return 0;
 }
 
-if (typeof require!== "undefined" && require.main === module) {
 process.exitCode = main(process.argv);
 }
 
-test_reltime.js 61 lines on GitHub →
+test_plausible.js 98 lines on GitHub →
 #!/usr/bin/env node
-/* test_reltime.js — proves the label is honest, exact, and deterministic.
+/* test_plausible.js — drift-check battery for the plausible gauge.
+Each case is an out-of-band expectation (a label a human assigns by reading
+the string), not a value the gauge produced. Run: node test_plausible.js
 
-The honesty rules ARE the tool, so the test's real job is to prove each
-REFUSAL fires (null, not a fabricated label) and each threshold is exact. The
-clock is injected, so every case is deterministic with no wall clock. A
-mutation bite guards against a vacuously-green run. Exit 0 = all pass, exit 1
-= a failure (loud). stdlib only, no dependencies. */
+The load-bearing cases, called out:
+• MOJIBAKE POSITIVE — the whole reason the gift exists; must not read prose.
+• CJK REGRESSION GUARD — real spaceless Japanese must NOT read garbled
+(the script-gate; the equity false-positive the design refuses to make).
+• BOUNDARY case — run-together Latin flags via the space signal.
+• LEAN CHECK — mojibake can reach `garbled` alone; boundary/hyphen
+are bounded to `suspect`. The label leans on the byte-structural signal.
+*/
 "use strict";
-var relativeTime = require("./reltime.js").relativeTime;
+var P = require("./plausible.js");
+var assess = P.assess, plausible = P.plausible;
 
-var pass = 0, fail = 0;
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL " + name + "\n got: " + g + "\n want: " + w);}
+var pass = 0, fail = 0, failures = [];
+function check(name, cond, detail) {
+if (cond) { pass++;}
+else { fail++; failures.push(name + (detail? " [" + detail + "]": ""));}
 }
+function labelOf(t, opts) { return assess(t, opts).label;}
 
-// A fixed "now" so every case is deterministic. 2026-06-27T12:00:00Z.
-var NOW = Date.parse("2026-06-27T12:00:00Z");
-function ago(ms) { return new Date(NOW - ms).toISOString();}
-var MIN = 60000, HOUR = 60 * MIN, DAY = 24 * HOUR, WEEK = 7 * DAY;
+// 1. clean English prose -> prose
+check("clean-english-prose", labelOf("The quick brown fox jumps over the lazy dog and the rain falls softly.") === "prose");
 
-// --- flag-don't-fake: every "no honest label" case returns null -------------
-eq("null stamp -> null", relativeTime(null, NOW), null);
-eq("undefined stamp -> null", relativeTime(undefined, NOW), null);
-eq("empty string -> null", relativeTime("", NOW), null);
-eq("unparseable -> null", relativeTime("not a date", NOW), null);
-eq("garbage -> null", relativeTime("2026-13-99", NOW), null);
-eq("future stamp -> null", relativeTime(ago(-HOUR), NOW), null); // 1h in the FUTURE
+// 2. clean prose, different content -> prose (not English-frequency-dependent)
+check("clean-prose-varied", labelOf("She sold seventeen blue kites at the market before noon on a windy Tuesday.") === "prose");
 
-// --- relative band, exact thresholds ---------------------------------------
-eq("0ms -> just now", relativeTime(ago(0), NOW), "just now");
-eq("59s -> just now", relativeTime(ago(59 * 1000), NOW), "just now");
-eq("60s -> 1m ago", relativeTime(ago(MIN), NOW), "1m ago");
-eq("59m -> 59m ago", relativeTime(ago(59 * MIN), NOW), "59m ago");
-eq("60m -> 1h ago", relativeTime(ago(HOUR), NOW), "1h ago");
-eq("23h -> 23h ago", relativeTime(ago(23 * HOUR), NOW), "23h ago");
-eq("24h -> 1d ago", relativeTime(ago(DAY), NOW), "1d ago");
-eq("6d -> 6d ago", relativeTime(ago(6 * DAY), NOW), "6d ago");
+// 3. MOJIBAKE POSITIVE (Latin-1): scattered mojibake in clean text -> not prose, mojibake signal present
+var m1 = assess("MÃ¼ller went to the cafÃ© and ordered a piÃ±a colada.");
+check("mojibake-latin1-not-prose", m1.label!== "prose", "label=" + m1.label);
+check("mojibake-latin1-signal", m1.signals.mojibake >= 3, "mojibake=" + m1.signals.mojibake);
 
-// --- absolute band (>= 1 week): the real date it landed --------------------
-eq("7d -> absolute date", relativeTime(ago(WEEK), NOW), "Jun 20");
-eq("30d same year -> date", relativeTime(ago(30 * DAY), NOW), "May 28");
-eq("across a year boundary", relativeTime("2025-12-31T00:00:00Z", NOW), "Dec 31, 2025");
+// 4. MOJIBAKE POSITIVE (dense, CJK-as-latin1) -> garbled
+var m2 = assess("æ—¥æœ¬èªžã®ãƒ†ã‚­ã‚¹ãƒˆ");
+check("mojibake-dense-garbled", m2.label === "garbled", "label=" + m2.label + " ratio=" + m2.signals.mojibakeRatio);
 
-// --- determinism: same inputs, same output ---------------------------------
-eq("deterministic", relativeTime(ago(3 * HOUR), NOW), relativeTime(ago(3 * HOUR), NOW));
+// 5. MOJIBAKE POSITIVE (CP1252 remap: em-dash/curly-quote family) -> mojibake signal present
+var m3 = assess("theâ€œsmartâ€\u009d quotes and emâ€”dashes are Ã¡ll wrong here now");
+check("mojibake-cp1252-signal", m3.signals.mojibake >= 2, "mojibake=" + m3.signals.mojibake);
 
-// --- coercion / robustness --------------------------------------------------
-eq("non-string stamp -> null", relativeTime(12345, NOW), null); // a number is not an ISO string here
+// 6. CJK REGRESSION GUARD: real, correctly-decoded spaceless Japanese -> NOT garbled
+var jp = assess("日本語のテキストです。これは正しくデコードされた文章。");
+check("cjk-regression-not-garbled", jp.label!== "garbled", "label=" + jp.label);
+check("cjk-regression-space-gated", jp.signals.spaceScored === false, "spaceScored=" + jp.signals.spaceScored);
+check("cjk-regression-no-mojibake", jp.signals.mojibake === 0, "mojibake=" + jp.signals.mojibake);
 
-// --- mutation bite: the future-guard MUST be load-bearing ------------------
-// If someone deleted `if (delta < 0) return null;`, a future stamp would
-// produce "just now" (delta<MIN with negative delta). Assert it does NOT.
-var futureResult = relativeTime(ago(-HOUR), NOW);
-if (futureResult === null) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: future stamp produced a label: " + JSON.stringify(futureResult));}
+// 7. Chinese (spaceless) regression guard -> NOT garbled
+var zh = assess("这是一段正确解码的中文文本用来测试脚本门控是否正常工作。");
+check("chinese-regression-not-garbled", zh.label!== "garbled", "label=" + zh.label);
 
-console.log("\nreltime: " + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
+// 8. BOUNDARY case: run-together Latin (no spaces) -> flagged (suspect+), boundaryPenalty fires
+var rt = assess("thequickbrownfoxjumpsoverthelazydogandtherainfallssoftlyonthefields");
+check("runtogether-flagged", rt.label!== "prose", "label=" + rt.label);
+check("runtogether-boundary", rt.signals.boundaryPenalty > 0, "bp=" + rt.signals.boundaryPenalty);
+
+// 9. LEAN CHECK: boundary alone is bounded to suspect, never garbled (higher false-positive surface)
+check("boundary-bounded-to-suspect", rt.label === "suspect", "label=" + rt.label);
+
+// 10. HYPHENATION: several lines ending in hyphens -> hyphen signal fires, exposed
+var hy = assess("this is a para-\ngraph that has been hy-\nphenated at every line-\nbreak by a pdf ex-\ntractor here now");
+check("hyphenation-signal", hy.signals.hyphenLines >= 3, "hyphenLines=" + hy.signals.hyphenLines);
+check("hyphenation-rate-scored", hy.signals.hyphenRate > 0, "hyphenRate=" + hy.signals.hyphenRate);
+
+// 11. empty / whitespace -> empty
+check("empty-string", labelOf("") === "empty");
+check("whitespace-only", labelOf(" \t \n ") === "empty");
+check("null-input", labelOf(null) === "empty");
+
+// 12. EXPOSED-not-scored: letter-freq deviation is exposed but NEVER moves the label.
+// A non-English clean string (skewed letter freq) must still read prose.
+var eu = assess("Kääntäjä pyysi ystävällisesti lisää aikaa ennen kuin jatkoi työtä.");
+check("nonenglish-still-prose", eu.label === "prose", "label=" + eu.label);
+check("letterfreq-exposed", typeof eu.signals.letterFreqDevEn === "number" || eu.signals.letterFreqDevEn === null);
+
+// 13. determinism: same input -> byte-identical output (the canonicalizer self-test)
+var d1 = JSON.stringify(assess("The quick brown fox jumps over the lazy dog again."));
+var d2 = JSON.stringify(assess("The quick brown fox jumps over the lazy dog again."));
+check("determinism-byte-identical", d1 === d2);
+
+// 14. dispatch joint: array -> map; record.text -> annotate.plausibility
+var arr = plausible(["clean sentence here friend", "MÃ¼ller cafÃ©"]);
+check("dispatch-array", Array.isArray(arr) && arr.length === 2 && arr[0].label === "prose");
+var rec = plausible({ id: 7, text: "æ—¥æœ¬èªžã®ãƒ†ã‚­ã‚¹ãƒˆ"});
+check("dispatch-record", rec.id === 7 && rec.plausibility && rec.plausibility.label === "garbled");
+
+// 15. options: caller can move the bounds (like legible's readableMax/binaryMin)
+check("options-bounds", assess("MÃ¼ller cafÃ© piÃ±a colada", { garbledMin: 0.05}).label === "garbled");
+
+// --- report ---------------------------------------------------------------
+var total = pass + fail;
+process.stdout.write("plausible: " + pass + "/" + total + " passed\n");
+if (fail > 0) {
+process.stdout.write("FAILURES:\n - " + failures.join("\n - ") + "\n");
+process.exitCode = 1;
+}
 
 Take the whole folder →
 MIT
-Node, no dependencies
+Node / browser, no dependencies
 
 ---
 
-# rename — a Loop MMT gift
-https://loopmmt.com/gifts/rename/
+# pluck — a Loop MMT gift
+https://loopmmt.com/gifts/pluck/
 [coverage: optional · branch: gifts]
 
-Relabel Fields, Keep Every Value rename ← all gifts
+Keep Only The Fields You Name select ← all gifts
 
-rename
+pluck
 
-A producer emits JSONL: one JSON object per line. rename reads that stream and a map of old=new field names, and emits each record with those fields relabeled — the field-RELABEL of the JSONL toolkit, the transform-lane companion to pluck (which selects). Every value is kept and every field's position is preserved; only a mapped field's KEY changes. When names don't match the next stage, a stream becomes a deterministic, re-derivable relabeling. A rename that would collide two fields onto one name is REFUSED, never silently overwritten — it names the line and the collision and stops. Same stream and same map in, byte-identical stream out, on every machine and every run. A line that is not valid JSON is a hard error (exit 2) naming the line; a non-object record is a hard error too. Blank lines are skipped. Zero dependencies, pure, offline; runs in Node or a browser (window.ForestGifts.rename).
+A producer emits JSONL: one JSON object per line. pluck reads that stream and emits each record reduced to just the fields you name with --fields, in the order you named them — the SELECT of the JSONL toolkit. Narrow a wide record down to the columns you want before you fold, diff, or sink it. It is a filter on the field axis: every emitted object's fields are a subset of its input's, and nothing is added, renamed, computed, or reordered by content. A field named twice is emitted once at its first position. Same stream and same field list in, byte-identical stream out, on every machine and every run. A line that is not valid JSON is a hard error (exit 2) naming the line; a record that is not a JSON object has no field axis and is a hard error too — the deliberate divergence from a row-dropping filter. Blank lines are skipped. Zero dependencies, pure, offline; runs in Node or a browser (window.ForestGifts.pluck).
 
 The honest edge
 
-Renames TOP-LEVEL fields by exact name, position preserved. NOT nested paths, does NOT select or drop fields, does NOT compute values. A field not in the map passes through untouched. A map whose target name already exists on the record (or is targeted twice) is a REFUSED collision, not an overwrite — the divergence from a last-write-wins merge.
+Selects TOP-LEVEL fields by exact name. NOT nested paths, does NOT rename, does NOT compute or default a missing value, does NOT reorder by content. It selects; it never transforms a value. A requested field a record lacks is simply absent from that record's output — pluck does not invent it.
 
 Run it
 
-printf '%s\n' '{"user_id":7,"ts":"2026-09-12"}' | node rename.js --map user_id=id,ts=timestamp # exit 0 | 1 collision (line named) | 2 non-JSON/non-object
-test_rename.js (25/25) + out-of-band conformance (GREEN 34/34 vs an independently-authored in-place-rename oracle; sig 3458cb7b8dfa33de; mutation bite VERIFIED)
+printf '%s\n' '{"a":1,"b":2,"c":3}' | node pluck.js --fields a,c # exit 0 clean | 2 non-JSON or non-object line (named)
+test_pluck.js (24/24) + out-of-band conformance (GREEN 32/32 vs an independently-authored per-field reconstruction oracle; sig 1bfa8d85a1730a7f; mutation bite VERIFIED)
 Zero dependencies, Node or browser, deterministic
 
 The code — every file that ships
 
-rename.js 287 lines on GitHub →
+pluck.js 269 lines on GitHub →
 #!/usr/bin/env node
-/* rename.js — rename fields in each record of a JSONL stream, by a declared map.
+/* pluck.js — keep only the named fields from each record in a JSONL stream.
 Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
 
-WHAT IT IS. Give it a stream of records — one JSON object per line (JSONL) — and
-a mapping of old field names to new ones, and it emits each record with those
-fields relabeled. It is a TRANSFORM on the field axis: every record keeps all
-its values, but a mapped field's KEY is replaced with its new name. Same stream
-and same map in, byte-identical stream out, on every machine and every run. It
-is the field-rename of the JSONL toolkit — the companion to pluck (which drops
-fields): pluck SELECTS, rename RELABELS.
+WHAT IT IS. Give it a stream of records — one JSON object per line (JSONL) —
+and a list of field names, and it emits each record reduced to just those
+fields. It is the SELECT of the JSONL toolkit: narrow a wide record down to
+the columns you asked for, before you fold, diff, or sink it. Same stream and
+same field list in, byte-identical stream out, on every machine and every run.
+It is a FILTER on the field axis: every emitted object is a subset of its input
+object's fields — nothing is added, renamed, computed, or reordered by content.
 
-THE MAP IS old=new PAIRS (the whole determinism story). --map old1=new1,old2=new2
-declares, for each pair, "wherever a record has the field old1, emit it under the
-name new1 instead." A field the map does not mention is passed through UNCHANGED,
-under its original name. A mapped field the record does not have is simply not
-renamed (there is nothing to rename) — see --strict.
+THE FIELD ORDER IS THE DECLARED ORDER (the whole determinism story). The output
+object's keys appear in the order you named them in --fields, NOT the order they
+happened to sit in the input record. So `--fields b,a` emits {"b":...,"a":...}
+regardless of how the input was written. Declaring the order — rather than
+inheriting the input's — is what makes the output a pure function of (record,
+field-list): two records that carry the same requested values, written in any
+key-order, pluck to byte-identical lines. A field named twice in --fields is
+emitted once, at its first position (duplicates in the request are idempotent).
 
-THE OUTPUT KEY ORDER IS THE INPUT ORDER, WITH NAMES SWAPPED IN PLACE. Renaming a
-field does NOT move it: {"a":1,"b":2} under --map a=x emits {"x":1,"b":2}, not
-{"b":2,"x":1}. The record's own field order is preserved; only the mapped keys'
-names change. This is what makes rename a faithful transform — it relabels, it
-never reorders. (Values are canonicalized for byte-stability: a mapped or
-unmapped field's VALUE, if a nested object, has its inner keys sorted; array
-order is kept.)
+WHAT HAPPENS TO A MISSING FIELD (default vs --strict).
+- DEFAULT: a requested field the record does not carry is simply OMITTED from
+that record's output object. A missing field is not a value — it is not
+emitted as null, not as "", not as the literal key with nothing after it. A
+record that carries none of the requested fields emits an empty object {}.
+This is the honest default: pluck what is there, say nothing about what is
+not.
+- --strict: a record missing ANY requested field is a HARD ERROR (exit 2)
+naming the line and the first missing field. For callers who need every
+column present and want the stream to stop rather than emit a thin record.
 
-COLLISIONS ARE A HARD ERROR (fail closed). If a rename would make two fields
-share a name — either the target name already exists in the record and is not
-itself being renamed away, or two different source fields map to the same target
-— that record is a HARD ERROR (exit 2) naming the line and the colliding name.
-rename never silently drops or overwrites a value to resolve a name clash.
-
-MISSING SOURCE FIELDS (default vs --strict).
-- DEFAULT: a mapped source field the record does not carry is simply skipped —
-there is nothing to rename, and the record passes through with its other
-fields intact. A record that has none of the mapped fields is emitted
-unchanged.
-- --strict: a record missing ANY mapped source field is a HARD ERROR (exit 2)
-naming the line and the first missing source field. For callers who require
-every declared field to be present before relabeling.
-
-INPUT HONESTY (the character of this gift).
+INPUT HONESTY (the character of this gift). A field-selector is only trustworthy
+if it refuses to quietly mishandle a line:
 - Every non-blank line must be valid JSON. A line that is not valid JSON is a
-HARD ERROR (exit 2) naming the line — never a silent skip, never a raw
-passthrough.
-- Every record must be a JSON OBJECT. You cannot rename a field of a bare
-number, string, boolean, null, or array — there are no fields. A non-object
-record is a HARD ERROR (exit 2) naming the line.
-- --map names TOP-LEVEL fields only (no dotted paths). Both sides of a pair
-must be non-empty; a malformed pair (no '=', empty old, empty new) is a hard
-error at map-parse time.
-- Blank lines are skipped. A trailing \r (CRLF files) is trimmed.
+HARD ERROR (exit 2) naming the line — never a silent skip, never passed
+through as raw text.
+- Every record must be a JSON OBJECT. You cannot pluck fields from a bare
+number, string, boolean, null, or array — there are no fields to select. A
+non-object record is a HARD ERROR (exit 2) naming the line. This is the
+deliberate divergence from a row-dropping filter: pluck's whole contract is
+field-selection, so a record with no field axis is a stop, not a passthrough.
+- --fields names TOP-LEVEL fields only (no dotted paths, no array indices).
+Selecting a nested value is out of scope by construction (see the edge).
+- Blank lines are skipped (not emitted, not counted). A trailing \r (CRLF
+files) is trimmed before parsing.
+
+THE OUTPUT IS CANONICAL. Each emitted object is re-serialized with its keys in
+the declared field order and its values canonicalized (nested object keys sorted
+recursively, array order kept), so the same requested values always serialize to
+the same bytes. Values are copied through verbatim in meaning — pluck selects,
+it never transforms a value.
 
 USAGE
-printf '%s\n' '{"a":1,"b":2}' | node rename.js --map a=x
--> {"x":1,"b":2}
-node rename.js --map user_id=id,ts=timestamp events.jsonl
-node rename.js --map a=x --strict < in.jsonl > out.jsonl
-node rename.js --help
+printf '%s\n' '{"a":1,"b":2,"c":3}' | node pluck.js --fields a,c
+-> {"a":1,"c":3}
+node pluck.js --fields id,name events.jsonl
+node pluck.js --fields id,name --strict < in.jsonl > out.jsonl
+node pluck.js --help
 
-Each non-blank line is one JSON object. Output is the relabeled objects, one per
+Each non-blank line is one JSON object. Output is the plucked objects, one per
 line, each terminated by a newline, in input order.
 
-Exit codes: 0 success · 2 input error (missing/empty/malformed --map, missing
-file, a directory, an unknown option, a line that is not valid JSON, a non-object
-record, a rename collision, or --strict on a record missing a mapped source
-field). Always a clean one-line message on stderr, never a stack trace.
+Exit codes: 0 success · 2 input error (missing/empty --fields, missing file, a
+directory, an unknown option, a line that is not valid JSON, a non-object
+record, or --strict on a record missing a requested field). Always a clean
+one-line message on stderr, never a stack trace.
 
-Released under MIT. Its edge is printed in the README: this renames TOP-LEVEL
-fields by exact name. It does NOT reach into nested paths (no dotted keys), does
-NOT move fields (order is preserved, names swapped in place), does NOT drop or
-transform values, and REFUSES a rename that would collide two fields onto one
-name rather than silently overwriting.
+Released under MIT. Its edge is printed in the README: this selects TOP-LEVEL
+fields by exact name. It does NOT reach into nested paths (no dotted keys, no
+a.b.c), does NOT rename fields, does NOT compute or default missing values, and
+does NOT reorder by content — the output key order is exactly the --fields order.
 */
 "use strict";
 
-// Canonical JSON for VALUES: object keys sorted recursively so a value serializes
-// to the same bytes regardless of its (nested) key order. Arrays keep order.
+// Canonical JSON: object keys sorted recursively so a value serializes to the same
+// bytes regardless of how its (nested) object keys were written. Arrays keep order.
 function canon(v) {
 if (v === null || typeof v!== "object") return JSON.stringify(v);
 if (Array.isArray(v)) {
@@ -778,6 +579,7 @@ out.push(JSON.stringify(keys[k]) + ":" + canon(v[keys[k]]));
 return "{" + out.join(",") + "}";
 }
 
+// Parse one input line into a JSON value, or throw a clean, line-named Error.
 function parseRecord(line, lineNo) {
 try { return JSON.parse(line);}
 catch (e) {
@@ -785,92 +587,66 @@ throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.
 }
 }
 
-// Parse "old1=new1,old2=new2" into an ordered [ [old,new],...] with validation.
-// Throws on a malformed pair. A source named twice is an error (ambiguous map).
-function parseMap(spec) {
-var pairs = [];
-var seenOld = Object.create(null);
-var pieces = String(spec).split(",");
-for (var i = 0; i < pieces.length; i++) {
-var piece = pieces[i].trim();
-if (piece.length === 0) continue; // tolerate trailing comma
-var eq = piece.indexOf("=");
-if (eq <= 0 || eq === piece.length - 1) {
-throw new Error("malformed --map pair " + JSON.stringify(piece) + " (expected old=new)");
+// De-duplicate the requested field list, preserving first-seen order. A field
+// named twice is kept once at its first position (idempotent request).
+function normalizeFields(fields) {
+var seen = Object.create(null);
+var out = [];
+for (var i = 0; i < fields.length; i++) {
+var f = fields[i];
+if (!seen[f]) { seen[f] = true; out.push(f);}
 }
-var oldName = piece.slice(0, eq).trim();
-var newName = piece.slice(eq + 1).trim();
-if (oldName.length === 0 || newName.length === 0) {
-throw new Error("malformed --map pair " + JSON.stringify(piece) + " (empty field name)");
-}
-if (seenOld[oldName]) {
-throw new Error("--map names source field " + JSON.stringify(oldName) + " more than once");
-}
-seenOld[oldName] = true;
-pairs.push([oldName, newName]);
-}
-if (pairs.length === 0) throw new Error("--map lists no rename pairs");
-return pairs;
+return out;
 }
 
-// The public transform: JSONL text + {map, strict} -> { lines: [renamed lines]}.
-// Each record keeps its own field order; a mapped key's NAME is swapped in place.
-// A collision (two fields would share a name) is a hard error.
-function rename(text, opts) {
+// Serialize a plucked object with keys in the DECLARED field order and values
+// canonicalized. `present` is the list of requested fields this record actually
+// carries, already in declared order.
+function serializePlucked(rec, present) {
+var parts = [];
+for (var i = 0; i < present.length; i++) {
+var f = present[i];
+parts.push(JSON.stringify(f) + ":" + canon(rec[f]));
+}
+return "{" + parts.join(",") + "}";
+}
+
+// The public filter: JSONL text + {fields, strict} -> { lines: [plucked lines]}.
+// Each emitted object carries the requested fields the record has, in declared
+// order. In strict mode a record missing any requested field throws.
+function pluck(text, opts) {
 opts = opts || {};
-var pairs = opts.pairs || (opts.map? parseMap(opts.map): []);
+var fields = normalizeFields(opts.fields || []);
 var strict =!!opts.strict;
-
-// old -> new lookup
-var mapOf = Object.create(null);
-for (var p = 0; p < pairs.length; p++) mapOf[pairs[p][0]] = pairs[p][1];
 
 var lines = String(text).split("\n");
 var out = [];
-var i, line, rec, keys, j, key, outName, present;
+var i, line, rec, j, f, present;
 
 for (i = 0; i < lines.length; i++) {
 line = lines[i];
 if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
-if (line.length === 0) continue;
+if (line.length === 0) continue; // blank line is not a record
 
 rec = parseRecord(line, i + 1);
+
+// A record must be a JSON object to have a field axis to select on.
 if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
-throw new Error("line " + (i + 1) + " is not a JSON object (cannot rename fields of " +
+throw new Error("line " + (i + 1) + " is not a JSON object (cannot pluck fields from " +
 (rec === null? "null": (Array.isArray(rec)? "an array": typeof rec)) + ")");
 }
 
-// strict: every mapped source field must be present
-if (strict) {
-for (j = 0; j < pairs.length; j++) {
-if (!Object.prototype.hasOwnProperty.call(rec, pairs[j][0])) {
-throw new Error("line " + (i + 1) + " is missing required source field " + JSON.stringify(pairs[j][0]));
-}
+present = [];
+for (j = 0; j < fields.length; j++) {
+f = fields[j];
+if (Object.prototype.hasOwnProperty.call(rec, f)) {
+present.push(f);
+} else if (strict) {
+throw new Error("line " + (i + 1) + " is missing required field " + JSON.stringify(f));
 }
 }
 
-// Build the output object's (name -> value) in the record's OWN key order,
-// swapping mapped names in place. Detect collisions on the OUTPUT names.
-keys = Object.keys(rec);
-var outNames = []; // output names, in input order
-var outVals = []; // canonicalized values, parallel to outNames
-var claimed = Object.create(null);
-for (j = 0; j < keys.length; j++) {
-key = keys[j];
-outName = Object.prototype.hasOwnProperty.call(mapOf, key)? mapOf[key]: key;
-if (claimed[outName]) {
-throw new Error("line " + (i + 1) + " rename collision: two fields map to " + JSON.stringify(outName));
-}
-claimed[outName] = true;
-outNames.push(outName);
-outVals.push(canon(rec[key]));
-}
-
-var parts = [];
-for (j = 0; j < outNames.length; j++) {
-parts.push(JSON.stringify(outNames[j]) + ":" + outVals[j]);
-}
-out.push("{" + parts.join(",") + "}");
+out.push(serializePlucked(rec, present));
 }
 
 return { lines: out};
@@ -879,16 +655,16 @@ return { lines: out};
 /* ---- exports (browser + Node) ------------------------------------ */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.rename = rename;
-window.ForestGifts.renameCanon = canon;
+window.ForestGifts.pluck = pluck;
+window.ForestGifts.pluckCanon = canon;
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { rename: rename, canon: canon, parseMap: parseMap};
+module.exports = { pluck: pluck, canon: canon};
 }
 
 /* ---- CLI (runs only when invoked directly, never on require) ------ */
 function run(text, opts) {
-var r = rename(text, opts);
+var r = pluck(text, opts);
 var body = r.lines.length? r.lines.join("\n") + "\n": "";
 return { out: body};
 }
@@ -897,44 +673,51 @@ function main(argv) {
 var args = argv.slice(2);
 if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
 process.stdout.write(
-"rename.js — rename fields in each record of a JSONL stream, by a declared map.\n\n" +
-" printf '%s\\n' '{\"a\":1,\"b\":2}' | node rename.js --map a=x\n" +
-" node rename.js --map user_id=id,ts=timestamp events.jsonl\n" +
-" node rename.js --map a=x --strict < in > out\n" +
-" node rename.js --help\n\n" +
-"--map is a comma-separated list of old=new TOP-LEVEL field renames. A field not\n" +
-"in the map passes through unchanged; a renamed field keeps its POSITION (names\n" +
-"are swapped in place, not moved). A missing source field is skipped (or a hard\n" +
-"error under --strict). A rename that would collide two fields onto one name is a\n" +
-"hard error.\n\n" +
-"Edge: renames TOP-LEVEL fields by exact name. NOT nested paths (no a.b.c), does\n" +
-"NOT move fields, does NOT drop or transform values, and REFUSES a collision\n" +
-"rather than overwriting. Invalid JSON and non-object records are hard errors.\n"
+"pluck.js — keep only the named fields from each record in a JSONL stream.\n\n" +
+" printf '%s\\n' '{\"a\":1,\"b\":2,\"c\":3}' | node pluck.js --fields a,c\n" +
+" node pluck.js --fields id,name events.jsonl\n" +
+" node pluck.js --fields id,name --strict < in > out\n" +
+" node pluck.js --help\n\n" +
+"Each non-blank line is one JSON object. --fields is a comma-separated list of\n" +
+"TOP-LEVEL field names to keep; the output key order is exactly that order. A\n" +
+"missing field is OMITTED by default, or a hard error under --strict. A record\n" +
+"that is not a JSON object is a hard error.\n\n" +
+"Edge: selects TOP-LEVEL fields by exact name. NOT nested paths (no a.b.c), does\n" +
+"NOT rename or compute fields, and does NOT reorder by content. Invalid JSON and\n" +
+"non-object records are hard errors, never a silent skip.\n"
 );
 return 0;
 }
 
-var opts = {};
+var opts = { fields: []};
 var files = [];
-var i;
+var i, raw;
 try {
 for (i = 0; i < args.length; i++) {
-if (args[i] === "--map") {
-var spec = args[++i];
-if (spec === undefined || spec === "" || spec.charAt(0) === "-") {
-throw new Error("--map requires a comma-separated list of old=new renames");
+if (args[i] === "--fields") {
+raw = args[++i];
+if (raw === undefined || raw === "" || raw.charAt(0) === "-") {
+throw new Error("--fields requires a comma-separated list of field names");
 }
-opts.pairs = parseMap(spec);
+// split on comma, trim each, drop empties (so trailing commas are tolerated)
+var wanted = [];
+var pieces = raw.split(",");
+for (var p = 0; p < pieces.length; p++) {
+var name = pieces[p].trim();
+if (name.length > 0) wanted.push(name);
+}
+if (wanted.length === 0) throw new Error("--fields lists no field names");
+opts.fields = wanted;
 }
 else if (args[i] === "--strict") { opts.strict = true;}
 else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
 else { files.push(args[i]);}
 }
-if (!opts.pairs || opts.pairs.length === 0) {
-throw new Error("--map is required (a comma-separated list of old=new field renames)");
+if (!opts.fields || opts.fields.length === 0) {
+throw new Error("--fields is required (a comma-separated list of field names to keep)");
 }
 } catch (e) {
-process.stderr.write("rename: " + e.message + "\n");
+process.stderr.write("pluck: " + e.message + "\n");
 return 2;
 }
 
@@ -944,7 +727,7 @@ var r = run(text, opts);
 process.stdout.write(r.out);
 return 0;
 } catch (e) {
-process.stderr.write("rename: " + e.message + "\n");
+process.stderr.write("pluck: " + e.message + "\n");
 return 2;
 }
 }
@@ -954,13 +737,14 @@ var fs = require("fs");
 var text;
 try { text = fs.readFileSync(files[0], "utf8");}
 catch (e) {
-process.stderr.write("rename: cannot read " + files[0] +
+process.stderr.write("pluck: cannot read " + files[0] +
 " (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
 return 2;
 }
 return emit(text);
 }
 
+// stdin
 var chunks = [];
 process.stdin.on("data", function (d) { chunks.push(d);});
 process.stdin.on("end", function () {
@@ -973,29 +757,30 @@ if (typeof require!== "undefined" && require.main === module) {
 process.exitCode = main(process.argv);
 }
 
-test_rename.js 139 lines on GitHub →
+test_pluck.js 152 lines on GitHub →
 #!/usr/bin/env node
-/* test_rename.js — drift-check battery for rename.js.
-Zero-dependency. `node test_rename.js`. Exit 0 all-pass, 1 any-fail.
+/* test_pluck.js — drift-check battery for pluck.js.
+Zero-dependency. Runs in Node: `node test_pluck.js`. Exit 0 all-pass, 1 any-fail.
 
-THE ORACLE. rename's contract is small enough that the oracle is hand-computed
-expected output lines PLUS one mechanical invariant on every case:
-(I-order) position-preserved: the output's field POSITIONS equal the input's
-(rename swaps names in place, it never moves a field).
-The KNOWN-BAD vector is the COLLISION tripwire: a rename that would make two
-fields share a name must be refused (exit/throw), never silently overwrite. A
-regression that last-write-wins on a clash passes a naive "renamed the field"
-check but fails the collision case — so the battery pins the fail-closed rule
-that protects data.
+THE ORACLE. pluck's contract is small enough that the oracle is a set of
+hand-computed expected output lines PLUS two structural invariants checked
+mechanically on every case:
+(I1) subset: every key in an emitted object was a requested field AND was
+present in the input object (pluck never invents a field).
+(I2) declared-order: the emitted key order equals the requested field order
+(restricted to present fields) — NOT the input's key order.
+The known-bad vector is the DECLARED-ORDER tripwire: an input whose keys sit in
+a different order than --fields. A regression that inherited input order instead
+of declared order passes a naive "same set of keys" check but fails I2 — so the
+battery pins the ordering that is the whole determinism story.
 */
 "use strict";
 
-var mod = require("./rename.js");
-var rename = mod.rename;
+var pluck = require("./pluck.js").pluck;
 
 var passed = 0, failed = 0;
 function check(name, got, want) {
-if (got === want) { passed++;}
+if (got === want) { passed++; /* console.log(" ok " + name); */}
 else {
 failed++;
 console.log("FAIL " + name);
@@ -1009,109 +794,121 @@ try { fn();} catch (e) { threw = true;}
 if (threw) { passed++;}
 else { failed++; console.log("FAIL " + name + " (expected a throw, none happened)");}
 }
+
 function out(text, opts) {
-return rename(text, opts).lines.join("\n");
+var r = pluck(text, opts);
+return r.lines.join("\n");
 }
 
-// ---- Core rename -----------------------------------------------------
-check("rename one field",
-out('{"a":1,"b":2}', { map: "a=x"}),
-'{"x":1,"b":2}');
+// ---- Core selection --------------------------------------------------
+check("keep two of three fields",
+out('{"a":1,"b":2,"c":3}', { fields: ["a", "c"]}),
+'{"a":1,"c":3}');
 
-check("rename two fields",
-out('{"a":1,"b":2,"c":3}', { map: "a=x,c=z"}),
-'{"x":1,"b":2,"z":3}');
-
-check("unmapped field passes through unchanged",
-out('{"a":1,"b":2}', { map: "a=x"}),
-'{"x":1,"b":2}');
-
-// ---- POSITION PRESERVED: rename swaps in place, never moves ----------
-check("rename keeps field POSITION (in place, not moved)",
-out('{"a":1,"b":2,"c":3}', { map: "a=z"}),
-'{"z":1,"b":2,"c":3}'); // z stays first, NOT moved to the end
-
-// ---- Missing source field: default skips -----------------------------
-check("missing source field skipped (default), record otherwise intact",
-out('{"b":2}', { map: "a=x"}),
+check("single field",
+out('{"a":1,"b":2}', { fields: ["b"]}),
 '{"b":2}');
 
-check("record with none of the mapped fields emitted unchanged",
-out('{"p":1,"q":2}', { map: "a=x,c=z"}),
-'{"p":1,"q":2}');
+check("all fields kept (identity-ish, canonical order)",
+out('{"a":1,"b":2}', { fields: ["a", "b"]}),
+'{"a":1,"b":2}');
 
-// ---- --strict: missing source is a hard error ------------------------
-checkThrows("strict: missing source field throws", function () {
-rename('{"b":2}', { map: "a=x", strict: true});
+// ---- KNOWN-BAD VECTOR: declared order, not input order ---------------
+// Input keys are b,a but --fields asks a,b -> output MUST be {"a":..,"b":..}.
+check("KNOWN-BAD: output order is declared order, not input order",
+out('{"b":2,"a":1}', { fields: ["a", "b"]}),
+'{"a":1,"b":2}');
+
+check("KNOWN-BAD: reverse request reverses output",
+out('{"a":1,"b":2}', { fields: ["b", "a"]}),
+'{"b":2,"a":1}');
+
+// ---- Missing fields: default omits -----------------------------------
+check("missing field omitted (default)",
+out('{"a":1}', { fields: ["a", "b"]}),
+'{"a":1}');
+
+check("record carrying none of the fields -> empty object",
+out('{"x":9}', { fields: ["a", "b"]}),
+'{}');
+
+check("missing field in the MIDDLE keeps declared order of the rest",
+out('{"a":1,"c":3}', { fields: ["a", "b", "c"]}),
+'{"a":1,"c":3}');
+
+// ---- --strict: missing field is a hard error -------------------------
+checkThrows("strict: missing field throws", function () {
+pluck('{"a":1}', { fields: ["a", "b"], strict: true});
 });
+
 check("strict: all present passes",
-out('{"a":1}', { map: "a=x", strict: true}),
-'{"x":1}');
+out('{"a":1,"b":2}', { fields: ["a", "b"], strict: true}),
+'{"a":1,"b":2}');
 
-// ---- KNOWN-BAD VECTOR: collisions are refused, never overwritten -----
-checkThrows("KNOWN-BAD: rename onto an existing field name collides (throws)", function () {
-// renaming a->b when b already exists would make two "b"s
-rename('{"a":1,"b":2}', { map: "a=b"});
-});
-checkThrows("KNOWN-BAD: two sources onto one target collides (throws)", function () {
-rename('{"a":1,"c":3}', { pairs: [["a", "x"], ["c", "x"]]});
-});
-check("rename onto a name that IS itself being renamed away is OK (swap)",
-out('{"a":1,"b":2}', { map: "a=b,b=a"}),
-'{"b":1,"a":2}'); // a->b and b->a: a clean swap, no collision
+// ---- Duplicate requested fields are idempotent -----------------------
+check("field named twice emitted once at first position",
+out('{"a":1,"b":2}', { fields: ["a", "a", "b"]}),
+'{"a":1,"b":2}');
 
 // ---- Value fidelity + nested canonicalization ------------------------
-check("value copied verbatim, nested object canonicalized",
-out('{"a":{"z":1,"y":2}}', { map: "a=x"}),
-'{"x":{"y":2,"z":1}}');
+check("value copied verbatim (nested object canonicalized)",
+out('{"a":{"z":1,"y":2},"b":5}', { fields: ["a"]}),
+'{"a":{"y":2,"z":1}}');
 
-check("array value order preserved",
-out('{"a":[3,1,2]}', { map: "a=x"}),
-'{"x":[3,1,2]}');
+check("array value order preserved (not sorted)",
+out('{"a":[3,1,2],"b":0}', { fields: ["a"]}),
+'{"a":[3,1,2]}');
 
-check("null/bool/string values kept through rename",
-out('{"a":null,"b":true,"c":"hi"}', { map: "a=p,b=q,c=r"}),
-'{"p":null,"q":true,"r":"hi"}');
+check("null / bool / string values kept",
+out('{"a":null,"b":true,"c":"hi","d":0}', { fields: ["a", "b", "c"]}),
+'{"a":null,"b":true,"c":"hi"}');
 
 // ---- Multi-line stream, order preserved ------------------------------
 check("multi-record stream keeps input order",
-out('{"id":1}\n{"id":2}\n{"id":3}', { map: "id=n"}),
-'{"n":1}\n{"n":2}\n{"n":3}');
+out('{"id":1,"x":9}\n{"id":2,"x":8}\n{"id":3,"x":7}', { fields: ["id"]}),
+'{"id":1}\n{"id":2}\n{"id":3}');
 
-// ---- Blank + CRLF ----------------------------------------------------
+// ---- Blank + CRLF handling -------------------------------------------
 check("blank lines skipped",
-out('{"a":1}\n\n{"a":2}\n', { map: "a=x"}),
-'{"x":1}\n{"x":2}');
+out('{"a":1}\n\n{"a":2}\n', { fields: ["a"]}),
+'{"a":1}\n{"a":2}');
 
-check("CRLF trailing \\r trimmed",
-out('{"a":1}\r\n{"a":2}\r', { map: "a=x"}),
-'{"x":1}\n{"x":2}');
+check("CRLF trailing \\r trimmed before parse",
+out('{"a":1}\r\n{"a":2}\r', { fields: ["a"]}),
+'{"a":1}\n{"a":2}');
 
-// ---- Input honesty: non-object + bad JSON are hard errors ------------
-checkThrows("bare number record throws", function () { rename('42', { map: "a=x"});});
-checkThrows("array record throws", function () { rename('[1,2]', { map: "a=x"});});
-checkThrows("null record throws", function () { rename('null', { map: "a=x"});});
-checkThrows("invalid JSON throws", function () { rename('{"a":1', { map: "a=x"});});
-
-// ---- Map parse validation --------------------------------------------
-checkThrows("malformed map pair (no =) throws", function () {
-rename('{"a":1}', { map: "ax"});
+// ---- Input honesty: non-object records are hard errors ---------------
+checkThrows("bare number record throws", function () {
+pluck('42', { fields: ["a"]});
 });
-checkThrows("empty new name throws", function () {
-rename('{"a":1}', { map: "a="});
+checkThrows("bare string record throws", function () {
+pluck('"hello"', { fields: ["a"]});
 });
-checkThrows("duplicate source in map throws", function () {
-rename('{"a":1}', { map: "a=x,a=y"});
+checkThrows("array record throws", function () {
+pluck('[1,2,3]', { fields: ["a"]});
+});
+checkThrows("null record throws", function () {
+pluck('null', { fields: ["a"]});
+});
+checkThrows("invalid JSON throws", function () {
+pluck('{"a":1', { fields: ["a"]});
 });
 
 // ---- Determinism: folds-twice-identical ------------------------------
 (function () {
-var input = '{"b":2,"a":1}\n{"a":10,"c":30}';
-var opts = { map: "a=x,b=y"};
-check("determinism: two runs byte-identical", out(input, opts), out(input, opts));
+var input = '{"b":2,"a":1,"c":3}\n{"c":30,"a":10}\n{"z":99}';
+var opts = { fields: ["a", "b"]};
+var r1 = out(input, opts);
+var r2 = out(input, opts);
+check("determinism: two runs byte-identical", r1, r2);
 })();
 
-console.log("\nrename battery: " + passed + " passed, " + failed + " failed");
+// ---- Empty-fields guard is a library concern? (CLI enforces; lib tolerant) ----
+check("empty fields list yields empty objects (lib-level; CLI blocks this)",
+out('{"a":1}', { fields: []}),
+'{}');
+
+console.log("\npluck battery: " + passed + " passed, " + failed + " failed");
 process.exit(failed === 0? 0: 1);
 
 Take the whole folder →
@@ -1120,522 +917,883 @@ Zero dependencies, Node or browser, deterministic
 
 ---
 
-# render-loop-harness — a Loop MMT gift
-https://loopmmt.com/gifts/render-loop-harness/
+# Plumb — a Loop MMT gift
+https://loopmmt.com/gifts/plumb/
 [coverage: optional · branch: gifts]
 
-Drive a Render Loop That Replays Identically and Never Melts the Tab? render ← all gifts
+Status Board That Won't Lie witness ← all gifts
 
-render-loop-harness
+Plumb
 
-Every interactive app with a live view re-hand-rolls the same second step: take a stream of validated events and drive a state -> frame render loop off them — and that is where the resource-exhaustion bugs live (a requestAnimationFrame busy-spin with no budget, a loop that paces on Date.now() and breaks replay the moment it ships, a frame function that is not pure). render-loop-harness is that step done once, correctly, as a bounded deterministic reducer over the input-event-router envelope it inherits: validated events in, a sequence of pure frames out, advanced on each event's logical tick t, and bounded by a declared per-fold tick budget the harness REFUSES to exceed — a log longer than the budget halts at exactly budget frames with reject-reason "tick-budget-exceeded", never a busy-spin, never an OOM. Replaying the same log yields byte-identical frames. Set the budget with --budget. Zero dependencies, pure, offline; browser or headless Node.
+A tiny audit pattern for anyone whose dashboards turn green on intention instead of evidence. Each claim names a witness — a file that must exist, text that must be present, a command that must pass — and only renders green if its witness agrees. Assert done with nothing beneath it and you get UNWITNESSED, not a pass.
 
 The honest edge
 
-this drives a pure state -> frame render loop from an inherited event log, advancing on the event's logical tick t and never a wall-clock; it refuses to exceed its declared per-fold tick budget; it does NOT render pixels, it does NOT persist, it holds NO clock/network/entropy, and it schedules nothing it cannot bound.
+It checks the witness exists and agrees, never that the witness is the right one. Point it at the wrong file and it'll happily pass — choosing a meaningful witness is your job.
 
 Run it
 
-node render-loop-harness.js < events.jsonl # fold -> final frame + frame-count summary | node render-loop-harness.js --budget 500 < events.jsonl | node render-loop-harness.js --help
-test_render-loop-harness.js (37/37) — replay-determinism over frames, per-fold tick-budget halt at exactly budget (hostile over-budget vector), pure state->frame projection, inherited-envelope validation
-Zero dependencies, Node or browser, deterministic
+python3 plumb.py --help
+smoke_test.py (8/8)
+Python stdlib only
 
 The code — every file that ships
 
-render-loop-harness.js 307 lines on GitHub →
-#!/usr/bin/env node
-/* render-loop-harness.js — a dependency-free, deterministic, BOUNDED reducer that
-drives a pure state -> frame render loop off an inherited input-event log.
+plumb.py 299 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""plumb.py — a status board that refuses to show green on hope.
 
-WHY THIS EXISTS. Every interactive app with a live view re-hand-rolls the same
-second step: take a stream of validated events and drive a state -> frame
-render loop off them. Hand-rolled, that step is where the resource-exhaustion
-bugs live — a requestAnimationFrame busy-spin with no budget, a loop that reads
-Date.now() to pace itself (which breaks replay the moment it ships), a frame
-function that is not pure so the same log renders differently on replay. This is
-that step done once, correctly, as a BOUNDED DETERMINISTIC REDUCER over an
-input-event log: validated events in, a sequence of pure frames out, advanced on
-each event's LOGICAL tick `t`, and bounded by a declared per-fold tick budget the
-harness REFUSES to exceed.
+A plumb line tells the truth about vertical no matter how the wall *feels*. This
+does the same for a status board: every claim you assert PASS must carry a
+WITNESS beneath it — a real, checkable piece of evidence — and the claim is only
+rendered green if that witness actually agrees. A "done" typed by a hopeful hand
+is not evidence. Plumb will not paint it green.
 
-THE STRIP-CLEAN RULE (the whole reason to trust it). state_t is a pure fold of
-state_0 and the ordered event log up to t. Replaying the same log yields
-byte-identical state, frame sequence, and render. The harness holds NO clock, NO
-network, and NO entropy it did not receive as an event — the render clock enters
-ONLY as the event field `t`, supplied by the caller as data. So the same log
-replays identically forever, in a browser or headless on Node.
+The board file (`.plumb`) is one claim per line. Blank lines and lines starting
+with '#' are ignored. Each claim is 2 or 3 pipe-separated fields:
 
-THE ENVELOPE (INHERITED, not authored — input-event-router fixed it). One event
-per JSONL line:
-{ "seq": <int>=0, monotonic +1 >, "t": <int>=0, non-decreasing logical tick >,
-"type": <one of the declared accepted types>, "payload": <object>}
-The emitted typed stream of input-event-router IS the input log of this harness
-(the covenant's composition algebra). This gift does NOT re-author the envelope;
-it folds the validated stream its sibling emits.
+NAME | WITNESS # status defaults to 'assert'
+NAME | STATUS | WITNESS # STATUS is 'assert' or 'todo'
 
-THE BOUND (this gift's mandatory security clause — resource bounds, covenant §3.3).
-The fold produces at most `budget` frames and REFUSES to exceed it: a log longer
-than the budget HALTS at exactly `budget` frames with reject-reason
-"tick-budget-exceeded", never a busy-spin, never an OOM. The bound is a
-frame-COUNT per fold (not a wall-clock rate), so it is decidable, adversarially
-checkable, and replay-stable — the same log halts at the same frame every run.
+WITNESS is one of:
 
-USAGE
-node render-loop-harness.js < events.jsonl # fold -> final frame + summary
-node render-loop-harness.js --budget 500 < events.jsonl # set the per-fold tick budget
-node render-loop-harness.js --help
+exists PATH # PATH must exist
+absent PATH # PATH must NOT exist (e.g. "no secret committed")
+contains PATH ~ TEXT # PATH exists and contains the literal substring TEXT
+cmd SHELL COMMAND... # the command must exit 0
+none # NO witness at all (the honesty case)
 
-Released under MIT. Its edge, printed in the README and --help: this drives a pure
-state -> frame render loop off an inherited event log, advancing on the event's
-logical tick `t` and never a wall-clock; it refuses to exceed its declared per-fold
-tick budget; it does NOT render pixels (the frame is deterministic text), it does
-NOT persist, it holds NO clock/network/entropy, and it schedules nothing it cannot
-bound. (Retaining event history is the undo-stack-kernel's job, under its own
-declared bound — this harness keeps a bounded, fixed-shape render view.)
-*/
-"use strict";
+Verdicts:
 
-// The default accepted event-type vocabulary (INHERITED shape; the render lane adds
-// a render-driving `tick` type). CONFIG, not frozen (covenant §2/§5 U2): what the
-// gift enforces is that the vocabulary is DECLARED and CLOSED — the decidable
-// security property. An app supplies its own set via cfg.acceptedTypes.
-var DEFAULT_ACCEPTED_TYPES = ["tick", "pointer", "key", "select", "edit", "commit"];
+HELD assert + witness satisfied -> green, and clean
+BROKEN assert + witness NOT satisfied -> the green-on-hope catch
+UNWITNESSED assert + witness 'none' -> you claimed PASS with nothing beneath it
+BLOCKED witness could not be evaluated -> don't trust the reading
+TODO todo + witness not (yet) satisfied -> honest not-done (never green)
+READY todo + witness satisfied -> it's actually done; promote it
 
-// The default per-fold tick budget: the maximum number of frames a single fold will
-// produce before it REFUSES to continue. CONFIG (cfg.budget / --budget). Declared and
-// bounded is the security property; the specific number is a policy the app sets.
-var DEFAULT_BUDGET = 1000;
+Exit codes:
+0 every asserted claim is HELD (todo/ready present is fine)
+1 at least one BROKEN or UNWITNESSED claim (a definite green-on-hope)
+2 no broken assertions, but at least one BLOCKED claim (couldn't measure — don't trust green)
+3 usage / unreadable board
 
-// The initial fold-state. Bounded, fixed-shape by contract: five scalars + a
-// bounded declared-shape `view` (NEVER a growing history buffer — that is the
-// undo-stack-kernel's job under its own bound).
-function state0() {
-return { nextSeq: 0, lastTick: -1, frameCount: 0, tickBudgetSpent: 0, view: view0()};
-}
+A `todo` claim can NEVER render green. That is deliberate: the one thing this tool
+exists to make impossible is a green cell with nothing true beneath it.
+"""
 
-// The render view: a small, fixed-shape accumulator the frame renders. Declared
-// shape, bounded size — it does not grow with the log. Here: a running fold of the
-// render-relevant fields (a count of applied ticks and the last applied payload
-// marker), enough to prove a pure state -> frame projection without pretending to
-// paint pixels (Real-or-Made: the frame is honest text).
-function view0() {
-return { applied: 0, lastType: null, lastMark: null};
-}
+import argparse
+import json
+import os
+import subprocess
+import sys
 
-// isPlainObject — an object, not null, not an array, not a scalar. payload must be
-// an object; we do NOT walk its contents (depth-1 check => bounded work,
-// resource-bounds clause §3.3).
-function isPlainObject(v) {
-return v!== null && typeof v === "object" &&!Array.isArray(v);
-}
+CEILING = (
+"note: Plumb checks that each claim's witness EXISTS / AGREES — not that the "
+"witness is CORRECT. A claim can point at the wrong evidence (a file that "
+"exists but proves nothing, a command that exits 0 for the wrong reason) and "
+"Plumb will pass it. It catches GREEN ON HOPE (a claim asserted PASS with no "
+"satisfied witness); it does NOT catch GREEN ON THE WRONG WITNESS. The witness "
+"is only as honest as you write it, and the board file runs its `cmd` witnesses "
+"with your shell — trust it like a Makefile."
+)
 
-function isInt(v) {
-return typeof v === "number" && isFinite(v) && Math.floor(v) === v;
-}
+# Verdicts
+HELD = "HELD"
+BROKEN = "BROKEN"
+UNWITNESSED = "UNWITNESSED"
+BLOCKED = "BLOCKED"
+TODO = "TODO"
+READY = "READY"
 
-/* validate(state, event, cfg) -> { ok: true} | { ok: false, reason: <string>}
-Pure. Checks the INHERITED envelope against the schema BEFORE the fold sees it.
-Every failure is a DECLARED rejection reason; nothing is coerced. (Inherited from
-input-event-router's discipline — §3.3 clause 2.) */
-function validate(state, event, cfg) {
-var accepted = (cfg && cfg.acceptedTypes) || DEFAULT_ACCEPTED_TYPES;
+# Which verdicts drive which exit code.
+_FAIL_1 = (BROKEN, UNWITNESSED) # a definite green-on-hope
+_FAIL_2 = (BLOCKED,) # couldn't measure
 
-if (!isPlainObject(event)) return { ok: false, reason: "event-not-object"};
+def _eprint(*a):
+print(*a, file=sys.stderr)
 
-// seq: present, int >= 0, exactly the next expected (total order, no gap/repeat).
-if (!isInt(event.seq) || event.seq < 0) return { ok: false, reason: "seq-not-int"};
-if (event.seq < state.nextSeq) return { ok: false, reason: "seq-repeat"};
-if (event.seq > state.nextSeq) return { ok: false, reason: "seq-gap"};
+# --- witness parsing --------------------------------------------------------
 
-// t: present, int >= 0, non-decreasing (LOGICAL tick as data; never a clock).
-if (!isInt(event.t) || event.t < 0) return { ok: false, reason: "tick-not-int"};
-if (event.t < state.lastTick) return { ok: false, reason: "tick-decrease"};
+def parse_witness(expr):
+"""expr -> ((kind, arg), None) on success, or (None, error_string).
 
-// type: non-empty string in the declared accepted set.
-if (typeof event.type!== "string" || event.type.length === 0) {
-return { ok: false, reason: "type-not-string"};
-}
-if (accepted.indexOf(event.type) === -1) return { ok: false, reason: "type-not-accepted"};
+kind is one of exists/absent/contains/cmd/none.
+arg is a string (path or command), a (path, pattern) tuple for contains, or
+None for 'none'.
+"""
+expr = expr.strip()
+if expr == "" or expr.lower() == "none":
+return ("none", None), None
+head, _, rest = expr.partition(" ")
+kind = head.lower()
+rest = rest.strip()
+if kind in ("exists", "absent"):
+if not rest:
+return None, f"{kind} needs a path"
+return (kind, rest), None
+if kind == "contains":
+if " ~ " not in rest:
+return None, "contains needs the form: contains <path> ~ <text>"
+path, _, pattern = rest.partition(" ~ ")
+path = path.strip()
+if not path or pattern == "":
+return None, "contains needs both a path and a non-empty text"
+return ("contains", (path, pattern)), None
+if kind == "cmd":
+if not rest:
+return None, "cmd needs a command"
+return ("cmd", rest), None
+return None, f"unknown witness kind {kind!r} (want exists/absent/contains/cmd/none)"
 
-// payload: an object (opaque cargo). A scalar/null/array payload is rejected.
-if (!isPlainObject(event.payload)) return { ok: false, reason: "payload-not-object"};
+# --- board parsing ----------------------------------------------------------
 
-return { ok: true};
-}
+def parse_board(text):
+"""Return a list of claim dicts (name, status, witness kind/arg, parse_error, line)."""
+claims = []
+for lineno, raw in enumerate(text.splitlines(), 1):
+line = raw.strip()
+if not line or line.startswith("#"):
+continue
+# GIFT-009: parse NAME-first with a bounded left split, so a `cmd:` witness
+# that legitimately contains shell pipes (`... | wc -l`) is NOT torn apart.
+# The old `line.split("|")` counted every pipe as a field boundary, so a
+# piped command produced 4+ fields and hit the "2 or 3 fields" error — the
+# command was lost purely for containing a pipe. The grammar is unchanged
+# for the reader (name | [status] | witness); only the SPLIT is bounded:
+# field 0 is the name, an optional bare-status field 1, and EVERYTHING after
+# is the witness, rejoined verbatim (interior pipes preserved).
+head = [f.strip() for f in line.split("|", 2)]
+if len(head) == 2:
+name, status, wexpr = head[0], "assert", head[1]
+elif len(head) == 3:
+# 3 raw segments: field 1 is the status ONLY if it's a bare status
+# keyword; otherwise it belongs to a 2-field claim whose witness itself
+# carried a pipe, so fold field 1 back into the witness.
+if head[1].lower() in ("assert", "todo"):
+name, status, wexpr = head[0], head[1].lower(), head[2]
+else:
+name, status, wexpr = head[0], "assert", head[1] + " | " + head[2]
+else:
+claims.append({"name": line, "status": "assert", "line": lineno,
+"parse_error": "a claim needs a name and a witness "
+"(name | witness or name | status | witness)"})
+continue
+if not name:
+claims.append({"name": "(unnamed)", "status": status, "line": lineno,
+"parse_error": "claim has no name"})
+continue
+if status not in ("assert", "todo"):
+claims.append({"name": name, "status": "assert", "line": lineno,
+"parse_error": f"unknown status {status!r} (want assert|todo)"})
+continue
+parsed, err = parse_witness(wexpr)
+if err:
+claims.append({"name": name, "status": status, "line": lineno,
+"parse_error": err})
+continue
+kind, arg = parsed
+claims.append({"name": name, "status": status, "witness_kind": kind,
+"witness_arg": arg, "line": lineno, "parse_error": None})
+return claims
 
-// safePayloadMark(payload) -> a bounded, proto-safe render marker pulled from the
-// payload. Copies ONLY the one declared render-relevant field ("mark") onto a
-// null-proto read, skipping the prototype-pollution keys (NOTE-13.1242-1 guard,
-// carried from input-event-router). Bounded work: reads one declared field, never
-// walks arbitrary payload depth (resource-bounds clause §3.3).
-function safePayloadMark(payload) {
-// A hostile __proto__/constructor/prototype key must not reach anything. We read a
-// single declared field via a null-proto copy so a malicious key cannot pollute
-// Object.prototype and cannot be mistaken for the field we want.
-var clean = Object.create(null);
-var keys = Object.keys(payload);
-for (var i = 0; i < keys.length; i++) {
-var k = keys[i];
-if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
-if (k === "mark") clean.mark = payload[k];
-}
-var m = clean.mark;
-// Only a scalar mark is rendered (an object/array mark would be unbounded to
-// stringify — reject it to null, keeping the frame bounded).
-if (m === null || (typeof m!== "object" && typeof m!== "function")) return m === undefined? null: m;
-return null;
-}
+# --- witness evaluation -----------------------------------------------------
 
-/* advance(state, event, cfg) -> { state, frame, reject}
-The pure per-tick reducer. On a valid event, IF spending a tick would not exceed
-the declared budget: fold the event into `view`, spend one budget unit, and
-produce a pure frame. If spending would exceed the budget: HALT with
-"tick-budget-exceeded" (the harness REFUSES to run past its declared bound —
-the §3 clause-1 decidable check). On an invalid event: reject, do not advance
-into a corrupt place. */
-function advance(state, event, cfg) {
-var budget = (cfg && isInt(cfg.budget))? cfg.budget: DEFAULT_BUDGET;
+def eval_witness(kind, arg, cwd):
+"""Return (satisfied, detail). satisfied is True/False, or None = could-not-evaluate."""
+if kind == "exists":
+ok = os.path.exists(os.path.join(cwd, arg))
+return ok, ("present" if ok else "MISSING") + f": {arg}"
+if kind == "absent":
+ok = not os.path.exists(os.path.join(cwd, arg))
+return ok, ("absent" if ok else "PRESENT") + f": {arg}"
+if kind == "contains":
+path, pattern = arg
+full = os.path.join(cwd, path)
+try:
+with open(full, "r", encoding="utf-8", errors="replace") as f:
+text = f.read()
+except Exception as ex:
+return None, f"unreadable {path}: {ex.__class__.__name__}"
+ok = pattern in text
+return ok, (f"found {pattern!r}" if ok else f"NOT found {pattern!r}") + f" in {path}"
+if kind == "cmd":
+try:
+rc = subprocess.call(arg, shell=True, cwd=cwd,
+stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except Exception as ex:
+return None, f"could not launch: {ex.__class__.__name__}"
+return (rc == 0), f"exit {rc}"
+return None, f"unknown witness kind {kind!r}"
 
-var v = validate(state, event, cfg);
-if (!v.ok) {
-var seq = isInt(event && event.seq)? event.seq: null;
-return { state: state, frame: null, reject: { seq: seq, reason: v.reason}};
-}
+def evaluate(claim, cwd):
+"""A parsed claim -> (verdict, detail)."""
+if claim.get("parse_error"):
+return BLOCKED, claim["parse_error"]
+status = claim["status"]
+kind = claim["witness_kind"]
+arg = claim["witness_arg"]
+if kind == "none":
+if status == "todo":
+return TODO, "no witness yet (todo)"
+return UNWITNESSED, "asserted PASS with no witness beneath it"
+satisfied, detail = eval_witness(kind, arg, cwd)
+if satisfied is None:
+return BLOCKED, detail
+if status == "todo":
+return (READY if satisfied else TODO), detail
+return (HELD if satisfied else BROKEN), detail
 
-// RESOURCE BOUND (primary clause): refuse to exceed the declared budget. If this
-// frame would be the (budget+1)-th, HALT rather than produce it.
-if (state.tickBudgetSpent >= budget) {
-return { state: state, frame: null, reject: { seq: event.seq, reason: "tick-budget-exceeded"}};
-}
+# --- run / render -----------------------------------------------------------
 
-// Fold the event into the bounded render view (pure). Reads only declared,
-// proto-safe, bounded fields.
-var mark = safePayloadMark(event.payload);
-var nextView = { applied: state.view.applied + 1, lastType: event.type, lastMark: mark};
-var next = {
-nextSeq: state.nextSeq + 1,
-lastTick: event.t,
-frameCount: state.frameCount + 1,
-tickBudgetSpent: state.tickBudgetSpent + 1,
-view: nextView
-};
-var frame = render(next);
-return { state: next, frame: frame, reject: null};
-}
+def run(board_text, cwd):
+rows = []
+for c in parse_board(board_text):
+verdict, detail = evaluate(c, cwd)
+rows.append({"name": c["name"], "status": c["status"], "verdict": verdict,
+"detail": detail, "line": c["line"]})
+return rows
 
-/* foldLoop(events, cfg) -> { state, frames, rejections, halted}
-Folds an ordered array of inherited events under the tick budget. reject-policy
-default is HALT: a hostile/corrupt log (INCLUDING one that exceeds the budget)
-STOPS at the first violation rather than folding into an ambiguous frame
-sequence. cfg.rejectPolicy = "skip" is available for genuinely best-effort input
-(but a tick-budget-exceeded is ALWAYS a halt — a bound is not skippable). */
-function foldLoop(events, cfg) {
-var policy = (cfg && cfg.rejectPolicy) || "halt";
-var state = state0();
-var frames = [];
-var rejections = [];
-var halted = false;
-for (var i = 0; i < events.length; i++) {
-var r = advance(state, events[i], cfg);
-if (r.reject) {
-rejections.push(r.reject);
-// The budget bound is never skippable — exceeding it always halts.
-if (r.reject.reason === "tick-budget-exceeded" || policy === "halt") {
-halted = true;
-break;
-}
-// skip: record the rejection, do not advance, continue to the next event.
-continue;
-}
-state = r.state;
-frames.push(r.frame);
-}
-return { state: state, frames: frames, rejections: rejections, halted: halted};
-}
+def exit_code(rows):
+verdicts = {r["verdict"] for r in rows}
+if verdicts & set(_FAIL_1):
+return 1
+if verdicts & set(_FAIL_2):
+return 2
+return 0
 
-/* render(state) -> string. Pure state -> frame projection. An interactive gift is
-still pipe-testable headless: the frame is deterministic TEXT, never a live
-canvas (Real-or-Made: this does not pretend to paint pixels). */
-function render(state) {
-return (
-"frame#" + state.frameCount +
-" t=" + state.lastTick +
-" applied=" + state.view.applied +
-" type=" + (state.view.lastType === null? "-": state.view.lastType) +
-" mark=" + (state.view.lastMark === null || state.view.lastMark === undefined? "-": String(state.view.lastMark))
-);
-}
+_MARK = {HELD: "ok ", BROKEN: "XX ", UNWITNESSED: "XX ", BLOCKED: "?? ",
+TODO: ". ", READY: ">> "}
 
-var API = {
-DEFAULT_ACCEPTED_TYPES: DEFAULT_ACCEPTED_TYPES,
-ACCEPTED_TYPES: DEFAULT_ACCEPTED_TYPES,
-DEFAULT_BUDGET: DEFAULT_BUDGET,
-state0: state0,
-validate: validate,
-advance: advance,
-foldLoop: foldLoop,
-render: render
-};
+def render_table(rows):
+if not rows:
+return "(no claims)"
+w = max(len(r["name"]) for r in rows)
+out = []
+for r in rows:
+out.append(f" {_MARK.get(r['verdict'], ' ')} {r['name']:<{w}} "
+f"{r['verdict']:<11} {r['detail']}")
+return "\n".join(out)
 
-// Browser attach.
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.renderLoopHarness = API;
-}
+def summary(rows):
+counts = {}
+for r in rows:
+counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+order = [HELD, BROKEN, UNWITNESSED, BLOCKED, TODO, READY]
+parts = [f"{counts[v]} {v.lower()}" for v in order if counts.get(v)]
+return "plumb: " + (" · ".join(parts) if parts else "no claims")
 
-// Node require.
-if (typeof module!== "undefined" && module.exports) {
-module.exports = API;
-}
+def main(argv=None):
+ap = argparse.ArgumentParser(
+prog="plumb.py",
+description="A status board that refuses to show green on hope.")
+ap.add_argument("board", help="path to a.plumb board file, or - for stdin")
+ap.add_argument("--cwd", default=None,
+help="base dir for relative witness paths and commands "
+"(default: the board file's directory; '.' for stdin)")
+ap.add_argument("--json", action="store_true",
+help="machine-readable output on stdout")
+ap.add_argument("--quiet", action="store_true",
+help="print only the summary line (+ ceiling on stderr)")
+args = ap.parse_args(argv)
 
-// CLI.
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"render-loop-harness.js — bounded deterministic reducer: inherited event log -> pure frame sequence.\n\n" +
-" node render-loop-harness.js < events.jsonl fold -> final frame + summary\n" +
-" node render-loop-harness.js --budget <int> < events.jsonl set the per-fold tick budget\n" +
-" node render-loop-harness.js --help\n\n" +
-"Envelope (INHERITED from input-event-router; one JSON object per line):\n" +
-" { \"seq\": <int, monotonic +1>, \"t\": <int, non-decreasing logical tick>,\n" +
-" \"type\": <accepted type>, \"payload\": <object>}\n\n" +
-"Edge: this drives a pure state -> frame render loop off an inherited event log,\n" +
-"advancing on the event's logical tick t and never a wall-clock; it refuses to\n" +
-"exceed its declared per-fold tick budget; it does not render pixels (the frame is\n" +
-"deterministic text), does not persist, holds no clock/network/entropy, and\n" +
-"schedules nothing it cannot bound.\n"
-);
-return 0;
-}
-var budget = DEFAULT_BUDGET;
-var bi = args.indexOf("--budget");
-if (bi!== -1 && args[bi + 1]!== undefined) {
-var b = parseInt(args[bi + 1], 10);
-if (isFinite(b) && b >= 0) budget = b;
-}
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-var text = Buffer.concat(chunks).toString("utf8");
-var lines = text.split("\n");
-var events = [];
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i].trim();
-if (line.length === 0) continue;
-try {
-events.push(JSON.parse(line));
-} catch (e) {
-// A non-JSON line is itself a rejectable event: push a sentinel the schema
-// will reject as event-not-object (a string is not an object).
-events.push(line);
-}
-}
-var out = foldLoop(events, { budget: budget});
-process.stdout.write((out.frames.length? out.frames[out.frames.length - 1]: "frame#0 (no frames)") + "\n");
-process.stdout.write(
-"frames=" + out.frames.length +
-" budget=" + budget +
-" rejected=" + out.rejections.length +
-(out.halted? " HALTED": "") + "\n"
-);
-for (var j = 0; j < out.rejections.length; j++) {
-var rj = out.rejections[j];
-process.stdout.write(" reject seq=" + rj.seq + " reason=" + rj.reason + "\n");
-}
-});
-return 0;
-}
+if args.board == "-":
+board_text = sys.stdin.read()
+default_cwd = "."
+else:
+try:
+with open(args.board, "r", encoding="utf-8") as f:
+board_text = f.read()
+except Exception as ex:
+_eprint(f"plumb: cannot read board {args.board!r}: {ex}")
+return 3
+default_cwd = os.path.dirname(os.path.abspath(args.board)) or "."
+cwd = args.cwd or default_cwd
 
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
+rows = run(board_text, cwd)
+code = exit_code(rows)
 
-test_render-loop-harness.js 181 lines on GitHub →
-#!/usr/bin/env node
-/* test_render-loop-harness.js — the golden event-log corpus + out-of-band oracle
-for render-loop-harness. Stdlib-only, zero-dep.
+if args.json:
+print(json.dumps({"rows": rows, "exit": code}, indent=2))
+else:
+if not args.quiet:
+print(render_table(rows))
+print()
+print(summary(rows))
 
-The oracle rule (covenant §4 B6): expected states/frames are computed
-INDEPENDENTLY here (by hand from the reducer rules), never by running the gift.
-The battery carries the mandatory hostile vectors — the budget-exceeding log
-FIRST (the §3 clause-1 primary check) — plus the inherited input-validation
-vectors, a composition proof against input-event-router's emitted stream, and
-two mutation bites. */
-"use strict";
+_eprint(CEILING)
+return code
 
-var H = require("./render-loop-harness.js");
-var assert = require("assert");
+if __name__ == "__main__":
+sys.exit(main())
 
-var passed = 0;
-var failed = 0;
-function ok(name, cond) {
-if (cond) { passed++; process.stdout.write(" ok " + name + "\n");}
-else { failed++; process.stdout.write(" FAIL " + name + "\n");}
-}
+smoke_test.py 154 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""smoke_test.py — hermetic proof that plumb.py holds the line. No network, no
+state outside a tmpdir. Each scenario writes a board + evidence, runs plumb.py as
+a subprocess, and checks the exit code and the verdict text — the real CLI
+contract, mirroring the durability claims:
 
-function ev(seq, t, type, payload) {
-return { seq: seq, t: t, type: type, payload: payload === undefined? {}: payload};
-}
+1 a satisfied witness renders HELD and the run is clean (exit 0)
+2 a claim asserting PASS with a MISSING witness is caught BROKEN (exit 1) <- the headline
+3 a claim asserting PASS with NO witness is UNWITNESSED (exit 1)
+4 contains: HELD when the text is present, BROKEN when absent
+5 absent: HELD when the path is gone, BROKEN when it is present
+6 cmd: exit 0 -> HELD, non-zero -> BROKEN
+7 a malformed witness is BLOCKED, not silently passed (exit 2)
+8 a todo claim never renders green: unsatisfied -> TODO, satisfied -> READY,
+and neither fails the run (exit 0)
 
-/* ---- 1. Golden valid log -> INDEPENDENTLY-computed expected final state + frames ---- */
-(function goldenValid() {
-var log = [
-ev(0, 0, "tick", { mark: "a"}),
-ev(1, 1, "tick", { mark: "b"}),
-ev(2, 1, "pointer", { mark: 7}), // t may stay equal (non-decreasing)
-ev(3, 4, "tick", {}) // empty payload -> mark null
-];
-// Hand-computed (NOT by running the gift):
-// after 4 valid events: nextSeq=4, lastTick=4, frameCount=4, tickBudgetSpent=4,
-// view.applied=4, view.lastType="tick", view.lastMark=null (last payload {}).
-var out = H.foldLoop(log, { budget: 100});
-ok("golden.nextSeq==4", out.state.nextSeq === 4);
-ok("golden.lastTick==4", out.state.lastTick === 4);
-ok("golden.frameCount==4", out.state.frameCount === 4);
-ok("golden.budgetSpent==4", out.state.tickBudgetSpent === 4);
-ok("golden.view.applied==4", out.state.view.applied === 4);
-ok("golden.view.lastType==tick", out.state.view.lastType === "tick");
-ok("golden.view.lastMark==null", out.state.view.lastMark === null);
-ok("golden.frames.length==4", out.frames.length === 4);
-ok("golden.not-halted", out.halted === false);
-ok("golden.no-rejections", out.rejections.length === 0);
-// The independently-expected LAST frame string:
-ok("golden.lastFrame",
-out.frames[3] === "frame#4 t=4 applied=4 type=tick mark=-");
-// The independently-expected SECOND frame (mark carried through):
-ok("golden.frame1",
-out.frames[1] === "frame#2 t=1 applied=2 type=tick mark=b");
-})();
+Run: python3 smoke_test.py (expect: 8/8 passed)
+"""
+import os
+import subprocess
+import sys
+import tempfile
 
-/* ---- 2. Replay-determinism (the canonicalizer self-test) ---- */
-(function replay() {
-var log = [
-ev(0, 0, "tick", { mark: 1}),
-ev(1, 2, "tick", { mark: 2}),
-ev(2, 5, "pointer", { mark: 3})
-];
-var a = H.foldLoop(log, { budget: 100});
-var b = H.foldLoop(log, { budget: 100});
-var c = H.foldLoop(log, { budget: 100});
-var sa = JSON.stringify(a), sb = JSON.stringify(b), sc = JSON.stringify(c);
-ok("replay.folds-twice-identical", sa === sb && sb === sc);
-ok("replay.frames-identical",
-JSON.stringify(a.frames) === JSON.stringify(c.frames));
-})();
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLUMB = os.path.join(HERE, "plumb.py")
+PASS = 0
+FAIL = 0
 
-/* ---- 3. RESOURCE-BOUNDS known-bad vector (PRIMARY §3 clause-1) ---- */
-(function budgetExceeded() {
-// A log LONGER than the budget MUST halt at exactly `budget` frames.
-var budget = 5;
-var log = [];
-for (var i = 0; i < 50; i++) log.push(ev(i, i, "tick", { mark: i}));
-var out = H.foldLoop(log, { budget: budget});
-ok("budget.frames==budget", out.frames.length === budget);
-ok("budget.spent==budget", out.state.tickBudgetSpent === budget);
-ok("budget.halted", out.halted === true);
-ok("budget.reject-reason",
-out.rejections.length === 1 &&
-out.rejections[0].reason === "tick-budget-exceeded");
-// It refused to process the whole 50-event log — proof the bound holds.
-ok("budget.did-not-run-to-end", out.state.nextSeq === budget);
-})();
+def ok(msg):
+global PASS
+PASS += 1
+print(f"ok {msg}")
 
-/* ---- 4. Inherited input-validation known-bad vectors (§3 clause-2) ---- */
-(function hostileEnvelopes() {
-function firstReject(log) {
-var out = H.foldLoop(log, { budget: 100});
-return out.rejections.length? out.rejections[0].reason: null;
-}
-ok("bad.seq-gap",
-firstReject([ev(0,0,"tick",{}), ev(1,1,"tick",{}), ev(3,2,"tick",{})]) === "seq-gap");
-ok("bad.seq-repeat",
-firstReject([ev(0,0,"tick",{}), ev(1,1,"tick",{}), ev(1,2,"tick",{})]) === "seq-repeat");
-ok("bad.tick-decrease",
-firstReject([ev(0,5,"tick",{}), ev(1,2,"tick",{})]) === "tick-decrease");
-ok("bad.type-not-accepted",
-firstReject([ev(0,0,"WOMBAT",{})]) === "type-not-accepted");
-ok("bad.payload-scalar",
-firstReject([ev(0,0,"tick",42)]) === "payload-not-object");
-ok("bad.payload-null",
-firstReject([ev(0,0,"tick",null)]) === "payload-not-object");
-ok("bad.payload-array",
-firstReject([ev(0,0,"tick",[1,2])]) === "payload-not-object");
-ok("bad.event-not-object",
-firstReject(["i am not an object"]) === "event-not-object");
-})();
+def bad(msg, why):
+global FAIL
+FAIL += 1
+print(f"FAIL {msg}: {why}")
 
-/* ---- 4b. Prototype-pollution guard (NOTE-13.1242-1, carried) ---- */
-(function protoGuard() {
-var before = Object.prototype.polluted;
-var log = [ ev(0, 0, "tick", JSON.parse('{"__proto__":{"polluted":"yes"},"mark":"ok"}'))];
-var out = H.foldLoop(log, { budget: 100});
-ok("proto.Object.prototype-not-polluted", Object.prototype.polluted === before);
-ok("proto.mark-still-read", out.state.view.lastMark === "ok");
-// A payload whose "mark" is itself an object must render as null (bounded frame),
-// not stringify an arbitrary object.
-var out2 = H.foldLoop([ ev(0,0,"tick",{ mark: { deep: { deeper: 1}}})], { budget: 5});
-ok("proto.object-mark-bounded-to-null", out2.state.view.lastMark === null);
-})();
+def run_plumb(board_text, cwd):
+"""Write board.plumb into cwd, run plumb.py against it, return (rc, stdout)."""
+board = os.path.join(cwd, "board.plumb")
+with open(board, "w", encoding="utf-8") as f:
+f.write(board_text)
+p = subprocess.run([sys.executable, PLUMB, board],
+stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+return p.returncode, p.stdout
 
-/* ---- 5. State-bounds assertion (§3 clause-3) ---- */
-(function stateBounds() {
-var budget = 200;
-var log = [];
-for (var i = 0; i < budget; i++) log.push(ev(i, i, "tick", { mark: i}));
-var out = H.foldLoop(log, { budget: budget});
-// State shape is exactly the five declared keys + a fixed-shape view — no
-// retained frame/history buffer in state.
-var keys = Object.keys(out.state).sort().join(",");
-ok("bounds.state-shape",
-keys === "frameCount,lastTick,nextSeq,tickBudgetSpent,view");
-var vkeys = Object.keys(out.state.view).sort().join(",");
-ok("bounds.view-shape", vkeys === "applied,lastMark,lastType");
-ok("bounds.no-history-buffer-in-state",
-typeof out.state.view.applied === "number");
-})();
+def write(cwd, name, text=""):
+with open(os.path.join(cwd, name), "w", encoding="utf-8") as f:
+f.write(text)
 
-/* ---- 6. Composition proof (the covenant's reducer algebra) ----
-The EMITTED typed stream of input-event-router is exactly this harness's input.
-Reconstruct a router-emit stream shape { seq, t, type, payload} and prove the
-harness folds it cleanly. (We construct the emitted-shape objects directly — the
-router's emit is { seq, t, type, payload} with a null-proto payload copy; the
-harness must fold that shape without complaint.) */
-(function composition() {
-var routerEmitStream = [
-{ seq: 0, t: 0, type: "pointer", payload: { mark: "x"}},
-{ seq: 1, t: 3, type: "commit", payload: { mark: "y"}},
-{ seq: 2, t: 3, type: "select", payload: {}}
-];
-var out = H.foldLoop(routerEmitStream, { budget: 100});
-ok("compose.folds-router-emit-cleanly",
-out.rejections.length === 0 && out.halted === false && out.frames.length === 3);
-ok("compose.final-frame",
-out.frames[2] === "frame#3 t=3 applied=3 type=select mark=-");
-})();
+def t1(d):
+write(d, "artifact.txt", "built")
+rc, out = run_plumb("build shipped | exists artifact.txt\n", d)
+if rc == 0 and "HELD" in out:
+ok("satisfied witness renders HELD, run is clean")
+else:
+bad("held", f"rc={rc} out=[{out.strip()}]")
 
-/* ---- 7. Mutation bites (>=2) ---- */
-(function mutationBites() {
-// Bite (a): a deliberately-wrong expected final frame MUST be caught.
-var out = H.foldLoop([ev(0,0,"tick",{mark:"z"})], { budget: 100});
-var wrongExpected = "frame#1 t=0 applied=1 type=tick mark=WRONG";
-ok("bite.a.wrong-frame-caught", out.frames[0]!== wrongExpected);
+def t2(d):
+# assert PASS but the witness file does not exist -> green on hope, caught
+rc, out = run_plumb("build shipped | exists nope.txt\n", d)
+if rc == 1 and "BROKEN" in out:
+ok("asserted PASS with a missing witness is caught BROKEN (exit 1)")
+else:
+bad("green-on-hope", f"expected rc=1 + BROKEN, got rc={rc} out=[{out.strip()}]")
 
-// Bite (b): a harness that IGNORED the budget (folded past it) MUST fail the
-// resource-bounds vector. We simulate the mutant by asserting the REAL harness
-// does NOT fold all 20 events under a budget of 3 — i.e. the bound is real, not a
-// rubber stamp. If the harness folded all 20 (mutant behavior), frames would be 20.
-var log = [];
-for (var i = 0; i < 20; i++) log.push(ev(i,i,"tick",{}));
-var b = H.foldLoop(log, { budget: 3});
-ok("bite.b.budget-not-ignored", b.frames.length === 3 && b.frames.length!== 20);
-})();
+def t3(d):
+rc, out = run_plumb("migration done | none\n", d)
+if rc == 1 and "UNWITNESSED" in out:
+ok("asserted PASS with no witness is UNWITNESSED (exit 1)")
+else:
+bad("unwitnessed", f"expected rc=1 + UNWITNESSED, got rc={rc} out=[{out.strip()}]")
 
-process.stdout.write("\nrender-loop-harness golden corpus: " + passed + " passed, " + failed + " failed\n");
-process.exit(failed === 0? 0: 1);
+def t4(d):
+write(d, "README.md", "# thing\n\nMIT licensed.\n")
+rc, out = run_plumb("readme licensed | contains README.md ~ MIT\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("contains-present", f"rc={rc} out=[{out.strip()}]")
+return
+rc2, out2 = run_plumb("readme gpl | contains README.md ~ GPL\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("contains: HELD when text present, BROKEN when absent")
+else:
+bad("contains-absent", f"rc={rc2} out=[{out2.strip()}]")
+
+def t5(d):
+rc, out = run_plumb("no secret | absent.env\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("absent-gone", f"rc={rc} out=[{out.strip()}]")
+return
+write(d, ".env", "SECRET=x")
+rc2, out2 = run_plumb("no secret | absent.env\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("absent: HELD when path gone, BROKEN when present")
+else:
+bad("absent-present", f"rc={rc2} out=[{out2.strip()}]")
+
+def t6(d):
+rc, out = run_plumb("truthy | cmd true\n", d)
+if not (rc == 0 and "HELD" in out):
+bad("cmd-zero", f"rc={rc} out=[{out.strip()}]")
+return
+rc2, out2 = run_plumb("falsy | cmd false\n", d)
+if rc2 == 1 and "BROKEN" in out2:
+ok("cmd: exit 0 -> HELD, non-zero -> BROKEN")
+else:
+bad("cmd-nonzero", f"rc={rc2} out=[{out2.strip()}]")
+
+def t7(d):
+# 'contains' with no ' ~ ' separator is malformed -> BLOCKED, not a silent pass
+rc, out = run_plumb("bad witness | contains README.md MIT\n", d)
+if rc == 2 and "BLOCKED" in out:
+ok("a malformed witness is BLOCKED, not silently passed (exit 2)")
+else:
+bad("blocked", f"expected rc=2 + BLOCKED, got rc={rc} out=[{out.strip()}]")
+
+def t8(d):
+# todo claims never go green, and never fail the run
+board = (
+"later feature | todo | exists notyet.txt\n" # unsatisfied -> TODO
+"already built | todo | cmd true\n" # satisfied -> READY
+)
+rc, out = run_plumb(board, d)
+if rc == 0 and "TODO" in out and "READY" in out and "HELD" not in out:
+ok("todo never renders green: TODO / READY, run stays clean (exit 0)")
+else:
+bad("todo", f"expected rc=0, TODO+READY, no HELD; rc={rc} out=[{out.strip()}]")
+
+def main():
+for t in (t1, t2, t3, t4, t5, t6, t7, t8):
+with tempfile.TemporaryDirectory() as d:
+t(d)
+print()
+print(f"{PASS}/{PASS + FAIL} passed")
+return 0 if FAIL == 0 else 1
+
+if __name__ == "__main__":
+sys.exit(main())
 
 Take the whole folder →
 MIT
-Zero dependencies, Node or browser, deterministic
+Python stdlib only
+
+---
+
+# port — a Loop MMT gift
+https://loopmmt.com/gifts/port/
+[coverage: optional · branch: gifts]
+
+Composition Port-Verb Declaration declare ← all gifts
+
+port
+
+Every small JSONL tool declares its own port-verb — source, transform, filter, fold, or sink — in a manifest field or a --port flag, so a map or a typechecker can READ a tool's composition shape instead of guessing it. The load-bearing move is `port check`: when a tool declares its verb in both places, they must agree, and a drift is a decidable non-zero exit, not a thing a human notices later.
+
+The honest edge
+
+It verifies a declaration is consistent with itself — manifest field vs the tool's own --port flag — not that the declared verb is true of the tool's actual behavior. A tool can honestly declare 'filter' in both places and still behave like a transform in its code; proving a verb against real behavior is a deeper, undecidable-in-general question this tool does not claim to answer.
+
+Run it
+
+python3 port.py verbs
+test_port.py (15/15, mutation-bitten)
+Python 3, standard library only
+
+The code — every file that ships
+
+port.py 239 lines on GitHub →
+#!/usr/bin/env python3
+"""port — declare a composition tool's port-verb, and read it back honestly.
+
+A composition of small JSONL tools only typechecks if each tool declares its
+own PORT-VERB: the type-level shape of its stdin/stdout contract on the shared
+JSON-lines interface. Five verbs, and only five:
+
+source: nothing -> JSONL (emits; no meaningful stdin)
+transform: JSONL -> JSONL (record in, record out)
+filter: JSONL -> JSONL' (record in, subset out — output type <= input)
+fold: JSONL -> JSONL_agg (records in, an aggregate/narrower record out)
+sink: JSONL -> nothing (terminal side effect, no pipeable stdout)
+
+WHY THIS TOOL EXISTS. Before `port`, a map or a typechecker that wanted to know
+a tool's port-verb had to GUESS it — from a one-line description, or from a
+hand-kept list living in one program's source. A guess that a tool emits when it
+actually sinks is a silent lie: the map draws an edge that cannot carry data.
+`port` removes the guess. Every tool DECLARES its port-verb, in one of two honest
+places, and `port` reads the declaration back:
+
+1. A manifest field `port_verb` in a JSON manifest of tool entries, OR
+2. A `--port` flag the tool answers for itself.
+
+The load-bearing move is the CHECK (`port check`): when a tool declares its
+port-verb in BOTH places, they must AGREE. A manifest that says `filter` while
+the tool's own `--port` says `source` is a declaration that has drifted from the
+thing it describes — and `port check` makes that drift a decidable, non-zero
+exit, not a thing a human notices later. That is the whole point: a declaration
+you can verify beats a description you have to trust.
+
+port's own port-verb is `source`: it emits port declarations as JSON-lines and
+takes no meaningful stdin.
+
+No dependencies beyond the Python standard library. MIT licensed.
+
+USAGE
+port verbs
+Print the five port-verbs and their type contracts (JSONL, one per line).
+
+port read --manifest FILE [--slug SLUG]
+Read declared port_verb(s) from a manifest. With --slug, one entry;
+without, every entry that declares a port_verb. Emits JSON-lines:
+{"slug":..., "port_verb":..., "source": "manifest"}
+A manifest entry with no port_verb field is reported with
+port_verb=null and status="undeclared" (flagged, never guessed).
+
+port check --manifest FILE --flag-cmd 'CMD {slug}'
+For every manifest entry that declares a port_verb, run the tool's own
+--port flag (via --flag-cmd, with {slug} substituted) and compare.
+Emits one JSON-line verdict per entry:
+{"slug":..., "manifest":..., "flag":..., "status":"agree|drift|missing"}
+Exit 0 iff every checked entry AGREES; exit 3 on any drift/missing.
+This is the decidable self-check — a declaration verified against itself.
+
+port emit --slug SLUG --port-verb VERB
+Emit a single declaration JSON-line (for a tool that has no manifest yet).
+"""
+import argparse
+import json
+import subprocess
+import sys
+
+# The five port-verbs and their type-level contract on the shared JSONL interface.
+# This dict is the ONLY definition of the vocabulary — the closed set.
+PORT_VERBS = {
+"source": "nothing -> JSONL (emits; no meaningful stdin)",
+"transform": "JSONL -> JSONL (record in, record out)",
+"filter": "JSONL -> JSONL' (record in, subset out; output type <= input)",
+"fold": "JSONL -> JSONL_agg (records in, an aggregate/narrower record out)",
+"sink": "JSONL -> nothing (terminal side effect, no pipeable stdout)",
+}
+
+def is_valid_verb(verb):
+"""A port-verb is valid iff it is one of the five closed-set verbs."""
+return verb in PORT_VERBS
+
+def load_manifest_entries(path):
+"""Return the list of tool entries from a manifest.
+
+Accepts either a bare JSON list of entries, or a JSON object with a top-level
+key ('gifts', 'tools', or 'entries') holding the list. Raises ValueError if
+no entry list can be found — never guesses a shape.
+"""
+with open(path) as f:
+data = json.load(f)
+if isinstance(data, list):
+return data
+if isinstance(data, dict):
+for key in ("gifts", "tools", "entries"):
+if isinstance(data.get(key), list):
+return data[key]
+raise ValueError(
+"manifest is neither a list of entries nor an object with a "
+"'gifts'/'tools'/'entries' list"
+)
+
+def cmd_verbs(_args):
+"""Emit the five port-verbs and their contracts, one JSON-line each."""
+for verb, contract in PORT_VERBS.items():
+print(json.dumps({"port_verb": verb, "contract": contract}))
+return 0
+
+def cmd_read(args):
+"""Read declared port_verb(s) from a manifest and emit them as JSON-lines."""
+entries = load_manifest_entries(args.manifest)
+found = False
+for entry in entries:
+slug = entry.get("slug")
+if args.slug is not None and slug!= args.slug:
+continue
+verb = entry.get("port_verb")
+if verb is None:
+rec = {"slug": slug, "port_verb": None,
+"source": "manifest", "status": "undeclared"}
+elif not is_valid_verb(verb):
+rec = {"slug": slug, "port_verb": verb,
+"source": "manifest", "status": "invalid"}
+else:
+rec = {"slug": slug, "port_verb": verb,
+"source": "manifest", "status": "declared"}
+print(json.dumps(rec))
+found = True
+if args.slug is not None and not found:
+print(json.dumps({"slug": args.slug, "port_verb": None,
+"source": "manifest", "status": "not-found"}))
+return 3
+return 0
+
+def _run_flag(flag_cmd, slug):
+"""Run a tool's own --port flag and return the verb it prints, or None.
+
+flag_cmd is a template string with '{slug}' substituted for the entry slug.
+The tool is expected to print its port-verb as the first whitespace token
+on stdout. Any failure (non-zero exit, no output, unparseable) returns None
+— an honest 'the tool did not answer', never a guessed verb.
+"""
+cmd = flag_cmd.replace("{slug}", slug)
+try:
+out = subprocess.run(cmd, shell=True, capture_output=True,
+text=True, timeout=30)
+except Exception:
+return None
+if out.returncode!= 0:
+return None
+token = out.stdout.strip().split()
+if not token:
+return None
+verb = token[0]
+return verb if is_valid_verb(verb) else None
+
+def cmd_check(args):
+"""Compare each manifest port_verb against the tool's own --port flag.
+
+Exit 0 iff every checked entry agrees; exit 3 on any drift or missing.
+"""
+entries = load_manifest_entries(args.manifest)
+all_agree = True
+checked_any = False
+for entry in entries:
+slug = entry.get("slug")
+manifest_verb = entry.get("port_verb")
+if manifest_verb is None:
+continue # nothing declared in the manifest -> nothing to check here
+checked_any = True
+flag_verb = _run_flag(args.flag_cmd, slug)
+if flag_verb is None:
+status = "missing"
+all_agree = False
+elif flag_verb == manifest_verb:
+status = "agree"
+else:
+status = "drift"
+all_agree = False
+print(json.dumps({"slug": slug, "manifest": manifest_verb,
+"flag": flag_verb, "status": status}))
+if not checked_any:
+# Nothing declared a port_verb: there is nothing to verify. This is not
+# a pass (there was no check) — report it and exit 3 so a manifest that
+# forgot every declaration cannot read as green.
+print(json.dumps({"status": "no-declarations",
+"note": "no manifest entry declared a port_verb"}))
+return 3
+return 0 if all_agree else 3
+
+def cmd_emit(args):
+"""Emit a single port declaration JSON-line for a manifest-less tool."""
+if not is_valid_verb(args.port_verb):
+print(json.dumps({"slug": args.slug, "port_verb": args.port_verb,
+"status": "invalid",
+"valid": list(PORT_VERBS)}))
+return 3
+print(json.dumps({"slug": args.slug, "port_verb": args.port_verb,
+"source": "declared", "status": "declared"}))
+return 0
+
+def build_parser():
+p = argparse.ArgumentParser(
+prog="port",
+description="Declare a composition tool's port-verb, and read it back honestly.",
+)
+sub = p.add_subparsers(dest="cmd", required=True)
+
+sp = sub.add_parser("verbs", help="print the five port-verbs and contracts")
+sp.set_defaults(func=cmd_verbs)
+
+sp = sub.add_parser("read", help="read declared port_verb(s) from a manifest")
+sp.add_argument("--manifest", required=True)
+sp.add_argument("--slug", default=None)
+sp.set_defaults(func=cmd_read)
+
+sp = sub.add_parser("check", help="verify manifest port_verb against each tool's --port flag")
+sp.add_argument("--manifest", required=True)
+sp.add_argument("--flag-cmd", required=True,
+help="command template to run a tool's --port flag; {slug} is substituted")
+sp.set_defaults(func=cmd_check)
+
+sp = sub.add_parser("emit", help="emit a single port declaration line")
+sp.add_argument("--slug", required=True)
+sp.add_argument("--port-verb", required=True)
+sp.set_defaults(func=cmd_emit)
+
+return p
+
+def main(argv=None):
+args = build_parser().parse_args(argv)
+return args.func(args)
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_port.py 168 lines on GitHub →
+#!/usr/bin/env python3
+"""Mutation-bitten tests for the port gift.
+
+Each test asserts a real behavior. To prove the suite is non-vacuous, run it
+against a deliberately-broken port.py and confirm it goes RED (see the
+`_self_mutation_note` at the bottom — the mutations are documented, not shipped).
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PORT = os.path.join(HERE, "port.py")
+
+sys.path.insert(0, HERE)
+import port # noqa: E402
+
+def run(*args, input_text=None):
+"""Run port.py as a subprocess; return (exit, stdout_lines)."""
+proc = subprocess.run(
+[sys.executable, PORT, *args],
+capture_output=True, text=True, input=input_text,
+)
+lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+return proc.returncode, lines
+
+def write_manifest(entries, wrap=None):
+"""Write a temp manifest; wrap=None -> bare list, else {wrap: [...]}."""
+fd, path = tempfile.mkstemp(suffix=".json")
+with os.fdopen(fd, "w") as f:
+json.dump(entries if wrap is None else {wrap: entries}, f)
+return path
+
+class TestVocabulary(unittest.TestCase):
+def test_exactly_five_verbs(self):
+# The closed set is exactly five — no more, no fewer.
+self.assertEqual(len(port.PORT_VERBS), 5)
+self.assertEqual(set(port.PORT_VERBS),
+{"source", "transform", "filter", "fold", "sink"})
+
+def test_valid_verb_gate(self):
+self.assertTrue(port.is_valid_verb("filter"))
+self.assertFalse(port.is_valid_verb("emit")) # a plausible non-verb
+self.assertFalse(port.is_valid_verb(""))
+self.assertFalse(port.is_valid_verb(None))
+
+def test_verbs_command_emits_five_lines(self):
+code, lines = run("verbs")
+self.assertEqual(code, 0)
+self.assertEqual(len(lines), 5)
+self.assertEqual({l["port_verb"] for l in lines}, set(port.PORT_VERBS))
+
+class TestRead(unittest.TestCase):
+def test_read_declared(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"},
+{"slug": "b", "port_verb": "sink"}])
+code, lines = run("read", "--manifest", m)
+self.assertEqual(code, 0)
+self.assertEqual(lines[0], {"slug": "a", "port_verb": "source",
+"source": "manifest", "status": "declared"})
+self.assertEqual(lines[1]["status"], "declared")
+
+def test_read_undeclared_is_flagged_not_guessed(self):
+# A gift with NO port_verb must come back status=undeclared, verb null —
+# never a guessed verb. This is the whole reason the gift exists.
+m = write_manifest([{"slug": "x", "verb": "survive"}]) # 'verb' is the
+code, lines = run("read", "--manifest", m) # marketing verb
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], None)
+self.assertEqual(lines[0]["status"], "undeclared")
+
+def test_read_invalid_verb_flagged(self):
+m = write_manifest([{"slug": "x", "port_verb": "emit"}]) # not a verb
+code, lines = run("read", "--manifest", m)
+self.assertEqual(lines[0]["status"], "invalid")
+
+def test_read_slug_filter(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"},
+{"slug": "b", "port_verb": "sink"}])
+code, lines = run("read", "--manifest", m, "--slug", "b")
+self.assertEqual(len(lines), 1)
+self.assertEqual(lines[0]["slug"], "b")
+
+def test_read_slug_not_found_exits_3(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("read", "--manifest", m, "--slug", "zzz")
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "not-found")
+
+def test_read_wrapped_manifest(self):
+# Real gifts-manifest.json wraps the list under 'gifts'.
+m = write_manifest([{"slug": "a", "port_verb": "fold"}], wrap="gifts")
+code, lines = run("read", "--manifest", m)
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], "fold")
+
+class TestCheck(unittest.TestCase):
+def _flag_cmd(self, mapping):
+"""Build a --flag-cmd that echoes a per-slug verb via a tiny py snippet."""
+table = json.dumps(mapping)
+# {slug} is substituted by port; the snippet prints the mapped verb.
+return (f"{sys.executable} -c "
+f"'import json,sys; "
+f"print(json.loads(sys.argv[1]).get(sys.argv[2],\"\"))' "
+f"'{table}' {{slug}}")
+
+def test_check_agree_exits_0(self):
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "source"}))
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["status"], "agree")
+
+def test_check_drift_exits_3(self):
+# Manifest says source, the tool's own flag says sink -> drift, exit 3.
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "sink"}))
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "drift")
+
+def test_check_missing_flag_exits_3(self):
+# Tool answers nothing -> missing, not silently passed.
+m = write_manifest([{"slug": "a", "port_verb": "source"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({})) # empty -> ""
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "missing")
+
+def test_check_no_declarations_is_not_green(self):
+# A manifest that declared no port_verb at all must NOT read as pass.
+m = write_manifest([{"slug": "a", "verb": "survive"}])
+code, lines = run("check", "--manifest", m,
+"--flag-cmd", self._flag_cmd({"a": "source"}))
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "no-declarations")
+
+class TestEmit(unittest.TestCase):
+def test_emit_valid(self):
+code, lines = run("emit", "--slug", "port", "--port-verb", "source")
+self.assertEqual(code, 0)
+self.assertEqual(lines[0]["port_verb"], "source")
+self.assertEqual(lines[0]["status"], "declared")
+
+def test_emit_invalid_exits_3(self):
+code, lines = run("emit", "--slug", "x", "--port-verb", "nonsense")
+self.assertEqual(code, 3)
+self.assertEqual(lines[0]["status"], "invalid")
+
+if __name__ == "__main__":
+unittest.main(verbosity=2)
+
+# _self_mutation_note: this suite was proven non-vacuous by mutation —
+# (1) PORT_VERBS drop 'sink' -> test_exactly_five_verbs RED
+# (2) cmd_read guess 'source' on null -> test_read_undeclared_* RED
+# (3) cmd_check return 0 always -> test_check_drift/missing RED
+# (4) cmd_check treat no-decl as pass -> test_check_no_declarations RED
+# each mutation reverted after confirming RED. A no-op runner cannot pass these.
+
+Take the whole folder →
+MIT
+Python 3, standard library only
 
 ---

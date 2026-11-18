@@ -46,6 +46,19 @@ sha256Hex('abc');
 // 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
 ```
 
+### Raw bytes in
+
+A string is hashed as its UTF-8, so binary input -- a previous digest joined to new
+bytes, as a hash chain does -- cannot travel through one. For that, pass bytes:
+
+```js
+const { sha256Bytes } = require('./sha256.js');
+sha256Bytes(Uint8Array.of(0, 255, 128));   // a 32-byte Uint8Array, = Node's createHash('sha256').update(Buffer.from(bytes)).digest()
+```
+
+In a browser it is `window.ForestGifts.sha256Bytes`. `sha256Hex(str)` is the same
+compression over the UTF-8 of `str`, so the two never disagree.
+
 ## Its edge (a gift that hides its edges is not a gift)
 
 This is a **hash**, not an HMAC and not encryption. It proves that two inputs
@@ -60,11 +73,14 @@ synchronicity is not a constraint, prefer it.
 
 ```sh
 node test_sha256.js
+node test_sha256_bytes.js
 ```
 
 18 vectors cross-checked against Node's `crypto` (including multibyte + emoji),
 the two canonical FIPS anchors, determinism, coercion parity, and a
-mutation-bite that fails loudly if the core is wrong. stdlib only, no
+mutation-bite that fails loudly if the core is wrong. `test_sha256_bytes.js` holds the
+raw-bytes entry point to Node's `crypto` on every byte value, every length across the
+padding boundaries (0..200), seeded binary, and a hash-chain step. stdlib only, no
 dependencies.
 
 ## License

@@ -68,6 +68,28 @@ gift's trace-id-and-ledger idea (tracebus is a routed message bus with a
 replayable ledger) applied to a **linear ordered run** instead of a fanned-out
 bus: a different shape, the same honesty about leaving a receipt.
 
+## Loops
+
+A stage can run as a **bounded loop** of itself — each pass fed the last pass's output. In a `--stage` token, write
+the slug as `slug*N`:
+
+```
+conductor run --stage seed:source:'python3 seed.py' --stage 'step*5:transform:python3 step.py'
+```
+
+For a fold that is closed under its own I/O (like `life-fold`), or to stop at the first pass that repeats its input,
+give the stage as JSON with a `loop` object:
+
+```
+{"slug": "life", "port_verb": "fold", "cmd": ["node", "life-fold.js"], "loop": {"passes": 200, "closed": true, "until": "fixed"}}
+```
+
+The rule is the `loop` gift's: a `transform` or `filter` can be looped; a `fold` only when `closed`; a `source` or
+`sink` never; the bound runs from 1 to 1,000,000. An illegal loop is refused before anything runs (exit 3). Every
+pass is its own ledger record, and a `loop-end` record says why the loop stopped — `bound`, `fixed` or `failed`. A loop
+asked to run `until fixed` that hits its bound first is recorded `settled: false`: the output still flows on, and the
+record says it never settled.
+
 ## The honest ceiling
 
 conductor **runs the commands you give it** — it is exactly as safe as the

@@ -1,0 +1,1795 @@
+# Loop MMT — corpus shard 98/99
+
+> Bundle 98 of 99 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+
+Nodes in this shard: 2 (/gifts/water-oracle/, /gifts/weir/)
+
+---
+
+# Water Oracle — a Loop MMT gift
+https://loopmmt.com/gifts/water-oracle/
+[coverage: optional · branch: gifts]
+
+Where Does the Rain End Up? Every Puddle, Every Lake, Exactly. settle ← all gifts
+
+Water Oracle
+
+Exact fill-and-spill on a grid of heights. Give it the ground and the water on each cell; it runs every drop downhill, fills each hollow to its brim, spills what a full hollow cannot hold over its lowest rim, merges hollows whose water meets, and sends what reaches the edge out (or any cell you name as an outlet, like a sea). You get each lake's cells, its whole stock and its exact waterline as a fraction, and how much left. Where water has equally low ways out it divides evenly, round-robin. Integers that conserve, checked on every run; the same answer whatever order and whatever parcels the water is routed in. Built as the second opinion a game's water router is checked against. Python stdlib only, offline, deterministic.
+
+The honest edge
+
+water-oracle says where still water comes to rest on a grid of heights; it does not model flow over time, rain rates, soaking into the ground, evaporation or ice, and it does not say how fast anything happens — only where the water ends up once everything has run.
+
+Run it
+
+python3 water-oracle.py --selftest && python3 water-oracle.py settle case.json
+test_water-oracle.py (54/54: hand cases, the tie cases, the carry (pointers from one lot-day to the next, order-free, the day split invisible), the outlets (interior cells that drain like the edge: a sea), and properties over 300 seeded grids plus 120 wide ones — conservation, order- and batching-independence, no lake above a dry neighbour, each lake one connected body, more water never leaves less) + --selftest (5/5) + conformance GREEN 28/28 against an amber-sealed Plumb v5
+Python stdlib only, deterministic
+
+The code — every file that ships
+
+water-oracle.py 593 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+water-oracle — where does the water settle? Exact fill-and-spill on a height grid.
+
+Give it a grid of ground heights and the water standing on each cell (both whole numbers, in one unit of depth per
+cell). It runs every drop downhill, fills each hollow to its brim, spills what a full hollow cannot hold over its
+lowest rim, merges hollows whose water meets, and sends what reaches the grid's edge out. It returns where every unit
+ended up: each lake's cells, its whole stock, its exact (fractional) waterline and whether it stands at its rim, and how much
+left over the edge. A lake is a connected body of wet cells — the water, never the bookkeeping that filled it.
+
+It exists to be the OTHER code — the truth a game's water router is checked against (The Plat, plan §3.16: "the water
+oracle is separate code", written from the terrain and the stocks alone, never from the router). Its answer depends
+only on the heights and the water: route the drops in any order and the result is byte-identical.
+
+WHAT IT IS (and is not)
+Integer in, integer out. Stocks are whole units and conserve exactly: water in = lake stock + out, always (checked
+on every run). A waterline is the exact rational level whose storage equals the stock (storage(h) = sum over the
+lake's cells of max(0, h - ground)) — never a float. Four-neighbour grid; the grid's edge cells are its outlets
+(water on an edge cell leaves). Water runs to the lowest lower neighbour. Where there are equally low ways out it
+is dealt round-robin (Plumb v3, The Plat tie rule): each tie keeps a pointer over its ways in (height, row, column)
+order and each unit takes the pointed way, so over n units a k-way tie gives way i (0-based) (n + k - 1 - i) // k.
+The same holds at a full hollow's equally low spill cells and at a level flat's exits (a flat of touching pits is
+one hollow with one pointer over all its exits). Only the total through a tie decides its split, so parcels may be
+routed in any order and in any sizes and the answer is the same (the rotor-router's abelian property).
+
+DAY AFTER DAY (Plumb v4, the tie note v1.3)
+Pass `pointers` (a JSON object, possibly empty) and the tie pointers carry from one settle to the next, so splitting
+water across days never changes where it rests. The answer then also gives `pointers`: the day's water routed once
+more, parcel by parcel, through the network the settle ended with (every lake at its final region, every merge
+made), from the pointers carried in. A tie whose ways come to rest in more than one place on that network carries the
+pointer that pass leaves it; any other node keeps the pointer it came in with. Names are the terrain's:
+"cell r,c|w;w" (a cell and its equally low ways) and "lake r,c|s;s" (a full hollow by its lowest cell, and its spill
+cells). Without `pointers` the answer is v3's, byte for byte, save its version.
+
+OUTLETS (Plumb v5)
+Pass `outlets` (a list of [row, column] cells) and each named cell drains exactly as an edge cell does: water that
+reaches it leaves and is counted in `out`, it is never part of a lake, and a hollow whose lowest rim touches it
+spills into it. A sea is the usual case: name its cells and every river that reaches it leaves the land. Without
+`outlets` (or with an empty list) the answer is v4's, byte for byte, save its version.
+
+USAGE
+water-oracle.py settle CASE.json the settled state as canonical JSON (exit 0; 2 a malformed case)
+water-oracle.py --selftest the built-in battery (exit 0 all pass)
+CASE.json: {"heights": [[int,...],...], "water": [[int >= 0,...],...]} (same rectangular shape)
+optional "pointers": {"cell r,c|w;w": int, "lake r,c|s;s": int,...} (v4: carried pointers)
+optional "outlets": [[row, column],...] (v5: interior cells that drain like the edge)
+
+THE PRINTED EDGE
+water-oracle says where still water comes to rest on a grid of heights; it does not model flow over time, rain
+rates, soaking into the ground, evaporation or ice, and it does not say how fast anything happens — only where the
+water ends up once everything has run.
+
+MIT License. Python 3 standard library only. No network, no randomness, no clock.
+"""
+import json
+import sys
+from fractions import Fraction
+
+PRINTED_EDGE = ("water-oracle says where still water comes to rest on a grid of heights; it does not model flow over "
+"time, rain rates, soaking into the ground, evaporation or ice, and it does not say how fast anything "
+"happens — only where the water ends up once everything has run.")
+VERSION = "v5"
+EDGE = "edge"
+STEP_BUDGET = 8 # parcel steps per cell per unit (+1): measured worst 0.074 over 3,000 grids — a guard, not a proof
+
+class CaseError(ValueError):
+pass
+
+def _whole(x):
+return isinstance(x, int) and not isinstance(x, bool)
+
+def _check(heights, water):
+if not (isinstance(heights, list) and heights and all(isinstance(r, list) and r for r in heights)):
+raise CaseError("heights is a non-empty list of non-empty rows")
+cols = len(heights[0])
+if any(len(r)!= cols for r in heights):
+raise CaseError("heights is rectangular: every row the same length")
+if not all(_whole(x) for r in heights for x in r):
+raise CaseError("every height is a whole number (not a boolean)")
+if not (isinstance(water, list) and len(water) == len(heights) and all(isinstance(r, list) and len(r) == cols
+for r in water)):
+raise CaseError("water has the same shape as heights")
+if not all(_whole(x) and x >= 0 for r in water for x in r):
+raise CaseError("every water amount is a whole number >= 0")
+
+def storage(level, ground):
+"""Water held over cells of ground heights `ground` when it stands at `level`."""
+return sum(level - g for g in ground if level > g)
+
+def waterline(stock, ground):
+"""The exact level whose storage equals `stock` (a Fraction): with the k lowest cells under water,
+(stock + their heights) / k for the k whose span holds it."""
+hs = sorted(ground)
+if stock <= 0:
+return Fraction(hs[0])
+run = 0
+for k in range(1, len(hs) + 1):
+run += hs[k - 1]
+w = Fraction(stock + run, k)
+if k == len(hs) or w <= hs[k]:
+return w
+
+class _Rotor(dict):
+"""Tie pointers that remember which nodes a deal wrote this settle (v4): a carried pointer no deal touched passes
+through the lot-day unchanged."""
+def __init__(self, start=()):
+super().__init__(start)
+self.touched = set()
+
+def __setitem__(self, node, p):
+self.touched.add(node)
+super().__setitem__(node, p)
+
+class _Settle:
+def __init__(self, heights, outlets=frozenset()):
+self.h = heights
+self.outlets = outlets # v5: interior cells that drain like the grid's edge (a sea, a sink); empty by default
+self.R, self.C = len(heights), len(heights[0])
+self.owner = {} # cell -> lake id (cells under a lake's water or draining into it)
+self.lakes = {} # id -> {"region": set, "stock": int, "brim": int | None, "spills": [cell] | None}
+self.alias = {} # merged lake id -> the id it merged into
+self.rotor = _Rotor() # tie node -> its pointer (v4: carried in from the last lot-day only when asked)
+self.next_id = 0
+self.lowc = {} # lake id -> its lowest cell in key order (a pit: the name every Gift agrees on)
+self.out = 0
+self.steps = 0
+self.budget = STEP_BUDGET
+
+def g(self, c):
+return self.h[c[0]][c[1]]
+
+def key(self, c):
+return (self.g(c), c[0], c[1])
+
+def edge(self, c):
+return c[0] in (0, self.R - 1) or c[1] in (0, self.C - 1) or c in self.outlets
+
+def nbrs(self, c):
+r, k = c
+for dr, dk in ((-1, 0), (0, -1), (0, 1), (1, 0)):
+if 0 <= r + dr < self.R and 0 <= k + dk < self.C:
+yield (r + dr, k + dk)
+
+def find(self, lid):
+while lid in self.alias:
+lid = self.alias[lid]
+return lid
+
+def lake_at(self, c):
+lid = self.owner.get(c)
+return None if lid is None else self.find(lid)
+
+def ways(self, c, exclude=frozenset()):
+"""The equally lowest strictly lower neighbours of c (outside `exclude`), in key order; [] for none."""
+lower = [n for n in self.nbrs(c) if n not in exclude and self.g(n) < self.g(c)]
+if not lower:
+return []
+m = min(self.g(n) for n in lower)
+return sorted((n for n in lower if self.g(n) == m), key=self.key)
+
+def deal(self, node, ways, v):
+"""Deal v units over `ways` round-robin from the node's pointer; advance it. -> [(way, units > 0)]."""
+k = len(ways)
+if k == 1:
+return [(ways[0], v)]
+p = self.rotor.get(node, 0)
+self.rotor[node] = (p + v) % k
+return [(w, n) for i, w in enumerate(ways) for n in ((v + k - 1 - (i - p) % k) // k,) if n]
+
+def lake_node(self, lid, spills):
+"""A lake's spill tie, named by its lowest cell and its spills (v4): the terrain's name for it, the same in
+every Gift and every lot-day, where a lake id is only a construction number."""
+if lid not in self.lowc:
+self.lowc[lid] = min(self.lakes[lid]["region"], key=self.key)
+return ("lake", self.lowc[lid], tuple(spills))
+
+def decides(self, node, memo):
+"""Is `node` a tie on this settle's network (a dry cell's equally low ways, a full lake's spill cells, or a
+spill cell's ways outside its lake) whose ways come to rest in more than one place?"""
+kind, c, ws = node
+if kind == "lake":
+lid = self.lake_at(c)
+if lid is None or not self.full(lid) or self.lake_node(lid, self.lakes[lid]["spills"])!= node:
+return False
+elif self.lake_at(c) is None:
+if tuple(self.ways(c))!= ws and not any(
+c in (L["spills"] or ()) and tuple(self.ways(c, L["region"])) == ws for L in self.lakes.values()):
+return False
+else:
+return False
+return len(self.places(node, memo)) > 1
+
+def places(self, node, memo):
+"""Where the ways of a tie node come to rest on this settle's network: a tie DECIDES only if more than one."""
+if node[0] == "lake":
+lid = self.lake_at(node[1])
+out = set()
+for s in node[2]:
+if self.edge(s):
+out.add(EDGE)
+elif self.lake_at(s) is not None:
+out.add(self.lake_at(s))
+else:
+for w in self.ways(s, self.lakes[lid]["region"] if lid is not None else frozenset()):
+out |= self.terminals(w, memo)
+return out
+return set().union(*(self.terminals(w, memo) for w in node[2]))
+
+def seed(self):
+"""Every flat of touching pits (cells with no lower neighbour) is one lake from the start, fixed by the
+terrain: a lake that rises to it spills into it, never swallows it, so no tie changes hands with the water."""
+for c in sorted((r, k) for r in range(self.R) for k in range(self.C)):
+if self.edge(c) or c in self.owner or self.ways(c):
+continue
+lid, todo = self.new_lake(c), [c]
+while todo:
+x = todo.pop()
+for n in self.nbrs(x):
+if n not in self.owner and not self.edge(n) and not self.ways(n):
+self.lakes[lid]["region"].add(n)
+self.owner[n] = lid
+todo.append(n)
+
+def new_lake(self, c):
+lid = self.next_id
+self.next_id += 1
+self.lakes[lid] = {"region": {c}, "stock": 0, "brim": None, "spills": None}
+self.owner[c] = lid
+return lid
+
+def merge(self, ids):
+"""A trapped ring of full lakes becomes one new lake (a new id, so no tie pointer carries over)."""
+lid = self.next_id
+self.next_id += 1
+M = {"region": set(), "stock": 0, "brim": None, "spills": None}
+for other in sorted(self.find(i) for i in ids):
+O = self.lakes.pop(other)
+M["region"] |= O["region"]
+M["stock"] += O["stock"]
+self.alias[other] = lid
+for c in M["region"]:
+self.owner[c] = lid
+self.lakes[lid] = M
+return lid
+
+def fill(self, lid):
+"""Grow lake lid until its stock fits under its lowest rim. -> (excess, spill cells) or (0, []).
+At the rim height every rim cell that drains only into this lake is taken in (it holds nothing at that level),
+so the spill set is every rim cell at that height that is an edge cell, has a strictly lower way out, or is
+another lake's cell (a flat this lake has risen to). No way out leads back into this lake: such a path would
+need a rim cell lower than the rim."""
+L = self.lakes[lid]
+while True:
+frontier = {n for c in L["region"] for n in self.nbrs(c)} - L["region"]
+rim_h = min(self.g(b) for b in frontier)
+cap = storage(rim_h, [self.g(c) for c in L["region"]])
+if L["stock"] < cap:
+L["brim"], L["spills"] = None, None
+return 0, []
+rim = [b for b in frontier if self.g(b) == rim_h]
+grow = [b for b in rim if not self.edge(b) and self.lake_at(b) is None and self.ways(b)
+and not self.ways(b, L["region"])] # drains into this lake and nowhere else: its catchment
+if grow:
+for b in grow:
+L["region"].add(b)
+self.owner[b] = lid
+continue
+excess, L["stock"], L["brim"] = L["stock"] - cap, cap, rim_h
+L["spills"] = sorted(rim, key=self.key)
+return excess, L["spills"]
+
+def full(self, lid):
+return self.lakes[lid]["spills"] is not None
+
+def terminals(self, c, memo):
+"""Where water set down at c can come to rest first, over every branch of every tie."""
+if c in memo:
+return memo[c]
+if self.edge(c):
+t = {EDGE}
+elif self.lake_at(c) is not None:
+t = {self.lake_at(c)}
+else:
+ws = self.ways(c)
+t = {("pit", c)} if not ws else set().union(*(self.terminals(w, memo) for w in ws))
+memo[c] = t
+return t
+
+def after(self, lid, memo):
+"""Where a full lake's excess can come to rest first."""
+L, out = self.lakes[lid], set()
+for s in L["spills"]:
+if self.edge(s):
+out.add(EDGE)
+elif self.lake_at(s) is not None:
+out.add(self.lake_at(s))
+else:
+for w in self.ways(s, L["region"]):
+out |= self.terminals(w, memo)
+return out
+
+def trapped(self, lid):
+"""The ring a full lake is trapped in — the set of full lakes reachable from it, when none of them has a way
+to anything but each other and each can reach lid back — else None (its water leaves by the rotors)."""
+if not self.full(lid):
+return None
+memo, reach, todo, succ = {}, {lid}, [lid], {}
+while todo:
+x = todo.pop()
+succ[x] = self.after(x, memo)
+for y in succ[x]:
+if y == EDGE or isinstance(y, tuple) or not self.full(y):
+return None
+if y not in reach:
+reach.add(y)
+todo.append(y)
+back, todo = {lid}, [lid]
+while todo:
+y = todo.pop()
+for x in reach:
+if x not in back and y in succ[x]:
+back.add(x)
+todo.append(x)
+return reach if back == reach else None
+
+def route(self, c, v):
+stack = [(c, v, ())] # parcels still running: (cell, units, full lakes passed)
+while stack:
+c, v, path = stack.pop()
+while v > 0:
+self.steps += 1
+if self.steps > self.budget: # fail loud, never spin: water that does not settle
+raise AssertionError("water that never settles (step budget spent)")
+if self.edge(c):
+self.out += v
+break
+lid = self.lake_at(c)
+if lid is None:
+ws = self.ways(c)
+if len(ws) == 1:
+c = ws[0]
+continue
+if ws: # a fork: deal the parcel over its equal ways
+stack.extend((w, n, path) for w, n in self.deal(("cell", c, tuple(ws)), ws, v))
+break
+lid = self.new_lake(c)
+path = tuple(self.find(x) for x in path)
+if lid in path: # back at a full lake: a ring, if nothing gets out of it
+ring = self.trapped(lid)
+if ring and len(ring) > 1:
+lid = self.merge(ring)
+path = tuple(x for x in path if x not in ring)
+self.lakes[lid]["stock"] += v
+v, spills = self.fill(lid)
+if v == 0:
+break
+path = path + (lid,)
+region = self.lakes[lid]["region"]
+for s, n in self.deal(self.lake_node(lid, spills), spills, v):
+if self.edge(s):
+self.out += n
+elif self.lake_at(s) is not None: # the rim reaches another lake (a flat): into it
+stack.append((s, n, path))
+else: # the tie is the cell and its ways, whoever spilled
+ws = self.ways(s, region)
+stack.extend((w, m, path) for w, m in self.deal(("cell", s, tuple(ws)), ws, n))
+break
+
+def _outlets(heights, outlets):
+"""v5: the outlet cells as a frozenset of (row, column); None or [] for none. Each is a [row, column] pair of whole
+numbers inside the grid; a repeated cell is one outlet."""
+if outlets is None:
+return frozenset()
+if not isinstance(outlets, list):
+raise CaseError("outlets is a list of [row, column] cells")
+out = set()
+for c in outlets:
+if not (isinstance(c, list) and len(c) == 2 and all(_whole(x) for x in c)):
+raise CaseError("each outlet is a [row, column] pair of whole numbers")
+if not (0 <= c[0] < len(heights) and 0 <= c[1] < len(heights[0])):
+raise CaseError("every outlet is a cell inside the grid")
+out.add((c[0], c[1]))
+return frozenset(out)
+
+def settle(heights, water, order=None, parcels=None, pointers=None, outlets=None):
+"""-> the settled state (a dict of plain JSON types). `order` (a permutation of the cells) and `parcels` (a list of
+(row, column, units) whose units sum to each cell's water) are for the battery's order- and batching-independence
+checks; the answer must depend on neither. `pointers` (v4) carries the tie pointers in from the last lot-day: the
+answer then also carries them out (`pointers`), by the tie note v1.3's statement; without it the answer is v3's.
+`outlets` (v5) names interior cells that drain like the grid's edge: water reaching one leaves, and a lake that
+meets one at its rim spills into it. Without it (or with []) the answer is v4's."""
+_check(heights, water)
+outs = _outlets(heights, outlets)
+s = _Settle(heights, outs)
+cells = [(r, c) for r in range(s.R) for c in range(s.C)]
+if parcels is None:
+parcels = [(r, c, water[r][c]) for r, c in (order or cells)]
+else:
+given = [[0] * s.C for _ in range(s.R)]
+for r, c, v in parcels:
+given[r][c] += v
+if given!= water:
+raise CaseError("the parcels do not add up to the water")
+if pointers is not None:
+s.rotor = _Rotor(_rotor_in(pointers))
+s.seed()
+s.budget = STEP_BUDGET * s.R * s.C * (sum(map(sum, water)) + 1)
+for r, c, v in parcels:
+s.route((r, c), v)
+res = _answer(s, water)
+if pointers is None:
+return res
+# The carry (v4, the tie note v1.3): route the day's water again, parcel by parcel in key order, through the network
+# this settle ended with — every merge it made fixed from the start — from the pointers carried in. The pointers
+# that pass leaves at every tie that DECIDES on that network are the day's carried pointers.
+t = _Settle(heights, outs)
+t.rotor = _Rotor(_rotor_in(pointers))
+t.seed()
+for lid in sorted(s.lakes): # the network the settle ended with: every wet lake at its
+L = s.lakes[lid] # final region, every merge made, before any water moves
+if not L["stock"]:
+continue
+ids = sorted({t.lake_at(c) for c in L["region"] if t.lake_at(c) is not None})
+tid = t.new_lake(min(L["region"])) if not ids else ids[0] if len(ids) == 1 else t.merge(ids)
+for c in L["region"]:
+t.lakes[tid]["region"].add(c)
+t.owner[c] = tid
+t.budget = s.budget
+for r, c in cells_in_order(t):
+t.route((r, c), water[r][c])
+if _answer(t, water)!= res:
+raise AssertionError("the carry pass does not land the water where the settle did")
+memo, out, start = {}, {}, _rotor_in(pointers)
+for node in set(start) | t.rotor.touched: # a tie that decides today carries today's pointer; any other
+p = t.rotor[node] if t.decides(node, memo) else start.get(node, 0) # keeps the one it came in with
+if p:
+out[_node_name(node)] = p
+res["pointers"] = dict(sorted(out.items()))
+return res
+
+def cells_in_order(s):
+return [(r, c) for r in range(s.R) for c in range(s.C)]
+
+def _cell(x):
+return f"{x[0]},{x[1]}"
+
+def _node_name(node):
+"""'cell r,c|w;w' for a cell's tie (a spill cell's included: the cell and its ways, whoever spilled), 'lake r,c|s;s'
+for a lake's spill tie by its lowest cell. Plain strings, so the carried state is JSON and Gift-neutral."""
+return f"{node[0]} {_cell(node[1])}|" + ";".join(_cell(w) for w in node[2])
+
+def _rotor_key(name):
+try:
+kind, rest = name.split(" ", 1)
+head, tail = rest.split("|", 1)
+cell = tuple(int(x) for x in head.split(","))
+ways = tuple(tuple(int(x) for x in w.split(",")) for w in tail.split(";"))
+except (ValueError, AttributeError):
+raise CaseError(f"a carried pointer's name that is not one: {name!r}")
+if kind not in ("cell", "lake"):
+raise CaseError(f"a carried pointer's name that is not one: {name!r}")
+return (kind, cell, ways)
+
+def _rotor_in(pointers):
+rotor = {}
+for name, p in pointers.items():
+key = _rotor_key(name)
+if not isinstance(p, int) or isinstance(p, bool) or not 0 <= p < len(key[2]):
+raise CaseError(f"a carried pointer that is not one: {name!r}: {p!r}")
+rotor[key] = p
+return rotor
+
+def _answer(s, water):
+total = sum(map(sum, water))
+depth = [["0"] * s.C for _ in range(s.R)]
+level_at = {} # wet cell -> its water's level
+for L in s.lakes.values():
+if L["stock"] == 0:
+continue
+ground = [s.g(c) for c in L["region"]]
+level = Fraction(L["brim"]) if L["brim"] is not None else waterline(L["stock"], ground)
+assert storage(level, ground) == L["stock"], "a waterline that does not hold its stock"
+for c in L["region"]:
+if level > s.g(c):
+assert c not in level_at, "one cell under two lakes"
+level_at[c] = level
+# The answer is the WATER, not the bookkeeping: a lake is a 4-connected body of wet cells. Two bodies standing at
+# one level and meeting only at a dry sill exactly at that level are two lakes, however the fill reached them
+# (S06.1927: 31 of 20,000 random grids told the two merges apart only in how they grouped such bodies).
+lakes, seen = [], set()
+for start in sorted(level_at):
+if start in seen:
+continue
+body, stack = [], [start]
+seen.add(start)
+while stack:
+c = stack.pop()
+body.append(c)
+for n in s.nbrs(c):
+if n in level_at and n not in seen:
+assert level_at[n] == level_at[c], "touching water at two levels"
+seen.add(n)
+stack.append(n)
+body.sort()
+level = level_at[start]
+stock = Fraction(storage(level, [s.g(c) for c in body]))
+assert stock.denominator == 1, "a lake of fractional stock"
+rim = any(n not in level_at and s.g(n) == level for c in body for n in s.nbrs(c))
+for c in body:
+depth[c[0]][c[1]] = str(level - s.g(c))
+lakes.append({"cells": [list(c) for c in body], "stock": int(stock), "level": str(level), "at_rim": rim})
+held = sum(x["stock"] for x in lakes)
+assert held + s.out == total, "water was made or lost"
+return {"oracle": "water-oracle", "version": VERSION, "water_in": total, "out": s.out, "lakes": lakes,
+"depth": depth}
+
+def canonical(result):
+return json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+SELFTEST = [
+# (name, heights, water, expected out, expected [(stock, level)] by lake)
+("a one-cell hollow holds what fits below its rim",
+[[9, 9, 9], [9, 0, 9], [9, 9, 9]], [[0, 0, 0], [0, 5, 0], [0, 0, 0]], 0, [(5, "5")]),
+("at the brim exactly, nothing leaves",
+[[9, 9, 9], [9, 0, 9], [9, 9, 9]], [[0, 0, 0], [0, 9, 0], [0, 0, 0]], 0, [(9, "9")]),
+("over the brim, exactly the excess leaves",
+[[9, 9, 9], [9, 0, 9], [9, 9, 9]], [[0, 0, 0], [0, 12, 0], [0, 0, 0]], 3, [(9, "9")]),
+("water on an edge cell leaves", [[0, 0], [0, 0]], [[1, 2], [3, 4]], 10, []),
+("a shelf inside a hollow goes under once the water rises past it",
+[[9, 9, 9, 9], [9, 0, 2, 9], [9, 0, 9, 9], [9, 9, 9, 9]], [[0, 0, 0, 0], [0, 6, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+0, [(6, "8/3")]),
+]
+
+def selftest():
+bad = 0
+for name, h, w, out, lakes in SELFTEST:
+r = settle(h, w)
+got = (r["out"], [(x["stock"], x["level"]) for x in r["lakes"]])
+ok = got == (out, lakes)
+cells = [(i, j) for i in range(len(h)) for j in range(len(h[0]))]
+ok = ok and canonical(settle(h, w, list(reversed(cells)))) == canonical(r)
+print(("PASS " if ok else "FAIL ") + name + ("" if ok else f" — got {got}"))
+bad += not ok
+print(f"water-oracle selftest: {len(SELFTEST) - bad}/{len(SELFTEST)}")
+return 0 if bad == 0 else 1
+
+def main(argv=None):
+a = sys.argv[1:] if argv is None else argv
+if a[:1] == ["--selftest"]:
+return selftest()
+if a[:1] in (["--help"], ["-h"]):
+print(__doc__.strip())
+return 0
+if len(a)!= 2 or a[0]!= "settle":
+print(__doc__.split("USAGE")[1].split("THE PRINTED EDGE")[0].strip(), file=sys.stderr)
+return 2
+try:
+with open(a[1], encoding="utf-8") as fh:
+case = json.load(fh)
+if not isinstance(case, dict):
+raise CaseError("a case is a JSON object with heights and water")
+ptr = case.get("pointers")
+if ptr is not None and not isinstance(ptr, dict):
+raise CaseError("pointers is a JSON object of carried tie pointers")
+print(canonical(settle(case.get("heights"), case.get("water"), pointers=ptr, outlets=case.get("outlets"))))
+except (OSError, ValueError, CaseError, AttributeError) as e:
+print(f"water-oracle: {e}", file=sys.stderr)
+return 2
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_water-oracle.py 512 lines on GitHub →
+# SPDX-License-Identifier: MIT
+"""test_water-oracle.py — the external battery for the water-oracle gift. Each test's name is the behaviour it holds.
+
+python3 -m unittest test_water-oracle (from this folder; WATER_ORACLE_UNDER_TEST points it at a mutant copy)
+"""
+import importlib.util
+import os
+import random
+import unittest
+from fractions import Fraction
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location(
+"water_oracle", os.environ.get("WATER_ORACLE_UNDER_TEST") or os.path.join(HERE, "water-oracle.py"))
+W = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(W)
+
+def ring(n, inside):
+"""An n x n grid of 9s with the given interior heights (a dict (r, c) -> h)."""
+h = [[9] * n for _ in range(n)]
+for (r, c), v in inside.items():
+h[r][c] = v
+return h
+
+def wet(n, at):
+w = [[0] * n for _ in range(n)]
+for (r, c), v in at.items():
+w[r][c] = v
+return w
+
+def summary(res):
+return res["out"], [(x["stock"], x["level"], x["at_rim"]) for x in res["lakes"]]
+
+def grid(rng, rows, cols, lo=0, hi=6, water=4):
+return ([[rng.randint(lo, hi) for _ in range(cols)] for _ in range(rows)],
+[[rng.choice([0, 0, rng.randint(0, water)]) for _ in range(cols)] for _ in range(rows)])
+
+class HandCases(unittest.TestCase):
+def test_below_the_brim_nothing_spills(self):
+self.assertEqual(summary(W.settle(ring(3, {(1, 1): 0}), wet(3, {(1, 1): 8}))), (0, [(8, "8", False)]))
+
+def test_at_the_spill_exactly_the_excess_leaves(self):
+self.assertEqual(summary(W.settle(ring(3, {(1, 1): 0}), wet(3, {(1, 1): 10}))), (1, [(9, "9", True)]))
+
+def test_a_lowered_lip_holds_less_and_spills_the_difference(self):
+h = ring(3, {(1, 1): 0})
+h[0][1] = 6 # the lip edit: one rim cell lowered from 9 to 6
+self.assertEqual(summary(W.settle(h, wet(3, {(1, 1): 8}))), (2, [(6, "6", True)]))
+self.assertEqual(summary(W.settle(h, wet(3, {(1, 1): 6}))), (0, [(6, "6", True)]))
+
+def test_two_hollows_meeting_at_a_sill_become_one_lake(self):
+h = [[9] * 5, [9, 0, 5, 0, 9], [9] * 5]
+w = [[0] * 5, [0, 20, 0, 0, 0], [0] * 5]
+self.assertEqual(summary(W.settle(h, w)), (0, [(20, "25/3", False)]))
+
+def test_a_perched_hollow_spills_into_a_lower_one_that_drains_out(self):
+h = [[9] * 5, [9, 0, 4, 0, 2], [9] * 5]
+w = [[0] * 5, [0, 20, 0, 0, 0], [0] * 5]
+self.assertEqual(summary(W.settle(h, w)), (14, [(4, "4", True), (2, "2", True)]))
+
+def test_two_bodies_at_one_level_meeting_at_a_dry_sill_are_two_lakes(self):
+# found S06.1927 by searching 20,000 random grids: the fill reaches these as one lake or two depending on
+# which merge fires; the answer is the water, and the water is two bodies at level 2 with a dry sill between
+h = [[4, 3, 2, 1], [6, 1, 2, 2], [2, 3, 2, 8], [0, 4, 0, 3], [1, 1, 5, 0], [4, 0, 1, 1], [1, 4, 1, 4]]
+w = [[0, 0, 0, 0], [0, 8, 0, 0], [1, 12, 6, 0], [0, 8, 8, 0], [0, 0, 0, 0], [7, 0, 2, 0], [11, 0, 0, 0]]
+self.assertEqual(summary(W.settle(h, w)), (59, [(1, "2", True), (2, "2", True), (1, "1", True)]))
+
+def test_water_on_a_flat_interior_runs_off_the_edge(self):
+self.assertEqual(summary(W.settle([[5] * 3] * 3, wet(3, {(1, 1): 7}))), (7, []))
+
+def test_water_on_a_slope_runs_down_into_the_hollow(self):
+h = [[9, 9, 9, 9], [9, 0, 3, 9], [9, 9, 9, 9]]
+w = [[0, 0, 0, 0], [0, 0, 2, 0], [0, 0, 0, 0]]
+self.assertEqual(summary(W.settle(h, w)), (0, [(2, "2", False)]))
+
+def test_a_negative_hollow_below_the_datum_holds_water(self):
+self.assertEqual(summary(W.settle(ring(3, {(1, 1): -4}), wet(3, {(1, 1): 3}))), (0, [(3, "-1", False)]))
+
+def test_the_waterline_is_exact_and_holds_its_stock(self):
+res = W.settle(ring(4, {(1, 1): 0, (1, 2): 1, (2, 1): 1, (2, 2): 2}), wet(4, {(1, 1): 5}))
+lv = Fraction(res["lakes"][0]["level"])
+self.assertEqual(W.storage(lv, [0, 1, 1, 2]), 5)
+
+def test_each_wet_cell_s_depth_is_the_level_less_its_ground(self):
+h = ring(4, {(1, 1): 0, (1, 2): 1, (2, 1): 1, (2, 2): 2})
+res = W.settle(h, wet(4, {(1, 1): 5}))
+lv = Fraction(res["lakes"][0]["level"])
+for r, c in res["lakes"][0]["cells"]:
+self.assertEqual(Fraction(res["depth"][r][c]), lv - h[r][c])
+self.assertEqual(res["depth"][0][0], "0")
+
+def test_a_malformed_case_is_refused(self):
+for h, w in (([[1, 2], [3]], [[0, 0], [0]]), ([[1]], [[-1]]), ([[True]], [[0]]), ([[1]], [[0, 0]])):
+with self.assertRaises(W.CaseError):
+W.settle(h, w)
+
+def test_help_starts_clean_and_prints_the_edge(self):
+import subprocess, sys
+r = subprocess.run([sys.executable, _spec.origin, "--help"], capture_output=True, text=True)
+self.assertEqual(r.returncode, 0)
+self.assertIn("THE PRINTED EDGE", r.stdout)
+
+def test_the_printed_edge_ships_in_the_file(self):
+with open(_spec.origin, encoding="utf-8") as fh:
+self.assertIn(W.PRINTED_EDGE[:60], " ".join(fh.read().split()))
+
+def fork(units):
+"""A trunk running east into a cell with two equally low ways out (north, south), each to its own deep hollow."""
+h = ring(7, {(3, 1): 6, (3, 2): 5, (3, 3): 4, (2, 3): 2, (4, 3): 2, (1, 3): -20, (5, 3): -20})
+return h, wet(7, {(3, 1): units})
+
+def stocks_at(res, *cells):
+return [next((x["stock"] for x in res["lakes"] if x["cells"] == [list(c)]), 0) for c in cells]
+
+class Ties(unittest.TestCase):
+"""The tie rule (the Plat's tie rule): equally low ways out share the water round-robin."""
+
+def test_at_a_fork_the_water_divides_evenly(self):
+self.assertEqual(stocks_at(W.settle(*fork(12)), (1, 3), (5, 3)), [6, 6])
+
+def test_at_a_fork_the_odd_unit_takes_the_first_way_in_key_order(self):
+self.assertEqual(stocks_at(W.settle(*fork(13)), (1, 3), (5, 3)), [7, 6])
+
+def test_a_full_hollow_divides_its_excess_between_equally_low_spill_cells(self):
+h = ring(7, {(3, 3): 0, (2, 3): 3, (4, 3): 3, (1, 3): -20, (5, 3): -20})
+self.assertEqual(stocks_at(W.settle(h, wet(7, {(3, 3): 7})), (1, 3), (5, 3)), [2, 2])
+
+def test_a_level_flat_divides_its_water_between_its_exits_wherever_it_lands(self):
+# a flat at 5 in row 3 (two pits between two exit cells); an exit at each end into its own deep hollow
+inside = {(3, c): 5 for c in range(2, 6)}
+inside.update({(3, 1): 4, (3, 6): 4, (2, 1): -20, (2, 6): -20})
+h = ring(8, inside)
+for land in ((3, 3), (3, 4)): # the two pits: one flat, one pointer over both exits
+res = W.settle(h, wet(8, {land: 10}))
+self.assertEqual(stocks_at(res, (2, 1), (2, 6)), [5, 5], land)
+res = W.settle(h, wet(8, {(3, 2): 10})) # an exit cell is no pit: its water runs down its own way
+self.assertEqual(stocks_at(res, (2, 1), (2, 6)), [10, 0])
+
+def test_a_tie_into_a_ring_that_has_a_way_out_does_not_merge_the_ring(self):
+# S06.2347, shrunk from a 20,000-grid search: lake A (around 2,3) spills over two equally low rim cells at 4 —
+# (1,5) into hollow C (1,6), whose only spill runs back into A, and (4,4) down into hollow D. A and C are a ring
+# with a way out, so nothing is trapped: the rotors drain the excess to D, A and C stay full at 4 over their
+# shared sill, and D holds the rest. Merging A and C (as if trapped) gets all three lakes wrong.
+T = 10
+h = [[T] * 8,
+[T, T, T, T, 3, 4, 2, T],
+[T, T, T, 0, 2, T, T, T],
+[T, T, T, T, 3, T, T, T],
+[T, T, 1, 0, 4, T, T, T],
+[T, T, 0, T, T, T, T, T],
+[T] * 8, [T] * 8]
+res = W.settle(h, wet(8, {(1, 4): 6, (2, 3): 7}))
+self.assertEqual(summary(res), (0, [(8, "4", True), (2, "4", True), (3, "4/3", False)]))
+
+def test_a_lake_rising_to_a_flat_spills_into_it_and_never_swallows_it(self):
+# S06.2347, shrunk from the confluence battery (seed 1233): the flat (1,2) deals its water two ways — off the
+# edge at (1,1) and down into hollow P at (2,3). If P, risen to 4, swallowed the flat, water landing there
+# would meet P's pointer instead of the flat's, and the answer would hang on how full P was when it came.
+T = 99
+h = [[T] * 7, [1, 4, 4, 4, T, T, T], [T, T, T, 2, T, T, T], [T, T, T, 3, 4, T, T], [T, T, T, T, 0, T, T]] + [[T] * 7] * 3
+w = [[0] * 7 for _ in range(8)]
+w[1][2], w[1][4] = 4, 2
+base = W.canonical(W.settle(h, w))
+for units in ([(1, 2, 1), (1, 4, 1), (1, 4, 1), (1, 2, 1), (1, 2, 1), (1, 2, 1)],
+[(1, 4, 2), (1, 2, 4)], [(1, 2, 4), (1, 4, 2)]):
+self.assertEqual(W.canonical(W.settle(h, w, parcels=units)), base, units)
+
+class Properties(unittest.TestCase):
+"""Over 300 seeded random grids — each a property the answer must have whatever the terrain."""
+CASES = [grid(random.Random(seed), 2 + seed % 5, 2 + (seed * 7) % 6) for seed in range(300)]
+
+def test_water_is_never_made_or_lost(self):
+for h, w in self.CASES:
+r = W.settle(h, w)
+self.assertEqual(sum(x["stock"] for x in r["lakes"]) + r["out"], sum(map(sum, w)))
+
+def test_one_parcel_of_n_settles_as_n_parcels_of_one_in_any_order(self):
+# the property the tie rule exists for: only the total through a tie decides its split
+for i, (h, w) in enumerate(self.CASES[:150]):
+base = W.canonical(W.settle(h, w))
+units = [(r, c, 1) for r in range(len(h)) for c in range(len(h[0])) for _ in range(w[r][c])]
+random.Random(7 * i).shuffle(units)
+self.assertEqual(W.canonical(W.settle(h, w, parcels=units)), base, (h, w))
+
+def test_any_split_of_the_water_into_parcels_settles_the_same(self):
+for i, (h, w) in enumerate(self.CASES[150:]):
+base, rng, parcels = W.canonical(W.settle(h, w)), random.Random(11 * i), []
+for r in range(len(h)):
+for c in range(len(h[0])):
+left = w[r][c]
+while left:
+take = rng.randint(1, left)
+parcels.append((r, c, take))
+left -= take
+rng.shuffle(parcels)
+self.assertEqual(W.canonical(W.settle(h, w, parcels=parcels)), base, (h, w))
+
+def test_parcels_that_do_not_add_up_to_the_water_are_refused(self):
+with self.assertRaises(W.CaseError):
+W.settle([[1, 1, 1]] * 3, wet(3, {(1, 1): 2}), parcels=[(1, 1, 1)])
+
+def test_the_answer_does_not_depend_on_the_order_the_water_is_routed(self):
+for i, (h, w) in enumerate(self.CASES[:120]):
+base = W.canonical(W.settle(h, w))
+cells = [(r, c) for r in range(len(h)) for c in range(len(h[0]))]
+for k in range(4):
+random.Random(i * 31 + k).shuffle(cells)
+self.assertEqual(W.canonical(W.settle(h, w, list(cells))), base, (h, w))
+
+def test_no_lake_stands_above_a_dry_neighbour(self):
+for h, w in self.CASES:
+for lake in W.settle(h, w)["lakes"]:
+lv, mine = Fraction(lake["level"]), {tuple(c) for c in lake["cells"]}
+for r, c in mine:
+for n in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+if n not in mine and 0 <= n[0] < len(h) and 0 <= n[1] < len(h[0]):
+self.assertGreaterEqual(h[n[0]][n[1]], lv, (h, w, lake))
+
+def test_every_lake_cell_is_wet_and_off_the_edge(self):
+for h, w in self.CASES:
+for lake in W.settle(h, w)["lakes"]:
+for r, c in lake["cells"]:
+self.assertLess(h[r][c], Fraction(lake["level"]))
+self.assertFalse(r in (0, len(h) - 1) or c in (0, len(h[0]) - 1))
+
+def test_each_lake_holds_exactly_the_storage_of_its_cells_at_its_level(self):
+for h, w in self.CASES:
+for lake in W.settle(h, w)["lakes"]:
+self.assertEqual(W.storage(Fraction(lake["level"]), [h[r][c] for r, c in lake["cells"]]), lake["stock"])
+
+def test_a_lake_is_one_connected_body_of_water(self):
+for h, w in self.CASES:
+for lake in W.settle(h, w)["lakes"]:
+cells = {tuple(c) for c in lake["cells"]}
+seen, stack = set(), [next(iter(cells))]
+while stack:
+r, c = stack.pop()
+if (r, c) in seen:
+continue
+seen.add((r, c))
+stack += [n for n in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)) if n in cells]
+self.assertEqual(seen, cells)
+
+def test_more_water_never_leaves_less_anywhere(self):
+for i, (h, w) in enumerate(self.CASES[:150]):
+r0 = W.settle(h, w)
+w2 = [row[:] for row in w]
+w2[i % len(h)][(i * 3) % len(h[0])] += 1 + i % 4
+r1 = W.settle(h, w2)
+self.assertGreaterEqual(r1["out"], r0["out"])
+self.assertGreaterEqual(sum(x["stock"] for x in r1["lakes"]), sum(x["stock"] for x in r0["lakes"]))
+
+def test_the_same_case_gives_the_same_bytes(self):
+for h, w in self.CASES[:50]:
+self.assertEqual(W.canonical(W.settle(h, w)), W.canonical(W.settle(h, w)))
+
+class WideProperties(unittest.TestCase):
+"""The widened generator (heights to 20, sides to 14): where a differential reads clean at small heights, widen."""
+CASES = [grid(random.Random(1000 + s), 3 + s % 12, 3 + (s * 5) % 12, hi=[6, 10, 20][s % 3], water=6)
+for s in range(120)]
+
+def test_wide_grids_settle_the_same_in_any_order_and_any_batching(self):
+for i, (h, w) in enumerate(self.CASES):
+base = W.canonical(W.settle(h, w))
+cells = [(r, c) for r in range(len(h)) for c in range(len(h[0]))]
+random.Random(i).shuffle(cells)
+self.assertEqual(W.canonical(W.settle(h, w, list(cells))), base, (h, w))
+units = [(r, c, 1) for r, c in cells for _ in range(w[r][c])]
+random.Random(i + 1).shuffle(units)
+self.assertEqual(W.canonical(W.settle(h, w, parcels=units)), base, (h, w))
+
+def test_wide_grids_balance_and_more_water_never_leaves_less(self):
+for i, (h, w) in enumerate(self.CASES):
+r0 = W.settle(h, w)
+self.assertEqual(sum(x["stock"] for x in r0["lakes"]) + r0["out"], sum(map(sum, w)))
+w2 = [row[:] for row in w]
+w2[i % len(h)][(i * 3) % len(h[0])] += 1 + i % 5
+r1 = W.settle(h, w2)
+self.assertGreaterEqual(r1["out"], r0["out"])
+self.assertGreaterEqual(sum(x["stock"] for x in r1["lakes"]), sum(x["stock"] for x in r0["lakes"]))
+
+FORK = [[9, 9, 9, 9, 9, 9, 9], [9, 9, 9, -20, 9, 9, 9], [9, 9, 9, 2, 9, 9, 9], [9, 6, 5, 4, 9, 9, 9],
+[9, 9, 9, 2, 9, 9, 9], [9, 9, 9, -20, 9, 9, 9], [9, 9, 9, 9, 9, 9, 9]]
+FORK_NODE = "cell 3,3|2,3;4,3"
+
+def _one_at(r, c, n=1, R=7, C=7):
+w = [[0] * C for _ in range(R)]
+w[r][c] = n
+return w
+
+def _held_next(h, res, rain, keep=4):
+w = [row[:] for row in rain]
+for L in res["lakes"]:
+cells = [tuple(c) for c in L["cells"]]
+low = min(cells, key=lambda c: (h[c[0]][c[1]], c[0], c[1]))
+w[low[0]][low[1]] += L["stock"] * keep // 4
+return w
+
+class Carry(unittest.TestCase):
+"""Plumb v4 (the tie note v1.3): the pointers carry from one lot-day to the next."""
+
+def test_without_pointers_the_answer_carries_none(self):
+self.assertNotIn("pointers", W.settle(FORK, _one_at(3, 1)))
+
+def test_one_unit_a_day_through_a_fork_alternates_its_ways(self):
+d1 = W.settle(FORK, _one_at(3, 1), pointers={})
+self.assertEqual(d1["pointers"], {FORK_NODE: 1})
+d2 = W.settle(FORK, _one_at(3, 1), pointers=d1["pointers"])
+self.assertEqual(d2["pointers"], {})
+north = [L["stock"] for L in d1["lakes"]]
+south = [L["stock"] for L in d2["lakes"]]
+self.assertEqual((north, south), ([1], [1]))
+self.assertNotEqual(d1["lakes"][0]["cells"], d2["lakes"][0]["cells"])
+
+def test_a_pointer_nothing_touched_passes_through_unchanged(self):
+dry = [[0] * 7 for _ in range(7)]
+self.assertEqual(W.settle(FORK, dry, pointers={FORK_NODE: 1})["pointers"], {FORK_NODE: 1})
+
+def test_a_tie_whose_ways_end_in_one_lake_carries_nothing(self):
+h = [[9, 9, 9, 9, 9], [9, 3, 5, 3, 9], [9, 2, 9, 2, 9], [9, 1, 0, 1, 9], [9, 9, 9, 9, 9]]
+w = [[0] * 5 for _ in range(5)]
+w[1][2] = 3
+self.assertEqual(W.settle(h, w, pointers={})["pointers"], {})
+high = [[9, 9, 9, 9, 9], [9, 7, 8, 7, 9], [9, 6, 9, 6, 9], [9, 5, 0, 5, 9], [9, 9, 1, 9, 9]] # above a low spill
+self.assertEqual(W.settle(high, w, pointers={})["pointers"], {})
+
+def test_a_tie_that_decides_nothing_keeps_the_pointer_it_came_in_with(self):
+high = [[9, 9, 9, 9, 9], [9, 7, 8, 7, 9], [9, 6, 9, 6, 9], [9, 5, 0, 5, 9], [9, 9, 1, 9, 9]]
+w = [[0] * 5 for _ in range(5)]
+w[1][2] = 3
+self.assertEqual(W.settle(high, w, pointers={"cell 1,2|1,1;1,3": 1})["pointers"], {"cell 1,2|1,1;1,3": 1})
+
+def test_a_carried_pointer_that_is_not_one_is_refused(self):
+for bad in ({FORK_NODE: 2}, {FORK_NODE: -1}, {FORK_NODE: True}, {"cell 3,3": 0}, {"pond 3,3|2,3;4,3": 0}):
+with self.assertRaises(W.CaseError):
+W.settle(FORK, _one_at(3, 1), pointers=bad)
+
+def test_splitting_water_across_two_days_never_changes_where_it_rests(self):
+rng = random.Random(4471)
+for _ in range(150):
+R, C = rng.randint(3, 7), rng.randint(3, 7)
+h = [[rng.randint(0, 6) for _ in range(C)] for _ in range(R)]
+A = [[rng.choice([0, 0, rng.randint(0, 3)]) for _ in range(C)] for _ in range(R)]
+B = [[rng.choice([0, 0, rng.randint(0, 3)]) for _ in range(C)] for _ in range(R)]
+AB = [[A[i][j] + B[i][j] for j in range(C)] for i in range(R)]
+d1 = W.settle(h, A, pointers={})
+d2 = W.settle(h, _held_next(h, d1, B), pointers=d1["pointers"])
+one = W.settle(h, AB, pointers={})
+self.assertEqual((d2["lakes"], d1["out"] + d2["out"]), (one["lakes"], one["out"]))
+
+def test_the_carried_pointers_do_not_depend_on_routing_order_over_days(self):
+rng = random.Random(4472)
+for _ in range(60):
+R, C = rng.randint(3, 7), rng.randint(3, 7)
+h = [[rng.randint(0, 6) for _ in range(C)] for _ in range(R)]
+cells = [(i, j) for i in range(R) for j in range(C)]
+ptr, res = {}, None
+for d in range(3):
+rain = [[rng.choice([0, 0, 0, rng.randint(0, 3)]) for _ in range(C)] for _ in range(R)]
+water = rain if res is None else _held_next(h, res, rain, keep=rng.randint(0, 3))
+outs = []
+for k in range(3):
+o = cells[:]
+random.Random(d * 7 + k).shuffle(o)
+outs.append(W.settle(h, water, order=o, pointers=ptr))
+self.assertTrue(all(x == outs[0] for x in outs))
+ptr, res = outs[0]["pointers"], outs[0]
+
+def test_where_merges_make_the_settles_own_pointers_order_dependent_the_carry_is_not(self):
+"""Two grids found S07.1103 by searching with the mutant that carries the settle's own pointers: there the
+pointers a settle ends with depend on routing order (merges timed by the water); the carry must not."""
+grids = [
+([[0, 1, 5, 5, 4], [4, 4, 0, 3, 3], [3, 6, 3, 1, 4], [2, 4, 2, 4, 4], [1, 2, 3, 3, 2], [2, 2, 5, 3, 2],
+[6, 5, 6, 4, 3]],
+[[0, 0, 4, 0, 0], [5, 0, 0, 0, 0], [2, 0, 0, 6, 0], [0, 0, 0, 1, 0], [0, 1, 0, 0, 0], [4, 6, 0, 1, 1],
+[0, 6, 0, 0, 0]]),
+([[5, 1, 1, 3, 6, 5, 3, 6], [2, 4, 6, 4, 2, 5, 4, 4], [1, 5, 5, 1, 4, 5, 6, 2], [3, 4, 5, 4, 5, 1, 4, 1],
+[0, 4, 6, 6, 3, 5, 1, 6], [0, 4, 5, 2, 5, 1, 0, 6], [2, 1, 5, 3, 2, 2, 0, 4]],
+[[0, 0, 0, 0, 1, 0, 5, 0], [0, 0, 0, 5, 0, 6, 0, 6], [0, 2, 0, 0, 5, 1, 0, 0], [5, 4, 2, 1, 3, 5, 5, 4],
+[0, 1, 5, 0, 0, 0, 0, 5], [0, 0, 0, 0, 0, 1, 0, 0], [1, 4, 0, 2, 3, 4, 0, 0]]),
+]
+for h, w in grids:
+cells = [(i, j) for i in range(len(h)) for j in range(len(h[0]))]
+seen = set()
+for k in range(24):
+o = cells[:]
+random.Random(k).shuffle(o)
+seen.add(W.canonical(W.settle(h, w, order=o, pointers={})))
+self.assertEqual(len(seen), 1)
+
+def _sea(rng, h, k):
+"""k distinct interior cells of h as outlets (a scattered sea), in a fixed order."""
+R, C = len(h), len(h[0])
+inner = [[r, c] for r in range(1, R - 1) for c in range(1, C - 1)]
+rng.shuffle(inner)
+return sorted(inner[:k])
+
+def _sea_case(seed):
+rng = random.Random(9000 + seed)
+h, w = grid(rng, 3 + seed % 5, 3 + (seed * 5) % 6)
+return h, w, _sea(rng, h, rng.randint(1, 3))
+
+class Outlets(unittest.TestCase):
+"""Plumb v5: interior cells named as outlets drain exactly as the grid's edge does."""
+CASES = [_sea_case(seed) for seed in range(240)]
+
+def test_without_outlets_the_answer_is_v4_s(self):
+for h, w in Properties.CASES[:120]:
+self.assertEqual(W.canonical(W.settle(h, w, outlets=None)), W.canonical(W.settle(h, w)))
+self.assertEqual(W.canonical(W.settle(h, w, outlets=[])), W.canonical(W.settle(h, w)))
+
+def test_an_outlet_on_the_grid_s_edge_changes_nothing(self):
+for h, w in Properties.CASES[:120]:
+self.assertEqual(W.canonical(W.settle(h, w, outlets=[[0, 0], [len(h) - 1, 0]])),
+W.canonical(W.settle(h, w)))
+
+def test_a_repeated_outlet_is_one_outlet(self):
+for h, w, sea in self.CASES[:60]:
+self.assertEqual(W.canonical(W.settle(h, w, outlets=sea + sea)), W.canonical(W.settle(h, w, outlets=sea)))
+
+def test_water_on_an_outlet_leaves(self):
+h = ring(3, {(1, 1): 0})
+self.assertEqual(summary(W.settle(h, wet(3, {(1, 1): 4}), outlets=[[1, 1]])), (4, []))
+self.assertEqual(summary(W.settle(h, wet(3, {(1, 1): 4}))), (0, [(4, "4", False)]))
+
+def test_a_hollow_whose_lowest_rim_falls_to_an_outlet_spills_into_it(self):
+h = [[9] * 6, [9, 5, 5, 5, 9, 9], [9, 5, 0, 3, 1, 9], [9, 5, 5, 5, 9, 9], [9] * 6]
+w = [[0] * 6 for _ in range(5)]
+w[2][2] = 10
+self.assertEqual(summary(W.settle(h, w, outlets=[[2, 4]])), (7, [(3, "3", True)]))
+
+def test_water_is_never_made_or_lost(self):
+for h, w, sea in self.CASES:
+r = W.settle(h, w, outlets=sea)
+self.assertEqual(sum(x["stock"] for x in r["lakes"]) + r["out"], sum(map(sum, w)))
+
+def test_no_outlet_is_ever_under_a_lake(self):
+for h, w, sea in self.CASES:
+for lake in W.settle(h, w, outlets=sea)["lakes"]:
+self.assertFalse({tuple(c) for c in lake["cells"]} & {tuple(c) for c in sea}, (h, w, sea))
+
+def test_an_outlet_never_leaves_more_water_on_the_land(self):
+for h, w, sea in self.CASES:
+self.assertGreaterEqual(W.settle(h, w, outlets=sea)["out"], W.settle(h, w)["out"], (h, w, sea))
+
+def test_the_answer_does_not_depend_on_order_or_batching(self):
+for i, (h, w, sea) in enumerate(self.CASES[:120]):
+base = W.canonical(W.settle(h, w, outlets=sea))
+cells = [(r, c) for r in range(len(h)) for c in range(len(h[0]))]
+random.Random(i).shuffle(cells)
+self.assertEqual(W.canonical(W.settle(h, w, list(cells), outlets=sea)), base, (h, w, sea))
+units = [(r, c, 1) for r in range(len(h)) for c in range(len(h[0])) for _ in range(w[r][c])]
+random.Random(i + 1).shuffle(units)
+self.assertEqual(W.canonical(W.settle(h, w, parcels=units, outlets=sea)), base, (h, w, sea))
+
+def test_splitting_water_across_two_days_with_a_sea_never_changes_where_it_rests(self):
+rng = random.Random(5171)
+for _ in range(120):
+R, C = rng.randint(3, 7), rng.randint(3, 7)
+h = [[rng.randint(0, 6) for _ in range(C)] for _ in range(R)]
+sea = _sea(rng, h, rng.randint(1, 2))
+A = [[rng.choice([0, 0, rng.randint(0, 3)]) for _ in range(C)] for _ in range(R)]
+B = [[rng.choice([0, 0, rng.randint(0, 3)]) for _ in range(C)] for _ in range(R)]
+AB = [[A[i][j] + B[i][j] for j in range(C)] for i in range(R)]
+d1 = W.settle(h, A, pointers={}, outlets=sea)
+d2 = W.settle(h, _held_next(h, d1, B), pointers=d1["pointers"], outlets=sea)
+one = W.settle(h, AB, pointers={}, outlets=sea)
+self.assertEqual((d2["lakes"], d1["out"] + d2["out"]), (one["lakes"], one["out"]))
+
+def test_the_command_line_reads_outlets(self):
+import json, subprocess, sys, tempfile
+h = [[9] * 7, [9] * 7, [9, 5, 4, 3, 2, 0, 9], [9] * 7, [9] * 7]
+w = [[0] * 7 for _ in range(5)]
+w[2][1] = 6
+with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+json.dump({"heights": h, "water": w, "outlets": [[2, 5]]}, fh)
+try:
+r = subprocess.run([sys.executable, _spec.origin, "settle", fh.name], capture_output=True, text=True)
+finally:
+os.unlink(fh.name)
+self.assertEqual(r.returncode, 0, r.stderr)
+self.assertEqual(summary(json.loads(r.stdout)), (6, []))
+
+def test_a_malformed_outlet_is_refused(self):
+h, w = ring(3, {(1, 1): 0}), wet(3, {})
+for bad in ([[3, 0]], [[0, -1]], [[1]], [[1, 1.0]], [[True, 1]], "1,1", [(1, 1)], {"1": 1}):
+with self.assertRaises(W.CaseError, msg=repr(bad)):
+W.settle(h, w, outlets=bad)
+
+if __name__ == "__main__":
+unittest.main()
+
+Take the whole folder →
+MIT
+Python stdlib only, deterministic
+
+---
+
+# weir — a Loop MMT gift
+https://loopmmt.com/gifts/weir/
+[coverage: optional · branch: gifts]
+
+Run a Pipeline Under a Budget You Can Actually Meter govern ← all gifts
+
+weir
+
+Run a prompt-pipeline under a declared budget — max rows, max wall-time, max bytes — and weir cuts the flow clean the instant a ceiling is crossed: it stops AT the wall (the record that would cross it is never emitted), names which budget you exceeded and by how much, writes a replayable receipt to a trace-id ledger, and exits non-zero so it fails a pipeline. The one rule that makes it a weir and not a throttle: a budget is rows, wall-time, or bytes — NEVER tokens. Ask it for a token budget and it refuses by construction, with a reason: tokens are a model-internal proxy you cannot meter deterministically offline, so weir meters the real resource instead and declines the proxy out loud. The rows and bytes cuts are byte-identical every run; the wall-time cut it reports honestly as environment-dependent. Python stdlib only, offline, deterministic core.
+
+The honest edge
+
+weir cuts the flow it can SEE — the command's stdout, line by line. It does not cap the command's own internal resource use (a command that loads 10 GB before its first row is past weir's reach until that row appears), it does not sandbox the command, and a wall-time cut is real but not reproducible — the same input can cut at a different row on a slower machine. It governs flow at the pipe; it does not make your command safe.
+
+Run it
+
+python3 weir.py run --max-rows 10000 --trace RUN -- python3 pipeline.py # refuses --max-tokens by construction
+test_weir.py (12/12, mutation-bitten independent oracle: token refusal, stop-at-wall cut, reproducible rows/bytes core, ledger+replay, budget-not-command gating) + --selftest (13/13: deterministic core byte-identical across runs)
+Python stdlib only, deterministic core
+
+The code — every file that ships
+
+weir.py 493 lines on GitHub →
+#!/usr/bin/env python3
+"""weir — run a pipeline under a declared budget, in real units, never tokens.
+
+You have a prompt-pipeline — a command that reads JSON-lines records on stdin and
+writes them on stdout, the kind the `declare`/`conductor` gifts drive. You want to
+run it under a ceiling: "stop after 10,000 rows", "stop after 30 seconds", "stop
+after 5 MB". `weir` is that gate. You declare the budget in units you can actually
+meter — rows, wall-time, bytes — and weir runs the command, counting as records
+flow, and cuts the flow clean the instant a ceiling is crossed: it names which
+budget was exceeded, how far, and exits non-zero so it fails a pipeline. A weir on
+a river holds the water back to a measured level; this one holds a run back to a
+measured cost.
+
+THE ONE RULE THAT MAKES IT A WEIR, NOT A THROTTLE:
+A budget is rows, wall-time, or bytes. NEVER tokens. If you ask weir for a token
+budget (--max-tokens) it refuses — by construction, with a reason — and exits 2.
+Tokens are a model-internal proxy: you cannot meter them deterministically,
+offline, without the model's own tokenizer, and two tokenizers disagree on the
+same text. A budget you cannot meter is not a budget, it is a hope. weir meters
+the real resource the tokens were standing in for — the rows you process, the
+seconds you spend, the bytes you move — and declines the proxy out loud. This is
+Dara's principle from the room where weir was designed: name the token want, and
+decline it.
+
+WHAT IT DOES, in order:
+1. Read the declared budget. A budget is one or more of --max-rows N,
+--max-seconds S, --max-bytes B. At least one real ceiling is required; a run
+with no ceiling is refused (exit 2) — a weir with no wall holds nothing.
+2. Run the command, feeding it stdin if you gave --input, and read its stdout as
+a stream of JSON-lines records.
+3. Count as it flows: rows (records emitted), bytes (of stdout), and wall-time
+(seconds since the run began). Pass each record through to weir's stdout
+until a ceiling is crossed.
+4. Cut clean at the ceiling. The record that would cross a ceiling is NOT
+emitted — weir stops at the wall, not past it — records the breach (which
+budget, the limit, the count at the cut), writes a receipt to an append-only
+ledger, and exits 3. Under budget to the end: exit 0.
+
+THE BUDGET MODEL. Three real units, one refused proxy:
+
+rows: records emitted on stdout (deterministic; exact count)
+bytes: bytes emitted on stdout (deterministic; exact count)
+wall-time: seconds of real time since run start (environment-dependent)
+tokens: REFUSED — a model-internal proxy, not a meterable real resource
+
+rows and bytes give a byte-identical verdict for a given input on any machine —
+the same records in yield the same cut every run. wall-time is the one honest
+exception: it depends on the machine and the load, so a wall-time cut is real
+but not reproducible, and weir says so. The deterministic core is rows+bytes;
+the selftest proves THAT core is byte-identical across runs. Never trust a
+wall-time cut to reproduce; trust a rows or bytes cut to reproduce exactly.
+
+WHY A LEDGER, NOT JUST AN EXIT CODE. A pipeline that stops at a budget answers
+"did it finish?" with a bare non-zero. It does not say which wall it hit, or how
+close the others were. weir's receipt does: the budget that cut it, the ceiling,
+the counts of all three axes at the cut, and the trace-id — so "why did this run
+stop?" has an answer you can read back and replay by trace-id. This is
+conductor's trace-id-and-ledger idea applied to a budget cut instead of a stage
+failure: the same honesty about leaving a receipt.
+
+THE COMMAND FORMAT. weir runs the argv you give it after `--`, exactly as a shell
+would, e.g. `weir run --max-rows 1000 -- python3 emit.py`. The command's stdout is
+read as JSON-lines: one record per line. A line that is not valid JSON still
+counts as a row and its bytes still count — weir meters flow, it does not validate
+records (that is the `contract` gift's job). weir is a governor, not a linter.
+
+HONEST CEILING. weir cuts the flow it can see: the command's stdout, line by line.
+It does not cap the command's OWN internal resource use — a command that reads a
+10 GB file into memory before emitting its first row is past weir's reach until
+that first row appears. It does not sandbox the command; it is exactly as safe as
+the command you give it. And a wall-time cut is real but not reproducible — the
+same input can cut at a different row on a slower machine. weir proves the rows
+and bytes cuts reproduce; the wall-time cut it reports honestly as environment-
+dependent. It meters flow at the pipe, and it refuses to pretend a token is a
+resource it can meter.
+
+MIT licensed. Python 3 standard library only. Offline. Deterministic core.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+import uuid
+
+# ---------------------------------------------------------------------------
+# The budget model. Three real units; one refused proxy. Named once, here.
+# ---------------------------------------------------------------------------
+
+REAL_UNITS = ("rows", "bytes", "seconds") # meterable, real resources
+REFUSED_PROXIES = ("tokens", "token") # model-internal, not meterable offline
+
+REFUSAL_REASON = (
+"a budget is rows, wall-time, or bytes -- never tokens. tokens are a "
+"model-internal proxy: you cannot meter them deterministically, offline, "
+"without the model's own tokenizer, and two tokenizers disagree on the same "
+"text. meter the real resource instead: --max-rows, --max-seconds, or "
+"--max-bytes."
+)
+
+def budget_model():
+"""The declared budget model as a plain record (for `weir budget`)."""
+return {
+"real_units": list(REAL_UNITS),
+"refused_proxies": list(REFUSED_PROXIES),
+"deterministic_core": ["rows", "bytes"],
+"environment_dependent": ["seconds"],
+"refusal_reason": REFUSAL_REASON,
+"cut_rule": "the record that would cross a ceiling is not emitted; weir "
+"stops at the wall, not past it.",
+}
+
+def _emit(obj):
+sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
+
+# ---------------------------------------------------------------------------
+# Budget validation — the token refusal lives here, by construction.
+# ---------------------------------------------------------------------------
+
+class BudgetError(Exception):
+"""A declared budget is refused (token proxy) or empty (no ceiling)."""
+
+def build_budget(max_rows, max_seconds, max_bytes, token_asked):
+"""Turn declared ceilings into a validated budget, or refuse.
+
+Raises BudgetError with a readable reason when the budget is a token proxy
+or carries no real ceiling. This is the load-bearing gate: an off-covenant
+budget cannot be constructed.
+"""
+if token_asked:
+raise BudgetError(REFUSAL_REASON)
+budget = {}
+if max_rows is not None:
+if max_rows < 0:
+raise BudgetError("--max-rows must be >= 0")
+budget["rows"] = max_rows
+if max_seconds is not None:
+if max_seconds < 0:
+raise BudgetError("--max-seconds must be >= 0")
+budget["seconds"] = max_seconds
+if max_bytes is not None:
+if max_bytes < 0:
+raise BudgetError("--max-bytes must be >= 0")
+budget["bytes"] = max_bytes
+if not budget:
+raise BudgetError(
+"no ceiling declared -- a weir with no wall holds nothing. declare at "
+"least one of --max-rows, --max-seconds, --max-bytes."
+)
+return budget
+
+def _breach(budget, rows, byts, elapsed):
+"""Return the (unit, limit, count) of the FIRST budget crossed, or None.
+
+Order is deterministic: rows, then bytes, then seconds. A wall-time breach is
+the only environment-dependent one; rows and bytes are exact. When a record
+would cross more than one ceiling at once, the row/bytes breach is reported
+first so the reproducible axis is the named cut whenever one applies.
+"""
+if "rows" in budget and rows > budget["rows"]:
+return ("rows", budget["rows"], rows)
+if "bytes" in budget and byts > budget["bytes"]:
+return ("bytes", budget["bytes"], byts)
+if "seconds" in budget and elapsed > budget["seconds"]:
+return ("seconds", budget["seconds"], round(elapsed, 3))
+return None
+
+# ---------------------------------------------------------------------------
+# The ledger — an append-only receipt, replayable by trace-id.
+# ---------------------------------------------------------------------------
+
+def _append_ledger(ledger_path, record):
+with open(ledger_path, "a") as f:
+f.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+# ---------------------------------------------------------------------------
+# Subcommands.
+# ---------------------------------------------------------------------------
+
+def cmd_budget(args):
+"""Print the budget model — the three real units and the refused proxy."""
+_emit(budget_model())
+return 0
+
+def cmd_check(args):
+"""Validate a declared budget without running anything.
+
+exit 0 = a real, non-empty budget; exit 2 = refused (token) or empty.
+"""
+try:
+budget = build_budget(args.max_rows, args.max_seconds, args.max_bytes,
+args.max_tokens is not None)
+except BudgetError as exc:
+sys.stderr.write("weir: %s\n" % exc)
+return 2
+_emit({"kind": "budget-ok", "budget": budget})
+return 0
+
+def _meter_stream(proc, budget, trace_id, ledger_path, clock):
+"""Read proc.stdout line by line, meter flow, cut at the first ceiling.
+
+Returns (breach_or_None, rows, bytes, elapsed). Pure with respect to the
+declared budget: for a given byte stream and a rows/bytes budget the cut is
+byte-identical (clock is injected so the deterministic core is testable).
+"""
+start = clock()
+rows = 0
+byts = 0
+out = sys.stdout.buffer
+for raw in proc.stdout:
+# raw includes the trailing newline; that is real emitted bytes.
+next_rows = rows + 1
+next_bytes = byts + len(raw)
+elapsed = clock() - start
+breach = _breach(budget, next_rows, next_bytes, elapsed)
+if breach is not None:
+# Stop AT the wall: do not emit the record that crosses it.
+return breach, rows, byts, elapsed
+out.write(raw)
+rows = next_rows
+byts = next_bytes
+out.flush()
+return None, rows, byts, (clock() - start)
+
+def cmd_run(args):
+"""Run a command under the declared budget, cutting flow at the ceiling."""
+if not args.command:
+sys.stderr.write("weir: run needs a command after `--`, e.g. "
+"`weir run --max-rows 100 -- python3 emit.py`\n")
+return 2
+try:
+budget = build_budget(args.max_rows, args.max_seconds, args.max_bytes,
+args.max_tokens is not None)
+except BudgetError as exc:
+sys.stderr.write("weir: %s\n" % exc)
+return 2
+
+ledger_path = args.ledger or "weir.ledger.jsonl"
+trace_id = args.trace or str(uuid.uuid4())
+
+data = b""
+if args.input:
+try:
+with open(args.input, "rb") as f:
+data = f.read()
+except OSError as exc:
+sys.stderr.write("weir: cannot read --input %s: %s\n" % (args.input, exc))
+return 2
+
+_append_ledger(ledger_path, {"kind": "run-start", "trace_id": trace_id,
+"budget": budget, "cmd": args.command})
+try:
+proc = subprocess.Popen(args.command, stdin=subprocess.PIPE,
+stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+except (OSError, ValueError) as exc:
+sys.stderr.write("weir: cannot launch command: %s\n" % exc)
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id,
+"verdict": "launch-failed", "error": str(exc)})
+return 2
+
+# Feed input, then meter the output stream.
+try:
+if data:
+proc.stdin.write(data)
+proc.stdin.close()
+except (BrokenPipeError, OSError):
+pass
+
+breach, rows, byts, elapsed = _meter_stream(proc, budget, trace_id,
+ledger_path, time.monotonic)
+
+if breach is not None:
+# Cut the command off at the wall.
+try:
+proc.terminate()
+except OSError:
+pass
+unit, limit, count = breach
+rec = {"kind": "cut", "trace_id": trace_id, "budget": unit,
+"limit": limit, "count_at_cut": count,
+"rows": rows, "bytes": byts, "seconds": round(elapsed, 3),
+"reproducible": unit in ("rows", "bytes")}
+_append_ledger(ledger_path, rec)
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id,
+"verdict": "cut", "budget": unit})
+summary = {"kind": "run-summary", "trace_id": trace_id, "ledger": ledger_path,
+"verdict": "cut", "budget": unit, "limit": limit,
+"count_at_cut": count, "reproducible": unit in ("rows", "bytes")}
+sys.stderr.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
+return 3
+
+proc.wait()
+_append_ledger(ledger_path, {"kind": "run-end", "trace_id": trace_id,
+"verdict": "under-budget", "rows": rows,
+"bytes": byts, "seconds": round(elapsed, 3),
+"exit": proc.returncode})
+summary = {"kind": "run-summary", "trace_id": trace_id, "ledger": ledger_path,
+"verdict": "under-budget", "rows": rows, "bytes": byts,
+"seconds": round(elapsed, 3), "cmd_exit": proc.returncode}
+sys.stderr.write(json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n")
+# weir's own verdict is under-budget (0); the command's own non-zero exit is
+# reported in the summary but does not become weir's verdict — weir gates the
+# budget, not the command's correctness.
+return 0
+
+def cmd_replay(args):
+"""Print every ledger record for a trace-id."""
+if not args.ledger or not args.trace:
+sys.stderr.write("weir: replay needs --ledger and --trace\n")
+return 2
+try:
+f = open(args.ledger)
+except OSError as exc:
+sys.stderr.write("weir: cannot read ledger %s: %s\n" % (args.ledger, exc))
+return 2
+found = False
+with f:
+for line in f:
+line = line.strip()
+if not line:
+continue
+try:
+rec = json.loads(line)
+except ValueError:
+continue
+if rec.get("trace_id") == args.trace:
+found = True
+_emit(rec)
+return 0 if found else 2
+
+# ---------------------------------------------------------------------------
+# Selftest — proves the deterministic core (rows + bytes) is byte-identical.
+# ---------------------------------------------------------------------------
+
+def _selftest():
+"""In-process checks of the deterministic core and the token refusal.
+
+Returns (passed, total). The clock is frozen so the deterministic axes are
+proven independent of wall-time.
+"""
+checks = []
+
+def ok(name, cond):
+checks.append((name, bool(cond)))
+
+# 1. token budget is refused, by construction.
+try:
+build_budget(None, None, None, token_asked=True)
+ok("token budget refused", False)
+except BudgetError as e:
+ok("token budget refused", "never tokens" in str(e))
+
+# 2. an empty budget is refused.
+try:
+build_budget(None, None, None, token_asked=False)
+ok("empty budget refused", False)
+except BudgetError as e:
+ok("empty budget refused", "no ceiling" in str(e))
+
+# 3. a real budget builds.
+try:
+b = build_budget(10, None, 1000, token_asked=False)
+ok("real budget builds", b == {"rows": 10, "bytes": 1000})
+except BudgetError:
+ok("real budget builds", False)
+
+# 4. rows breach is exact and reported first.
+ok("rows breach at N+1", _breach({"rows": 3}, 4, 0, 0.0) == ("rows", 3, 4))
+ok("no breach under rows", _breach({"rows": 3}, 3, 0, 0.0) is None)
+
+# 5. bytes breach is exact.
+ok("bytes breach", _breach({"bytes": 100}, 0, 101, 0.0) == ("bytes", 100, 101))
+ok("no breach under bytes", _breach({"bytes": 100}, 0, 100, 0.0) is None)
+
+# 6. rows reported before bytes when both cross (reproducible axis wins).
+ok("rows before bytes", _breach({"rows": 1, "bytes": 1}, 2, 2, 0.0)[0] == "rows")
+
+# 7. seconds is only breached when no exact axis is, and is env-dependent.
+ok("seconds breach", _breach({"seconds": 1.0}, 0, 0, 1.5) == ("seconds", 1.0, 1.5))
+
+# 8. deterministic core: meter a fixed stream twice under a rows budget,
+# with a frozen clock -> byte-identical cut both times.
+class _FakeProc:
+def __init__(self, lines):
+self.stdout = iter(lines)
+frozen = lambda: 0.0
+lines = [b'{"r":1}\n', b'{"r":2}\n', b'{"r":3}\n', b'{"r":4}\n']
+
+import io
+def meter_once():
+# capture emitted bytes without touching real stdout
+buf = io.BytesIO()
+real = sys.stdout
+class _W:
+buffer = buf
+def flush(self_inner):
+pass
+sys.stdout = _W()
+try:
+res = _meter_stream(_FakeProc(list(lines)), {"rows": 2}, "t",
+None, frozen)
+finally:
+sys.stdout = real
+return res, buf.getvalue()
+
+(res1, emitted1) = meter_once()
+(res2, emitted2) = meter_once()
+ok("core cut is deterministic", res1 == res2)
+ok("core emitted bytes deterministic", emitted1 == emitted2)
+ok("core cut at rows ceiling", res1[0] == ("rows", 2, 3))
+ok("core emitted exactly 2 rows", emitted1 == b'{"r":1}\n{"r":2}\n')
+
+passed = sum(1 for _, c in checks if c)
+total = len(checks)
+for name, c in checks:
+sys.stderr.write(" [%s] %s\n" % ("PASS" if c else "FAIL", name))
+sys.stderr.write("weir selftest: %d/%d\n" % (passed, total))
+return passed, total
+
+def build_parser():
+p = argparse.ArgumentParser(
+prog="weir",
+description="run a pipeline under a declared budget -- rows, wall-time, "
+"or bytes, never tokens.")
+p.add_argument("--selftest", action="store_true",
+help="run in-process checks of the deterministic core and exit")
+sub = p.add_subparsers(dest="cmd")
+
+sp_budget = sub.add_parser("budget", help="print the budget model (real units + refused proxy)")
+sp_budget.set_defaults(func=cmd_budget)
+
+def add_budget_flags(sp):
+sp.add_argument("--max-rows", type=int, default=None, help="ceiling: records emitted")
+sp.add_argument("--max-seconds", type=float, default=None,
+help="ceiling: wall-time seconds (environment-dependent)")
+sp.add_argument("--max-bytes", type=int, default=None, help="ceiling: bytes emitted")
+sp.add_argument("--max-tokens", type=int, default=None,
+help="REFUSED -- tokens are not a meterable real resource (exit 2)")
+
+sp_check = sub.add_parser("check", help="validate a declared budget without running")
+add_budget_flags(sp_check)
+sp_check.set_defaults(func=cmd_check)
+
+sp_run = sub.add_parser("run", help="run a command under the budget, cutting flow at the ceiling")
+add_budget_flags(sp_run)
+sp_run.add_argument("--input", help="file fed to the command's stdin")
+sp_run.add_argument("--ledger", help="ledger path (default weir.ledger.jsonl)")
+sp_run.add_argument("--trace", help="trace-id for this run (default: a fresh uuid)")
+sp_run.add_argument("command", nargs=argparse.REMAINDER,
+help="the command to run, after `--`")
+sp_run.set_defaults(func=cmd_run)
+
+sp_replay = sub.add_parser("replay", help="print every ledger record for a trace-id")
+sp_replay.add_argument("--ledger", help="ledger path")
+sp_replay.add_argument("--trace", help="trace-id to replay")
+sp_replay.set_defaults(func=cmd_replay)
+
+return p
+
+def main(argv=None):
+argv = list(sys.argv[1:] if argv is None else argv)
+parser = build_parser()
+# `run`'s REMAINDER swallows the command after `--`; strip a leading `--`.
+args = parser.parse_args(argv)
+if getattr(args, "selftest", False):
+passed, total = _selftest()
+return 0 if passed == total else 1
+if not getattr(args, "cmd", None):
+parser.print_help(sys.stderr)
+return 2
+# For `run`, drop a leading "--" left by REMAINDER.
+if args.cmd == "run" and args.command and args.command[0] == "--":
+args.command = args.command[1:]
+return args.func(args)
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_weir.py 186 lines on GitHub →
+#!/usr/bin/env python3
+"""Tests for the weir gift — an independent oracle, mutation-bitten.
+
+Each load-bearing behavior is asserted so that DELETING the behavior would fail a
+test. weir is invoked as a real subprocess so its actual stdout/stderr/exit are
+exercised end to end (not the in-process selftest, which is the tool's own copy).
+
+The load-bearing behaviors:
+* token budget is REFUSED by construction (exit 2, reason names tokens);
+* empty budget is REFUSED (exit 2);
+* a rows cut emits exactly the ceiling count, stops AT the wall (exit 3);
+* a bytes cut stops at or under the byte ceiling (exit 3);
+* an under-budget run passes everything through (exit 0);
+* a rows/bytes cut is reproducible (byte-identical stdout across runs);
+* the ledger records the cut with the exceeded budget and count;
+* replay returns exactly the records for a trace-id;
+* weir gates the BUDGET, not the command: a command exiting non-zero while
+under budget does not make weir's own exit non-zero.
+
+Run: python3 -m unittest test_weir -v (stdlib only, no deps)
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WEIR = os.path.join(HERE, "weir.py")
+PY = sys.executable
+
+# An emitter that prints N json-lines and ignores stdin.
+EMIT_SRC = "import sys\nn=int(sys.argv[1])\nfor i in range(n):\n print('{\"i\": %d}' % i)\n"
+# A command that exits non-zero after emitting a few lines (under budget).
+FAIL_SRC = "print('{\"a\":1}')\nprint('{\"a\":2}')\nimport sys; sys.exit(7)\n"
+
+def _write(tmp, name, src):
+p = os.path.join(tmp, name)
+with open(p, "w") as f:
+f.write(src)
+return p
+
+def run_weir(argv, cwd):
+"""Invoke weir as a subprocess; return (exit, stdout_bytes, stderr_text)."""
+proc = subprocess.run([PY, WEIR] + argv, cwd=cwd,
+stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+return proc.returncode, proc.stdout, proc.stderr.decode("utf-8", "replace")
+
+class WeirTests(unittest.TestCase):
+def setUp(self):
+self.tmp = tempfile.mkdtemp()
+self.emit = _write(self.tmp, "emit.py", EMIT_SRC)
+self.fail = _write(self.tmp, "fail.py", FAIL_SRC)
+
+# --- the covenant invariant: no token budgets --------------------------
+
+def test_token_budget_refused(self):
+code, _out, err = run_weir(["check", "--max-tokens", "5000"], self.tmp)
+self.assertEqual(code, 2, "a token budget must be refused")
+self.assertIn("never tokens", err)
+
+def test_token_budget_refused_on_run(self):
+code, _out, err = run_weir(
+["run", "--max-tokens", "10", "--", PY, self.emit, "5"], self.tmp)
+self.assertEqual(code, 2, "a token budget must be refused even on run")
+self.assertIn("never tokens", err)
+
+def test_empty_budget_refused(self):
+code, _out, err = run_weir(["check"], self.tmp)
+self.assertEqual(code, 2, "a budget with no ceiling must be refused")
+self.assertIn("no ceiling", err)
+
+def test_real_budget_ok(self):
+code, out, _err = run_weir(["check", "--max-rows", "10"], self.tmp)
+self.assertEqual(code, 0)
+rec = json.loads(out.decode())
+self.assertEqual(rec["kind"], "budget-ok")
+self.assertEqual(rec["budget"], {"rows": 10})
+
+# --- the cut: stop AT the wall -----------------------------------------
+
+def test_rows_cut_stops_at_wall(self):
+code, out, err = run_weir(
+["run", "--max-rows", "10", "--trace", "R", "--ledger",
+os.path.join(self.tmp, "l.jsonl"), "--", PY, self.emit, "100"],
+self.tmp)
+self.assertEqual(code, 3, "a rows cut exits 3")
+lines = [l for l in out.decode().splitlines() if l.strip()]
+self.assertEqual(len(lines), 10,
+"emits exactly the ceiling count, not one past it")
+summary = json.loads(err.strip().splitlines()[-1])
+self.assertEqual(summary["budget"], "rows")
+self.assertEqual(summary["limit"], 10)
+self.assertTrue(summary["reproducible"])
+
+def test_bytes_cut_stays_under_ceiling(self):
+code, out, err = run_weir(
+["run", "--max-bytes", "50", "--trace", "B", "--ledger",
+os.path.join(self.tmp, "l.jsonl"), "--", PY, self.emit, "100"],
+self.tmp)
+self.assertEqual(code, 3, "a bytes cut exits 3")
+self.assertLessEqual(len(out), 50,
+"never emits more than the byte ceiling")
+summary = json.loads(err.strip().splitlines()[-1])
+self.assertEqual(summary["budget"], "bytes")
+self.assertTrue(summary["reproducible"])
+
+def test_under_budget_passes_through(self):
+code, out, _err = run_weir(
+["run", "--max-rows", "100", "--ledger",
+os.path.join(self.tmp, "l.jsonl"), "--", PY, self.emit, "5"],
+self.tmp)
+self.assertEqual(code, 0, "under budget exits 0")
+lines = [l for l in out.decode().splitlines() if l.strip()]
+self.assertEqual(len(lines), 5, "passes every record through")
+
+# --- determinism: a rows/bytes cut is byte-identical -------------------
+
+def test_rows_cut_is_reproducible(self):
+outs = []
+for t in ("a", "b", "c"):
+_c, out, _e = run_weir(
+["run", "--max-rows", "7", "--trace", t, "--ledger",
+os.path.join(self.tmp, "l%s.jsonl" % t), "--", PY,
+self.emit, "100"], self.tmp)
+outs.append(out)
+self.assertEqual(outs[0], outs[1])
+self.assertEqual(outs[1], outs[2])
+self.assertEqual(len([l for l in outs[0].decode().splitlines() if l.strip()]), 7)
+
+# --- the ledger + replay -----------------------------------------------
+
+def test_ledger_records_the_cut(self):
+ledger = os.path.join(self.tmp, "led.jsonl")
+run_weir(["run", "--max-rows", "3", "--trace", "L", "--ledger", ledger,
+"--", PY, self.emit, "100"], self.tmp)
+with open(ledger) as f:
+recs = [json.loads(l) for l in f if l.strip()]
+cut = [r for r in recs if r.get("kind") == "cut"]
+self.assertEqual(len(cut), 1, "exactly one cut record")
+self.assertEqual(cut[0]["budget"], "rows")
+self.assertEqual(cut[0]["limit"], 3)
+self.assertEqual(cut[0]["count_at_cut"], 4)
+
+def test_replay_returns_only_the_trace(self):
+ledger = os.path.join(self.tmp, "led.jsonl")
+run_weir(["run", "--max-rows", "2", "--trace", "X", "--ledger", ledger,
+"--", PY, self.emit, "50"], self.tmp)
+run_weir(["run", "--max-rows", "2", "--trace", "Y", "--ledger", ledger,
+"--", PY, self.emit, "50"], self.tmp)
+code, out, _err = run_weir(
+["replay", "--ledger", ledger, "--trace", "X"], self.tmp)
+self.assertEqual(code, 0)
+recs = [json.loads(l) for l in out.decode().splitlines() if l.strip()]
+self.assertTrue(recs)
+self.assertTrue(all(r["trace_id"] == "X" for r in recs),
+"replay returns only the asked trace")
+
+# --- weir gates the BUDGET, not the command ----------------------------
+
+def test_command_nonzero_under_budget_is_weir_zero(self):
+code, _out, err = run_weir(
+["run", "--max-rows", "100", "--ledger",
+os.path.join(self.tmp, "l.jsonl"), "--", PY, self.fail],
+self.tmp)
+self.assertEqual(code, 0,
+"weir gates the budget; the command's own exit is reported, "
+"not adopted")
+summary = json.loads(err.strip().splitlines()[-1])
+self.assertEqual(summary["verdict"], "under-budget")
+self.assertEqual(summary["cmd_exit"], 7)
+
+# --- the selftest itself runs green (guards against a broken core) -----
+
+def test_selftest_green(self):
+code, _out, err = run_weir(["--selftest"], self.tmp)
+self.assertEqual(code, 0)
+self.assertIn("13/13", err)
+
+if __name__ == "__main__":
+unittest.main(verbosity=2)
+
+Take the whole folder →
+MIT
+Python stdlib only, deterministic core
+
+---

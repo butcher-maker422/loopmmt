@@ -98,6 +98,40 @@ def golden_checks(m):
                 m.conformsTo("transform", "transform") and not m.conformsTo("filter", "transform")))
     out.append(("conformsTo empty-required True", m.conformsTo("x", "") is True))
 
+    # --- bounded loops (slug*N, slug*N:closed): the trace, checked by the loop gift's rule ---
+    hops, ok = m.typecheck_pipeline(["src", "xf*3", "snk"], VERBS)
+    st = [h for h in hops if h["kind"] == "stage" and h["pos"] == 1][0]
+    out.append(("a bounded transform loop in the middle typechecks and carries its bound",
+                ok is True and st.get("loop") == {"passes": 3, "closed": False}))
+    hops, ok = m.typecheck_pipeline(["src", "flt*2", "snk"], VERBS)
+    out.append(("a bounded filter loop typechecks", ok is True))
+    hops, ok = m.typecheck_pipeline(["src", "fold*3", "snk"], VERBS)
+    out.append(("an unclosed fold loop is refused", ok is False))
+    hops, ok = m.typecheck_pipeline(["src", "fold*3:closed", "snk"], VERBS)
+    out.append(("a fold loop declared closed typechecks", ok is True))
+    hops, ok = m.typecheck_pipeline(["src*2", "snk"], VERBS)
+    out.append(("a source can never be looped", ok is False))
+    hops, ok = m.typecheck_pipeline(["src", "snk*2"], VERBS)
+    out.append(("a sink can never be looped", ok is False))
+    for bad in ("xf*", "xf*0", "xf*1000001", "xf*x", "xf*2:open"):
+        hops, ok = m.typecheck_pipeline(["src", bad, "snk"], VERBS)
+        out.append((f"a malformed or unbounded loop '{bad}' is refused", ok is False))
+    hops, ok = m.typecheck_pipeline(["src", "xf*1000000", "snk"], VERBS)
+    out.append(("the largest allowed bound typechecks", ok is True))
+
+    # --- the house manifest is JSON Lines; it must load ---
+    import os, tempfile
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        fh.write('{"_comment": "header line, no slug"}\n{"slug": "a", "port_verb": "source"}\n'
+                 '{"slug": "b", "port_verb": "sink"}\n')
+    try:
+        loaded = m.load_verbs(path)
+    except Exception:
+        loaded = None
+    os.unlink(path)
+    out.append(("a JSON Lines manifest loads slug -> port_verb", loaded == {"a": "source", "b": "sink"}))
+
     out.append(("EMITS(sink) False / EMITS(source) True", (m.EMITS("sink") is False) and (m.EMITS("source") is True)))
     out.append(("ACCEPTS(source) False / ACCEPTS(sink) True", (m.ACCEPTS("source") is False) and (m.ACCEPTS("sink") is True)))
 
@@ -121,6 +155,10 @@ MUTATIONS = [
      "verb = verbs.get(slug)",
      'verb = verbs.get(slug) or "transform"'),
     ("gate ignores ACCEPTS", "passes = emits and accepts", "passes = emits"),
+    ("loop bound not enforced", "    if passes < 1 or passes > MAX_PASSES:", "    if False:"),
+    ("unclosed fold loopable", 'if verb == "fold" and not loop["closed"]:', "if False:"),
+    ("loop refusal ignored", "if loop_error or (loop is not None and loop_refusal(verb, loop)):", "if False:"),
+    ("JSON Lines fallback removed", "    except json.JSONDecodeError:\n        # JSON Lines", "    except KeyError:\n        # JSON Lines"),
 ]
 
 

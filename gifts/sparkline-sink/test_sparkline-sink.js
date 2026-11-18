@@ -91,5 +91,40 @@ check('nested arrays and inverted domain throw', () => {
   assert.throws(() => sparkline({ series: [1, 2], min: 5, max: 5 }), /min must be < max/);
 });
 
+// The file door (S18.1220-quiet-cellar-f6sj84; owed node-gifts-file-output-short-write-silent). Node reports a write to a regular
+// file that only partly fit as a success, so a cut sparkline used to exit 0.
+(function () {
+  const cp = require('child_process'), fs = require('fs'), os = require('os'), path = require('path');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sparkline-sink-file-'));
+  fs.writeFileSync(path.join(tmp, 'in.txt'), JSON.stringify(Array.from({length: 20000}, (_, i) => i)) + '\n');
+  const q = JSON.stringify(process.execPath) + ' ' + JSON.stringify(path.join(__dirname, 'sparkline-sink.js'));
+  const sh = (cmd) => cp.spawnSync('bash', ['-c', cmd], { cwd: tmp, encoding: 'utf8' });
+  const piped = sh(q + ' < in.txt').stdout;
+  check('file: the sparkline written to a regular file is the same bytes as the sparkline written to a pipe', () => {
+    assert.strictEqual(sh(q + ' < in.txt > whole.out; echo $?').stdout.trim(), '0');
+    assert.ok(Buffer.byteLength(piped) > 8192, 'the answer must be larger than the 8 KB limit below');
+    assert.strictEqual(fs.readFileSync(path.join(tmp, 'whole.out'), 'utf8'), piped);
+  });
+  check('file: a file that takes only part of the sparkline exits 1, says so in one line, and is left empty', () => {
+    const r = sh('ulimit -f 8; ' + q + ' < in.txt > cut.out 2> cut.err; echo $?');
+    assert.strictEqual(r.stdout.trim(), '1', 'exit code');
+    assert.strictEqual(fs.statSync(path.join(tmp, 'cut.out')).size, 0, 'a cut answer was left in the file');
+    const err = fs.readFileSync(path.join(tmp, 'cut.err'), 'utf8').trim().split('\n');
+    assert.strictEqual(err.length, 1);
+    assert.ok(/^sparkline-sink: cannot write the whole output/.test(err[0]), err[0]);
+  });
+  check('file: appending a sparkline that does not fit leaves what the file held', () => {
+    fs.writeFileSync(path.join(tmp, 'log.txt'), 'yesterday\n');
+    assert.strictEqual(sh('ulimit -f 8; ' + q + ' < in.txt >> log.txt 2>/dev/null; echo $?').stdout.trim(), '1');
+    assert.strictEqual(fs.readFileSync(path.join(tmp, 'log.txt'), 'utf8'), 'yesterday\n');
+  });
+  check('browser: the file still loads where there is no require', () => {
+    const vm = require('vm'), sandbox = { window: {} };
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'sparkline-sink.js'), 'utf8'), sandbox);
+    if (sandbox.window.LoopGifts) assert.strictEqual(typeof sandbox.window.LoopGifts['sparkline-sink'], 'object');
+  });
+  fs.rmSync(tmp, { recursive: true, force: true });
+})();
+
 console.log('\n' + passed + '/' + n + ' passed');
 if (passed !== n) process.exit(1);

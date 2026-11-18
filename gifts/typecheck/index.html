@@ -207,7 +207,7 @@ HAIL:A:END -->
           <div class="zone-label">Run it</div>
           <div class="runbox">
             <code class="run">python3 typecheck.py text --pipeline A,B,C --manifest gifts-manifest.json</code>
-            <span class="badge">test_typecheck.py (15/15 golden, 8/8 mutations caught)</span>
+            <span class="badge">test_typecheck.py (28/28 golden, 12/12 mutations caught; bounded loops and JSON Lines manifests)</span>
             <span class="badge">Python 3, standard library only</span>
           </div>
         </section>
@@ -215,7 +215,7 @@ HAIL:A:END -->
         <section class="zone" aria-label="The code">
           <div class="zone-label">The code &mdash; every file that ships</div>
           <details class="code-fold">
-            <summary><code class="fname">typecheck.py</code><span class="lines">385 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/typecheck/typecheck.py">on GitHub &rarr;</a></summary>
+            <summary><code class="fname">typecheck.py</code><span class="lines">456 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/typecheck/typecheck.py">on GitHub &rarr;</a></summary>
             <pre class="code"><code>#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 &quot;&quot;&quot;
@@ -264,6 +264,13 @@ WHAT IT DELIBERATELY DOES NOT DO (the honesty flag — a build requirement)
     only ever WARNed) is exactly that record-shape layer, and it is DROPPED on
     purpose: this gift claims port-compatibility and flags record-shape as
     UNPROVEN — it never asserts semantic fit.
+
+LOOPS (the trace)
+    A pipeline element may be a bounded loop of one stage: slug*N, or
+    slug*N:closed for a fold closed under its own I/O (e.g. life-fold). The
+    `loop` gift&#x27;s rule, restated: transform/filter loopable; fold only :closed;
+    source/sink never; 1 &lt;= N &lt;= 1,000,000, and a missing N is refused. A loop
+    takes on its stage&#x27;s port-verb. The manifest may be JSON or JSON Lines.
 
 USAGE
     typecheck check --pipeline A,B,C --manifest gifts-manifest.json
@@ -334,7 +341,23 @@ def load_verbs(path):
     absent from the map, so a pipeline naming it reports UNRESOLVED.
     &quot;&quot;&quot;
     with open(path) as f:
-        data = json.load(f)
+        text = f.read()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # JSON Lines: one object per line (the house manifest&#x27;s own shape). Every
+        # line must parse; a line that is not JSON is an error, never skipped.
+        data = []
+        for n, line in enumerate(text.splitlines(), 1):
+            line = line.strip().rstrip(&quot;,&quot;)
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f&quot;{path}: line {n} is neither part of one JSON document nor a JSON line ({exc.msg})&quot;)
+            if isinstance(obj, dict) and &quot;slug&quot; in obj:
+                data.append(obj)
     if isinstance(data, list):
         entries = data
     elif isinstance(data, dict):
@@ -357,6 +380,41 @@ def load_verbs(path):
     return verbs
 
 
+MAX_PASSES = 1_000_000
+
+
+def parse_element(element):
+    &quot;&quot;&quot;A pipeline element is a slug, or a bounded loop of one: slug*N or slug*N:closed.
+
+    Returns (slug, loop, error). loop is None for a plain stage, else {&quot;passes&quot;: N, &quot;closed&quot;: bool}.
+    The rule is the `loop` gift&#x27;s, restated (gifts never import each other).&quot;&quot;&quot;
+    if &quot;*&quot; not in element:
+        return element, None, None
+    slug, _, rest = element.partition(&quot;*&quot;)
+    count, _, flag = rest.partition(&quot;:&quot;)
+    if not slug:
+        return element, None, &quot;a loop needs a stage before &#x27;*&#x27;&quot;
+    if flag not in (&quot;&quot;, &quot;closed&quot;):
+        return slug, None, f&quot;unknown loop flag &#x27;{flag}&#x27; (only &#x27;:closed&#x27;)&quot;
+    if not count.isdigit():
+        return slug, None, &quot;a loop needs a bound: slug*N with N from 1 to %d — an unbounded loop is refused&quot; % MAX_PASSES
+    passes = int(count)
+    if passes &lt; 1 or passes &gt; MAX_PASSES:
+        return slug, None, &quot;the loop bound must be from 1 to %d&quot; % MAX_PASSES
+    return slug, {&quot;passes&quot;: passes, &quot;closed&quot;: flag == &quot;closed&quot;}, None
+
+
+def loop_refusal(verb, loop):
+    &quot;&quot;&quot;Why a resolved stage cannot be looped, or None. Only a stage that accepts what it emits can be fed back.&quot;&quot;&quot;
+    if verb == &quot;source&quot;:
+        return &quot;a source takes no input, so it cannot be looped&quot;
+    if verb == &quot;sink&quot;:
+        return &quot;a sink emits nothing, so it cannot be looped&quot;
+    if verb == &quot;fold&quot; and not loop[&quot;closed&quot;]:
+        return &quot;a fold narrows to an aggregate; loop it only if closed under its own I/O (slug*N:closed)&quot;
+    return None
+
+
 def typecheck_pipeline(pipeline, verbs):
     &quot;&quot;&quot;Walk a declared pipeline and check every adjacent pair + the endpoints.
 
@@ -377,7 +435,8 @@ def typecheck_pipeline(pipeline, verbs):
 
     # Resolve every stage first; an unresolved stage is a hard fail (never guessed).
     resolved = []
-    for i, slug in enumerate(pipeline):
+    for i, element in enumerate(pipeline):
+        slug, loop, loop_error = parse_element(element)
         verb = verbs.get(slug)
         pos = &quot;first&quot; if i == 0 else (&quot;last&quot; if i == n - 1 else &quot;middle&quot;)
         if verb is None:
@@ -388,6 +447,15 @@ def typecheck_pipeline(pipeline, verbs):
                 &quot;reason&quot;: &quot;UNRESOLVED — slug not in manifest, or no valid port_verb; not guessed&quot;,
             })
             resolved.append(None)
+            continue
+        if loop_error or (loop is not None and loop_refusal(verb, loop)):
+            ok = False
+            hops.append({
+                &quot;kind&quot;: &quot;stage&quot;, &quot;pos&quot;: i, &quot;slug&quot;: slug, &quot;verb&quot;: verb,
+                &quot;role&quot;: pos, &quot;role_ok&quot;: False, &quot;loop&quot;: loop,
+                &quot;reason&quot;: &quot;LOOP REFUSED — &quot; + (loop_error or loop_refusal(verb, loop)),
+            })
+            resolved.append(verb)
             continue
 
         # Endpoint rule. A stage in a non-first position must ACCEPT (else it
@@ -403,10 +471,13 @@ def typecheck_pipeline(pipeline, verbs):
             reason = f&quot;a {verb} emits no stdout, but it is not the last stage — downstream gets nothing&quot;
         if not role_ok:
             ok = False
-        hops.append({
+        record = {
             &quot;kind&quot;: &quot;stage&quot;, &quot;pos&quot;: i, &quot;slug&quot;: slug, &quot;verb&quot;: verb,
             &quot;role&quot;: pos, &quot;role_ok&quot;: role_ok, &quot;reason&quot;: reason,
-        })
+        }
+        if loop is not None:
+            record[&quot;loop&quot;] = loop
+        hops.append(record)
         resolved.append(verb)
 
     # The gate on each adjacent pair.
@@ -604,7 +675,7 @@ if __name__ == &quot;__main__&quot;:
 </code></pre>
           </details>
           <details class="code-fold">
-            <summary><code class="fname">test_typecheck.py</code><span class="lines">170 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/typecheck/test_typecheck.py">on GitHub &rarr;</a></summary>
+            <summary><code class="fname">test_typecheck.py</code><span class="lines">208 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/typecheck/test_typecheck.py">on GitHub &rarr;</a></summary>
             <pre class="code"><code>#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 &quot;&quot;&quot;
@@ -705,6 +776,40 @@ def golden_checks(m):
                 m.conformsTo(&quot;transform&quot;, &quot;transform&quot;) and not m.conformsTo(&quot;filter&quot;, &quot;transform&quot;)))
     out.append((&quot;conformsTo empty-required True&quot;, m.conformsTo(&quot;x&quot;, &quot;&quot;) is True))
 
+    # --- bounded loops (slug*N, slug*N:closed): the trace, checked by the loop gift&#x27;s rule ---
+    hops, ok = m.typecheck_pipeline([&quot;src&quot;, &quot;xf*3&quot;, &quot;snk&quot;], VERBS)
+    st = [h for h in hops if h[&quot;kind&quot;] == &quot;stage&quot; and h[&quot;pos&quot;] == 1][0]
+    out.append((&quot;a bounded transform loop in the middle typechecks and carries its bound&quot;,
+                ok is True and st.get(&quot;loop&quot;) == {&quot;passes&quot;: 3, &quot;closed&quot;: False}))
+    hops, ok = m.typecheck_pipeline([&quot;src&quot;, &quot;flt*2&quot;, &quot;snk&quot;], VERBS)
+    out.append((&quot;a bounded filter loop typechecks&quot;, ok is True))
+    hops, ok = m.typecheck_pipeline([&quot;src&quot;, &quot;fold*3&quot;, &quot;snk&quot;], VERBS)
+    out.append((&quot;an unclosed fold loop is refused&quot;, ok is False))
+    hops, ok = m.typecheck_pipeline([&quot;src&quot;, &quot;fold*3:closed&quot;, &quot;snk&quot;], VERBS)
+    out.append((&quot;a fold loop declared closed typechecks&quot;, ok is True))
+    hops, ok = m.typecheck_pipeline([&quot;src*2&quot;, &quot;snk&quot;], VERBS)
+    out.append((&quot;a source can never be looped&quot;, ok is False))
+    hops, ok = m.typecheck_pipeline([&quot;src&quot;, &quot;snk*2&quot;], VERBS)
+    out.append((&quot;a sink can never be looped&quot;, ok is False))
+    for bad in (&quot;xf*&quot;, &quot;xf*0&quot;, &quot;xf*1000001&quot;, &quot;xf*x&quot;, &quot;xf*2:open&quot;):
+        hops, ok = m.typecheck_pipeline([&quot;src&quot;, bad, &quot;snk&quot;], VERBS)
+        out.append((f&quot;a malformed or unbounded loop &#x27;{bad}&#x27; is refused&quot;, ok is False))
+    hops, ok = m.typecheck_pipeline([&quot;src&quot;, &quot;xf*1000000&quot;, &quot;snk&quot;], VERBS)
+    out.append((&quot;the largest allowed bound typechecks&quot;, ok is True))
+
+    # --- the house manifest is JSON Lines; it must load ---
+    import os, tempfile
+    fd, path = tempfile.mkstemp(suffix=&quot;.json&quot;)
+    with os.fdopen(fd, &quot;w&quot;) as fh:
+        fh.write(&#x27;{&quot;_comment&quot;: &quot;header line, no slug&quot;}\n{&quot;slug&quot;: &quot;a&quot;, &quot;port_verb&quot;: &quot;source&quot;}\n&#x27;
+                 &#x27;{&quot;slug&quot;: &quot;b&quot;, &quot;port_verb&quot;: &quot;sink&quot;}\n&#x27;)
+    try:
+        loaded = m.load_verbs(path)
+    except Exception:
+        loaded = None
+    os.unlink(path)
+    out.append((&quot;a JSON Lines manifest loads slug -&gt; port_verb&quot;, loaded == {&quot;a&quot;: &quot;source&quot;, &quot;b&quot;: &quot;sink&quot;}))
+
     out.append((&quot;EMITS(sink) False / EMITS(source) True&quot;, (m.EMITS(&quot;sink&quot;) is False) and (m.EMITS(&quot;source&quot;) is True)))
     out.append((&quot;ACCEPTS(source) False / ACCEPTS(sink) True&quot;, (m.ACCEPTS(&quot;source&quot;) is False) and (m.ACCEPTS(&quot;sink&quot;) is True)))
 
@@ -728,6 +833,10 @@ MUTATIONS = [
      &quot;verb = verbs.get(slug)&quot;,
      &#x27;verb = verbs.get(slug) or &quot;transform&quot;&#x27;),
     (&quot;gate ignores ACCEPTS&quot;, &quot;passes = emits and accepts&quot;, &quot;passes = emits&quot;),
+    (&quot;loop bound not enforced&quot;, &quot;    if passes &lt; 1 or passes &gt; MAX_PASSES:&quot;, &quot;    if False:&quot;),
+    (&quot;unclosed fold loopable&quot;, &#x27;if verb == &quot;fold&quot; and not loop[&quot;closed&quot;]:&#x27;, &quot;if False:&quot;),
+    (&quot;loop refusal ignored&quot;, &quot;if loop_error or (loop is not None and loop_refusal(verb, loop)):&quot;, &quot;if False:&quot;),
+    (&quot;JSON Lines fallback removed&quot;, &quot;    except json.JSONDecodeError:\n        # JSON Lines&quot;, &quot;    except KeyError:\n        # JSON Lines&quot;),
 ]
 
 
@@ -809,7 +918,7 @@ if __name__ == &quot;__main__&quot;:
         <p class="footer-docs">Documents: <a href="/site/corpus.html">Creed, PiF, Glossary &amp; the full corpus &rarr;</a></p>
         <div class="footer-mark">
           <img src="/site/assets/wordmark.svg" alt="Loop MMT" style="height:19px;width:auto;">
-          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.152</span>
+          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.153</span>
         </div>
         <p><a href="mailto:shea@loopmmt.com">shea@loopmmt.com</a></p>
       </div>

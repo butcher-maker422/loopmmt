@@ -129,5 +129,41 @@ check('line: single point renders as a dot', () => {
   assert.ok(svg.indexOf('<polyline') === -1);
 });
 
+// 13-16 — the file door (S18.1220; owed node-gifts-file-output-short-write-silent). Node reports a write to a regular
+// file that only partly fit as a success, so a cut chart used to exit 0. 2,000 points make a chart past 8 KB.
+(function () {
+  const cp = require('child_process'), fs = require('fs'), os = require('os'), path = require('path');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'svg-sink-file-'));
+  const series = []; for (let i = 0; i < 2000; i++) series.push(Math.round(Math.sin(i / 9) * 1000));
+  fs.writeFileSync(path.join(tmp, 'in.json'), JSON.stringify(series));
+  const q = JSON.stringify(process.execPath) + ' ' + JSON.stringify(path.join(__dirname, 'svg-sink.js'));
+  const sh = (cmd) => cp.spawnSync('bash', ['-c', cmd], { cwd: tmp, encoding: 'utf8' });
+  const piped = sh(q + ' < in.json').stdout;
+  check('file: a chart written to a regular file is the same bytes as the chart written to a pipe', () => {
+    assert.strictEqual(sh(q + ' < in.json > whole.svg; echo $?').stdout.trim(), '0');
+    assert.ok(piped.length > 8192, 'the chart must be larger than the 8 KB limit below');
+    assert.strictEqual(fs.readFileSync(path.join(tmp, 'whole.svg'), 'utf8'), piped);
+  });
+  check('file: a file that takes only part of the chart exits 1, says so in one line, and is left empty', () => {
+    const r = sh('ulimit -f 8; ' + q + ' < in.json > cut.svg 2> cut.err; echo $?');
+    assert.strictEqual(r.stdout.trim(), '1', 'exit code');
+    assert.strictEqual(fs.statSync(path.join(tmp, 'cut.svg')).size, 0, 'a cut chart was left in the file');
+    const err = fs.readFileSync(path.join(tmp, 'cut.err'), 'utf8').trim().split('\n');
+    assert.strictEqual(err.length, 1);
+    assert.ok(/^svg-sink: cannot write the whole output/.test(err[0]), err[0]);
+  });
+  check('file: appending a chart that does not fit leaves what the file held', () => {
+    fs.writeFileSync(path.join(tmp, 'log.txt'), 'yesterday\n');
+    assert.strictEqual(sh('ulimit -f 8; ' + q + ' < in.json >> log.txt 2>/dev/null; echo $?').stdout.trim(), '1');
+    assert.strictEqual(fs.readFileSync(path.join(tmp, 'log.txt'), 'utf8'), 'yesterday\n');
+  });
+  check('browser: the file still loads where there is no require, and attaches renderSVG', () => {
+    const vm = require('vm'), sandbox = { window: {} };
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'svg-sink.js'), 'utf8'), sandbox);
+    assert.strictEqual(typeof sandbox.window.LoopGifts['svg-sink'].renderSVG, 'function');
+  });
+  fs.rmSync(tmp, { recursive: true, force: true });
+})();
+
 console.log('\n' + passed + '/' + n + ' passed');
 if (passed !== n) process.exit(1);

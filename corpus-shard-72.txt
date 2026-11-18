@@ -1,520 +1,853 @@
-# Loop MMT — corpus shard 72/95
+# Loop MMT — corpus shard 72/99
 
-> Bundle 72 of 95 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 72 of 99 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/jq-lite/, /gifts/json-source/, /gifts/jsonl-diff/)
+Nodes in this shard: 3 (/gifts/heatmap-sink/, /gifts/histogram-fold/, /gifts/hmac-webhook/)
 
 ---
 
-# jq-lite — a Loop MMT gift
-https://loopmmt.com/gifts/jq-lite/
+# Heatmap-sink — a Loop MMT gift
+https://loopmmt.com/gifts/heatmap-sink/
 [coverage: optional · branch: gifts]
 
-A Tiny jq-Style Query Language for JSON transform ← all gifts
+Cells In, One Heatmap SVG Out render ← all gifts
 
-jq-lite
+Heatmap-sink
 
-jq-lite gives you jq's common moves — pull a field (.user.name), index an array (.[0],.[-1]), iterate a stream (.[]), and pipe one step into the next (.items[] |.id) — over JSON on stdin, without installing jq. It follows jq's rules where they save you: a missing key is null (not a crash), and the? operator skips a type mismatch so one ragged record doesn't abort the stream. Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+heatmap-sink turns a stream of (x,y,value) cells into one standalone, deterministic heatmap SVG with zero dependencies — one <rect> per grid cell, painted from a fixed 5-bucket color scale. It renders no axes, labels, legend, colorbar, or title — only the field — so it drops straight into a README, a report, or a CI comment where a plotting library would be overkill. The load-bearing property: integer grid coordinates and INTEGER color buckets mean no float ever reaches the output, and cells are drawn row-major regardless of arrival order, so the same set of cells produces byte-identical SVG out — in Node or a browser, committable and diffable.
 
 The honest edge
 
-jq-lite implements a SMALL subset of jq — identity, field/index/bracket access,.[] iteration, the pipe, and the? optional. It has no functions, no arithmetic, no object/array construction, no select/map/comparison, and no recursion (..). For those, use jq itself. A malformed filter or invalid JSON input is refused (exit 2); an unmarked runtime type error is exit 3.
+heatmap-sink is a grid-of-rects heatmap primitive, not a plotting library: one <rect> per (x,y) cell, no axes, labels, legend, colorbar, or title, no fonts/CSS/script. It takes NUMBERS ONLY — (x,y,v) triples — so no caller text reaches the output and there is no escaping surface. Colors come from a fixed named 5-bucket scale (missing cells take a fixed empty fill) — never caller-chosen. Two values in the same band draw the SAME color: it shows the FIELD, not the exact magnitude. A non-finite value, a bad coordinate, or a duplicate (x,y) is a hard error, never a guessed cell. Same cells in → byte-identical SVG out, independent of order.
 
 Run it
 
-echo '{"items":[{"id":10},{"id":20}]}' | node jq-lite.js '.items[] |.id' # -> 10 20
-test_jq-lite.js (426/426, independent recursive-descent oracle) + mutation-bite (7/7) + Plumb conformance GREEN (346/346, signed 2026-09-12, clock-independent, non-vacuity proven)
+printf '[0,0,0]\n[1,0,1]\n[0,1,2]\n[1,1,3]\n' | node heatmap-sink.js # a 2x2 heatmap SVG (--palette heat|cool|mono|viridis · --cell N · --min/--max to pin)
+test_heatmap-sink.js (16/16, out-of-band hand-computed SVG oracle) + Plumb conformance GREEN (I1-I5, signed, clock-independent) + the file door (all or nothing into a file, exit 1; full-write gift-block, Plumb v2 I6)
 Node / browser, no dependencies
 
 The code — every file that ships
 
-jq-lite.js 492 lines on GitHub →
+heatmap-sink.js 353 lines on GitHub →
 #!/usr/bin/env node
-/* jq-lite.js — a tiny jq-style query language for JSON, in one dependency-free file.
-Deterministic, pure, MIT. Runs in Node or a browser.
+/*
+* heatmap-sink — turn (x,y,v) cells into one standalone, deterministic heatmap SVG, no deps.
+* MIT · zero-dependency · standalone gift · lane: sink (consumes data, emits an artifact).
+*
+* THE PRINTED EDGE (read before trusting the output):
+* This is a GRID-OF-RECTS heatmap primitive, not a plotting library. It draws GEOMETRY
+* ONLY — one <rect> per (x,y) grid cell inside a plain <svg> frame. It renders NO axes,
+* tick marks, tick labels, legend, colorbar, title, or interactivity, and it embeds NO
+* fonts, NO CSS, and NO <script>. It takes NUMBERS ONLY — (x,y,v) triples — so no caller
+* text ever reaches the output, and there is no text-escaping surface to get wrong.
+* Colors are NOT free-form input: each cell is painted from a fixed, named, DISCRETE color
+* scale (value → one of N buckets across the data's [min,max]), and missing cells take a
+* fixed empty fill — so the output can never carry an attacker-chosen attribute string.
+* Because there are only N buckets, two values in the same band draw the SAME color: it
+* shows the FIELD, not the exact magnitude, and it is not a substitute for the number. A
+* non-finite v, a non-integer or negative coordinate, a duplicate (x,y), or a cell outside
+* a pinned grid is a HARD ERROR, never silently dropped or guessed. Output is a PURE
+* FUNCTION of the input, independent of cell ORDER: same cells in → byte-identical SVG out.
+*
+* USAGE:
+* printf '[0,0,0]\n[1,0,1]\n[0,1,2]\n[1,1,3]\n' | node heatmap-sink.js # 2x2 heatmap
+* printf '{"x":0,"y":0,"v":9}\n' | node heatmap-sink.js # object cells
+* printf '[0,0,5]\n[1,0,5]\n' | node heatmap-sink.js --palette cool --min 0 --max 10
+* echo '{"cells":[[0,0,1],[1,1,9]],"palette":"mono"}' | node heatmap-sink.js # spec object
+* node heatmap-sink.js --help
+*
+* INPUT (stdin): either
+* - JSONL — one cell per line, each `[x,y,v]` or `{"x":X,"y":Y,"v":V}` (the streaming form)
+* - a single JSON spec object { cells, min, max, palette, cell, cols, rows, empty}
+* x,y are NON-NEGATIVE INTEGER grid coordinates (column, row); v is a finite number.
+* CLI flags (--palette --cell --min --max --cols --rows --empty) OVERRIDE object fields.
+*
+* OUTPUT (stdout): one SVG document string (UTF-8), trailing newline. No cells → an empty frame.
+*
+* DETERMINISM: integer grid coordinates, integer cell size, INTEGER color buckets, cells drawn
+* in row-major order regardless of input order, 3-decimal coordinate precision, stable
+* attribute order. No wall-clock, no randomness. Same cells → same bytes, in Node or a browser.
+* PORTABILITY: pure JS on plain arrays/strings — identical in Node and the browser.
+*/
+'use strict';
 
-WHAT IT IS. A TRANSFORM: it takes JSON in and emits JSON out, reshaped by a filter
-expression you write in a small, well-defined query language. It is the "reach for jq"
-move without installing jq — the mini-language that lets you pull `.user.name` out of a
-blob, iterate `.items[]`, index `.[0]`, and pipe one step into the next, over a single
-JSON value or a JSONL stream of them:
+// ---- color scales (the ONLY source of cell color; no free-form color input) -----
+// Named, closed sets of N=5 discrete colors, low value → high value. A value v is painted
+// SCALES[name][level(v)]; level is an integer bucket, so no float ever reaches the output.
+var N_BUCKETS = 5;
+var SCALES = {
+heat: ['#ffffcc', '#fed976', '#fd8d3c', '#e31a1c', '#800026'], // light yellow → deep red
+cool: ['#f7fbff', '#c6dbef', '#6baed6', '#2171b5', '#08306b'], // light → deep blue
+mono: ['#f7f7f7', '#cccccc', '#969696', '#636363', '#252525'], // light → dark gray
+viridis: ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725'] // dark purple → yellow
+};
+// Empty (missing) cells: a closed choice, never caller free-form. 'none' omits the rect.
+var EMPTY_FILLS = { light: '#eeeeee', dark: '#333333', none: null};
+var DEFAULTS = { palette: 'heat', cell: 16, empty: 'light'};
 
-echo '{"user":{"name":"ada"}}' | node jq-lite.js '.user.name' -> "ada"
-printf '{"a":1}\n{"a":2}\n' | node jq-lite.js '.a' -> 1 \n 2
+// ---- deterministic number formatting (verbatim from svg-sink) -------------------
+// Round to 3 decimals, strip trailing zeros (and a bare trailing dot), normalize -0.
+var PRECISION = 3, SCALE = 1000;
+function num(x) {
+var r = Math.round(x * SCALE) / SCALE;
+var s = r.toFixed(PRECISION);
+s = s.replace(/\.?0+$/, '');
+return (s === '' || s === '-0')? '0': s;
+}
 
-It is the adapter between "a JSON blob" and "the one field/element you actually want",
-at the front or middle of a pipe: `line-source access.log |... | jq-lite '.status'`.
+// ---- validation helpers --------------------------------------------------------
+function finiteV(v, x, y) {
+if (typeof v!== 'number' ||!isFinite(v)) {
+throw new Error('cell (' + x + ',' + y + ') value is not a finite number: ' + JSON.stringify(v));
+}
+return v;
+}
+function coord(c, which, cellRepr) {
+if (typeof c!== 'number' ||!isFinite(c) || Math.floor(c)!== c) {
+throw new Error(which + ' coordinate must be a non-negative integer, got ' + JSON.stringify(c) + ' in cell ' + cellRepr);
+}
+if (c < 0) throw new Error(which + ' coordinate must be a non-negative integer, got ' + JSON.stringify(c) + ' in cell ' + cellRepr);
+return c;
+}
+function posInt(v, dflt, name) {
+if (v == null) return dflt;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n <= 0) throw new Error(name + ' must be a positive integer, got ' + JSON.stringify(v));
+return n;
+}
+function nonNegIntOrNull(v, name) {
+if (v == null) return null;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n < 0) throw new Error(name + ' must be a non-negative integer, got ' + JSON.stringify(v));
+return n;
+}
 
-THE QUIET FAILURES IT FIXES. Everyone reaches for `obj.a.b.c` and everyone gets it
-subtly wrong, in ways that only bite on the input you didn't test:
+// ---- one cell -> {x,y,v} (accepts [x,y,v] or {x,y,v}) --------------------------
+function asCell(raw) {
+var repr = JSON.stringify(raw);
+var x, y, v;
+if (Array.isArray(raw)) {
+if (raw.length!== 3) throw new Error('cell array must be [x,y,v] (3 numbers), got ' + repr);
+x = raw[0]; y = raw[1]; v = raw[2];
+} else if (raw && typeof raw === 'object') {
+if (!('x' in raw) ||!('y' in raw) ||!('v' in raw)) throw new Error('cell object must have x,y,v, got ' + repr);
+x = raw.x; y = raw.y; v = raw.v;
+} else {
+throw new Error('cell must be [x,y,v] or {x,y,v}, got ' + repr);
+}
+coord(x, 'x', repr); coord(y, 'y', repr); finiteV(v, x, y);
+return { x: x, y: y, v: v};
+}
 
-1. THE MISSING-KEY CRASH. `obj.a.b` throws the moment `obj.a` is absent
-(`Cannot read properties of undefined`). jq-lite follows jq's rule: a missing
-object key yields `null`, not an exception — `.a.b.c` on `{}` is `null`, quietly
-and correctly. You opt INTO strictness, you are never ambushed by it.
+// ---- scale (shared value-domain across all cells; shape from svg-sink/sparkline) --
+function domain(values, min, max) {
+var lo = (min!= null)? Number(min): Infinity;
+var hi = (max!= null)? Number(max): -Infinity;
+if (min == null || max == null) {
+for (var i = 0; i < values.length; i++) {
+var v = values[i];
+if (min == null && v < lo) lo = v;
+if (max == null && v > hi) hi = v;
+}
+}
+if (!isFinite(lo)) lo = 0;
+if (!isFinite(hi)) hi = 0;
+if (lo === hi) { lo -= 1; hi += 1;} // flat field -> unit window, painted mid-scale
+return { lo: lo, hi: hi};
+}
+function level(v, lo, hi) {
+var k = Math.floor(((v - lo) / (hi - lo)) * N_BUCKETS);
+if (k < 0) k = 0;
+if (k >= N_BUCKETS) k = N_BUCKETS - 1; // v == hi -> N clamps to N-1
+return k;
+}
 
-2. THE TYPE-CONFUSION. Indexing a string or a number as if it were an object/array
-(`.foo` on `"hi"`, `.[0]` on `42`) is a real error you WANT surfaced — but only
-when you meant it. jq-lite errors loudly on a genuine type mismatch, and gives you
-the `?` operator (`.foo?`, `.[0]?`) to say "skip it if it doesn't fit" — so one
-ragged record in a stream doesn't abort the whole run.
+// ---- input normalization -------------------------------------------------------
+// Accept: [[x,y,v],...] | [{x,y,v},...] | {cells,...}. Return a validated spec.
+function normalize(input, flags) {
+var spec = {};
+var cellsRaw;
+if (input &&!Array.isArray(input) && typeof input === 'object') {
+cellsRaw = input.cells;
+if (input.min!= null) spec.min = input.min;
+if (input.max!= null) spec.max = input.max;
+if (input.palette!= null) spec.palette = input.palette;
+if (input.cell!= null) spec.cell = input.cell;
+if (input.cols!= null) spec.cols = input.cols;
+if (input.rows!= null) spec.rows = input.rows;
+if (input.empty!= null) spec.empty = input.empty;
+} else {
+cellsRaw = input;
+}
+flags = flags || {};
+for (var k in flags) if (flags[k]!= null) spec[k] = flags[k];
 
-3. THE STREAM FAN-OUT. `.[]` turns one input into MANY outputs (each array element
-or object value), and a pipe must thread that correctly: `.items[] |.id` runs
-`.id` over EACH item, not over the array. Hand-rolled `.map(x => x.id)` forgets
-the empty-array case, the object case, and the compose-with-a-later-`[]` case.
-jq-lite treats every filter as value -> stream and composes streams properly.
+if (cellsRaw == null) cellsRaw = [];
+if (!Array.isArray(cellsRaw)) throw new Error('input has no cells (expected [[x,y,v],...] or a {cells:...} object)');
 
-THE LANGUAGE (this is the whole of it — the "lite" is the point):
+var cells = cellsRaw.map(asCell);
 
-. identity — the input value, unchanged
-.foo.foo.bar field access (missing key -> null; non-object -> error unless?)
-.["a b"] bracketed string key (for keys that aren't bare identifiers)
-.[2].foo[0] array index (negative counts from the end:.[-1] is the last)
-.[] iterate — emit each array element, or each object VALUE, as a stream
-a | b pipe — run b over every output of a
-.foo?.[0]?.[]? optional — on a type mismatch, emit nothing instead of erroring
+spec.palette = (spec.palette!= null)? String(spec.palette): DEFAULTS.palette;
+spec.empty = (spec.empty!= null)? String(spec.empty): DEFAULTS.empty;
+spec.cell = posInt(spec.cell, DEFAULTS.cell, 'cell');
+spec.pinCols = nonNegIntOrNull(spec.cols, 'cols');
+spec.pinRows = nonNegIntOrNull(spec.rows, 'rows');
+if (spec.min!= null) spec.min = numOrThrow(spec.min, 'min');
+if (spec.max!= null) spec.max = numOrThrow(spec.max, 'max');
+if (spec.min!= null && spec.max!= null && spec.min >= spec.max) {
+throw new Error('min must be < max (got min=' + spec.min + ', max=' + spec.max + ')');
+}
+if (!SCALES[spec.palette]) throw new Error('unknown palette "' + spec.palette + '" (expected ' + Object.keys(SCALES).join(' | ') + ')');
+if (!(spec.empty in EMPTY_FILLS)) throw new Error('unknown empty "' + spec.empty + '" (expected ' + Object.keys(EMPTY_FILLS).join(' | ') + ')');
 
-Values are standard JSON. Output is one JSON value per result; with --jsonl-out (the
-default for stream input) each result is a line. A filter is applied to EACH input
-value independently; a JSONL input runs the filter per line.
+// build the cell map; a duplicate (x,y) is a HARD error (ambiguous cell, no silent last-wins)
+var mapKey = {}, maxX = -1, maxY = -1;
+for (var i = 0; i < cells.length; i++) {
+var c = cells[i], key = c.x + ',' + c.y;
+if (Object.prototype.hasOwnProperty.call(mapKey, key)) {
+throw new Error('duplicate cell at (' + c.x + ',' + c.y + ') — each grid position may appear at most once');
+}
+mapKey[key] = c.v;
+if (c.x > maxX) maxX = c.x;
+if (c.y > maxY) maxY = c.y;
+}
+var cols = (spec.pinCols!= null)? spec.pinCols: maxX + 1;
+var rows = (spec.pinRows!= null)? spec.pinRows: maxY + 1;
+if (spec.pinCols!= null && maxX >= spec.pinCols) throw new Error('cell x=' + maxX + ' is outside the pinned grid cols=' + spec.pinCols);
+if (spec.pinRows!= null && maxY >= spec.pinRows) throw new Error('cell y=' + maxY + ' is outside the pinned grid rows=' + spec.pinRows);
+if (cols < 0) cols = 0;
+if (rows < 0) rows = 0;
 
---raw-output if a result is a JSON string, print it without quotes (jq -r)
---slurp read the whole input as ONE JSON value (an array of the inputs) before
-filtering, instead of per-value (jq -s)
---compact (default) one-line JSON per result
+spec.cellMap = mapKey;
+spec.cols = cols;
+spec.rows = rows;
+spec.values = cells.map(function (c) { return c.v;});
+return spec;
+}
+function numOrThrow(v, name) {
+var n = Number(v);
+if (typeof n!== 'number' ||!isFinite(n)) throw new Error(name + ' must be a finite number, got ' + JSON.stringify(v));
+return n;
+}
 
-DETERMINISM. run(value, filter) is a pure function — no clock, no randomness, no I/O
-beyond the value you pass, no ambient state. The same value and filter yield
-byte-identical output on every run and every machine. Object VALUE iteration (`.[]`)
-emits values in the object's own key insertion order (JSON parse order), which is
-stable for a given input.
+// ---- core: renderHeatmap(spec) -> string (pure, the whole gift) ----------------
+function heatmap(input, flags) {
+var spec = normalize(input, flags);
+var cell = spec.cell, cols = spec.cols, rows = spec.rows;
+var W = cols * cell, H = rows * cell;
+var scale = SCALES[spec.palette];
+var emptyFill = EMPTY_FILLS[spec.empty]; // may be null (omit empty rects)
+var dom = domain(spec.values, spec.min, spec.max);
+
+var body = [];
+// row-major order — INPUT-ORDER-INDEPENDENT and deterministic.
+for (var y = 0; y < rows; y++) {
+for (var x = 0; x < cols; x++) {
+var key = x + ',' + y;
+var fill;
+if (Object.prototype.hasOwnProperty.call(spec.cellMap, key)) {
+fill = scale[level(spec.cellMap[key], dom.lo, dom.hi)];
+} else if (emptyFill == null) {
+continue; // 'none' -> omit the rect entirely
+} else {
+fill = emptyFill;
+}
+body.push('<rect x="' + num(x * cell) + '" y="' + num(y * cell) +
+'" width="' + num(cell) + '" height="' + num(cell) + '" fill="' + fill + '" />');
+}
+}
+
+// Fixed attribute order; xmlns first so the fragment is a valid standalone document.
+var open = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '">';
+return open + '\n' + (body.length? body.join('\n') + '\n': '') + '</svg>\n';
+}
+
+// ---- exports (browser attach · require · direct run) ---------------------------
+if (typeof window!== 'undefined') {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts['heatmap-sink'] = { heatmap: heatmap, SCALES: SCALES, EMPTY_FILLS: EMPTY_FILLS};
+}
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { heatmap: heatmap, num: num, normalize: normalize, domain: domain, SCALES: SCALES, EMPTY_FILLS: EMPTY_FILLS, N_BUCKETS: N_BUCKETS};
+}
+
+// ---- cli -----------------------------------------------------------------------
+var HELP =
+'heatmap-sink — (x,y,v) cells -> a standalone, deterministic heatmap SVG, zero deps.\n\n' +
+" printf '[0,0,0]\\n[1,0,1]\\n[0,1,2]\\n[1,1,3]\\n' | node heatmap-sink.js\n" +
+" printf '{\"x\":0,\"y\":0,\"v\":9}\\n' | node heatmap-sink.js\n" +
+" printf '[0,0,5]\\n[1,0,5]\\n' | node heatmap-sink.js --palette cool --min 0 --max 10\n" +
+" echo '{\"cells\":[[0,0,1],[1,1,9]]}' | node heatmap-sink.js --cell 24\n\n" +
+'INPUT (stdin): JSONL of [x,y,v] or {x,y,v} cells (one per line), OR a {cells,...} spec object.\n' +
+'Flags (override object fields): --palette heat|cool|mono|viridis --cell N --min N --max N\n' +
+' --cols N --rows N --empty light|dark|none\n\n' +
+'Geometry only: one <rect> per cell, no axes/labels/legend/fonts/CSS/script. Numbers in, a\n' +
+'grid out. Colors come from a fixed named 5-bucket scale (not caller input). A non-finite v,\n' +
+'a bad coordinate, or a duplicate (x,y) -> error.\n';
+
+function parseFlags(argv) {
+var f = {};
+for (var i = 0; i < argv.length; i++) {
+var a = argv[i];
+if (a === '--palette') f.palette = argv[++i];
+else if (a === '--cell') f.cell = Number(argv[++i]);
+else if (a === '--min') f.min = Number(argv[++i]);
+else if (a === '--max') f.max = Number(argv[++i]);
+else if (a === '--cols') f.cols = Number(argv[++i]);
+else if (a === '--rows') f.rows = Number(argv[++i]);
+else if (a === '--empty') f.empty = argv[++i];
+}
+return f;
+}
+
+// Parse stdin: a single JSON spec object {cells:...} passes through; otherwise treat the
+// input as JSONL — one cell per non-empty line. Blank lines are skipped.
+function parseStdin(raw) {
+var trimmed = raw.trim();
+if (trimmed === '') return { cells: []};
+// single-object spec form?
+if (trimmed.charAt(0) === '{') {
+try {
+var obj = JSON.parse(trimmed);
+if (obj &&!Array.isArray(obj) && typeof obj === 'object' && 'cells' in obj) return obj;
+} catch (e) { /* fall through to JSONL (multi-line objects) */}
+}
+var cells = [];
+var lines = trimmed.split('\n');
+for (var i = 0; i < lines.length; i++) {
+var ln = lines[i].trim();
+if (ln === '') continue;
+var cell;
+try { cell = JSON.parse(ln);}
+catch (e) { throw new Error('line ' + (i + 1) + ' is not valid JSON: ' + e.message);}
+cells.push(cell);
+}
+return { cells: cells};
+}
+
+/* >>> gift-block full-write · a shared block, stamped verbatim from the house's block source; edit the source, never this copy >>> */
+/* full-write: write a whole answer to stdout, all of it or none of it. Node reports a write to a regular file that
+only partly fit (a full disk, a file-size limit, a quota) as a success and drops the count, so into a regular file
+the bytes are counted here, and an answer that did not all fit is taken back out, but only when the file grew by
+exactly what this run wrote: then nothing that was there before and nothing another writer added is removed.
+Into a pipe or a terminal the answer is one write. A reader that has gone away (EPIPE) is not an error. Any other
+failure to write sets process.exitCode to failCode and says so in one line on stderr, prefixed with name.
+Never throws. The shape is cosine-fold's emit() (the cosine-fold Gift, Plumb v2).
+Joins: cosine-fold's emit() (the same logic, left in place: its bytes are the blessed ones). */
+function fullWrite(text, failCode, name) {
+var fs = require("fs"), st = null, said = false;
+function failed(e, kept) {
+if (said || (e && e.code === "EPIPE")) return;
+said = true;
+var what = kept === 0? ": nothing was kept": (kept > 0? ": a partial file may remain": "");
+try { process.stderr.write(name + ": cannot write the whole output (" + ((e && e.code) || "error") + ")" + what + "\n");} catch (x) {}
+process.exitCode = failCode;
+}
+try { st = fs.fstatSync(1);} catch (x) {}
+if (st && st.isFile()) {
+var buf = Buffer.from(String(text), "utf8"), off = 0;
+try {
+while (off < buf.length) {
+var n = fs.writeSync(1, buf, off, buf.length - off);
+if (!(n > 0)) { var short = new Error("short write"); short.code = "EIO"; throw short;}
+off += n;
+}
+} catch (e) {
+var kept = off;
+try { if (off > 0 && fs.fstatSync(1).size === st.size + off) { fs.ftruncateSync(1, st.size); kept = 0;}} catch (x) {}
+failed(e, kept);
+}
+return;
+}
+process.stdout.on("error", function (e) { failed(e);});
+process.stdout.write(String(text), function (e) { if (e) failed(e);});
+}
+/* <<< gift-block full-write <<< */
+
+function main() {
+var argv = process.argv.slice(2);
+if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) { process.stdout.write(HELP); return;}
+var flags = parseFlags(argv);
+var chunks = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (d) { chunks += d;});
+process.stdin.on('end', function () {
+var input;
+try { input = parseStdin(chunks);}
+catch (e) { process.stderr.write('heatmap-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+var svg;
+try { svg = heatmap(input, flags);}
+catch (e) { process.stderr.write('heatmap-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+fullWrite(svg, 1, 'heatmap-sink');
+});
+}
+if (typeof require!== 'undefined' && require.main === module) { main();}
+
+test_heatmap-sink.js 203 lines on GitHub →
+#!/usr/bin/env node
+/*
+* test_heatmap-sink.js — drift-check battery for the heatmap-sink gift.
+*
+* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The expected SVG documents below are
+* hand-computed from the documented math — level(v) = clamp(floor((v-lo)/(hi-lo)*5), 0, 4),
+* lo/hi the auto-fit or pinned domain (flat field -> unit window), cells drawn row-major at
+* (x*cell, y*cell) — written independently of the emitter, not captured from its output. A
+* build cannot certify itself, so the expected strings are the author's fact. The remaining
+* checks are contract properties (determinism, order-independence, closed palette, honest errors).
+*
+* Run: node test_heatmap-sink.js (exit 0 = all pass; nonzero = a named failure)
+*/
+'use strict';
+const assert = require('assert');
+const { heatmap, SCALES, EMPTY_FILLS} = require('./heatmap-sink.js');
+
+let n = 0, passed = 0;
+function check(name, fn) {
+n++;
+try { fn(); passed++; console.log(' ok ' + name);}
+catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
+}
+
+// ---- hand-computed expected SVGs (heat palette, cell=16, empty=light) ------------
+// heat = #ffffcc #fed976 #fd8d3c #e31a1c #800026; empty light = #eeeeee
+const RAMP_2x2 =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fed976" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#e31a1c" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
+
+// 1 — full 2x2 grid, values 0..3 auto-domain [0,3] -> one bucket per corner, in order.
+// level(0)=0 level(1)=floor(1/3*5)=1 level(2)=floor(2/3*5)=3 level(3)=clamp(5)=4
+check('ramp 2x2: [0,1,2,3] -> #ffffcc #fed976 #e31a1c #800026', () => {
+assert.strictEqual(heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]}), RAMP_2x2);
+});
+
+// 2 — flat field: all equal -> unit window -> every cell mid-scale (bucket 2 = #fd8d3c).
+check('flat field: [5,5,5,5] -> all #fd8d3c (mid-scale, no divide-by-0)', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,5],[1,0,5],[0,1,5],[1,1,5]]}), exp);
+});
+
+// 3 — single cell -> flat window -> one mid-scale rect, 16x16 frame.
+check('single cell: [0,0,7] -> one #fd8d3c rect', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,7]]}), exp);
+});
+
+// 4 — sparse input: two corners set, 3x3 grid, the 7 missing cells take the empty fill.
+check('sparse: [(0,0)=0,(2,2)=10] -> corners painted, 7 empty #eeeeee', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="0" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="0" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="16" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="0" y="32" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="16" y="32" width="16" height="16" fill="#eeeeee" />\n' +
+'<rect x="32" y="32" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,0],[2,2,10]]}), exp);
+});
+
+// 5 — pinned domain overrides the flat-window auto-fit: [5,5] on [0,10] -> bucket 2.
+check('pinned: {cells:[5,5],min:0,max:10} -> both #fd8d3c', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 16" width="32" height="16">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'<rect x="16" y="0" width="16" height="16" fill="#fd8d3c" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,5],[1,0,5]], min: 0, max: 10}), exp);
+});
+
+// 6 — empty input -> a valid, empty 0x0 frame, never a crash.
+check('empty: {cells:[]} -> empty <svg> frame', () => {
+assert.strictEqual(heatmap({ cells: []}),
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 0 0" width="0" height="0">\n</svg>\n');
+});
+
+// 7 — 'none' empty omits missing rects entirely.
+check("empty:none -> missing cells produce no rect", () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">\n' +
+'<rect x="0" y="0" width="16" height="16" fill="#ffffcc" />\n' +
+'<rect x="16" y="16" width="16" height="16" fill="#800026" />\n' +
+'</svg>\n';
+assert.strictEqual(heatmap({ cells: [[0,0,0],[1,1,10]], empty: 'none'}), exp);
+});
+
+// 8 — object-form cells {x,y,v} render identically to array-form.
+check('object cells {x,y,v} == array cells [x,y,v]', () => {
+const a = heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]});
+const o = heatmap({ cells: [{x:0,y:0,v:0},{x:1,y:0,v:1},{x:0,y:1,v:2},{x:1,y:1,v:3}]});
+assert.strictEqual(o, a);
+assert.strictEqual(o, RAMP_2x2);
+});
+
+// 9 — INPUT-ORDER-INDEPENDENCE: scrambled cell order -> byte-identical SVG (a heatmap is a SET).
+check('order-independent: scrambled cells -> identical bytes', () => {
+const scrambled = heatmap({ cells: [[1,1,3],[0,0,0],[1,0,1],[0,1,2]]});
+assert.strictEqual(scrambled, RAMP_2x2);
+});
+
+// 10 — determinism: same cells -> byte-identical output, twice.
+check('determinism: repeated render is byte-identical', () => {
+const c = { cells: [[0,0,3],[1,0,1],[2,0,4],[0,1,1],[1,1,5],[2,1,9]]};
+assert.strictEqual(heatmap(c), heatmap(c));
+});
+
+// 11 — closed palette + no text: every fill is in the named scale (∪ empty); no <text|script|style.
+check('closed palette: only scale colors + empty, no text/script/style', () => {
+const out = heatmap({ cells: [[0,0,0],[1,0,50],[0,1,100],[1,1,25]], palette: 'cool', min: 0, max: 100});
+const allowed = new Set(SCALES.cool.concat([EMPTY_FILLS.light]));
+const fills = out.match(/fill="([^"]*)"/g).map(s => s.slice(6, -1));
+for (const f of fills) assert.ok(allowed.has(f), 'unexpected fill ' + f);
+assert.ok(!/<text|<script|<style|font/.test(out), 'output must contain no text/script/style/font');
+assert.ok(out.startsWith('<svg ') && out.endsWith('</svg>\n'), 'well-formed svg frame');
+});
+
+// 12 — non-finite value is a hard, named error (never a guessed color).
+check('non-finite value throws, naming the cell', () => {
+assert.throws(() => heatmap({ cells: [[0,0,0],[1,0,NaN]]}), /cell \(1,0\) value is not a finite number/);
+assert.throws(() => heatmap({ cells: [[0,0,Infinity]]}), /is not a finite number/);
+});
+
+// 13 — bad coordinates throw: negative and non-integer are both refused.
+check('negative / non-integer coordinate throws', () => {
+assert.throws(() => heatmap({ cells: [[-1,0,5]]}), /coordinate must be a non-negative integer/);
+assert.throws(() => heatmap({ cells: [[0.5,0,5]]}), /coordinate must be a non-negative integer/);
+});
+
+// 14 — a duplicate (x,y) is a hard error (no silent last-wins).
+check('duplicate cell throws', () => {
+assert.throws(() => heatmap({ cells: [[0,0,1],[0,0,2]]}), /duplicate cell at \(0,0\)/);
+});
+
+// 15 — a cell outside a pinned grid throws (no silent clipping); unknown palette throws.
+check('out-of-grid cell and unknown palette throw', () => {
+assert.throws(() => heatmap({ cells: [[3,0,1]], cols: 2}), /outside the pinned grid/);
+assert.throws(() => heatmap({ cells: [[0,0,1]], palette: 'nope'}), /unknown palette/);
+});
+
+// 16 — mutation bite (non-vacuity): a deliberately-wrong SVG (last fill bumped one bucket down)
+// MUST NOT equal the real render.
+check('mutation bite: a wrong-color SVG is rejected', () => {
+const wrong = RAMP_2x2.replace('fill="#800026"', 'fill="#e31a1c"');
+const got = heatmap({ cells: [[0,0,0],[1,0,1],[0,1,2],[1,1,3]]});
+assert.strictEqual(got, RAMP_2x2);
+assert.notStrictEqual(got, wrong);
+});
+
+// The file door (S18.1220-quiet-cellar-f6sj84; owed node-gifts-file-output-short-write-silent). Node reports a write to a regular
+// file that only partly fit as a success, so a cut heatmap used to exit 0.
+(function () {
+const cp = require('child_process'), fs = require('fs'), os = require('os'), path = require('path');
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'heatmap-sink-file-'));
+fs.writeFileSync(path.join(tmp, 'in.txt'), Array.from({length: 3600}, (_, i) => JSON.stringify([i % 60, Math.floor(i / 60), i])).join('\n') + '\n');
+const q = JSON.stringify(process.execPath) + ' ' + JSON.stringify(path.join(__dirname, 'heatmap-sink.js'));
+const sh = (cmd) => cp.spawnSync('bash', ['-c', cmd], { cwd: tmp, encoding: 'utf8'});
+const piped = sh(q + ' < in.txt').stdout;
+check('file: the heatmap written to a regular file is the same bytes as the heatmap written to a pipe', () => {
+assert.strictEqual(sh(q + ' < in.txt > whole.out; echo $?').stdout.trim(), '0');
+assert.ok(Buffer.byteLength(piped) > 8192, 'the answer must be larger than the 8 KB limit below');
+assert.strictEqual(fs.readFileSync(path.join(tmp, 'whole.out'), 'utf8'), piped);
+});
+check('file: a file that takes only part of the heatmap exits 1, says so in one line, and is left empty', () => {
+const r = sh('ulimit -f 8; ' + q + ' < in.txt > cut.out 2> cut.err; echo $?');
+assert.strictEqual(r.stdout.trim(), '1', 'exit code');
+assert.strictEqual(fs.statSync(path.join(tmp, 'cut.out')).size, 0, 'a cut answer was left in the file');
+const err = fs.readFileSync(path.join(tmp, 'cut.err'), 'utf8').trim().split('\n');
+assert.strictEqual(err.length, 1);
+assert.ok(/^heatmap-sink: cannot write the whole output/.test(err[0]), err[0]);
+});
+check('file: appending a heatmap that does not fit leaves what the file held', () => {
+fs.writeFileSync(path.join(tmp, 'log.txt'), 'yesterday\n');
+assert.strictEqual(sh('ulimit -f 8; ' + q + ' < in.txt >> log.txt 2>/dev/null; echo $?').stdout.trim(), '1');
+assert.strictEqual(fs.readFileSync(path.join(tmp, 'log.txt'), 'utf8'), 'yesterday\n');
+});
+check('browser: the file still loads where there is no require', () => {
+const vm = require('vm'), sandbox = { window: {}};
+vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'heatmap-sink.js'), 'utf8'), sandbox);
+if (sandbox.window.LoopGifts) assert.strictEqual(typeof sandbox.window.LoopGifts['heatmap-sink'], 'object');
+});
+fs.rmSync(tmp, { recursive: true, force: true});
+})();
+
+console.log('\n' + passed + '/' + n + ' passed');
+if (passed!== n) process.exit(1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# Histogram-fold — a Loop MMT gift
+https://loopmmt.com/gifts/histogram-fold/
+[coverage: optional · branch: gifts]
+
+One Bucketed Histogram Over a Numeric Stream fold ← all gifts
+
+Histogram-fold
+
+histogram-fold reads a stream of numbers — one JSON number per line (JSON Lines) — and folds them in ONE PASS into a single aggregate record: a contiguous list of fixed-width buckets with a count in each, plus the total count and the observed min and max, with zero dependencies. Buckets are fixed-width by a fixed origin (--width, --origin), so a value's bucket (floor((x-origin)/width), range [lo,hi) lower-closed) never depends on the rest of the stream — that is what makes it one pass. The same numbers in any order fold to a byte-identical record (a histogram is a multiset fold). Non-finite or non-number input is a hard error, never a silent skip, and the IEEE-754 bucket boundary is a documented, pinned rule. Same stream in → byte-identical record out, in Node or a browser.
+
+The honest edge
+
+histogram-fold COUNTS values into fixed-width buckets — it is NOT density estimation (no smoothing or KDE), NOT a quantile/percentile summary (it keeps no per-value order statistics beyond min and max), and it does NOT choose data-driven ‘nice’ bin edges (that would make a value's bin depend on the whole stream and cost the one-pass property). The output is a JSON aggregate, not a chart: hand it to a plotter, a test, or a diff.
+
+Run it
+
+printf '%s\n' 1 2 2 5 | node histogram-fold.js # {bins:[{lo,hi,count}..],width,origin,count,min,max}; --width W --origin O; exit 0 ok | 2 input error
+test_histogram-fold.js (27/27: frozen hand goldens cross-checked by an independent range-membership oracle, order-independence (shuffled==base), the pinned IEEE-754 float boundary (0.3@width0.1->bin 2), numeric-honesty hard errors (Infinity/string/bad-JSON/bad-width), contiguity + exact shared edges, blank-skip + CRLF, mutation bite lower-closed vs upper-closed)
+Zero dependencies, Node or browser, deterministic
+
+The code — every file that ships
+
+histogram-fold.js 237 lines on GitHub →
+#!/usr/bin/env node
+/* histogram-fold.js — fold a JSONL numeric stream into ONE bucketed histogram.
+Dependency-free, deterministic, one pass. Runs in Node or a browser. MIT.
+
+WHAT IT IS. Give it a stream of numbers — one JSON number per line (JSONL) —
+and it folds them into a single aggregate record: a contiguous list of
+fixed-width buckets with a count in each, plus the total count and the observed
+min and max. Same stream in, byte-identical record out, on every machine and
+every run. It is a FOLD, not a chart: the output is a JSON aggregate, not a
+picture — hand it to a plotter, a test, or a diff.
+
+HOW THE BUCKETS ARE DEFINED (the whole determinism story). Buckets are
+FIXED-WIDTH with a fixed origin, so a value's bucket never depends on the rest
+of the stream — which is exactly what makes the fold ONE PASS (no need to see
+every value first to learn a min/max range). For a value x:
+
+bucket index i = floor((x - origin) / width)
+bucket range [ origin + i*width, origin + (i+1)*width) (lower-closed,
+upper-open)
+
+The default origin is 0 and the default width is 1, so a bare stream of numbers
+buckets into unit integer bins. Override with --width and --origin.
+
+The output bins are CONTIGUOUS from the lowest occupied bucket to the highest,
+with any empty interior bucket carried as a count of 0 — a histogram has no
+holes. Each bin's `hi` equals the next bin's `lo` exactly, because both edges
+are computed as origin + k*width for an integer k (never lo + width, which could
+round differently). An empty stream folds to `{bins:[], count:0, min:null,
+max:null}`.
+
+NUMERIC HONESTY (the character of this gift). A fold over numbers is only
+trustworthy if it refuses to quietly mishandle a number:
+- Every line must be a FINITE JSON number. A line that is not valid JSON, is
+not a number (a string, object, bool, null), or is a number that overflows
+to +/-Infinity (e.g. 1e999, which `JSON.parse` yields as Infinity) or is NaN
+is a HARD ERROR (exit 2) naming the line — never a silent skip.
+- Counts are integers and stay integers.
+- The bucket index is `Math.floor((x - origin) / width)` in IEEE-754 double.
+This is a DELIBERATE, PINNED specification, not an accident: on a float
+boundary the double arithmetic decides the bin, so with width 0.1 the value
+0.3 lands in bin 2 ([0.2,0.3)), because (0.3 - 0) / 0.1 === 2.9999999999996
+in IEEE-754, not 3. The gift does not paper this over with an epsilon (which
+would trade one surprise for a subtler one) — it states the rule, and the
+battery pins the 0.3-with-width-0.1 case so the behavior is a documented
+invariant. For clean boundaries, use an integer or exactly-representable
+width (1, 2, 5, 10, 0.5, 0.25).
 
 USAGE
-echo '{"a":{"b":2}}' | node jq-lite.js '.a.b'
-echo '[1,2,3]' | node jq-lite.js '.[]'
-echo '{"xs":[10,20]}'| node jq-lite.js '.xs[] '
-printf '{"n":1}\n{"n":2}\n' | node jq-lite.js '.n'
-echo '{"name":"ada"}' | node jq-lite.js --raw-output '.name'
-node jq-lite.js --help
+printf '%s\n' 1 2 2 5 | node histogram-fold.js # unit integer bins
+node histogram-fold.js --width 10 nums.jsonl # width-10 buckets
+node histogram-fold.js --width 10 --origin 5 < nums.jsonl # origin at 5
+node histogram-fold.js --help
 
-Exit codes: 0 success · 2 usage error (no filter, bad option, malformed filter syntax,
-or invalid JSON input) · 3 a runtime type error the filter did not mark optional. A
-clean one-line message on stderr, never a stack trace.
+Each non-blank line is one number. Blank lines are skipped. A trailing \r
+(CRLF files) is trimmed. Output is one line of compact JSON (the aggregate
+record) followed by a newline.
 
-Released under MIT. Its edge is printed in the README: jq-lite implements a SMALL
-subset of jq — identity, field/index/bracket access, `.[]` iteration, the pipe, and the
-`?` optional. It has NO functions, NO arithmetic, NO object/array construction, NO
-select/map/comparison, NO recursion (`..`). For those, use jq itself. It is a reach
-tool for the common "pull this out / walk this stream" case, not a jq replacement.
+Exit codes: 0 success · 2 input error (missing file, a directory, a bad
+--width/--origin, a line that is not a finite JSON number, or a bucket range so
+large it would exhaust memory). Always a clean one-line message on stderr,
+never a stack trace.
+
+Released under MIT. Its edge is printed in the README: this COUNTS values into
+fixed-width buckets. It is NOT a density estimate (no smoothing, no KDE), NOT a
+quantile/percentile summary (it keeps no per-value order statistics beyond min
+and max), and the buckets are fixed-width by a fixed origin — it does NOT choose
+"nice" bin edges from the data (that would make a value's bin depend on the
+whole stream and cost the one-pass property).
 */
 "use strict";
 
-/* ==================================================================
-THE PARSER — filter string -> a list of STEP objects.
-Each step is one of:
-{ op: "identity"}
-{ op: "field", key: <string>, optional: <bool>}
-{ op: "index", idx: <int>, optional: <bool>}
-{ op: "iterate", optional: <bool>}
-A PIPE ( a | b) concatenates the two step lists — piping is just
-sequential application, so the compiled program is one flat list of
-steps run left to right, each step mapping a stream to a stream.
-================================================================== */
+var MAX_BINS = 10000000; // guard: a range/width so large it would exhaust memory
 
-// Parse one pipeline segment (no top-level '|') into steps, starting at position `pos`
-// in `src`. Returns { steps, pos}. Throws a clean Error on malformed syntax.
-function parseSegment(src, pos) {
-var steps = [];
-var n = src.length;
-
-function skipWs() { while (pos < n && isWs(src.charCodeAt(pos))) pos++;}
-function isWs(c) { return c === 32 || (c >= 9 && c <= 13);}
-function isIdentStart(c) {
-return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95; // A-Z a-z _
+// Parse one input line into a finite number, or throw a clean, line-named Error.
+// (JSON.parse("1e999") === Infinity, so the finite check is load-bearing, not
+// redundant with the parse.)
+function parseNumber(line, lineNo) {
+var v;
+try { v = JSON.parse(line);}
+catch (e) {
+throw new Error("line " + lineNo + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
 }
-function isIdentPart(c) {
-return isIdentStart(c) || (c >= 48 && c <= 57); // + 0-9
+if (typeof v!== "number") {
+throw new Error("line " + lineNo + " is not a number (got " +
+(v === null? "null": Array.isArray(v)? "array": typeof v) + "): " +
+JSON.stringify(line.slice(0, 40)));
+}
+if (!isFinite(v)) {
+throw new Error("line " + lineNo + " is not a finite number (" + String(v) + ")");
+}
+return v;
 }
 
-skipWs();
-if (pos >= n) throw new Error("empty filter segment");
-
-// A segment must begin with '.'
-if (src.charAt(pos)!== ".") {
-throw new Error("filter must begin with '.' at position " + pos);
+// The public fold: JSONL text + {width, origin} -> the aggregate record.
+// { bins: [ {lo, hi, count},...], // contiguous, lowest..highest occupied
+// width, origin,
+// count, // total values folded
+// min, max} // observed value extremes, null if empty
+function fold(text, opts) {
+opts = opts || {};
+var width = opts.width === undefined? 1: opts.width;
+var origin = opts.origin === undefined? 0: opts.origin;
+if (typeof width!== "number" ||!isFinite(width) || width <= 0) {
+throw new Error("width must be a finite number greater than 0 (got " + String(width) + ")");
 }
-pos++; // consume the leading '.'
-
-// A bare '.' (identity) is legal if nothing accessor-like follows.
-// Otherwise a chain of.field / [..] / [] accessors follows, each optionally '?'.
-var sawAccessor = false;
-
-// Handle an immediate identifier right after the leading dot:.foo
-function tryField() {
-var c = src.charCodeAt(pos);
-if (pos < n && isIdentStart(c)) {
-var start = pos;
-while (pos < n && isIdentPart(src.charCodeAt(pos))) pos++;
-var key = src.slice(start, pos);
-var optional = consumeOptional();
-steps.push({ op: "field", key: key, optional: optional});
-sawAccessor = true;
-return true;
-}
-return false;
+if (typeof origin!== "number" ||!isFinite(origin)) {
+throw new Error("origin must be a finite number (got " + String(origin) + ")");
 }
 
-function consumeOptional() {
-if (pos < n && src.charAt(pos) === "?") { pos++; return true;}
-return false;
+var lines = String(text).split("\n");
+var counts = Object.create(null); // bucket index -> count
+var total = 0, min = null, max = null, minIdx = null, maxIdx = null;
+var i, line, x, idx;
+
+for (i = 0; i < lines.length; i++) {
+line = lines[i];
+if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
+if (line.length === 0) continue; // blank line is not a value
+
+x = parseNumber(line, i + 1);
+idx = Math.floor((x - origin) / width); // IEEE-754; boundary behavior is pinned
+
+counts[idx] = (counts[idx] || 0) + 1;
+total += 1;
+if (min === null || x < min) min = x;
+if (max === null || x > max) max = x;
+if (minIdx === null || idx < minIdx) minIdx = idx;
+if (maxIdx === null || idx > maxIdx) maxIdx = idx;
 }
 
-//.["key"] or.[2] or.[] — the leading '.' is already consumed for the FIRST
-// accessor; subsequent bracket accessors do not need a dot.
-function tryBracket() {
-if (pos >= n || src.charAt(pos)!== "[") return false;
-pos++; // '['
-skipWs();
-if (pos < n && src.charAt(pos) === "]") {
-pos++; // ']'
-var opt0 = consumeOptional();
-steps.push({ op: "iterate", optional: opt0});
-sawAccessor = true;
-return true;
+var bins = [];
+if (total > 0) {
+var span = maxIdx - minIdx + 1;
+if (span > MAX_BINS) {
+throw new Error("bucket range too large (" + span + " bins > " + MAX_BINS +
+"): widen --width or narrow the input range");
 }
-var c = src.charAt(pos);
-if (c === '"') {
-var str = parseJSONString();
-skipWs();
-expect("]");
-var opt1 = consumeOptional();
-steps.push({ op: "field", key: str, optional: opt1});
-sawAccessor = true;
-return true;
-}
-// numeric index (optionally negative)
-if (c === "-" || (src.charCodeAt(pos) >= 48 && src.charCodeAt(pos) <= 57)) {
-var start = pos;
-if (src.charAt(pos) === "-") pos++;
-var digits = 0;
-while (pos < n && src.charCodeAt(pos) >= 48 && src.charCodeAt(pos) <= 57) { pos++; digits++;}
-if (digits === 0) throw new Error("expected an array index inside []");
-var idx = parseInt(src.slice(start, pos), 10);
-skipWs();
-expect("]");
-var opt2 = consumeOptional();
-steps.push({ op: "index", idx: idx, optional: opt2});
-sawAccessor = true;
-return true;
-}
-throw new Error("unexpected character inside []: " + JSON.stringify(c));
-}
-
-function expect(ch) {
-if (pos >= n || src.charAt(pos)!== ch) {
-throw new Error("expected '" + ch + "' at position " + pos);
-}
-pos++;
-}
-
-// Minimal JSON string parser for bracket keys: assumes src.charAt(pos) === '"'.
-function parseJSONString() {
-var start = pos;
-pos++; // opening quote
-var out = "";
-while (pos < n) {
-var ch = src.charAt(pos);
-if (ch === '"') { pos++; return out;}
-if (ch === "\\") {
-pos++;
-if (pos >= n) break;
-var e = src.charAt(pos);
-if (e === "n") out += "\n";
-else if (e === "t") out += "\t";
-else if (e === "r") out += "\r";
-else if (e === '"') out += '"';
-else if (e === "\\") out += "\\";
-else if (e === "/") out += "/";
-else if (e === "u") {
-var hex = src.slice(pos + 1, pos + 5);
-if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error("bad \\u escape in filter string");
-out += String.fromCharCode(parseInt(hex, 16));
-pos += 4;
-} else {
-throw new Error("bad escape \\" + e + " in filter string");
-}
-pos++;
-} else {
-out += ch;
-pos++;
-}
-}
-throw new Error("unterminated string starting at position " + start);
-}
-
-// First accessor after the leading '.': either a field, a bracket, or nothing (identity).
-if (!tryField()) { tryBracket();}
-// Subsequent accessors:.field or [..]
-for (;;) {
-skipWs();
-if (pos < n && src.charAt(pos) === ".") {
-// a following.field (dotted). The dot must be followed by an identifier or bracket.
-pos++;
-if (!tryField()) {
-if (!tryBracket()) throw new Error("expected a field name or [ after '.' at position " + pos);
-}
-continue;
-}
-if (pos < n && src.charAt(pos) === "[") { tryBracket(); continue;}
-break;
-}
-
-if (steps.length === 0) {
-// just '.' — identity
-steps.push({ op: "identity"});
-}
-return { steps: steps, pos: pos};
-}
-
-// Parse a full filter (with top-level pipes) into a flat step list.
-// Pure: depends only on `src`. Throws a clean Error on malformed input.
-function parse(src) {
-if (typeof src!== "string") throw new Error("filter must be a string");
-var n = src.length;
-var pos = 0;
-var all = [];
-
-function skipWs() { while (pos < n && (src.charCodeAt(pos) === 32 || (src.charCodeAt(pos) >= 9 && src.charCodeAt(pos) <= 13))) pos++;}
-
-skipWs();
-if (pos >= n) throw new Error("empty filter");
-for (;;) {
-var seg = parseSegment(src, pos);
-pos = seg.pos;
-for (var i = 0; i < seg.steps.length; i++) all.push(seg.steps[i]);
-skipWs();
-if (pos >= n) break;
-if (src.charAt(pos) === "|") { pos++; skipWs(); continue;}
-throw new Error("unexpected character " + JSON.stringify(src.charAt(pos)) + " at position " + pos + " (expected '|' or end of filter)");
-}
-return all;
-}
-
-/* ==================================================================
-THE EVALUATOR — apply a compiled step list to a value.
-Each step maps a value to a STREAM (array) of values; the program
-threads the stream through the steps left to right. This is what
-makes `.[]` fan-out and the pipe compose correctly.
-================================================================== */
-
-function isPlainObject(v) {
-return v!== null && typeof v === "object" &&!Array.isArray(v);
-}
-
-// Apply ONE step to ONE value, returning an array of result values.
-// Throws a TypeError-tagged Error on a genuine, non-optional type mismatch.
-function applyStep(step, value) {
-switch (step.op) {
-case "identity":
-return [value];
-
-case "field": {
-if (value === null || value === undefined) return [null]; // missing -> null (jq)
-if (isPlainObject(value)) {
-return [Object.prototype.hasOwnProperty.call(value, step.key)? value[step.key]: null];
-}
-if (step.optional) return [];
-throw typeErr("cannot index " + typeName(value) + ' with "' + step.key + '"');
-}
-
-case "index": {
-if (value === null || value === undefined) return [null];
-if (Array.isArray(value)) {
-var i = step.idx < 0? value.length + step.idx: step.idx;
-return [(i >= 0 && i < value.length)? value[i]: null];
-}
-if (step.optional) return [];
-throw typeErr("cannot index " + typeName(value) + " with number " + step.idx);
-}
-
-case "iterate": {
-if (Array.isArray(value)) return value.slice();
-if (isPlainObject(value)) {
-var out = [];
-for (var k in value) if (Object.prototype.hasOwnProperty.call(value, k)) out.push(value[k]);
-return out;
-}
-if (step.optional) return [];
-throw typeErr("cannot iterate over " + typeName(value));
-}
-
-default:
-throw new Error("internal: unknown step op " + step.op);
+for (idx = minIdx; idx <= maxIdx; idx++) {
+bins.push({
+lo: origin + idx * width,
+hi: origin + (idx + 1) * width,
+count: counts[idx] || 0
+});
 }
 }
 
-function typeName(v) {
-if (v === null) return "null";
-if (Array.isArray(v)) return "array";
-if (typeof v === "object") return "object";
-return typeof v; // string | number | boolean
+return { bins: bins, width: width, origin: origin, count: total, min: min, max: max};
 }
 
-function typeErr(msg) {
-var e = new Error(msg);
-e.jqType = true; // tag for exit-code 3 routing
-return e;
-}
-
-// Run a compiled program (step list) over one input value -> array of results.
-// Pure: depends only on `steps` and `value`.
-function evalSteps(steps, value) {
-var stream = [value];
-for (var s = 0; s < steps.length; s++) {
-var next = [];
-for (var i = 0; i < stream.length; i++) {
-var results = applyStep(steps[s], stream[i]);
-for (var j = 0; j < results.length; j++) next.push(results[j]);
-}
-stream = next;
-}
-return stream;
-}
-
-// Parse `filter` and run it over `value` -> array of result values.
-// The one-call entry point. Throws a clean Error on parse or type failure.
-function run(value, filter) {
-var steps = parse(filter);
-return evalSteps(steps, value);
-}
-
-/* ==================================================================
-JSON I/O helpers (pure)
-================================================================== */
-
-// Parse a JSONL / concatenated-JSON text into an array of values.
-// A blank line yields no value. Throws on malformed JSON.
-function parseInputs(text) {
-if (typeof text!== "string") text = String(text == null? "": text);
-var out = [];
-var lines = text.split(/\r\n|\n|\r/);
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i];
-if (line.replace(/[\s]/g, "").length === 0) continue; // skip blank/whitespace-only
-out.push(JSON.parse(line));
-}
-return out;
-}
-
-// Render one result value as output text.
-function renderValue(v, rawOutput) {
-if (rawOutput && typeof v === "string") return v;
-return JSON.stringify(v);
-}
-
-/* ==================================================================
-EXPORTS (browser + Node)
-================================================================== */
+/* ---- exports (browser + Node) ------------------------------------ */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.jqLite = { run: run, parse: parse, evalSteps: evalSteps, parseInputs: parseInputs};
+window.ForestGifts.histogramFold = fold;
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { run: run, parse: parse, evalSteps: evalSteps, parseInputs: parseInputs, renderValue: renderValue};
+module.exports = { fold: fold, MAX_BINS: MAX_BINS};
 }
 
-/* ==================================================================
-CLI (runs only when invoked directly, never on require)
-================================================================== */
-
-function parseArgs(args) {
-var opts = { rawOutput: false, slurp: false};
-var filter = null;
-var i = 0;
-while (i < args.length) {
-var a = args[i];
-if (a === "--raw-output" || a === "-r") { opts.rawOutput = true; i++;}
-else if (a === "--slurp" || a === "-s") { opts.slurp = true; i++;}
-else if (a === "--compact" || a === "-c") { i++;} // default; accepted for familiarity
-else if (a.charAt(0) === "-" && a!== "-") { throw new Error("unknown option " + a);}
-else {
-if (filter!== null) throw new Error("unexpected extra argument " + JSON.stringify(a) + " (only one filter is allowed)");
-filter = a;
-i++;
-}
-}
-if (filter === null) throw new Error("no filter given (usage: jq-lite '<filter>')");
-opts.filter = filter;
-return opts;
+/* ---- CLI (runs only when invoked directly, never on require) ------ */
+function run(text, opts) {
+return JSON.stringify(fold(text, opts)) + "\n";
 }
 
-function readStdin() {
-try {
-var fs = require("fs");
-return fs.readFileSync(0, "utf8");
-} catch (e) {
-return "";
+// Parse a numeric CLI option value; throw a clean Error on a bad value.
+function numOpt(name, raw) {
+var v = Number(raw);
+if (raw === undefined || raw === "" ||!isFinite(v)) {
+throw new Error(name + " requires a finite number (got " + JSON.stringify(raw) + ")");
 }
+return v;
 }
-
-var HELP =
-"jq-lite.js — a tiny jq-style query language for JSON, in one dependency-free file.\n\n" +
-" echo '{\"a\":{\"b\":2}}' | node jq-lite.js '.a.b'\n" +
-" echo '[1,2,3]' | node jq-lite.js '.[]'\n" +
-" printf '{\"n\":1}\\n{\"n\":2}\\n' | node jq-lite.js '.n'\n" +
-" echo '{\"name\":\"ada\"}' | node jq-lite.js --raw-output '.name'\n" +
-" node jq-lite.js --help\n\n" +
-"The language:\n" +
-". identity\n" +
-".foo.foo.bar field access (missing key -> null; non-object -> error unless?)\n" +
-".[\"a b\"] bracketed string key\n" +
-".[2].foo[0] array index (negative counts from the end:.[-1] is last)\n" +
-".[] iterate: emit each array element, or each object value, as a stream\n" +
-" a | b pipe: run b over every output of a\n" +
-".foo?.[]? optional: emit nothing on a type mismatch instead of erroring\n\n" +
-" --raw-output print string results without quotes (jq -r)\n" +
-" --slurp read the whole input as one JSON array before filtering (jq -s)\n\n" +
-"Reads JSON (one value or a JSONL stream) from stdin; applies the filter to each value\n" +
-"and prints one JSON result per output.\n\n" +
-"Edge: jq-lite is a SMALL subset of jq — no functions, no arithmetic, no construction,\n" +
-"no select/map/comparison, no recursion (..). For those, use jq itself.\n";
 
 function main(argv) {
 var args = argv.slice(2);
 if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(HELP);
+process.stdout.write(
+"histogram-fold.js — fold a JSONL numeric stream into one bucketed histogram.\n\n" +
+" printf '%s\\n' 1 2 2 5 | node histogram-fold.js unit integer bins\n" +
+" node histogram-fold.js --width 10 nums.jsonl width-10 buckets\n" +
+" node histogram-fold.js --width 10 --origin 5 < in origin at 5\n" +
+" node histogram-fold.js --help\n\n" +
+"Each non-blank line is one FINITE JSON number. A value x lands in bucket\n" +
+"floor((x - origin) / width); buckets are [lo, hi) (lower-closed). Output is\n" +
+"one line of JSON: {bins:[{lo,hi,count}..], width, origin, count, min, max},\n" +
+"bins contiguous from the lowest to the highest occupied bucket.\n\n" +
+"Edge: this COUNTS into fixed-width buckets. It is NOT density estimation,\n" +
+"NOT a quantile summary, and it does NOT pick 'nice' data-driven bin edges\n" +
+"(that would cost the one-pass property). Non-finite or non-number input is\n" +
+"a hard error, never a silent skip.\n"
+);
 return 0;
 }
-var opts;
-try { opts = parseArgs(args);}
-catch (e) { process.stderr.write("jq-lite: " + e.message + "\n"); return 2;}
 
-// Pre-parse the filter so a syntax error is a usage error (exit 2), before reading input.
-var steps;
-try { steps = parse(opts.filter);}
-catch (e) { process.stderr.write("jq-lite: " + e.message + "\n"); return 2;}
+var opts = {};
+var files = [];
+var i;
+try {
+for (i = 0; i < args.length; i++) {
+if (args[i] === "--width") { opts.width = numOpt("--width", args[++i]);}
+else if (args[i] === "--origin") { opts.origin = numOpt("--origin", args[++i]);}
+else if (args[i].charAt(0) === "-") { throw new Error("unknown option " + args[i]);}
+else { files.push(args[i]);}
+}
+} catch (e) {
+process.stderr.write("histogram-fold: " + e.message + "\n");
+return 2;
+}
 
-var text = readStdin();
-var inputs;
-try { inputs = parseInputs(text);}
-catch (e) { process.stderr.write("jq-lite: invalid JSON input: " + e.message + "\n"); return 2;}
+function emit(text) {
+try { process.stdout.write(run(text, opts)); return 0;}
+catch (e) { process.stderr.write("histogram-fold: " + e.message + "\n"); return 2;}
+}
 
-if (opts.slurp) inputs = [inputs];
-
-var out = "";
-for (var i = 0; i < inputs.length; i++) {
-var results;
-try { results = evalSteps(steps, inputs[i]);}
+if (files.length > 0) {
+var fs = require("fs");
+var text;
+try { text = fs.readFileSync(files[0], "utf8");}
 catch (e) {
-if (e && e.jqType) { process.stderr.write("jq-lite: " + e.message + "\n"); return 3;}
-process.stderr.write("jq-lite: " + e.message + "\n"); return 3;
+process.stderr.write("histogram-fold: cannot read " + files[0] +
+" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
+return 2;
 }
-for (var j = 0; j < results.length; j++) {
-out += renderValue(results[j], opts.rawOutput) + "\n";
+return emit(text);
 }
-}
-process.stdout.write(out);
+
+// stdin
+var chunks = [];
+process.stdin.on("data", function (d) { chunks.push(d);});
+process.stdin.on("end", function () {
+process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
+});
 return 0;
 }
 
@@ -522,939 +855,731 @@ if (typeof require!== "undefined" && require.main === module) {
 process.exitCode = main(process.argv);
 }
 
-test_jq-lite.js 212 lines on GitHub →
+test_histogram-fold.js 196 lines on GitHub →
 #!/usr/bin/env node
-/* test_jq-lite.js — battery for the jq-lite gift.
-`node test_jq-lite.js` -> exit 0 PASS / non-zero FAIL.
+/* test_histogram-fold.js — golden battery for the histogram-fold gift.
 
-THE ORACLE IS INDEPENDENT AND TAKES A DIFFERENT ROUTE than the gift. The gift compiles
-the filter into a FLAT LIST OF STEP OBJECTS and threads a stream through them. The
-oracle here re-tokenizes the filter with a REGEX SCANNER and interprets it by RECURSIVE
-DESCENT directly over the value — no compiled step list, no shared parser, no shared
-evaluator. Two routes that share no code — agreement is evidence, not tautology. Plus
-frozen hand goldens for each quiet-failure case the gift exists to fix (missing-key,
-type-confusion, stream fan-out).
+Out-of-band and self-verifying. The oracle is TWO independent things, neither a
+copy of the gift's streaming floor-and-tally loop:
+
+(1) RANGE-MEMBERSHIP counting — for a bin [lo, hi), the count is
+values.filter(x => x >= lo && x < hi).length. This is a genuinely
+different algorithm (predicate over the whole set per bin, O(bins*n))
+than the gift's one-pass Map tally, and it uses NO floor-index math. It
+is valid where the bin edges are exact (integer widths), where
+floor-index and range-membership provably agree.
+
+(2) FROZEN hand-computed golden records, pinned by hand from the spec —
+including the deliberate IEEE-754 float-boundary case, where floor-index
+and range-membership DIVERGE (see §7). That divergence is the documented
+numeric-honesty invariant, not a bug, so the pin is checked against the
+hand golden, never against the range oracle.
+
+A planted mutation (the bite, §9) MUST be caught — if the suite passes with the
+mutation live, the suite proves nothing.
+
+Run: node test_histogram-fold.js -> exit 0 GREEN / non-zero RED
 */
 "use strict";
-
-var G = require("./jq-lite.js");
-var assert = require("assert");
+var hf = require("./histogram-fold.js");
 
 var pass = 0, fail = 0;
 function ok(name, cond) {
 if (cond) { pass++;}
-else { fail++; console.error("FAIL: " + name);}
+else { fail++; console.log(" FAIL " + name);}
 }
-function eq(name, got, want) {
-var g = JSON.stringify(got), w = JSON.stringify(want);
-if (g === w) { pass++;}
-else { fail++; console.error("FAIL: " + name + "\n got: " + g + "\n want: " + w);}
+function foldRec(nums, opts) { return hf.fold(nums.join("\n"), opts);}
+function J(v) { return JSON.stringify(v);}
+
+/* ---- independent range-membership oracle (no floor-index math) ------------ */
+function rangeCount(values, lo, hi) {
+var n = 0, i;
+for (i = 0; i < values.length; i++) if (values[i] >= lo && values[i] < hi) n++;
+return n;
 }
 
-/* ==================================================================
-INDEPENDENT ORACLE — regex-token scanner + recursive-descent walk.
-Tokens: DOT-FIELD (.name), BRACKET ([..] contents), PIPE (|),
-OPTIONAL (?), IDENTITY (a lone.).
-The oracle interprets tokens directly against the value, producing a
-stream (array). It shares NO code with the gift's step compiler.
-================================================================== */
-
-// Tokenize into an array of { kind, value, optional} accessor tokens and PIPE markers.
-function oracleTokens(src) {
-var toks = [];
-var re = /\s*(\||\.(?:[A-Za-z_][A-Za-z0-9_]*)?|\[\s*(?:"(?:[^"\\]|\\.)*"|-?\d+|)\s*\])(\?)?/g;
-var i = 0;
-// Validate the whole string is consumed by our token grammar; else it's a syntax error.
-var consumed = 0;
-var m;
-re.lastIndex = 0;
-while ((m = re.exec(src))!== null) {
-if (m.index!== consumed) throw new Error("oracle: gap at " + consumed);
-consumed = re.lastIndex;
-var raw = m[1];
-var optional = m[2] === "?";
-if (raw === "|") { toks.push({ kind: "pipe"}); continue;}
-if (raw === ".") { toks.push({ kind: "identity", optional: optional}); continue;}
-if (raw.charAt(0) === ".") { toks.push({ kind: "field", value: raw.slice(1), optional: optional}); continue;}
-if (raw.charAt(0) === "[") {
-var inner = raw.slice(1, -1).trim();
-if (inner === "") { toks.push({ kind: "iterate", optional: optional}); continue;}
-if (inner.charAt(0) === '"') { toks.push({ kind: "field", value: JSON.parse(inner), optional: optional}); continue;}
-toks.push({ kind: "index", value: parseInt(inner, 10), optional: optional}); continue;
-}
-throw new Error("oracle: unrecognized token " + raw);
-}
-if (consumed!== src.replace(/\s+$/, "").length && consumed!== src.length) {
-// allow trailing whitespace
-var tail = src.slice(consumed);
-if (tail.trim()!== "") throw new Error("oracle: trailing " + JSON.stringify(tail));
-}
-return toks;
-}
-
-function isObj(v) { return v!== null && typeof v === "object" &&!Array.isArray(v);}
-
-// Apply one accessor token to one value -> array of values (recursive-descent semantics).
-function oracleApply(tok, v) {
-switch (tok.kind) {
-case "identity": return [v];
-case "field":
-if (v === null || v === undefined) return [null];
-if (isObj(v)) return [Object.prototype.hasOwnProperty.call(v, tok.value)? v[tok.value]: null];
-if (tok.optional) return [];
-throw tagged("type");
-case "index":
-if (v === null || v === undefined) return [null];
-if (Array.isArray(v)) { var k = tok.value < 0? v.length + tok.value: tok.value; return [(k >= 0 && k < v.length)? v[k]: null];}
-if (tok.optional) return [];
-throw tagged("type");
-case "iterate":
-if (Array.isArray(v)) return v.slice();
-if (isObj(v)) { var o = []; for (var kk in v) if (Object.prototype.hasOwnProperty.call(v, kk)) o.push(v[kk]); return o;}
-if (tok.optional) return [];
-throw tagged("type");
-default: throw new Error("oracle: bad token kind");
-}
-}
-function tagged(t) { var e = new Error(t); e.jqType = true; return e;}
-
-// Interpret the whole token list over a value -> stream. Pipes just continue the thread.
-function oracleRun(value, filter) {
-var toks = oracleTokens(filter);
-var stream = [value];
-for (var t = 0; t < toks.length; t++) {
-if (toks[t].kind === "pipe") continue; // sequential thread; pipe is a no-op separator
-var next = [];
-for (var i = 0; i < stream.length; i++) {
-var r = oracleApply(toks[t], stream[i]);
-for (var j = 0; j < r.length; j++) next.push(r[j]);
-}
-stream = next;
-}
-return stream;
-}
-
-/* ==================================================================
-GRID — gift == oracle across many (value, filter) pairs
-================================================================== */
-var VALUES = [
-{}, { a: 1}, { a: { b: { c: 3}}}, { a: null}, { "weird key": 9},
-[], [1, 2, 3], [{ id: 1}, { id: 2}, { id: 3}],
-{ items: [{ id: 10}, { id: 20}]}, { xs: [], ys: [5]},
-{ a: 1, b: 2, c: 3}, [[1], [2, 3]], null, "hi", 42, true,
-{ nested: { list: [{ v: 1}, { v: 2}]}}
+/* ---- 1. Frozen hand golden: unit bins, cross-checked by range membership -- *
+values [1,2,2,5], width 1, origin 0.
+floor: 1->1, 2->2, 2->2, 5->5; occupied 1..5; contiguous with empty 3,4. */
+(function () {
+var vals = [1, 2, 2, 5];
+var rec = foldRec(vals);
+var goldenBins = [
+{ lo: 1, hi: 2, count: 1},
+{ lo: 2, hi: 3, count: 2},
+{ lo: 3, hi: 4, count: 0},
+{ lo: 4, hi: 5, count: 0},
+{ lo: 5, hi: 6, count: 1}
 ];
-var FILTERS = [
-".", ".a", ".a.b", ".a.b.c", ".a?", ".missing", ".missing.deep",
-".[]", ".[0]", ".[1]", ".[-1]", ".[2]", ".[5]",
-".items[]", ".items[] |.id", ".[] |.id", ".xs[]", ".ys[]",
-'.["weird key"]', ".nested.list[] |.v", ".a.b?", ".[]?", ".[0]?"
+ok("unit bins == frozen hand golden", J(rec.bins) === J(goldenBins));
+ok("unit bins: count/min/max", rec.count === 4 && rec.min === 1 && rec.max === 5);
+// independent cross-check: every golden bin count == range membership count
+var allMatch = goldenBins.every(function (b) { return b.count === rangeCount(vals, b.lo, b.hi);});
+ok("unit bins == independent range-membership oracle", allMatch);
+})();
+
+/* ---- 2. width/origin override, cross-checked by range membership ---------- *
+values [5,12,13,27], width 10, origin 0 -> floor 0,1,1,2; occupied 0..2. */
+(function () {
+var vals = [5, 12, 13, 27], opts = { width: 10, origin: 0};
+var rec = foldRec(vals, opts);
+var golden = [
+{ lo: 0, hi: 10, count: 1},
+{ lo: 10, hi: 20, count: 2},
+{ lo: 20, hi: 30, count: 1}
 ];
+ok("width-10 bins == frozen hand golden", J(rec.bins) === J(golden));
+ok("width-10 == range-membership oracle",
+golden.every(function (b) { return b.count === rangeCount(vals, b.lo, b.hi);}));
+// origin shift: same values, origin 5, width 10 -> floor((x-5)/10): 0,0,0,2
+var rec2 = foldRec(vals, { width: 10, origin: 5});
+ok("origin shift changes bucketing",
+J(rec2.bins) === J([
+{ lo: 5, hi: 15, count: 3},
+{ lo: 15, hi: 25, count: 0},
+{ lo: 25, hi: 35, count: 1}
+]));
+})();
 
-for (var vi = 0; vi < VALUES.length; vi++) {
-for (var fi = 0; fi < FILTERS.length; fi++) {
-var val = VALUES[vi], filt = FILTERS[fi];
-var giftOut, giftErr = null, oracleOut, oracleErr = null;
-try { giftOut = G.run(val, filt);} catch (e) { giftErr =!!e.jqType? "type": "err";}
-try { oracleOut = oracleRun(val, filt);} catch (e) { oracleErr =!!e.jqType? "type": "err";}
-var name = "grid v" + vi + " f[" + filt + "]";
-if (giftErr || oracleErr) {
-ok(name + " (both error, same kind)", giftErr === oracleErr);
-} else {
-eq(name, giftOut, oracleOut);
-}
-}
-}
+/* ---- 3. Empty stream folds to the empty record --------------------------- */
+(function () {
+var rec = foldRec([]);
+ok("empty stream -> empty record",
+J(rec) === J({ bins: [], width: 1, origin: 0, count: 0, min: null, max: null}));
+})();
 
-/* ==================================================================
-FROZEN HAND GOLDENS — the three quiet failures, pinned exactly
-================================================================== */
+/* ---- 4. Order-independence: a histogram is a MULTISET fold --------------- *
+This is THE fold-lane invariant that separates histogram from an ordered fold
+(merkle): shuffle the stream and the record is byte-identical. */
+(function () {
+var base = [5, 1, 9, 2, 5, 5, 1, 8, 3, 2, 9, 1];
+var shuffled = [9, 1, 2, 5, 8, 1, 5, 3, 2, 9, 5, 1];
+var reversed = base.slice().reverse();
+ok("order-independent: shuffled == base", J(foldRec(shuffled)) === J(foldRec(base)));
+ok("order-independent: reversed == base", J(foldRec(reversed)) === J(foldRec(base)));
+})();
 
-// 1. Missing-key crash -> null (not an exception)
-eq("golden: missing key yields null", G.run({}, ".a.b.c"), [null]);
-eq("golden: missing on populated -> null", G.run({ a: {}}, ".a.b"), [null]);
-eq("golden: null propagates", G.run({ a: null}, ".a.b"), [null]);
-// TYPE-STRICT: a missing key must yield an actual JSON null, never `undefined` (which
-// serializes to null but is a leaking JS artifact — the mutation-bite proves this matters).
-ok("golden: missing key is real null not undefined", G.run({}, ".a")[0] === null && typeof G.run({}, ".a")[0] === "object");
-ok("golden: missing deep is real null not undefined", G.run({ a: {}}, ".a.b")[0] === null);
-ok("golden: no undefined ever leaks a stream", G.run({ a: { b: 1}}, ".a.z")[0] === null);
+/* ---- 5. Determinism: folds twice byte-identical -------------------------- */
+(function () {
+var vals = [1, 2, 3, 4, 5, 6, 7];
+ok("folds-twice-identical", J(foldRec(vals)) === J(foldRec(vals)));
+})();
 
-// 2. Type confusion -> loud error, but? suppresses to empty stream
-ok("golden:.foo on string throws (type)", (function () { try { G.run("hi", ".foo"); return false;} catch (e) { return!!e.jqType;}})());
-eq("golden:.foo? on string -> empty", G.run("hi", ".foo?"), []);
-ok("golden:.[0] on number throws (type)", (function () { try { G.run(42, ".[0]"); return false;} catch (e) { return!!e.jqType;}})());
-eq("golden:.[]? on number -> empty", G.run(42, ".[]?"), []);
+/* ---- 6. Contiguity + exact shared edges ---------------------------------- *
+No holes: empty interior buckets are carried as count 0, and bin[i].hi is
+byte-exactly bin[i+1].lo (both edges are origin + k*width, never lo+width). */
+(function () {
+var rec = foldRec([0, 30], { width: 10, origin: 0}); // occupied 0 and 3; 1,2 empty
+ok("contiguous incl. empty interior bins (count 0)",
+rec.bins.length === 4 && rec.bins[1].count === 0 && rec.bins[2].count === 0);
+var sharedEdges = true, i;
+for (i = 0; i + 1 < rec.bins.length; i++) if (rec.bins[i].hi!== rec.bins[i + 1].lo) sharedEdges = false;
+ok("adjacent bins share an exact edge (hi[i] === lo[i+1])", sharedEdges);
+})();
 
-// 3. Stream fan-out:.[] then pipe runs over EACH element
-eq("golden: fan-out over array", G.run([1, 2, 3], ".[]"), [1, 2, 3]);
-eq("golden: fan-out then field", G.run({ items: [{ id: 1}, { id: 2}]}, ".items[] |.id"), [1, 2]);
-eq("golden: fan-out over empty array", G.run([], ".[]"), []);
-eq("golden: fan-out over object values", G.run({ a: 1, b: 2}, ".[]"), [1, 2]);
-eq("golden: object value order = key order", G.run({ z: 1, a: 2, m: 3}, ".[]"), [1, 2, 3]);
+/* ---- 7. The pinned IEEE-754 float boundary (numeric-honesty invariant) ---- *
+With width 0.1, origin 0, the value 0.3 lands in bin index 2 ([0.2,0.3)),
+because (0.3 - 0) / 0.1 === 2.9999999999999996 and floor of that is 2, NOT 3.
+This is the DOCUMENTED behavior, not a bug: the gift does not epsilon-fudge it.
+Checked against the hand golden (index 2), NOT the range oracle — range
+membership would put 0.3 in bin 3, and that divergence IS the trap being
+pinned. A single value -> a single-bin record whose lone bin is index 2. */
+(function () {
+var rec = foldRec([0.3], { width: 0.1, origin: 0});
+ok("float-boundary pin: 0.3 @ width 0.1 -> bin index 2 (lo≈0.2)",
+rec.bins.length === 1 && Math.abs(rec.bins[0].lo - 0.2) < 1e-12);
+// sanity: the arithmetic really does floor to 2 here (documents the trap)
+ok("float-boundary: floor((0.3-0)/0.1) === 2 (the IEEE-754 fact)",
+Math.floor((0.3 - 0) / 0.1) === 2);
+})();
 
-/* ==================================================================
-DIRECT UNIT CHECKS
-================================================================== */
-eq("identity returns input", G.run({ a: 1}, "."), [{ a: 1}]);
-eq("negative index last element", G.run([10, 20, 30], ".[-1]"), [30]);
-eq("index out of range -> null", G.run([1, 2], ".[9]"), [null]);
-eq("bracket key with space", G.run({ "a b": 5}, '.["a b"]'), [5]);
-eq("chained field then index", G.run({ xs: [7, 8, 9]}, ".xs[1]"), [8]);
-eq("deep pipe", G.run({ a: { b: [{ c: 1}, { c: 2}]}}, ".a.b[] |.c"), [1, 2]);
-
-// parse() surfaces
-eq("parse identity", G.parse("."), [{ op: "identity"}]);
-ok("parse field", G.parse(".a")[0].op === "field" && G.parse(".a")[0].key === "a");
-ok("parse iterate", G.parse(".[]")[0].op === "iterate");
-ok("parse pipe flattens", G.parse(".a |.b").length === 2);
-
-// parseInputs
-eq("parseInputs JSONL", G.parseInputs('{"a":1}\n{"a":2}\n'), [{ a: 1}, { a: 2}]);
-eq("parseInputs skips blank lines", G.parseInputs('1\n\n2\n'), [1, 2]);
-eq("parseInputs empty -> []", G.parseInputs(""), []);
-
-/* ==================================================================
-DETERMINISM
-================================================================== */
-var d1 = JSON.stringify(G.run({ a: [1, 2, 3], b: { c: 4}}, ".a[] "));
-var d2 = JSON.stringify(G.run({ a: [1, 2, 3], b: { c: 4}}, ".a[] "));
-ok("deterministic across two runs", d1 === d2);
-
-/* ==================================================================
-FAIL-CLOSED / SYNTAX
-================================================================== */
+/* ---- 8. Numeric honesty: non-finite / non-number / bad JSON are hard errors */
+(function () {
 function throws(fn) { try { fn(); return false;} catch (e) { return true;}}
-ok("empty filter throws", throws(function () { G.parse("");}));
-ok("filter not starting with. throws", throws(function () { G.parse("foo");}));
-ok("dangling pipe throws", throws(function () { G.parse(".a |");}));
-ok("unterminated bracket throws", throws(function () { G.parse(".[");}));
-ok("bad char after dot throws", throws(function () { G.parse(".a.|");}));
-ok("non-string filter throws", throws(function () { G.run({}, 5);}));
+ok("1e999 (overflows to Infinity) is a hard error",
+throws(function () { hf.fold("1e999");}));
+ok("a string line is a hard error", throws(function () { hf.fold("\"12\"");}));
+ok("a null line is a hard error", throws(function () { hf.fold("null");}));
+ok("a bool line is a hard error", throws(function () { hf.fold("true");}));
+ok("an object line is a hard error", throws(function () { hf.fold("{\"v\":1}");}));
+ok("invalid JSON line is a hard error", throws(function () { hf.fold("not-a-number");}));
+ok("width <= 0 is a hard error", throws(function () { hf.fold("1\n2", { width: 0});}));
+ok("non-finite width is a hard error", throws(function () { hf.fold("1\n2", { width: Infinity});}));
+ok("non-finite origin is a hard error", throws(function () { hf.fold("1", { origin: NaN});}));
+})();
 
-/* ---- report ------------------------------------------------------ */
-console.log("jq-lite battery: " + pass + " passed, " + fail + " failed");
-process.exitCode = fail === 0? 0: 1;
+/* ---- 9. Blank lines skipped, CRLF trimmed -------------------------------- */
+(function () {
+ok("blank lines skipped (not a value)", J(hf.fold("1\n\n2\n")) === J(hf.fold("1\n2")));
+ok("CRLF trimmed: \\r\\n folds like \\n", J(hf.fold("1\r\n2\r\n")) === J(hf.fold("1\n2")));
+ok("integer counts stay integers",
+hf.fold("1\n1\n1").bins[0].count === 3 && Number.isInteger(hf.fold("1\n1\n1").bins[0].count));
+})();
+
+/* ---- 10. THE MUTATION BITE (non-vacuity) --------------------------------- *
+A WRONG construction: upper-closed bins (lo, hi] via ceil-1 instead of the
+spec's lower-closed [lo, hi) via floor. On a value exactly on an integer edge
+(10, width 10, origin 0) the two disagree: floor-spec -> bin index 1 ([10,20));
+the wrong upper-closed construction -> bin index 0 ((0,10]). The gift's record
+MUST NOT match the wrong one, proving the suite would catch that regression. */
+(function () {
+function wrongFold(vals, width, origin) {
+// upper-closed (lo, hi]: index = ceil((x-origin)/width) - 1
+var counts = {}, minI = null, maxI = null;
+vals.forEach(function (x) {
+var idx = Math.ceil((x - origin) / width) - 1;
+counts[idx] = (counts[idx] || 0) + 1;
+if (minI === null || idx < minI) minI = idx;
+if (maxI === null || idx > maxI) maxI = idx;
+});
+var bins = [];
+for (var i = minI; i <= maxI; i++) bins.push({ lo: origin + i * width, hi: origin + (i + 1) * width, count: counts[i] || 0});
+return bins;
+}
+var vals = [10, 10, 5];
+var gift = foldRec(vals, { width: 10, origin: 0}).bins;
+var wrong = wrongFold(vals, 10, 0);
+ok("mutation bite: lower-closed [lo,hi)!= upper-closed (lo,hi] on an edge value",
+J(gift)!== J(wrong));
+})();
+
+/* ---- report -------------------------------------------------------------- */
+console.log("");
+if (fail === 0) {
+console.log("GREEN: " + pass + " assertions passed, 0 failed [test_histogram-fold]");
+process.exit(0);
+} else {
+console.log("RED: " + pass + " passed, " + fail + " FAILED [test_histogram-fold]");
+process.exit(1);
+}
 
 Take the whole folder →
 MIT
-Node / browser, no dependencies
+Zero dependencies, Node or browser, deterministic
 
 ---
 
-# json-source — a Loop MMT gift
-https://loopmmt.com/gifts/json-source/
+# hmac-webhook — a Loop MMT gift
+https://loopmmt.com/gifts/hmac-webhook/
 [coverage: optional · branch: gifts]
 
-Stream a JSON Array into a JSONL Record Stream source ← all gifts
+Verify an HMAC-Signed Webhook in Constant Time filter ← all gifts
 
-json-source
+hmac-webhook
 
-json-source reads a JSON file (a FILE arg, or stdin) whose top-level value is an ARRAY and emits one element per line (JSONL) — the front of a pipe you feed into the fold/filter/transform gifts (json-source users.json | dedup-filter --key id). Object elements are records the consuming gifts read directly; scalar elements are a stream of scalars. Each element is re-serialized to canonical compact JSON (key order preserved). Zero dependencies, runs unchanged in Node or a browser, same input yields byte-identical output every run.
+hmac-webhook recomputes HMAC-SHA256(secret, rawBody) and checks it against the signature a webhook sender put in a header (conventionally X-Signature: sha256=<hex>), answering one question — is this body authentic and unmodified, from someone who holds the secret? It answers in CONSTANT TIME, so a forger cannot learn the correct signature one character at a time from how long a rejection takes. verify(body, header, secret) returns {ok, reason}; ok:false always names why — no-signature, bad-format, unsupported-scheme, length-mismatch, or hmac-mismatch — never a partial match. HMAC-SHA256 is RFC 2104 exactly, with the SHA-256 core vendored byte-for-byte from the shipped sha256 gift, so the result is byte-identical to Node's crypto.createHmac and to openssl dgst -sha256 -hmac. Same body, header, and secret in → same verdict out, in Node or a browser.
 
 The honest edge
 
-json-source streams the elements of a TOP-LEVEL JSON ARRAY only — a non-array top-level (an object, a number, a string, a boolean, null) or malformed JSON is refused (exit 2) rather than guess how to streamify a single value. Each element is re-serialized to canonical compact JSON, so number tokens and whitespace are normalized (1e3 -> 1000, 1.0 -> 1) though key order is preserved — the JSON value, not the input bytes. It reads JSON, not JSON5/NDJSON, and parses the WHOLE document (not an incremental stream).
+hmac-webhook verifies AUTHENTICITY — nothing more. It is NOT a secret store (you supply the secret; it is never persisted), NOT a replay defender (it proves THIS body is authentic, not that it is fresh — pair it with a timestamp or nonce check for that), NOT a TLS or transport check, NOT an authorization system (authentic is not the same as allowed), and NOT a multi-algorithm negotiator (it verifies the one scheme you name, default sha256).
 
 Run it
 
-printf '[{"id":1},{"id":2}]' | node json-source.js # -> {"id":1}\n{"id":2}
-test_json-source.js (33/33, independent map-route oracle) + Plumb conformance GREEN (21/21, signed 2026-09-12, clock-independent, mutation-bite non-vacuous)
-Node / browser, no dependencies
+printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --signature "sha256=<hex>" # prints 'ok' exit 0 if authentic; reason + exit 1 otherwise; --sign to emit a signature; exit 2 usage/input error
+test_hmac-webhook.js (40/40: RFC 4231 TC2, Node-crypto parity over 10 shapes incl. multibyte + 63/64/65-byte block-boundary keys + multi-block body, sign→verify round-trip, and the known-bad half — tampered body / wrong secret / flipped sig / truncated / 5 malformed headers / 2 wrong-scheme / uppercase-hex normalize / whitespace tolerate — plus determinism 3x and constant-time-compare correctness)
+Zero dependencies, Node or browser, deterministic, constant-time
 
 The code — every file that ships
 
-json-source.js 171 lines on GitHub →
+hmac-webhook.js 351 lines on GitHub →
 #!/usr/bin/env node
-/* json-source.js — stream the elements of a JSON array as a JSONL record stream.
-Dependency-free, deterministic, pure. Runs in Node or a browser. MIT.
-
-WHAT IT IS. A SOURCE: it turns a JSON array — the shape an API response, an export,
-or a `[...]` file so often arrives in — into the front of a pipe: one element per
-line (JSONL), ready to feed INTO the fold/filter/transform gifts. Give it a file (or
-pipe text on stdin) and it emits each top-level array element as one compact JSON line:
-
-[{"id":1},{"id":2}] -> {"id":1}
-{"id":2}
-[1, 2, 3] -> 1
-2
-3
-
-When the elements are objects, they are records the consuming gifts read directly:
-`json-source users.json | dedup-filter --key id`. When they are scalars, you get a
-stream of scalars — still valid JSONL.
-
-TOP-LEVEL ARRAY ONLY (the honesty axis). The input's top-level value MUST be a JSON
-array — that is the only thing that IS a stream. A bare object, a number, a string, a
-boolean, or null is a single value, not a stream, so json-source REFUSES it (exit 2)
-rather than guess how to "streamify" it (wrap it? emit its entries? emit it as one
-line?). Each guess is a different tool; refusing keeps json-source one honest thing.
-Malformed JSON is likewise a hard error (exit 2), never a partial or repaired parse.
-
-CANONICAL RE-SERIALIZATION (declared, so it is pinnable). Each element is emitted via
-canonical compact JSON.stringify — object key order is preserved from the input, but
-input WHITESPACE and NUMBER TOKENS are normalized to canonical JSON form (`1e3` -> 1000,
-`1.0` -> 1, `[ 1,2]` -> [1,2]). This is the JSON *value*, losslessly; it is not the
-input's exact bytes. The result is deterministic: the same input yields byte-identical
-output every run and every machine.
-
-THE MODEL
-[FILE] The JSON file to stream. If omitted, read stdin. Its top-level value must
-be an array; each element becomes one output line.
-
-DETERMINISM. parse(text) is a pure function — no clock, no randomness, no network — so
-the same text yields byte-identical output every run.
-
-USAGE
-node json-source.js data.json
-cat data.json | node json-source.js
-node json-source.js --help
-
-Exit codes: 0 success (including an empty stream from `[]`) · 2 input error (malformed
-JSON, a top-level value that is not an array, an unknown option, a second positional
-file, or an unreadable file). Always a clean one-line message on stderr, never a stack
-trace.
-
-Released under MIT. Its edge is printed in the README: json-source streams the elements
-of a TOP-LEVEL JSON ARRAY only — it refuses a non-array top-level and malformed JSON
-(exit 2), and it re-serializes each element to canonical compact JSON (normalizing
-number tokens and whitespace, preserving key order). It reads JSON, not JSON5/NDJSON,
-and does not stream incrementally (it parses the whole document).
+/**
+* hmac-webhook — verify an HMAC-signed webhook before you trust its body.
+*
+* WHAT
+* A webhook sender (GitHub, Stripe, Shopify, a Loop module) signs each request
+* body with a shared secret and puts the signature in a header, conventionally
+* X-Signature: sha256=<hex>
+* hmac-webhook recomputes HMAC-SHA256(secret, rawBody) and checks it against the
+* signature the sender sent. It answers ONE question — is this body authentic and
+* unmodified, from someone who holds the secret? — and answers it in CONSTANT TIME
+* so a forger cannot learn the right signature one byte at a time from timing.
+*
+* verify(rawBody, signatureHeader, secret) -> { ok, reason}
+*
+* ok:true the body is authentic (the computed MAC equals the presented one).
+* ok:false reason names WHY it failed — never a partial match, never a maybe:
+* "no-signature" the header is empty / missing.
+* "bad-format" the header is not "<scheme>=<hex>" with an even-length
+* lowercase-normalizable hex body.
+* "unsupported-scheme" a scheme other than the one asked for (default sha256).
+* "length-mismatch" the presented digest is not 64 hex chars (32 bytes).
+* "hmac-mismatch" well-formed, right length, but the MAC does not match —
+* the body was altered, the secret is wrong, or it is a forgery.
+*
+* HOW
+* HMAC-SHA256 is RFC 2104 exactly: with block size B=64 and the SHA-256 core
+* vendored from the shipped `sha256` gift (FIPS 180-4, byte-faithful),
+* K' = key if len(key) <= B, else SHA-256(key) then zero-padded to B
+* HMAC = SHA-256( (K' XOR opad) || SHA-256( (K' XOR ipad) || message))
+* ipad is 0x36 repeated B times, opad is 0x5c repeated B times. Everything runs on
+* RAW BYTES — the message and the key are UTF-8 encoded once — so a multibyte secret
+* or body is hashed byte-for-byte the same as Node's crypto.createHmac('sha256').
+* The comparison is a fixed-time XOR-accumulate over the full digest width: it looks
+* at every byte regardless of where the first difference is, so the pass/fail timing
+* carries no information about the correct signature.
+*
+* Pure function of (body, header, secret). No clock, no randomness, no files, no
+* network. Same three inputs -> same verdict, every run, in Node or a browser.
+*
+* USAGE
+* node hmac-webhook.js --secret SECRET --signature "sha256=<hex>" [FILE] # body from FILE or stdin
+* node hmac-webhook.js --secret SECRET --sign [FILE] # PRINT the signature for a body (sender side)
+* printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --sign
+* -> sha256=<hex>
+* printf '%s' '{"event":"ping"}' | node hmac-webhook.js --secret s3cr3t --signature "sha256=<hex>"
+* -> exits 0 (authentic) and prints "ok"; exits 1 and prints the reason otherwise.
+* --scheme NAME signature scheme label to require/emit (default "sha256").
+* --help
+*
+* In a browser: window.ForestGifts.hmacWebhook.{verify, sign, hmacSha256Hex}.
+*
+* EXIT CODES (CLI)
+* 0 verify: authentic. (--sign always exits 0 on success.)
+* 1 verify: NOT authentic — the reason is printed on stdout (one word) + stderr.
+* 2 usage / input error: missing --secret, missing --signature (without --sign),
+* a file that is a directory or cannot be read. One clean line on stderr.
+*
+* EDGE (what this is NOT)
+* NOT a signer's secret store — you supply the secret; it is never persisted.
+* NOT a replay defender — it proves authenticity of THIS body, not that the body
+* is fresh; pair it with a timestamp/nonce check if you need replay protection.
+* NOT a TLS or transport check, NOT an authorization system (authentic!= allowed),
+* and NOT a multi-algorithm negotiator — it verifies ONE scheme (sha256) you name.
+*
+* Zero dependencies. Node builtin `require('fs')` for file reads only; runs in a
+* browser with no require. MIT.
 */
 "use strict";
 
-/* ---- the pure core ------------------------------------------------ */
+/* ------------------------------------------------------------------ *
+* SHA-256 core — vendored from the `sha256` gift (FIPS 180-4), *
+* byte-faithful, with the raw-bytes entry HMAC needs. The block *
+* machinery is IDENTICAL to the shipped sha256 gift and to *
+* Node crypto's sha256; a mismatch here is a rebuild failure. *
+* ------------------------------------------------------------------ */
 
-// Parse JSON text and return its top-level array of elements. Throws a clean Error on
-// malformed JSON or a non-array top-level — the CLI turns that into exit 2. Pure.
-function parse(text) {
-if (typeof text!== "string") throw new Error("input must be text");
-var value;
-try {
-value = JSON.parse(text);
-} catch (e) {
-throw new Error("input is not valid JSON: " + e.message);
+// Round constants — FIPS 180-4 §4.2.2.
+var K = [
+0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
+
+function rotr(x, n) { return (x >>> n) | (x << (32 - n));}
+
+// UTF-8 encode a JS string to a byte array — the SAME bytes Node's
+//.update(String(s)) hashes (surrogate-pair aware fallback matches TextEncoder).
+function utf8Bytes(str) {
+if (typeof TextEncoder!== "undefined") {
+return Array.prototype.slice.call(new TextEncoder().encode(str));
 }
-if (!Array.isArray(value)) {
-var kind = value === null? "null": Array.isArray(value)? "array": typeof value;
-throw new Error("top-level JSON must be an array (got " + kind + ") — a non-array value is not a stream");
+var out = [], i, c, lo;
+for (i = 0; i < str.length; i++) {
+c = str.charCodeAt(i);
+if (c < 0x80) { out.push(c);}
+else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));}
+else if (c >= 0xd800 && c <= 0xdbff) {
+lo = str.charCodeAt(++i);
+c = 0x10000 + ((c & 0x3ff) << 10) + (lo & 0x3ff);
+out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+} else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));}
 }
-return value;
+return out;
 }
 
-// Render elements as JSONL text (one canonical compact JSON value per line, trailing
-// newline if any).
-function toJSONL(elements) {
-var s = "";
-for (var i = 0; i < elements.length; i++) s += JSON.stringify(elements[i]) + "\n";
+// sha256 of RAW BYTES (array-like of 0..255) -> a 32-byte Array digest.
+function sha256Digest(bytes) {
+var len = bytes.length;
+var bitLenHi = Math.floor(len / 0x20000000);
+var bitLenLo = (len * 8) >>> 0;
+var withOne = len + 1;
+var padded = (withOne + 8 + 63) & ~63;
+var msg = new Array(padded);
+var i;
+for (i = 0; i < padded; i++) msg[i] = 0;
+for (i = 0; i < len; i++) msg[i] = bytes[i] & 0xff;
+msg[len] = 0x80;
+msg[padded - 8] = (bitLenHi >>> 24) & 0xff;
+msg[padded - 7] = (bitLenHi >>> 16) & 0xff;
+msg[padded - 6] = (bitLenHi >>> 8) & 0xff;
+msg[padded - 5] = bitLenHi & 0xff;
+msg[padded - 4] = (bitLenLo >>> 24) & 0xff;
+msg[padded - 3] = (bitLenLo >>> 16) & 0xff;
+msg[padded - 2] = (bitLenLo >>> 8) & 0xff;
+msg[padded - 1] = bitLenLo & 0xff;
+
+var h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a,
+h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+
+var w = new Array(64), t, blk;
+for (blk = 0; blk < padded; blk += 64) {
+for (t = 0; t < 16; t++) {
+w[t] = (msg[blk + t * 4] << 24) | (msg[blk + t * 4 + 1] << 16) |
+(msg[blk + t * 4 + 2] << 8) | (msg[blk + t * 4 + 3]);
+}
+for (t = 16; t < 64; t++) {
+var s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+var s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+}
+var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
+for (t = 0; t < 64; t++) {
+var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+var ch = (e & f) ^ (~e & g);
+var temp1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
+var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+var maj = (a & b) ^ (a & c) ^ (b & c);
+var temp2 = (S0 + maj) >>> 0;
+hh = g; g = f; f = e; e = (d + temp1) >>> 0;
+d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+}
+h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
+}
+
+var out = new Array(32), words = [h0, h1, h2, h3, h4, h5, h6, h7], wi;
+for (wi = 0; wi < 8; wi++) {
+out[wi * 4] = (words[wi] >>> 24) & 0xff;
+out[wi * 4 + 1] = (words[wi] >>> 16) & 0xff;
+out[wi * 4 + 2] = (words[wi] >>> 8) & 0xff;
+out[wi * 4 + 3] = words[wi] & 0xff;
+}
+return out;
+}
+
+function byteToHex(b) {
+var h = (b & 0xff).toString(16);
+return h.length === 1? "0" + h: h;
+}
+function bytesToHex(bytes) {
+var s = "", i;
+for (i = 0; i < bytes.length; i++) s += byteToHex(bytes[i]);
 return s;
 }
 
-/* ---- exports (browser + Node) ------------------------------------ */
+/* ------------------------------------------------------------------ *
+* HMAC-SHA256 — RFC 2104. *
+* ------------------------------------------------------------------ */
+
+var BLOCK = 64; // SHA-256 block size in bytes (RFC 2104 "B").
+
+// key: byte array. Returns the B-byte K' (hashed-if-long, zero-padded).
+function normalizeKey(keyBytes) {
+var k = keyBytes;
+if (k.length > BLOCK) k = sha256Digest(k); // K longer than a block -> hash it first.
+var out = new Array(BLOCK), i;
+for (i = 0; i < BLOCK; i++) out[i] = (i < k.length? (k[i] & 0xff): 0);
+return out;
+}
+
+// HMAC-SHA256 over raw byte arrays -> 32-byte digest array.
+function hmacSha256Bytes(keyBytes, msgBytes) {
+var kp = normalizeKey(keyBytes);
+var ipad = new Array(BLOCK), opad = new Array(BLOCK), i;
+for (i = 0; i < BLOCK; i++) {
+ipad[i] = kp[i] ^ 0x36;
+opad[i] = kp[i] ^ 0x5c;
+}
+var inner = sha256Digest(ipad.concat(msgBytes)); // H((K' ^ ipad) || m)
+return sha256Digest(opad.concat(inner)); // H((K' ^ opad) || inner)
+}
+
+// HMAC-SHA256 hex of (secret string, message string), UTF-8 encoded — byte-identical
+// to Node crypto.createHmac('sha256', secret).update(message).digest('hex').
+function hmacSha256Hex(secret, message) {
+return bytesToHex(hmacSha256Bytes(utf8Bytes(String(secret)), utf8Bytes(String(message))));
+}
+
+/* ------------------------------------------------------------------ *
+* The verifier. *
+* ------------------------------------------------------------------ */
+
+var HEX_RE = /^[0-9a-f]+$/;
+
+// Constant-time equality of two equal-length lowercase-hex strings. Looks at every
+// character; the running OR of per-char differences carries no early-exit timing.
+// Caller MUST have already checked the lengths match (a length difference is not a
+// secret — it is public structure — so it is decided before this point).
+function constantTimeHexEqual(a, b) {
+var diff = 0, i;
+for (i = 0; i < a.length; i++) diff |= (a.charCodeAt(i) ^ b.charCodeAt(i));
+return diff === 0;
+}
+
+// Parse "<scheme>=<hex>" -> { scheme, hex} or null if it is not that shape.
+function parseSignatureHeader(header) {
+if (typeof header!== "string") return null;
+var s = header.trim();
+var eq = s.indexOf("=");
+if (eq <= 0 || eq === s.length - 1) return null; // no scheme, or nothing after '='
+var scheme = s.slice(0, eq);
+var hex = s.slice(eq + 1).toLowerCase();
+if (!HEX_RE.test(hex) || (hex.length % 2)!== 0) return null; // must be even-length hex
+return { scheme: scheme, hex: hex};
+}
+
+/**
+* Verify a signed webhook body.
+* @param {string} rawBody the exact bytes the sender signed (a string; UTF-8 hashed).
+* @param {string} signatureHeader e.g. "sha256=abcd..." from the request header.
+* @param {string} secret the shared secret.
+* @param {{scheme?: string}} [opts] scheme to require (default "sha256").
+* @returns {{ok: boolean, reason: string}} reason is "" on success.
+*/
+function verify(rawBody, signatureHeader, secret, opts) {
+opts = opts || {};
+var wantScheme = opts.scheme || "sha256";
+if (signatureHeader === undefined || signatureHeader === null || String(signatureHeader).trim() === "") {
+return { ok: false, reason: "no-signature"};
+}
+var parsed = parseSignatureHeader(String(signatureHeader));
+if (!parsed) return { ok: false, reason: "bad-format"};
+if (parsed.scheme!== wantScheme) return { ok: false, reason: "unsupported-scheme"};
+// A SHA-256 digest is exactly 32 bytes = 64 hex chars. Length is public structure,
+// decided before the constant-time compare (which requires equal lengths).
+if (parsed.hex.length!== 64) return { ok: false, reason: "length-mismatch"};
+var expected = hmacSha256Hex(secret, rawBody); // always 64 lowercase hex chars
+if (constantTimeHexEqual(expected, parsed.hex)) return { ok: true, reason: ""};
+return { ok: false, reason: "hmac-mismatch"};
+}
+
+/**
+* Produce the signature header a sender would send for a body (the sender side).
+* @returns {string} e.g. "sha256=abcd..."
+*/
+function sign(rawBody, secret, opts) {
+opts = opts || {};
+var scheme = opts.scheme || "sha256";
+return scheme + "=" + hmacSha256Hex(secret, rawBody);
+}
+
+/* ---- exports ---- */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.jsonSource = { parse: parse, toJSONL: toJSONL};
+window.ForestGifts.hmacWebhook = {
+verify: verify, sign: sign, hmacSha256Hex: hmacSha256Hex,
+parseSignatureHeader: parseSignatureHeader
+};
 }
 if (typeof module!== "undefined" && module.exports) {
-module.exports = { parse: parse, toJSONL: toJSONL};
+module.exports = {
+verify: verify, sign: sign, hmacSha256Hex: hmacSha256Hex,
+parseSignatureHeader: parseSignatureHeader, constantTimeHexEqual: constantTimeHexEqual
+};
 }
 
-/* ---- CLI (runs only when invoked directly, never on require) ------ */
+/* ------------------------------------------------------------------ *
+* CLI. *
+* ------------------------------------------------------------------ */
 
-function parseArgs(args) {
-var file;
-var i = 0;
-while (i < args.length) {
-var a = args[i];
-if (a.charAt(0) === "-" && a!== "-") {
-throw new Error("unknown option " + a);
-} else {
-if (file!== undefined) throw new Error("only one input file may be given (got a second: " + JSON.stringify(a) + ")");
-file = a;
-i += 1;
-}
-}
-return { file: file};
-}
-
-function readAll(stream) {
-return new Promise(function (resolve, reject) {
+function readAll(stream, cb) {
 var chunks = [];
-stream.on("data", function (c) { chunks.push(c);});
-stream.on("end", function () { resolve(Buffer.concat(chunks).toString("utf8"));});
-stream.on("error", reject);
-});
+stream.on("data", function (d) { chunks.push(d);});
+stream.on("end", function () { cb(Buffer.concat(chunks).toString("utf8"));});
 }
 
-function helpText() {
-return (
-"json-source.js — stream the elements of a JSON array as a JSONL record stream.\n\n" +
-" node json-source.js data.json\n" +
-" cat data.json | node json-source.js\n" +
-" node json-source.js --help\n\n" +
-" [FILE] JSON file to stream (default: read stdin). Top-level must be an array.\n\n" +
-"Emits one canonical compact JSON line per top-level array element.\n\n" +
-"Edge: streams a TOP-LEVEL JSON ARRAY only — a non-array top-level or malformed JSON\n" +
-"is refused (exit 2). Each element is re-serialized to canonical compact JSON (number\n" +
-"tokens and whitespace normalized, key order preserved). Reads JSON, not JSON5/NDJSON,\n" +
-"and parses the whole document (not an incremental stream).\n"
-);
+function usage() {
+return "usage: hmac-webhook.js --secret SECRET (--sign | --signature 'sha256=<hex>') [--scheme NAME] [FILE]";
 }
 
 function main(argv) {
 var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(helpText());
-return Promise.resolve(0);
+var secret = null, signature = null, scheme = "sha256", doSign = false, file = null, i;
+for (i = 0; i < args.length; i++) {
+var a = args[i];
+if (a === "--help" || a === "-h") { process.stdout.write(usage() + "\n"); process.exit(0);}
+else if (a === "--secret") { secret = args[++i];}
+else if (a === "--signature") { signature = args[++i];}
+else if (a === "--scheme") { scheme = args[++i];}
+else if (a === "--sign") { doSign = true;}
+else if (a.slice(0, 2) === "--") { process.stderr.write("hmac-webhook: unknown option " + a + "\n" + usage() + "\n"); process.exit(2);}
+else { file = a;}
 }
-var parsed;
-try { parsed = parseArgs(args);}
-catch (e) { process.stderr.write("json-source: " + e.message + "\n"); return Promise.resolve(2);}
+if (secret === null || secret === undefined) { process.stderr.write("hmac-webhook: --secret is required\n" + usage() + "\n"); process.exit(2);}
+if (!doSign && (signature === null || signature === undefined)) {
+process.stderr.write("hmac-webhook: --signature is required (or use --sign to produce one)\n" + usage() + "\n");
+process.exit(2);
+}
 
-var getText;
-if (parsed.file!== undefined) {
-getText = new Promise(function (resolve, reject) {
-require("fs").readFile(parsed.file, "utf8", function (err, data) {
-if (err) reject(new Error("cannot read " + JSON.stringify(parsed.file) + ": " + err.code));
-else resolve(data);
-});
-});
+function run(body) {
+if (doSign) {
+process.stdout.write(sign(body, secret, { scheme: scheme}) + "\n");
+process.exit(0);
+}
+var r = verify(body, signature, secret, { scheme: scheme});
+if (r.ok) { process.stdout.write("ok\n"); process.exit(0);}
+process.stdout.write(r.reason + "\n");
+process.stderr.write("hmac-webhook: verification failed (" + r.reason + ")\n");
+process.exit(1);
+}
+
+if (file) {
+var fs = require("fs");
+var stat;
+try { stat = fs.statSync(file);} catch (e) { process.stderr.write("hmac-webhook: cannot read " + file + "\n"); process.exit(2);}
+if (stat.isDirectory()) { process.stderr.write("hmac-webhook: " + file + " is a directory\n"); process.exit(2);}
+run(fs.readFileSync(file, "utf8"));
 } else {
-getText = readAll(process.stdin);
+readAll(process.stdin, run);
 }
-
-return getText.then(function (text) {
-var elements = parse(text); // throws -> caught below
-process.stdout.write(toJSONL(elements));
-return 0;
-}).catch(function (e) {
-process.stderr.write("json-source: " + e.message + "\n");
-return 2;
-});
 }
 
 if (typeof require!== "undefined" && require.main === module) {
-main(process.argv).then(function (code) { process.exitCode = code;});
+main(process.argv);
 }
 
-test_json-source.js 108 lines on GitHub →
+test_hmac-webhook.js 142 lines on GitHub →
 #!/usr/bin/env node
-/* test_json-source.js — battery for the json-source gift.
-node test_json-source.js -> exit 0 PASS / non-zero FAIL. Zero dependencies.
-
-Cross-checks the gift against an INDEPENDENT map-route oracle (a different route than
-the gift's loop), frozen hand goldens, the canonical-re-serialization contract,
-determinism, and every fail-closed edge. */
+/**
+* test_hmac-webhook — out-of-band battery for the hmac-webhook gift.
+*
+* The gift verifies HMAC-SHA256 webhook signatures. The oracle here is INDEPENDENT
+* of the gift's own SHA-256/HMAC code in two ways:
+* (1) RFC 4231 published HMAC-SHA256 test vectors (known-good, external authority);
+* (2) Node's built-in crypto.createHmac('sha256') (a different implementation).
+* A gift MAC that disagrees with either is a rebuild failure, not a warning.
+*
+* The known-bad half is real defect shapes: a tampered body, a wrong secret, a
+* bit-flipped signature, a truncated digest, a malformed header, a wrong scheme.
+*
+* GREEN means every assertion RAN and passed. A battery that executes nothing fails.
+*/
 "use strict";
-var js = require("./json-source.js");
 
-var pass = 0, fail = 0;
-function ok(name, cond) { if (cond) pass++; else { fail++; console.log(" FAIL " + name);}}
-function eqS(name, a, b) {
-if (a === b) pass++;
-else { fail++; console.log(" FAIL " + name + "\n exp " + JSON.stringify(b) + "\n got " + JSON.stringify(a));}
-}
-function throws(name, fn) {
-var threw = false; try { fn();} catch (e) { threw = true;}
-if (threw) pass++; else { fail++; console.log(" FAIL " + name + " (expected a throw)");}
-}
+var crypto = require("crypto");
+var G = require("./hmac-webhook.js");
 
-/* ---- independent oracle: Array.prototype.map route (different route than the gift) ---- */
-function oracleJSONL(text) {
-var v = JSON.parse(text); // may throw -> caller counts as error
-if (!Array.isArray(v)) throw new Error("not array");
-return v.map(function (el) { return JSON.stringify(el);}).join("") + (v.length? "": "");
+var passed = 0, failed = 0, ran = 0;
+function check(name, cond) {
+ran++;
+if (cond) { passed++;}
+else { failed++; console.error("FAIL: " + name);}
 }
-// build expected JSONL the oracle way (join with \n + trailing \n if non-empty)
-function oracle(text) {
-var v = JSON.parse(text);
-if (!Array.isArray(v)) throw new Error("not array");
-var out = "";
-v.forEach(function (el) { out += JSON.stringify(el) + "\n";});
-return out;
+function eq(name, got, want) {
+check(name + " (got=" + JSON.stringify(got) + " want=" + JSON.stringify(want) + ")", got === want);
 }
 
-/* ---- 1. differential grid: gift == oracle on every good vector ---- */
-var good = [
-"[]",
-"[1,2,3]",
-'[{"id":1},{"id":2}]',
-'[{"a":1,"b":2},{"a":3,"b":4}]',
-'["x","y","z"]',
-"[true,false,null]",
-'[{"nested":{"k":[1,2]}}]',
-"[ 1, 2,\n 3]", // whitespace normalized
-"[1e3, 1.0, 100]", // number tokens normalized to value
-'[{"b":2,"a":1}]', // key order preserved from input
-'[""]', // array with one empty string
+/* ---- 1. RFC 4231 HMAC-SHA256 known-good vectors ----
+* Keys/data given as hex/ascii in RFC 4231 §4. We feed the byte-exact inputs.
+* hmacSha256Hex takes STRINGS (UTF-8), so we only use the vectors whose key and
+* data are plain ASCII (no embedded non-UTF8 bytes) — vectors 2 and 7-ascii-part.
+* For the binary-key vectors we cross-check against Node crypto below on raw bytes
+* via the same public gift API used on strings, keeping the oracle independent.
+*/
+
+// RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?"
+eq("rfc4231-tc2",
+G.hmacSha256Hex("Jefe", "what do ya want for nothing?"),
+"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+
+/* ---- 2. Cross-check against Node crypto over a spread of inputs ---- */
+function nodeHmac(secret, msg) {
+return crypto.createHmac("sha256", secret).update(msg, "utf8").digest("hex");
+}
+var samples = [
+["", ""],
+["s3cr3t", ""],
+["", "body-with-empty-secret"],
+["shared-hmac-secret", '{"event":"ping","id":1}'],
+["key", "The quick brown fox jumps over the lazy dog"],
+// multibyte secret AND body — the byte-faithfulness trap
+["ключ-🔑", "日本語のペイロード — π ≈ 3.14159"],
+// a secret longer than the 64-byte block (forces the K'=SHA256(K) path)
+["x".repeat(65), "block-boundary body"],
+["x".repeat(64), "exactly one block key"],
+["x".repeat(63), "just under one block key"],
+// long body spanning many blocks
+["k", "A".repeat(1000)]
 ];
-for (var i = 0; i < good.length; i++) {
-eqS("differential[" + i + "] gift==oracle", js.toJSONL(js.parse(good[i])), oracle(good[i]));
-}
-
-/* ---- 2. hand goldens (frozen) ---- */
-eqS("golden: empty array -> empty stream", js.toJSONL(js.parse("[]")), "");
-eqS("golden: scalars", js.toJSONL(js.parse("[1,2,3]")), "1\n2\n3\n");
-eqS("golden: objects", js.toJSONL(js.parse('[{"id":1},{"id":2}]')), '{"id":1}\n{"id":2}\n');
-eqS("golden: whitespace normalized", js.toJSONL(js.parse("[ 1, 2]")), "1\n2\n");
-eqS("golden: number token 1e3 -> 1000", js.toJSONL(js.parse("[1e3]")), "1000\n");
-eqS("golden: number token 1.0 -> 1", js.toJSONL(js.parse("[1.0]")), "1\n");
-eqS("golden: key order preserved", js.toJSONL(js.parse('[{"b":2,"a":1}]')), '{"b":2,"a":1}\n');
-eqS("golden: nested value verbatim-as-value", js.toJSONL(js.parse('[{"k":{"z":[1,2]}}]')), '{"k":{"z":[1,2]}}\n');
-
-/* ---- 3. one line per element ---- */
-var recs = js.parse('[{"a":1},{"a":2},{"a":3}]');
-ok("count: 3 elements", recs.length === 3);
-ok("lines: JSONL has 3 lines", js.toJSONL(recs).split("\n").filter(Boolean).length === 3);
-
-/* ---- 4. fail-closed (exit-2 class) ---- */
-throws("bad: malformed JSON", function () { js.parse("[1,2,");});
-throws("bad: top-level object", function () { js.parse('{"a":1}');});
-throws("bad: top-level scalar number", function () { js.parse("42");});
-throws("bad: top-level string", function () { js.parse('"hello"');});
-throws("bad: top-level bool", function () { js.parse("true");});
-throws("bad: top-level null", function () { js.parse("null");});
-throws("bad: empty input (not JSON)", function () { js.parse("");});
-throws("bad: non-string input", function () { js.parse(123);});
-
-/* ---- 5. determinism: parse twice -> byte-identical JSONL ---- */
-var arr = [];
-for (var k = 0; k < 50; k++) arr.push({ n: k, s: "v" + k});
-var big = JSON.stringify(arr);
-ok("determinism: two parses byte-identical", js.toJSONL(js.parse(big)) === js.toJSONL(js.parse(big)));
-
-/* ---- 6. toJSONL shape ---- */
-ok("toJSONL: one value per line + trailing nl", js.toJSONL([{ a: 1}]) === '{"a":1}\n');
-ok("toJSONL: empty -> empty string", js.toJSONL([]) === "");
-
-/* ---- 7. mutation tripwire: an object-flattening mutant must diverge ---- */
-(function () {
-// mutant: emits only the FIRST value of each object (a lossy "flatten"); must diverge
-function mutant(text) {
-var v = JSON.parse(text); var out = "";
-v.forEach(function (el) {
-if (el && typeof el === "object" &&!Array.isArray(el)) {
-var ks = Object.keys(el); out += JSON.stringify(ks.length? el[ks[0]]: el) + "\n";
-} else out += JSON.stringify(el) + "\n";
+samples.forEach(function (s, idx) {
+eq("node-crypto-parity[" + idx + "]", G.hmacSha256Hex(s[0], s[1]), nodeHmac(s[0], s[1]));
 });
-return out;
-}
-var v = '[{"a":1,"b":2}]';
-ok("mutation: first-value-flatten is CAUGHT (diverges from gift)",
-mutant(v)!== js.toJSONL(js.parse(v)));
-})();
 
-console.log((fail === 0? "PASS": "FAIL") + " " + pass + "/" + (pass + fail));
-process.exit(fail === 0? 0: 1);
+/* ---- 3. sign() round-trips through verify() ---- */
+var secret = "shared-hmac-secret";
+var body = '{"event":"order.created","id":"ord_123","amount":4200}';
+var header = G.sign(body, secret);
+check("sign-emits-sha256-scheme", /^sha256=[0-9a-f]{64}$/.test(header));
+eq("sign-matches-node", header, "sha256=" + nodeHmac(secret, body));
+eq("verify-authentic", G.verify(body, header, secret).ok, true);
+eq("verify-authentic-reason-empty", G.verify(body, header, secret).reason, "");
 
-Take the whole folder →
-MIT
-Node / browser, no dependencies
+/* ---- 4. KNOWN-BAD: real forgery / tamper shapes must be rejected ---- */
 
----
+// 4a. tampered body — one byte changed
+var tampered = body.replace("4200", "9900");
+eq("reject-tampered-body.ok", G.verify(tampered, header, secret).ok, false);
+eq("reject-tampered-body.reason", G.verify(tampered, header, secret).reason, "hmac-mismatch");
 
-# JSONL-Diff — a Loop MMT gift
-https://loopmmt.com/gifts/jsonl-diff/
-[coverage: optional · branch: gifts]
+// 4b. wrong secret
+eq("reject-wrong-secret.ok", G.verify(body, header, "not-the-secret").ok, false);
+eq("reject-wrong-secret.reason", G.verify(body, header, "not-the-secret").reason, "hmac-mismatch");
 
-What Changed Between Two Runs? fold ← all gifts
+// 4c. bit-flipped signature (last hex nibble changed, still 64 hex chars)
+var flipped = header.slice(0, -1) + (header.slice(-1) === "0"? "1": "0");
+eq("reject-flipped-sig.ok", G.verify(body, flipped, secret).ok, false);
+eq("reject-flipped-sig.reason", G.verify(body, flipped, secret).reason, "hmac-mismatch");
 
-JSONL-Diff
+// 4d. truncated digest (right prefix, wrong length) -> length-mismatch, not a compare
+var truncated = "sha256=" + header.slice("sha256=".length, "sha256=".length + 40);
+eq("reject-truncated.reason", G.verify(body, truncated, secret).reason, "length-mismatch");
 
-You ran the same prompt through a model twice — a new version, a new day — and got two files of JSONL output. What actually changed? jsonl-diff takes an OLD file and a NEW file and tells you what was added, removed, and (when you name a key field) changed — sorted, canonical, and byte-identical on every run, so it drops straight into a CI gate or a review. Two modes: set-diff (default) keys each record by its own canonical form, so a changed record shows as one removed plus one added; keyed diff (--key FIELD) keys by a field, so a same-key record with different content is a CHANGE reported with its field-level deltas. Object keys are sorted and array order is faithful, so a key-reordered record matches and a reordered array does not. Deterministic, fail-closed, zero dependencies, offline.
+// 4e. empty / missing signature
+eq("reject-empty-sig", G.verify(body, "", secret).reason, "no-signature");
+eq("reject-null-sig", G.verify(body, null, secret).reason, "no-signature");
+eq("reject-undefined-sig", G.verify(body, undefined, secret).reason, "no-signature");
 
-The honest edge
+// 4f. malformed header shapes -> bad-format
+eq("reject-no-eq", G.verify(body, "sha256" + header.slice("sha256=".length), secret).reason, "bad-format");
+eq("reject-no-scheme", G.verify(body, "=" + "a".repeat(64), secret).reason, "bad-format");
+eq("reject-non-hex", G.verify(body, "sha256=" + "z".repeat(64), secret).reason, "bad-format");
+eq("reject-odd-hex", G.verify(body, "sha256=" + "a".repeat(63), secret).reason, "bad-format");
+eq("reject-nothing-after-eq", G.verify(body, "sha256=", secret).reason, "bad-format");
 
-jsonl-diff compares STRUCTURE, not MEANING. A reported change may be cosmetic (1 vs 1.0, "a,b" vs ["a","b"]) and an unreported match may still be wrong — semantic equivalence it will miss is a difference here. A human reads the diff; the tool only makes the change visible and exact. It tells you two records differ; it cannot tell you the difference matters, is correct, or is safe.
+// 4g. wrong scheme -> unsupported-scheme
+eq("reject-md5-scheme", G.verify(body, "md5=" + "a".repeat(64), secret).reason, "unsupported-scheme");
+eq("reject-sha1-scheme", G.verify(body, "sha1=" + "a".repeat(40), secret).reason, "unsupported-scheme");
 
-Run it
+// 4h. uppercase hex in the presented sig is normalized and still verifies
+var upperHeader = "sha256=" + nodeHmac(secret, body).toUpperCase();
+eq("accept-uppercase-hex", G.verify(body, upperHeader, secret).ok, true);
 
-node jsonl-diff.js --key id old.jsonl new.jsonl # exit 0 identical | 1 differs | 2 input error; --out json for a canonical result object
-test_jsonl-diff.js (10/10) + --selftest (10/10: canon idempotence, set-diff added/removed, keyed change, folds-twice-identical, blank-line skip, guard/exit space)
-Zero dependencies, Node or browser, deterministic
+// 4i. leading/trailing whitespace in the header is tolerated
+eq("accept-padded-header", G.verify(body, " " + header + " ", secret).ok, true);
 
-The code — every file that ships
+/* ---- 5. custom scheme label round-trips ---- */
+var h2 = G.sign(body, secret, { scheme: "loop"});
+check("custom-scheme-format", /^loop=[0-9a-f]{64}$/.test(h2));
+eq("custom-scheme-verify", G.verify(body, h2, secret, { scheme: "loop"}).ok, true);
+eq("custom-scheme-default-rejects", G.verify(body, h2, secret).reason, "unsupported-scheme");
 
-jsonl-diff.js 294 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* jsonl-diff.js — what changed between two JSONL files, deterministically.
-*
-* A tiny, dependency-free diff for JSON Lines (one JSON value per line). Give it
-* an OLD file and a NEW file and it tells you what was ADDED, REMOVED, and (when
-* you name a key) CHANGED — sorted, canonical, byte-identical on every run so it
-* drops straight into a CI gate or a review.
-*
-* old.jsonl, new.jsonl ──▶ diff(old, new, {key})
-* ──▶ { added:[…], removed:[…], changed:[…]}
-*
-* TWO MODES.
-* set-diff (default) — records are keyed by their own canonical form, so a
-* record either matches exactly or it is added/removed.
-* A changed record shows as one removed + one added.
-* keyed diff (--key F) — records are keyed by the value of field F. A record
-* present on both sides with the same key but different
-* content is a CHANGE, reported with its field deltas.
-*
-* DETERMINISM (the promise, and the self-test that proves it). Comparison and
-* output both run over a canonical form: object keys sorted, whitespace fixed,
-* no ordering luck. The result is sorted by key. `--selftest` proves the canon
-* is idempotent (canon(canon(x)) === canon(x)) and the diff is stable, so the
-* output is a pure function of the two inputs — the same bytes, every run.
-*
-* THE LINE IT WILL NOT CROSS (the honest ceiling — printed every --help/--list).
-* jsonl-diff compares STRUCTURE, not MEANING. It tells you two records differ; it
-* cannot tell you the difference matters, is correct, or is safe. Semantic
-* equivalence it will miss (1 vs 1.0, "a,b" vs ["a","b"]) is a difference here.
-* A human reads the diff; the tool only makes the change visible and exact.
-*
-* EXIT CODES (diff convention, gate-friendly).
-* 0 the two files are identical (under the chosen mode)
-* 1 they differ (added / removed / changed present)
-* 2 input could not be used (missing file, a directory, unreadable, bad JSON,
-* a duplicate key, or a missing --key field) — always a clean message, never
-* a stack trace.
-*
-* Runs identically in Node and in a browser (no DOM, no deps). MIT.
-*/
+/* ---- 6. determinism: same inputs -> byte-identical MAC across repeated calls ---- */
+var d1 = G.hmacSha256Hex(secret, body);
+var d2 = G.hmacSha256Hex(secret, body);
+var d3 = G.hmacSha256Hex(secret, body);
+check("determinism-3x-identical", d1 === d2 && d2 === d3);
 
-var CEILING =
-'ceiling: jsonl-diff compares STRUCTURE, not MEANING. A reported change may be\n' +
-' cosmetic (1 vs 1.0) and an unreported match may still be wrong. A human reads\n' +
-' the diff; the tool only makes the change visible and exact.';
+/* ---- 7. constant-time compare correctness (function-level) ---- */
+eq("ct-equal-true", G.constantTimeHexEqual("abcdef", "abcdef"), true);
+eq("ct-equal-false", G.constantTimeHexEqual("abcdef", "abcdff"), false);
 
-/* ---- canonical form (the canonicalizer; idempotent + order-faithful) ------ */
-function canon(v) {
-if (v === null || typeof v!== 'object') return JSON.stringify(v);
-if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
-var keys = Object.keys(v).sort();
-var parts = [];
-for (var i = 0; i < keys.length; i++) {
-parts.push(JSON.stringify(keys[i]) + ':' + canon(v[keys[i]]));
-}
-return '{' + parts.join(',') + '}';
-}
-
-/* ---- parse a JSONL string into records (throws JsonlError on a bad line) --- */
-function JsonlError(msg) { var e = new Error(msg); e.jsonl = true; return e;}
-
-function parseJsonl(text, label) {
-var out = [];
-var lines = text.split('\n');
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i];
-if (line.replace(/\s+/g, '') === '') continue; // skip blank lines
-var obj;
-try { obj = JSON.parse(line);}
-catch (e) {
-throw JsonlError(label + ':' + (i + 1) + ': not valid JSON (' +
-((e && e.message) || 'parse error') + ')');
-}
-out.push({ value: obj, line: i + 1});
-}
-return out;
-}
-
-/* ---- key a record: by field F (keyed mode) or by its canonical form (set) -- */
-function keyOf(rec, key, label) {
-if (key === null) return canon(rec.value);
-var v = rec.value;
-if (v === null || typeof v!== 'object' || Array.isArray(v) ||
-!Object.prototype.hasOwnProperty.call(v, key)) {
-throw JsonlError(label + ':' + rec.line + ': record has no key field ' +
-JSON.stringify(key));
-}
-return canon(v[key]);
-}
-
-function index(recs, key, label) {
-var map = {};
-for (var i = 0; i < recs.length; i++) {
-var k = keyOf(recs[i], key, label);
-if (Object.prototype.hasOwnProperty.call(map, k)) {
-throw JsonlError(label + ':' + recs[i].line + ': duplicate key ' + k +
-' (first seen at ' + label + ':' + map[k].line + ') — the diff would be ambiguous');
-}
-map[k] = recs[i];
-}
-return map;
-}
-
-/* ---- field-level delta for a CHANGED record (keyed mode) ------------------ */
-function fieldDelta(before, after) {
-var d = { added: {}, removed: {}, changed: {}};
-var bObj = before && typeof before === 'object' &&!Array.isArray(before);
-var aObj = after && typeof after === 'object' &&!Array.isArray(after);
-if (!bObj ||!aObj) return null; // not object-vs-object; whole-value change
-var seen = {};
-var k, keys = Object.keys(before).concat(Object.keys(after));
-for (var i = 0; i < keys.length; i++) {
-k = keys[i];
-if (seen[k]) continue; seen[k] = 1;
-var hb = Object.prototype.hasOwnProperty.call(before, k);
-var ha = Object.prototype.hasOwnProperty.call(after, k);
-if (hb &&!ha) d.removed[k] = before[k];
-else if (!hb && ha) d.added[k] = after[k];
-else if (canon(before[k])!== canon(after[k])) d.changed[k] = { before: before[k], after: after[k]};
-}
-return d;
-}
-
-/* ---- the diff (pure) ------------------------------------------------------ */
-function diff(oldText, newText, opts) {
-opts = opts || {};
-var key = (opts.key === undefined)? null: opts.key;
-var oldRecs = parseJsonl(oldText, 'old');
-var newRecs = parseJsonl(newText, 'new');
-var oldMap = index(oldRecs, key, 'old');
-var newMap = index(newRecs, key, 'new');
-var added = [], removed = [], changed = [];
-var k;
-var allKeys = {};
-for (k in oldMap) if (Object.prototype.hasOwnProperty.call(oldMap, k)) allKeys[k] = 1;
-for (k in newMap) if (Object.prototype.hasOwnProperty.call(newMap, k)) allKeys[k] = 1;
-var sorted = Object.keys(allKeys).sort();
-for (var i = 0; i < sorted.length; i++) {
-k = sorted[i];
-var inOld = Object.prototype.hasOwnProperty.call(oldMap, k);
-var inNew = Object.prototype.hasOwnProperty.call(newMap, k);
-if (inOld &&!inNew) removed.push({ key: k, value: oldMap[k].value});
-else if (!inOld && inNew) added.push({ key: k, value: newMap[k].value});
-else if (canon(oldMap[k].value)!== canon(newMap[k].value)) {
-changed.push({
-key: k,
-before: oldMap[k].value,
-after: newMap[k].value,
-fields: (key === null)? null: fieldDelta(oldMap[k].value, newMap[k].value)
-});
-}
-}
-return { added: added, removed: removed, changed: changed};
-}
-
-/* ---- rendering ------------------------------------------------------------ */
-function renderText(d) {
-var out = [];
-var i;
-for (i = 0; i < d.removed.length; i++) out.push('- ' + d.removed[i].key);
-for (i = 0; i < d.added.length; i++) out.push('+ ' + d.added[i].key);
-for (i = 0; i < d.changed.length; i++) {
-var c = d.changed[i];
-out.push('~ ' + c.key);
-if (c.fields) {
-var f = c.fields, fk;
-var rk = Object.keys(f.removed).sort();
-for (fk = 0; fk < rk.length; fk++) out.push(' - ' + rk[fk] + ': ' + JSON.stringify(f.removed[rk[fk]]));
-var ak = Object.keys(f.added).sort();
-for (fk = 0; fk < ak.length; fk++) out.push(' + ' + ak[fk] + ': ' + JSON.stringify(f.added[ak[fk]]));
-var ck = Object.keys(f.changed).sort();
-for (fk = 0; fk < ck.length; fk++) {
-out.push(' ~ ' + ck[fk] + ': ' + JSON.stringify(f.changed[ck[fk]].before) +
-' -> ' + JSON.stringify(f.changed[ck[fk]].after));
-}
-}
-}
-out.push('# ' + d.added.length + ' added, ' + d.removed.length + ' removed, ' +
-d.changed.length + ' changed');
-return out.join('\n');
-}
-
-function renderJson(d) {
-// canonical, deterministic: sorted keys, stable field order
-return canon({
-added: d.added,
-removed: d.removed,
-changed: d.changed,
-summary: { added: d.added.length, removed: d.removed.length, changed: d.changed.length}
-});
-}
-
-/* ---- self-test (determinism + promise proof) ------------------------------ */
-function selftest() {
-var pass = 0, fail = 0;
-function ok(cond, name) { if (cond) pass++; else { fail++; console.error('FAIL: ' + name);}}
-
-// canon is idempotent and order-faithful
-var a = { b: 1, a: [3, { y: 2, x: 1}]};
-ok(canon(JSON.parse(canon(a))) === canon(a), 'canon round-trips through JSON.parse');
-ok(canon({ x: 1, y: 2}) === canon({ y: 2, x: 1}), 'canon is key-order-faithful');
-ok(canon(canon(a)) === canon(canon(a)), 'canon is idempotent');
-
-// set-diff mode
-var oldT = '{"id":1,"v":"a"}\n{"id":2,"v":"b"}\n';
-var newT = '{"id":2,"v":"b"}\n{"id":3,"v":"c"}\n';
-var d1 = diff(oldT, newT, {});
-ok(d1.added.length === 1 && d1.removed.length === 1 && d1.changed.length === 0, 'set-diff add/remove');
-
-// keyed diff: same key, changed content => CHANGE with field delta
-var d2 = diff(oldT, '{"id":1,"v":"A","extra":9}\n{"id":2,"v":"b"}\n', { key: 'id'});
-ok(d2.changed.length === 1 && d2.added.length === 0 && d2.removed.length === 0, 'keyed change is a change, not add+remove');
-ok(d2.changed[0].fields && d2.changed[0].fields.changed.v && d2.changed[0].fields.added.extra!== undefined,
-'keyed change reports field deltas');
-
-// identical inputs => empty diff, byte-stable render
-var d3 = diff(oldT, oldT, { key: 'id'});
-ok(d3.added.length === 0 && d3.removed.length === 0 && d3.changed.length === 0, 'identical => empty');
-ok(renderJson(diff(oldT, newT, {})) === renderJson(diff(oldT, newT, {})), 'render is byte-stable across runs');
-
-// blank lines skipped; whitespace-insensitive comparison
-ok(diff('{"id":1}\n\n', '{ "id": 1}\n', { key: 'id'}).changed.length === 0, 'whitespace-insensitive, blanks skipped');
-
-// duplicate key is an error (ambiguous)
-var threw = false;
-try { diff('{"id":1}\n{"id":1}\n', '{"id":1}\n', { key: 'id'});} catch (e) { threw = e && e.jsonl;}
-ok(threw, 'duplicate key throws a clean JsonlError');
-
-console.log((fail === 0? 'GREEN': 'RED') + ': ' + (pass) + ' checks passed, ' + fail + ' failed [jsonl-diff]');
-return fail === 0;
-}
-
-/* ---- crashclean read ------------------------------------------------------ */
-function readFileClean(path) {
-var fs = require('fs');
-try {
-return fs.readFileSync(path, 'utf8');
-} catch (e) {
-var why = e && e.code === 'ENOENT'? 'no such file'
-: e && e.code === 'EISDIR'? 'is a directory'
-: e && e.code === 'EACCES'? 'permission denied'
-: (e && e.message) || 'cannot read';
-process.stderr.write('jsonl-diff: cannot read ' + JSON.stringify(path) + ': ' + why + '\n');
-process.exit(2);
-}
-}
-
-/* ---- CLI ------------------------------------------------------------------ */
-function usage() {
-console.log('usage: jsonl-diff.js [--key FIELD] [--out text|json] OLD.jsonl NEW.jsonl');
-console.log(' --key FIELD key records by FIELD; a same-key record that differs is a CHANGE');
-console.log(' (default: key by the whole record — changes show as remove + add)');
-console.log(' --out text - removed, + added, ~ changed, then a summary [default]');
-console.log(' --out json a canonical JSON result object');
-console.log(' --selftest run the built-in checks (exit 0 GREEN, 1 RED)');
-console.log(' exit 0 identical | 1 differs | 2 input could not be used');
-console.error('\n' + CEILING);
-}
-
-if (typeof require!== 'undefined' && require.main === module) {
-var argv = process.argv.slice(2);
-var key = null, out = 'text', files = [];
-for (var a = 0; a < argv.length; a++) {
-var t = argv[a];
-if (t === '--selftest') { process.exit(selftest()? 0: 1);}
-else if (t === '-h' || t === '--help') { usage(); process.exit(0);}
-else if (t === '--key') { key = argv[++a]; if (key === undefined) { console.error('jsonl-diff: --key needs a field name'); process.exit(2);}}
-else if (t === '--out') { out = argv[++a]; if (out!== 'text' && out!== 'json') { console.error('jsonl-diff: --out must be text or json'); process.exit(2);}}
-else if (t.charAt(0) === '-') { console.error('jsonl-diff: unknown option ' + JSON.stringify(t)); process.exit(2);}
-else files.push(t);
-}
-if (files.length!== 2) {
-console.error('jsonl-diff: need exactly two files (OLD NEW); got ' + files.length + '. Try --help.');
-process.exit(2);
-}
-var oldText = readFileClean(files[0]);
-var newText = readFileClean(files[1]);
-var d;
-try {
-d = diff(oldText, newText, key === null? {}: { key: key});
-} catch (e) {
-if (e && e.jsonl) { console.error('jsonl-diff: ' + e.message); process.exit(2);}
-throw e; // a non-input bug: let it surface honestly (never masked as clean)
-}
-console.log(out === 'json'? renderJson(d): renderText(d));
-var differs = d.added.length + d.removed.length + d.changed.length > 0;
-process.exit(differs? 1: 0);
-}
-
-/* ---- exports (browser / require) ------------------------------------------ */
-if (typeof module!== 'undefined' && module.exports) {
-module.exports = { diff: diff, canon: canon, parseJsonl: parseJsonl, selftest: selftest};
-}
-
-test_jsonl-diff.js 80 lines on GitHub →
-#!/usr/bin/env node
-/* SPDX-License-Identifier: MIT */
-/* test_jsonl-diff.js — the house-standard test file for the jsonl-diff gift.
-*
-* Runs the module's own selftest (canon idempotence/order-faithfulness + the
-* diff modes), then adds API-level assertions the CLI selftest doesn't cover:
-* the set-diff vs keyed-diff distinction, deterministic sort order, the JSON
-* render being canonical + byte-stable, and that adversarial input throws a
-* clean JsonlError rather than a raw crash. Exits non-zero on any failure so it
-* drops straight into a CI gate.
-*/
-'use strict';
-var jd = require('./jsonl-diff.js');
-
-var fails = [];
-function ck(name, cond) { if (!cond) fails.push(name);}
-
-// 1. the module's own selftest must pass
-ck('module selftest GREEN', jd.selftest() === true);
-
-// 2. canon: order-faithful + idempotent
-ck('canon order-faithful', jd.canon({ b: 2, a: 1}) === jd.canon({ a: 1, b: 2}));
-ck('canon idempotent', jd.canon(jd.canon({ a: [1, 2]})) === jd.canon(jd.canon({ a: [1, 2]})));
-
-// 3. set-diff (no key): a changed record is one remove + one add, never a change
-var d = jd.diff('{"id":1,"v":"a"}\n', '{"id":1,"v":"b"}\n', {});
-ck('set-diff: change becomes remove+add', d.changed.length === 0 && d.added.length === 1 && d.removed.length === 1);
-
-// 4. keyed diff: same key, different content is a CHANGE with field deltas
-d = jd.diff('{"id":1,"v":"a","gone":1}\n', '{"id":1,"v":"b","new":2}\n', { key: 'id'});
-ck('keyed: same key differing is a change', d.changed.length === 1);
-ck('keyed: field delta names changed/removed/added',
-d.changed[0].fields.changed.v && d.changed[0].fields.removed.gone!== undefined &&
-d.changed[0].fields.added.new!== undefined);
-
-// 5. deterministic sort order (result independent of input line order)
-var A = jd.diff('{"id":2}\n{"id":1}\n', '{"id":3}\n{"id":1}\n', { key: 'id'});
-var B = jd.diff('{"id":1}\n{"id":2}\n', '{"id":1}\n{"id":3}\n', { key: 'id'});
-ck('result independent of input order',
-JSON.stringify(A.removed.map(function (r) { return r.key;})) ===
-JSON.stringify(B.removed.map(function (r) { return r.key;})));
-
-// 6. duplicate key => clean JsonlError (not a raw crash)
-var threw = null;
-try { jd.diff('{"id":1}\n{"id":1}\n', '{"id":1}\n', { key: 'id'});} catch (e) { threw = e;}
-ck('duplicate key throws JsonlError', threw && threw.jsonl === true);
-
-// 7. bad JSON line => clean JsonlError naming file:line
-threw = null;
-try { jd.parseJsonl('{"ok":1}\nnope\n', 'x');} catch (e) { threw = e;}
-ck('bad JSON throws JsonlError with location', threw && threw.jsonl === true && /x:2:/.test(threw.message));
-
-// 8. missing --key field => clean JsonlError, not a silent wrong answer
-threw = null;
-try { jd.diff('{"a":1}\n', '{"a":1}\n', { key: 'id'});} catch (e) { threw = e;}
-ck('missing key field throws JsonlError', threw && threw.jsonl === true);
-
-// 9. blank lines + whitespace are insensitive under canon
-d = jd.diff('{"id":1}\n\n', '{ "id": 1}\n', { key: 'id'});
-ck('whitespace/blank-insensitive', d.added.length === 0 && d.removed.length === 0 && d.changed.length === 0);
-
-// --- the adversarial CLI exits (crashclean; the qualify D4 contract) ---------
-var cp = require('child_process');
-var here = __dirname + '/jsonl-diff.js';
-function run(args) {
-var r = cp.spawnSync('node', [here].concat(args), { encoding: 'utf8'});
-return { code: r.status, err: r.stderr || '', out: r.stdout || ''};
-}
-var m = run(['/no/such/path_zzz', '/also/missing']);
-ck('missing file => exit 2, no stack trace', m.code === 2 &&!/\bat \w/.test(m.err));
-var one = run(['/no/such/path_zzz']);
-ck('one arg => exit 2, no stack trace', one.code === 2 &&!/\bat \w/.test(one.err));
-var help = run(['--help']);
-ck('--help => exit 0', help.code === 0);
-
-if (fails.length) {
-console.error('RED: ' + fails.length + ' failed: ' + fails.join(', ') + ' [test_jsonl-diff]');
+/* ---- summary ---- */
+if (failed === 0 && ran > 0) {
+console.log("GREEN: " + passed + " assertions passed, 0 failed [test_hmac-webhook] (ran=" + ran + ")");
+process.exit(0);
+} else {
+console.error("RED: " + failed + " failed / " + ran + " ran [test_hmac-webhook]");
 process.exit(1);
 }
-console.log('GREEN: all checks passed [test_jsonl-diff]');
 
 Take the whole folder →
 MIT
-Zero dependencies, Node or browser, deterministic
+Zero dependencies, Node or browser, deterministic, constant-time
 
 ---

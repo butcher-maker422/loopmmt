@@ -47,6 +47,13 @@ WHAT IT DELIBERATELY DOES NOT DO (the honesty flag — a build requirement)
     purpose: this gift claims port-compatibility and flags record-shape as
     UNPROVEN — it never asserts semantic fit.
 
+LOOPS (the trace)
+    A pipeline element may be a bounded loop of one stage: slug*N, or
+    slug*N:closed for a fold closed under its own I/O (e.g. life-fold). The
+    `loop` gift's rule, restated: transform/filter loopable; fold only :closed;
+    source/sink never; 1 <= N <= 1,000,000, and a missing N is refused. A loop
+    takes on its stage's port-verb. The manifest may be JSON or JSON Lines.
+
 USAGE
     typecheck check --pipeline A,B,C --manifest gifts-manifest.json
         Walk the declared pipeline; per-hop verdict JSONL + a summary line.
@@ -116,7 +123,23 @@ def load_verbs(path):
     absent from the map, so a pipeline naming it reports UNRESOLVED.
     """
     with open(path) as f:
-        data = json.load(f)
+        text = f.read()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # JSON Lines: one object per line (the house manifest's own shape). Every
+        # line must parse; a line that is not JSON is an error, never skipped.
+        data = []
+        for n, line in enumerate(text.splitlines(), 1):
+            line = line.strip().rstrip(",")
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}: line {n} is neither part of one JSON document nor a JSON line ({exc.msg})")
+            if isinstance(obj, dict) and "slug" in obj:
+                data.append(obj)
     if isinstance(data, list):
         entries = data
     elif isinstance(data, dict):
@@ -139,6 +162,41 @@ def load_verbs(path):
     return verbs
 
 
+MAX_PASSES = 1_000_000
+
+
+def parse_element(element):
+    """A pipeline element is a slug, or a bounded loop of one: slug*N or slug*N:closed.
+
+    Returns (slug, loop, error). loop is None for a plain stage, else {"passes": N, "closed": bool}.
+    The rule is the `loop` gift's, restated (gifts never import each other)."""
+    if "*" not in element:
+        return element, None, None
+    slug, _, rest = element.partition("*")
+    count, _, flag = rest.partition(":")
+    if not slug:
+        return element, None, "a loop needs a stage before '*'"
+    if flag not in ("", "closed"):
+        return slug, None, f"unknown loop flag '{flag}' (only ':closed')"
+    if not count.isdigit():
+        return slug, None, "a loop needs a bound: slug*N with N from 1 to %d — an unbounded loop is refused" % MAX_PASSES
+    passes = int(count)
+    if passes < 1 or passes > MAX_PASSES:
+        return slug, None, "the loop bound must be from 1 to %d" % MAX_PASSES
+    return slug, {"passes": passes, "closed": flag == "closed"}, None
+
+
+def loop_refusal(verb, loop):
+    """Why a resolved stage cannot be looped, or None. Only a stage that accepts what it emits can be fed back."""
+    if verb == "source":
+        return "a source takes no input, so it cannot be looped"
+    if verb == "sink":
+        return "a sink emits nothing, so it cannot be looped"
+    if verb == "fold" and not loop["closed"]:
+        return "a fold narrows to an aggregate; loop it only if closed under its own I/O (slug*N:closed)"
+    return None
+
+
 def typecheck_pipeline(pipeline, verbs):
     """Walk a declared pipeline and check every adjacent pair + the endpoints.
 
@@ -159,7 +217,8 @@ def typecheck_pipeline(pipeline, verbs):
 
     # Resolve every stage first; an unresolved stage is a hard fail (never guessed).
     resolved = []
-    for i, slug in enumerate(pipeline):
+    for i, element in enumerate(pipeline):
+        slug, loop, loop_error = parse_element(element)
         verb = verbs.get(slug)
         pos = "first" if i == 0 else ("last" if i == n - 1 else "middle")
         if verb is None:
@@ -170,6 +229,15 @@ def typecheck_pipeline(pipeline, verbs):
                 "reason": "UNRESOLVED — slug not in manifest, or no valid port_verb; not guessed",
             })
             resolved.append(None)
+            continue
+        if loop_error or (loop is not None and loop_refusal(verb, loop)):
+            ok = False
+            hops.append({
+                "kind": "stage", "pos": i, "slug": slug, "verb": verb,
+                "role": pos, "role_ok": False, "loop": loop,
+                "reason": "LOOP REFUSED — " + (loop_error or loop_refusal(verb, loop)),
+            })
+            resolved.append(verb)
             continue
 
         # Endpoint rule. A stage in a non-first position must ACCEPT (else it
@@ -185,10 +253,13 @@ def typecheck_pipeline(pipeline, verbs):
             reason = f"a {verb} emits no stdout, but it is not the last stage — downstream gets nothing"
         if not role_ok:
             ok = False
-        hops.append({
+        record = {
             "kind": "stage", "pos": i, "slug": slug, "verb": verb,
             "role": pos, "role_ok": role_ok, "reason": reason,
-        })
+        }
+        if loop is not None:
+            record["loop"] = loop
+        hops.append(record)
         resolved.append(verb)
 
     # The gate on each adjacent pair.

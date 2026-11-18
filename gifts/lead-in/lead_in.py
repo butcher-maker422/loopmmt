@@ -262,7 +262,24 @@ def build(raw, path="<memory>"):
     return vocab
 
 
+VOCAB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocabularies")
+
+
+def resolve_vocab(name):
+    """The file a vocabulary argument names. A path that exists is itself. A bare name (no directory part, no
+    .json) that is not a file here is the vocabulary `list` prints under that name, VOCAB_DIR/<name>.json, if
+    that file exists. Anything else comes back unchanged, so a missing path still errors under its own name."""
+    if os.path.exists(name):
+        return name
+    if os.path.basename(name) == name and not name.endswith(".json"):
+        listed = os.path.join(VOCAB_DIR, name + ".json")
+        if os.path.isfile(listed):
+            return listed
+    return name
+
+
 def load(path):
+    path = resolve_vocab(path)
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -670,7 +687,7 @@ def _cmd_check(args):
 
 
 def _cmd_list(args):
-    directory = args.dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocabularies")
+    directory = args.dir or VOCAB_DIR
     try:
         names = sorted(os.listdir(directory))
     except OSError as error:

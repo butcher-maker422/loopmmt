@@ -77,7 +77,26 @@ function toHex8(x) {
 // sha256Hex(input) -> 64-char lowercase hex, byte-identical to Node's
 // crypto.createHash('sha256').update(String(input)).digest('hex').
 function sha256Hex(input) {
-  var bytes = utf8Bytes(String(input));
+  return hexOf(digestWords(utf8Bytes(String(input))));
+}
+
+// sha256Bytes(bytes) -> the 32-byte digest (Uint8Array) of RAW bytes (a Uint8Array or an array of 0..255), byte-identical
+// to Node's crypto.createHash('sha256').update(Buffer.from(bytes)).digest(). For hashing binary input -- a previous
+// digest joined to new bytes, say -- that no JS string can carry (a string is hashed as its UTF-8, so a raw byte >= 0x80
+// cannot round-trip through one). Added S28.0232 (loop21-rebuild: a browser host's synchronous hash chain).
+function sha256Bytes(bytes) {
+  var w = digestWords(bytes), out = new Uint8Array(32), i;
+  for (i = 0; i < 8; i++) {
+    out[i * 4] = (w[i] >>> 24) & 0xff; out[i * 4 + 1] = (w[i] >>> 16) & 0xff;
+    out[i * 4 + 2] = (w[i] >>> 8) & 0xff; out[i * 4 + 3] = w[i] & 0xff;
+  }
+  return out;
+}
+
+function hexOf(w) { return toHex8(w[0]) + toHex8(w[1]) + toHex8(w[2]) + toHex8(w[3]) + toHex8(w[4]) + toHex8(w[5]) + toHex8(w[6]) + toHex8(w[7]); }
+
+// The compression over a byte sequence -> the eight 32-bit words of the digest (FIPS 180-4 §6.2).
+function digestWords(bytes) {
   var len = bytes.length;
 
   // Padding: append 0x80, then 0x00s, then the 64-bit big-endian bit length,
@@ -128,17 +147,17 @@ function sha256Hex(input) {
     h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + hh) >>> 0;
   }
 
-  return toHex8(h0) + toHex8(h1) + toHex8(h2) + toHex8(h3) +
-         toHex8(h4) + toHex8(h5) + toHex8(h6) + toHex8(h7);
+  return [h0, h1, h2, h3, h4, h5, h6, h7];
 }
 
 // Browser: attach to a namespace. Node/require: export. CLI: run below.
 if (typeof window !== "undefined") {
   window.ForestGifts = window.ForestGifts || {};
   window.ForestGifts.sha256Hex = sha256Hex;
+  window.ForestGifts.sha256Bytes = sha256Bytes;
 }
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { sha256Hex: sha256Hex };
+  module.exports = { sha256Hex: sha256Hex, sha256Bytes: sha256Bytes };
 }
 
 // ---- CLI (runs only when invoked directly, never on require) ----------------

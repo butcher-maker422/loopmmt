@@ -63,11 +63,26 @@ stream the next stage needs — both are errors it names.
 
 ## The manifest
 
-The port-verbs come from a manifest — any JSON list of entries (or an object
-with a `gifts` / `tools` / `entries` list), where each entry has a `slug` and a
-`port_verb`. A slug you name in the pipeline that isn't in the manifest, or has
+The port-verbs come from a manifest — any JSON list of entries, an object
+with a `gifts` / `tools` / `entries` list, or JSON Lines (one entry per line; a
+line with no `slug`, such as a header comment, is passed over), where each entry
+has a `slug` and a `port_verb`. A slug you name in the pipeline that isn't in the manifest, or has
 no valid port-verb, is reported as **UNRESOLVED** and fails the check — it is
 never guessed.
+
+## Loops
+
+A stage can also be a **bounded loop** of itself, written `slug*N` (run the
+stage N times, each pass fed the last pass's output), or `slug*N:closed` for a
+fold that is closed under its own I/O, like `life-fold`. The same rule the
+`loop` gift uses decides it: a `transform` or `filter` can be looped; a `fold`
+only when marked `:closed`; a `source` or `sink` never. The bound is required
+and runs from 1 to 1,000,000 — `slug*` with no number is refused. A loop takes
+on its stage's port-verb, so the rest of the pipeline is checked as usual.
+
+```
+typecheck text --pipeline 'life-fold*200:closed,svg-sink' --manifest gifts-manifest.json
+```
 
 ## What it does not do — read this
 

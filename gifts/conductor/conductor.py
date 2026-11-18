@@ -56,6 +56,15 @@ added), or read from a declare score file with `--score` when the score carries
 per-stage `cmd`s. A stage with a port-verb but no `cmd` can be typechecked but
 not run (conductor says so and exits 2 on a run).
 
+LOOPS (the trace). A stage may be a bounded loop of itself: write its slug as slug*N in a --stage
+token (a transform or filter run N passes, each fed the last pass's output), or give a JSON stage a
+"loop" object {"passes": N, "closed": true|false, "until": "passes"|"fixed"} — needed for a fold closed
+under its own I/O (e.g. life-fold) or to stop at the first pass that repeats its input. The `loop`
+gift's rule, restated: transform/filter loopable; fold only closed; source/sink never; 1 <= N <=
+1,000,000. An illegal loop is refused at the desk (exit 3) like a broken pipeline. Each pass is its own
+ledger record (with "pass"), and a "loop-end" record says why it stopped; until=fixed reaching the bound
+first is recorded settled:false — the output still flows on, but the record says it never settled.
+
 HONEST CEILING. conductor runs the commands you give it — it is exactly as safe
 as the commands in the score, and it does not sandbox them. Its typecheck is the
 TYPE-level gate (ports line up so data can flow), NOT a proof the RECORDS fit or
@@ -159,17 +168,59 @@ def _emit(obj):
     sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+MAX_PASSES = 1_000_000
+
+
+def _parse_loop(slug_part):
+    """'slug' -> (slug, None); 'slug*N' -> (slug, {passes: N, closed: False, until: 'passes'}).
+    A bad bound raises ValueError. (A closed fold, or until=fixed, is declared in the JSON stage form.)"""
+    if "*" not in slug_part:
+        return slug_part, None
+    slug, _, count = slug_part.partition("*")
+    if not slug or not count.isdigit():
+        raise ValueError("a loop stage is slug*N with N from 1 to %d — got '%s'" % (MAX_PASSES, slug_part))
+    return slug, {"passes": int(count), "closed": False, "until": "passes"}
+
+
+def _check_loop_decl(slug, loop):
+    """Normalise a JSON stage's loop object; raise ValueError if it is malformed."""
+    if not isinstance(loop, dict):
+        raise ValueError("stage '%s': loop must be an object {passes, closed, until}" % slug)
+    passes = loop.get("passes")
+    if not isinstance(passes, int) or isinstance(passes, bool):
+        raise ValueError("stage '%s': loop.passes must be an integer" % slug)
+    until = loop.get("until", "passes")
+    if until not in ("passes", "fixed"):
+        raise ValueError("stage '%s': loop.until must be 'passes' or 'fixed'" % slug)
+    return {"passes": passes, "closed": bool(loop.get("closed", False)), "until": until}
+
+
+def loop_refusal(verb, loop):
+    """Why a stage cannot be looped, or None — the `loop` gift's rule, restated (gifts never import each other)."""
+    if not 1 <= loop["passes"] <= MAX_PASSES:
+        return "the loop bound must be from 1 to %d — an unbounded loop is refused" % MAX_PASSES
+    if verb == "source":
+        return "a source takes no input, so it cannot be looped"
+    if verb == "sink":
+        return "a sink emits nothing, so it cannot be looped"
+    if verb == "fold" and not loop["closed"]:
+        return "a fold narrows to an aggregate; loop it only if closed under its own I/O (loop.closed: true)"
+    return None
+
+
 def _parse_stage_token(tok):
-    """Parse 'slug:verb' or 'slug:verb:cmd' -> (slug, verb, cmd_list_or_None).
+    """Parse 'slug:verb' or 'slug:verb:cmd' -> (slug, verb, cmd_list_or_None, loop_or_None).
 
     Only the first two colons split slug/verb; the remainder is the command
-    (shell-split), so a cmd may itself contain colons."""
+    (shell-split), so a cmd may itself contain colons. A slug written slug*N is
+    a bounded loop of that stage."""
     parts = tok.split(":", 2)
     if len(parts) < 2:
         raise ValueError("stage token '%s' must be slug:verb[:cmd]" % tok)
-    slug, verb = parts[0], parts[1]
+    slug, loop = _parse_loop(parts[0])
+    verb = parts[1]
     cmd = shlex.split(parts[2]) if len(parts) == 3 and parts[2] else None
-    return (slug, verb, cmd)
+    return (slug, verb, cmd, loop)
 
 
 def _collect_stages(args):
@@ -196,7 +247,14 @@ def _collect_stages(args):
             if slug is None:
                 sys.stderr.write("conductor: stdin record has no 'slug': %s\n" % line)
                 return None, 2
-            stages.append((slug, obj.get("port_verb", ""), obj.get("cmd")))
+            loop = obj.get("loop")
+            if loop is not None:
+                try:
+                    loop = _check_loop_decl(slug, loop)
+                except ValueError as exc:
+                    sys.stderr.write("conductor: %s\n" % exc)
+                    return None, 2
+            stages.append((slug, obj.get("port_verb", ""), obj.get("cmd"), loop))
     if not stages:
         sys.stderr.write("conductor: no stages (use --stage, or --stdin with JSON-lines)\n")
         return None, 2
@@ -213,6 +271,11 @@ def _typecheck_or_report(stages):
     if not ok:
         _emit({"kind": "refused", "reason": "pipeline does not typecheck", "broken_joins": broken})
         return 3
+    for index, (slug, verb, _cmd, loop) in enumerate(stages):
+        why = loop_refusal(verb, loop) if loop is not None else None
+        if why:
+            _emit({"kind": "refused", "reason": "loop refused", "index": index, "slug": slug, "why": why})
+            return 3
     return 0
 
 
@@ -246,7 +309,7 @@ def cmd_run(args):
     if code != 0:
         return code
     # Every stage must carry a cmd to be run.
-    for slug, verb, cmd in stages:
+    for slug, verb, cmd, _loop in stages:
         if not cmd:
             sys.stderr.write("conductor: stage '%s' has no cmd — cannot run "
                              "(use slug:verb:cmd)\n" % slug)
@@ -266,11 +329,16 @@ def cmd_run(args):
     _append_ledger(ledger_path, {"kind": "run-start", "trace_id": trace_id,
                                  "n_stages": len(stages)})
     failed_index = None
-    for i, (slug, verb, cmd) in enumerate(stages):
+    for i, (slug, verb, cmd, loop) in enumerate(stages):
         if failed_index is not None:
             _append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id,
                                          "index": i, "slug": slug, "cmd": cmd,
                                          "verdict": "skipped", "reason": "an earlier stage failed"})
+            continue
+        if loop is not None:
+            data, ok = _run_loop_stage(ledger_path, trace_id, i, slug, cmd, loop, data)
+            if not ok:
+                failed_index = i
             continue
         try:
             proc = subprocess.run(cmd, input=data, stdout=subprocess.PIPE,
@@ -303,6 +371,45 @@ def cmd_run(args):
                                  "failed_index": failed_index})
     _emit_run_summary(trace_id, ledger_path, ok=False, failed_index=failed_index, stages=stages)
     return 5
+
+
+def _run_loop_stage(ledger_path, trace_id, index, slug, cmd, loop, data):
+    """Run one bounded loop stage: each pass reads the last pass's output. One ledger record per pass, then a
+    loop-end record. -> (output, ok). With until=fixed, a pass that returns its input byte for byte stops the loop;
+    reaching the bound first is recorded settled:false (not a failure — the output still flows on)."""
+    current = data
+    for n in range(1, loop["passes"] + 1):
+        try:
+            proc = subprocess.run(cmd, input=current, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except (OSError, ValueError) as exc:
+            _append_ledger(ledger_path, {"kind": "stage", "trace_id": trace_id, "index": index, "slug": slug,
+                                         "cmd": cmd, "pass": n, "verdict": "failed", "exit": None,
+                                         "error": str(exc)})
+            _append_ledger(ledger_path, {"kind": "loop-end", "trace_id": trace_id, "index": index, "slug": slug,
+                                         "passes": n, "stopped": "failed"})
+            return current, False
+        fixed = proc.returncode == 0 and proc.stdout == current
+        rec = {"kind": "stage", "trace_id": trace_id, "index": index, "slug": slug, "cmd": cmd, "pass": n,
+               "exit": proc.returncode, "bytes_in": len(current), "bytes_out": len(proc.stdout),
+               "verdict": "failed" if proc.returncode != 0 else ("fixed" if fixed else "ok")}
+        if proc.returncode != 0:
+            rec["stderr_tail"] = proc.stderr.decode("utf-8", "replace")[-500:]
+            _append_ledger(ledger_path, rec)
+            _append_ledger(ledger_path, {"kind": "loop-end", "trace_id": trace_id, "index": index, "slug": slug,
+                                         "passes": n, "stopped": "failed"})
+            return current, False
+        _append_ledger(ledger_path, rec)
+        current = proc.stdout
+        if loop["until"] == "fixed" and fixed:
+            _append_ledger(ledger_path, {"kind": "loop-end", "trace_id": trace_id, "index": index, "slug": slug,
+                                         "passes": n, "stopped": "fixed", "settled": True})
+            return current, True
+    end = {"kind": "loop-end", "trace_id": trace_id, "index": index, "slug": slug, "passes": loop["passes"],
+           "stopped": "bound"}
+    if loop["until"] == "fixed":
+        end["settled"] = False
+    _append_ledger(ledger_path, end)
+    return current, True
 
 
 def _emit_run_summary(trace_id, ledger_path, ok, failed_index, stages):

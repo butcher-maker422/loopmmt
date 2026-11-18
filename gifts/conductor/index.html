@@ -207,7 +207,7 @@ HAIL:A:END -->
           <div class="zone-label">Run it</div>
           <div class="runbox">
             <code class="run">python3 conductor.py check --stage census:source:&#x27;python3 census.py&#x27; --stage map:fold:&#x27;python3 map.py&#x27;</code>
-            <span class="badge">test_conductor.py (12/12, mutation-bitten)</span>
+            <span class="badge">test_conductor.py (21/21 incl. bounded loop stages, mutation-bitten)</span>
             <span class="badge">Python 3, standard library only</span>
           </div>
         </section>
@@ -215,7 +215,7 @@ HAIL:A:END -->
         <section class="zone" aria-label="The code">
           <div class="zone-label">The code &mdash; every file that ships</div>
           <details class="code-fold">
-            <summary><code class="fname">conductor.py</code><span class="lines">381 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/conductor/conductor.py">on GitHub &rarr;</a></summary>
+            <summary><code class="fname">conductor.py</code><span class="lines">488 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/conductor/conductor.py">on GitHub &rarr;</a></summary>
             <pre class="code"><code>#!/usr/bin/env python3
 &quot;&quot;&quot;conductor — run a declared pipeline of small JSONL tools, with a record.
 
@@ -273,6 +273,15 @@ piped in on stdin as JSON-lines (the shape `declare show` emits, with a `cmd`
 added), or read from a declare score file with `--score` when the score carries
 per-stage `cmd`s. A stage with a port-verb but no `cmd` can be typechecked but
 not run (conductor says so and exits 2 on a run).
+
+LOOPS (the trace). A stage may be a bounded loop of itself: write its slug as slug*N in a --stage
+token (a transform or filter run N passes, each fed the last pass&#x27;s output), or give a JSON stage a
+&quot;loop&quot; object {&quot;passes&quot;: N, &quot;closed&quot;: true|false, &quot;until&quot;: &quot;passes&quot;|&quot;fixed&quot;} — needed for a fold closed
+under its own I/O (e.g. life-fold) or to stop at the first pass that repeats its input. The `loop`
+gift&#x27;s rule, restated: transform/filter loopable; fold only closed; source/sink never; 1 &lt;= N &lt;=
+1,000,000. An illegal loop is refused at the desk (exit 3) like a broken pipeline. Each pass is its own
+ledger record (with &quot;pass&quot;), and a &quot;loop-end&quot; record says why it stopped; until=fixed reaching the bound
+first is recorded settled:false — the output still flows on, but the record says it never settled.
 
 HONEST CEILING. conductor runs the commands you give it — it is exactly as safe
 as the commands in the score, and it does not sandbox them. Its typecheck is the
@@ -377,17 +386,59 @@ def _emit(obj):
     sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;)) + &quot;\n&quot;)
 
 
+MAX_PASSES = 1_000_000
+
+
+def _parse_loop(slug_part):
+    &quot;&quot;&quot;&#x27;slug&#x27; -&gt; (slug, None); &#x27;slug*N&#x27; -&gt; (slug, {passes: N, closed: False, until: &#x27;passes&#x27;}).
+    A bad bound raises ValueError. (A closed fold, or until=fixed, is declared in the JSON stage form.)&quot;&quot;&quot;
+    if &quot;*&quot; not in slug_part:
+        return slug_part, None
+    slug, _, count = slug_part.partition(&quot;*&quot;)
+    if not slug or not count.isdigit():
+        raise ValueError(&quot;a loop stage is slug*N with N from 1 to %d — got &#x27;%s&#x27;&quot; % (MAX_PASSES, slug_part))
+    return slug, {&quot;passes&quot;: int(count), &quot;closed&quot;: False, &quot;until&quot;: &quot;passes&quot;}
+
+
+def _check_loop_decl(slug, loop):
+    &quot;&quot;&quot;Normalise a JSON stage&#x27;s loop object; raise ValueError if it is malformed.&quot;&quot;&quot;
+    if not isinstance(loop, dict):
+        raise ValueError(&quot;stage &#x27;%s&#x27;: loop must be an object {passes, closed, until}&quot; % slug)
+    passes = loop.get(&quot;passes&quot;)
+    if not isinstance(passes, int) or isinstance(passes, bool):
+        raise ValueError(&quot;stage &#x27;%s&#x27;: loop.passes must be an integer&quot; % slug)
+    until = loop.get(&quot;until&quot;, &quot;passes&quot;)
+    if until not in (&quot;passes&quot;, &quot;fixed&quot;):
+        raise ValueError(&quot;stage &#x27;%s&#x27;: loop.until must be &#x27;passes&#x27; or &#x27;fixed&#x27;&quot; % slug)
+    return {&quot;passes&quot;: passes, &quot;closed&quot;: bool(loop.get(&quot;closed&quot;, False)), &quot;until&quot;: until}
+
+
+def loop_refusal(verb, loop):
+    &quot;&quot;&quot;Why a stage cannot be looped, or None — the `loop` gift&#x27;s rule, restated (gifts never import each other).&quot;&quot;&quot;
+    if not 1 &lt;= loop[&quot;passes&quot;] &lt;= MAX_PASSES:
+        return &quot;the loop bound must be from 1 to %d — an unbounded loop is refused&quot; % MAX_PASSES
+    if verb == &quot;source&quot;:
+        return &quot;a source takes no input, so it cannot be looped&quot;
+    if verb == &quot;sink&quot;:
+        return &quot;a sink emits nothing, so it cannot be looped&quot;
+    if verb == &quot;fold&quot; and not loop[&quot;closed&quot;]:
+        return &quot;a fold narrows to an aggregate; loop it only if closed under its own I/O (loop.closed: true)&quot;
+    return None
+
+
 def _parse_stage_token(tok):
-    &quot;&quot;&quot;Parse &#x27;slug:verb&#x27; or &#x27;slug:verb:cmd&#x27; -&gt; (slug, verb, cmd_list_or_None).
+    &quot;&quot;&quot;Parse &#x27;slug:verb&#x27; or &#x27;slug:verb:cmd&#x27; -&gt; (slug, verb, cmd_list_or_None, loop_or_None).
 
     Only the first two colons split slug/verb; the remainder is the command
-    (shell-split), so a cmd may itself contain colons.&quot;&quot;&quot;
+    (shell-split), so a cmd may itself contain colons. A slug written slug*N is
+    a bounded loop of that stage.&quot;&quot;&quot;
     parts = tok.split(&quot;:&quot;, 2)
     if len(parts) &lt; 2:
         raise ValueError(&quot;stage token &#x27;%s&#x27; must be slug:verb[:cmd]&quot; % tok)
-    slug, verb = parts[0], parts[1]
+    slug, loop = _parse_loop(parts[0])
+    verb = parts[1]
     cmd = shlex.split(parts[2]) if len(parts) == 3 and parts[2] else None
-    return (slug, verb, cmd)
+    return (slug, verb, cmd, loop)
 
 
 def _collect_stages(args):
@@ -414,7 +465,14 @@ def _collect_stages(args):
             if slug is None:
                 sys.stderr.write(&quot;conductor: stdin record has no &#x27;slug&#x27;: %s\n&quot; % line)
                 return None, 2
-            stages.append((slug, obj.get(&quot;port_verb&quot;, &quot;&quot;), obj.get(&quot;cmd&quot;)))
+            loop = obj.get(&quot;loop&quot;)
+            if loop is not None:
+                try:
+                    loop = _check_loop_decl(slug, loop)
+                except ValueError as exc:
+                    sys.stderr.write(&quot;conductor: %s\n&quot; % exc)
+                    return None, 2
+            stages.append((slug, obj.get(&quot;port_verb&quot;, &quot;&quot;), obj.get(&quot;cmd&quot;), loop))
     if not stages:
         sys.stderr.write(&quot;conductor: no stages (use --stage, or --stdin with JSON-lines)\n&quot;)
         return None, 2
@@ -431,6 +489,11 @@ def _typecheck_or_report(stages):
     if not ok:
         _emit({&quot;kind&quot;: &quot;refused&quot;, &quot;reason&quot;: &quot;pipeline does not typecheck&quot;, &quot;broken_joins&quot;: broken})
         return 3
+    for index, (slug, verb, _cmd, loop) in enumerate(stages):
+        why = loop_refusal(verb, loop) if loop is not None else None
+        if why:
+            _emit({&quot;kind&quot;: &quot;refused&quot;, &quot;reason&quot;: &quot;loop refused&quot;, &quot;index&quot;: index, &quot;slug&quot;: slug, &quot;why&quot;: why})
+            return 3
     return 0
 
 
@@ -464,7 +527,7 @@ def cmd_run(args):
     if code != 0:
         return code
     # Every stage must carry a cmd to be run.
-    for slug, verb, cmd in stages:
+    for slug, verb, cmd, _loop in stages:
         if not cmd:
             sys.stderr.write(&quot;conductor: stage &#x27;%s&#x27; has no cmd — cannot run &quot;
                              &quot;(use slug:verb:cmd)\n&quot; % slug)
@@ -484,11 +547,16 @@ def cmd_run(args):
     _append_ledger(ledger_path, {&quot;kind&quot;: &quot;run-start&quot;, &quot;trace_id&quot;: trace_id,
                                  &quot;n_stages&quot;: len(stages)})
     failed_index = None
-    for i, (slug, verb, cmd) in enumerate(stages):
+    for i, (slug, verb, cmd, loop) in enumerate(stages):
         if failed_index is not None:
             _append_ledger(ledger_path, {&quot;kind&quot;: &quot;stage&quot;, &quot;trace_id&quot;: trace_id,
                                          &quot;index&quot;: i, &quot;slug&quot;: slug, &quot;cmd&quot;: cmd,
                                          &quot;verdict&quot;: &quot;skipped&quot;, &quot;reason&quot;: &quot;an earlier stage failed&quot;})
+            continue
+        if loop is not None:
+            data, ok = _run_loop_stage(ledger_path, trace_id, i, slug, cmd, loop, data)
+            if not ok:
+                failed_index = i
             continue
         try:
             proc = subprocess.run(cmd, input=data, stdout=subprocess.PIPE,
@@ -521,6 +589,45 @@ def cmd_run(args):
                                  &quot;failed_index&quot;: failed_index})
     _emit_run_summary(trace_id, ledger_path, ok=False, failed_index=failed_index, stages=stages)
     return 5
+
+
+def _run_loop_stage(ledger_path, trace_id, index, slug, cmd, loop, data):
+    &quot;&quot;&quot;Run one bounded loop stage: each pass reads the last pass&#x27;s output. One ledger record per pass, then a
+    loop-end record. -&gt; (output, ok). With until=fixed, a pass that returns its input byte for byte stops the loop;
+    reaching the bound first is recorded settled:false (not a failure — the output still flows on).&quot;&quot;&quot;
+    current = data
+    for n in range(1, loop[&quot;passes&quot;] + 1):
+        try:
+            proc = subprocess.run(cmd, input=current, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except (OSError, ValueError) as exc:
+            _append_ledger(ledger_path, {&quot;kind&quot;: &quot;stage&quot;, &quot;trace_id&quot;: trace_id, &quot;index&quot;: index, &quot;slug&quot;: slug,
+                                         &quot;cmd&quot;: cmd, &quot;pass&quot;: n, &quot;verdict&quot;: &quot;failed&quot;, &quot;exit&quot;: None,
+                                         &quot;error&quot;: str(exc)})
+            _append_ledger(ledger_path, {&quot;kind&quot;: &quot;loop-end&quot;, &quot;trace_id&quot;: trace_id, &quot;index&quot;: index, &quot;slug&quot;: slug,
+                                         &quot;passes&quot;: n, &quot;stopped&quot;: &quot;failed&quot;})
+            return current, False
+        fixed = proc.returncode == 0 and proc.stdout == current
+        rec = {&quot;kind&quot;: &quot;stage&quot;, &quot;trace_id&quot;: trace_id, &quot;index&quot;: index, &quot;slug&quot;: slug, &quot;cmd&quot;: cmd, &quot;pass&quot;: n,
+               &quot;exit&quot;: proc.returncode, &quot;bytes_in&quot;: len(current), &quot;bytes_out&quot;: len(proc.stdout),
+               &quot;verdict&quot;: &quot;failed&quot; if proc.returncode != 0 else (&quot;fixed&quot; if fixed else &quot;ok&quot;)}
+        if proc.returncode != 0:
+            rec[&quot;stderr_tail&quot;] = proc.stderr.decode(&quot;utf-8&quot;, &quot;replace&quot;)[-500:]
+            _append_ledger(ledger_path, rec)
+            _append_ledger(ledger_path, {&quot;kind&quot;: &quot;loop-end&quot;, &quot;trace_id&quot;: trace_id, &quot;index&quot;: index, &quot;slug&quot;: slug,
+                                         &quot;passes&quot;: n, &quot;stopped&quot;: &quot;failed&quot;})
+            return current, False
+        _append_ledger(ledger_path, rec)
+        current = proc.stdout
+        if loop[&quot;until&quot;] == &quot;fixed&quot; and fixed:
+            _append_ledger(ledger_path, {&quot;kind&quot;: &quot;loop-end&quot;, &quot;trace_id&quot;: trace_id, &quot;index&quot;: index, &quot;slug&quot;: slug,
+                                         &quot;passes&quot;: n, &quot;stopped&quot;: &quot;fixed&quot;, &quot;settled&quot;: True})
+            return current, True
+    end = {&quot;kind&quot;: &quot;loop-end&quot;, &quot;trace_id&quot;: trace_id, &quot;index&quot;: index, &quot;slug&quot;: slug, &quot;passes&quot;: loop[&quot;passes&quot;],
+           &quot;stopped&quot;: &quot;bound&quot;}
+    if loop[&quot;until&quot;] == &quot;fixed&quot;:
+        end[&quot;settled&quot;] = False
+    _append_ledger(ledger_path, end)
+    return current, True
 
 
 def _emit_run_summary(trace_id, ledger_path, ok, failed_index, stages):
@@ -600,7 +707,7 @@ if __name__ == &quot;__main__&quot;:
 </code></pre>
           </details>
           <details class="code-fold">
-            <summary><code class="fname">test_conductor.py</code><span class="lines">210 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/conductor/test_conductor.py">on GitHub &rarr;</a></summary>
+            <summary><code class="fname">test_conductor.py</code><span class="lines">298 lines</span><a class="blob" href="https://github.com/butcher-maker422/loopmmt/blob/main/gifts/conductor/test_conductor.py">on GitHub &rarr;</a></summary>
             <pre class="code"><code>#!/usr/bin/env python3
 &quot;&quot;&quot;Tests for the conductor gift.
 
@@ -809,6 +916,94 @@ class TestVerbs(unittest.TestCase):
                          [&quot;source&quot;, &quot;transform&quot;, &quot;filter&quot;, &quot;fold&quot;, &quot;sink&quot;])
 
 
+# --- bounded loops (the trace): slug*N tokens and JSON &quot;loop&quot; objects ------------------------------------------
+SEED = &quot;%s -c \&quot;print(&#x27;{\\\&quot;n\\\&quot;: 0}&#x27;)\&quot;&quot; % PY
+STEP = (&quot;%s -c \&quot;import sys,json\nfor l in sys.stdin:\n  l=l.strip()\n  if l:\n    r=json.loads(l); &quot;
+        &quot;r[&#x27;n&#x27;]=min(r[&#x27;n&#x27;]+1,3); print(json.dumps(r,sort_keys=True))\&quot;&quot; % PY)
+
+
+def loop_records(ledger, index):
+    return [r for r in read_ledger(ledger) if r.get(&quot;index&quot;) == index and r[&quot;kind&quot;] in (&quot;stage&quot;, &quot;loop-end&quot;)]
+
+
+class TestLoops(TmpCase):
+    def test_a_token_loop_feeds_each_pass_the_last_output(self):
+        code, out, _ = run([&quot;run&quot;, &quot;--stage&quot;, &quot;seed:source:&quot; + SEED, &quot;--stage&quot;, &quot;step*2:transform:&quot; + STEP,
+                            &quot;--ledger&quot;, self.ledger, &quot;--trace&quot;, &quot;L1&quot;])
+        self.assertEqual(code, 0)
+        self.assertEqual(out[-1], {&quot;n&quot;: 2})
+        recs = loop_records(self.ledger, 1)
+        self.assertEqual([r.get(&quot;pass&quot;) for r in recs], [1, 2, None])
+        self.assertEqual((recs[-1][&quot;kind&quot;], recs[-1][&quot;stopped&quot;], recs[-1][&quot;passes&quot;]), (&quot;loop-end&quot;, &quot;bound&quot;, 2))
+
+    def test_until_fixed_stops_at_the_first_repeat_and_says_settled(self):
+        stdin = json.dumps({&quot;slug&quot;: &quot;step&quot;, &quot;port_verb&quot;: &quot;transform&quot;, &quot;cmd&quot;: cd.shlex.split(STEP),
+                            &quot;loop&quot;: {&quot;passes&quot;: 50, &quot;until&quot;: &quot;fixed&quot;}})
+        seed = os.path.join(self.d, &quot;seed.jsonl&quot;)
+        with open(seed, &quot;w&quot;) as f:
+            f.write(&#x27;{&quot;n&quot;: 0}\n&#x27;)
+        code, out, _ = run([&quot;run&quot;, &quot;--stdin&quot;, &quot;--input&quot;, seed, &quot;--ledger&quot;, self.ledger, &quot;--trace&quot;, &quot;L2&quot;],
+                           stdin_text=stdin)
+        self.assertEqual(code, 0)
+        self.assertEqual(out[-1], {&quot;n&quot;: 3})
+        end = loop_records(self.ledger, 0)[-1]
+        self.assertEqual((end[&quot;stopped&quot;], end[&quot;passes&quot;], end[&quot;settled&quot;]), (&quot;fixed&quot;, 4, True))
+
+    def test_until_fixed_that_hits_the_bound_is_recorded_unsettled_not_failed(self):
+        stdin = json.dumps({&quot;slug&quot;: &quot;step&quot;, &quot;port_verb&quot;: &quot;transform&quot;, &quot;cmd&quot;: cd.shlex.split(STEP),
+                            &quot;loop&quot;: {&quot;passes&quot;: 2, &quot;until&quot;: &quot;fixed&quot;}})
+        seed = os.path.join(self.d, &quot;seed.jsonl&quot;)
+        with open(seed, &quot;w&quot;) as f:
+            f.write(&#x27;{&quot;n&quot;: 0}\n&#x27;)
+        code, out, _ = run([&quot;run&quot;, &quot;--stdin&quot;, &quot;--input&quot;, seed, &quot;--ledger&quot;, self.ledger, &quot;--trace&quot;, &quot;L3&quot;],
+                           stdin_text=stdin)
+        self.assertEqual(code, 0)
+        end = loop_records(self.ledger, 0)[-1]
+        self.assertEqual((end[&quot;stopped&quot;], end[&quot;settled&quot;]), (&quot;bound&quot;, False))
+
+    def test_a_zero_or_oversized_bound_is_refused_before_any_stage_runs(self):
+        for bad in (&quot;step*0&quot;, &quot;step*1000001&quot;):
+            code, out, _ = run([&quot;run&quot;, &quot;--stage&quot;, &quot;seed:source:&quot; + SEED, &quot;--stage&quot;, bad + &quot;:transform:&quot; + STEP,
+                                &quot;--ledger&quot;, self.ledger, &quot;--trace&quot;, &quot;L4&quot;])
+            self.assertEqual(code, 3, bad)
+            self.assertEqual(out[0][&quot;reason&quot;], &quot;loop refused&quot;)
+        self.assertEqual([r for r in read_ledger(self.ledger) if r[&quot;kind&quot;] == &quot;stage&quot;], [])
+
+    def test_a_malformed_bound_is_a_usage_error(self):
+        code, _, _ = run([&quot;check&quot;, &quot;--stage&quot;, &quot;step*two:transform:&quot; + STEP])
+        self.assertEqual(code, 2)
+
+    def test_a_source_or_sink_can_never_be_looped(self):
+        code, _, _ = run([&quot;check&quot;, &quot;--stage&quot;, &quot;seed*2:source:&quot; + SEED, &quot;--stage&quot;, &quot;s:sink:&quot; + SINK])
+        self.assertEqual(code, 3)
+        code, _, _ = run([&quot;check&quot;, &quot;--stage&quot;, &quot;seed:source:&quot; + SEED, &quot;--stage&quot;, &quot;s*2:sink:&quot; + SINK])
+        self.assertEqual(code, 3)
+
+    def test_a_fold_loops_only_when_declared_closed(self):
+        open_fold = json.dumps({&quot;slug&quot;: &quot;c&quot;, &quot;port_verb&quot;: &quot;fold&quot;, &quot;cmd&quot;: cd.shlex.split(COUNT), &quot;loop&quot;: {&quot;passes&quot;: 2}})
+        code, _, _ = run([&quot;check&quot;, &quot;--stdin&quot;], stdin_text=open_fold)
+        self.assertEqual(code, 3)
+        closed = json.dumps({&quot;slug&quot;: &quot;c&quot;, &quot;port_verb&quot;: &quot;fold&quot;, &quot;cmd&quot;: cd.shlex.split(COUNT),
+                             &quot;loop&quot;: {&quot;passes&quot;: 2, &quot;closed&quot;: True}})
+        code, _, _ = run([&quot;check&quot;, &quot;--stdin&quot;], stdin_text=closed)
+        self.assertEqual(code, 0)
+
+    def test_a_malformed_loop_object_is_a_usage_error(self):
+        for bad in ({&quot;passes&quot;: &quot;2&quot;}, {&quot;passes&quot;: 2, &quot;until&quot;: &quot;forever&quot;}, &quot;loop&quot;):
+            stdin = json.dumps({&quot;slug&quot;: &quot;x&quot;, &quot;port_verb&quot;: &quot;transform&quot;, &quot;cmd&quot;: cd.shlex.split(PASS), &quot;loop&quot;: bad})
+            code, _, _ = run([&quot;check&quot;, &quot;--stdin&quot;], stdin_text=stdin)
+            self.assertEqual(code, 2, bad)
+
+    def test_a_failing_pass_stops_the_loop_and_skips_later_stages(self):
+        code, _, err = run([&quot;run&quot;, &quot;--stage&quot;, &quot;seed:source:&quot; + SEED, &quot;--stage&quot;, &quot;boom*3:transform:&quot; + BOOM,
+                            &quot;--stage&quot;, &quot;s:sink:&quot; + SINK, &quot;--ledger&quot;, self.ledger, &quot;--trace&quot;, &quot;L5&quot;])
+        self.assertEqual(code, 5)
+        recs = loop_records(self.ledger, 1)
+        self.assertEqual((recs[0][&quot;pass&quot;], recs[0][&quot;verdict&quot;], recs[-1][&quot;stopped&quot;]), (1, &quot;failed&quot;, &quot;failed&quot;))
+        later = [r for r in read_ledger(self.ledger) if r.get(&quot;index&quot;) == 2]
+        self.assertEqual(later[0][&quot;verdict&quot;], &quot;skipped&quot;)
+
+
 if __name__ == &quot;__main__&quot;:
     unittest.main()
 </code></pre>
@@ -845,7 +1040,7 @@ if __name__ == &quot;__main__&quot;:
         <p class="footer-docs">Documents: <a href="/site/corpus.html">Creed, PiF, Glossary &amp; the full corpus &rarr;</a></p>
         <div class="footer-mark">
           <img src="/site/assets/wordmark.svg" alt="Loop MMT" style="height:19px;width:auto;">
-          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.152</span>
+          <span>&copy; 2026 Shea Gunther &middot; New Gloucester, Maine &middot; CC BY-NC 4.0 &middot; v1.153</span>
         </div>
         <p><a href="mailto:shea@loopmmt.com">shea@loopmmt.com</a></p>
       </div>

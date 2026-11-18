@@ -1,258 +1,1079 @@
-# Loop MMT — corpus shard 71/95
+# Loop MMT — corpus shard 71/99
 
-> Bundle 71 of 95 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
+> Bundle 71 of 99 in the excavation shard set. The authoritative tree is https://loopmmt.com/corpus-manifest.json; the shard index is https://loopmmt.com/corpus-shards.json. Read every shard (or account for each skipped node by coverage class) to complete a full excavation. See The Reckoning for the coverage-ledger and final-report contract.
 
-Nodes in this shard: 3 (/gifts/input-event-router/, /gifts/interval-math/, /gifts/isvalidcsscolor/)
+Nodes in this shard: 4 (/gifts/grain/, /gifts/grid-sink/, /gifts/grid-source/, /gifts/harness-fold/)
 
 ---
 
-# input-event-router — a Loop MMT gift
-https://loopmmt.com/gifts/input-event-router/
+# Grain — a Loop MMT gift
+https://loopmmt.com/gifts/grain/
 [coverage: optional · branch: gifts]
 
-Is This Input Event Safe to Fold? route ← all gifts
+Structure Smell Test smell ← all gifts
 
-input-event-router
+Grain
 
-Every interactive app re-hand-rolls the same first step: turn raw, untrusted pointer/key input into something a reducer can safely fold — and that is where the bugs and the attack surface live. input-event-router is that step done once, correctly: a dependency-free deterministic reducer that folds a raw input-event log (JSONL) into a typed, schema-validated event stream, plus an O(1) fold-state (sequence integrity + a monotonic logical tick). seq is a strict total order (a gap or repeat is a rejection, never coerced); t is logical time supplied as data, never a wall-clock read, so the same log replays byte-identically forever — in a browser or headless on Node; type must be in a declared, closed vocabulary; payload is an opaque object it never interprets. It authors the interactive lane's {seq,t,type,payload} event envelope that render-loop-harness and undo-stack-kernel fold. Zero dependencies, pure, offline.
+Compress your data, compare the ratio against a size-matched random null model drawn live, and get a self-calibrating reading of how much structure vs. noise — no hand-set threshold. Snapshot it over time and it becomes a cheap drift alarm.
 
 The honest edge
 
-this normalizes and validates raw input events against a declared schema, folding them into a deterministic typed event stream; it does NOT sanitize application semantics, it does NOT persist, it holds NO clock/network/entropy, and it trusts no event it did not schema.
+It's a smell, not a proof — a smoke alarm, not an arson investigator. Great for staleness and homogenization drift; not a data-rot or dead-link checker.
 
 Run it
 
-node input-event-router.js < events.jsonl # fold a JSONL event log -> render + emitted-stream summary | node input-event-router.js --help
-test_input-event-router.js (25/25) — replay-determinism, seq total-order rejection, closed-vocabulary enforcement, O(1) state bound under a large synthetic log, crash-clean on bad/empty JSON
-Zero dependencies, Node or browser, deterministic
+python3 grain.py --help
+test_grain.py (5/5)
+Python stdlib only
 
 The code — every file that ships
 
-input-event-router.js 230 lines on GitHub →
+grain.py 315 lines on GitHub →
+#!/usr/bin/env python3
+"""
+grain.py — a self-calibrating structure & drift smell test for any corpus.
+
+Does this text/relation have *grain* — real structure — or is it slurry?
+
+WHAT IT DOES
+It compresses your data with zlib (a Kolmogorov UPPER bound: DEFLATE finds
+repeated substructure) and compares the compression ratio against a
+size-matched, deterministically-seeded RANDOM NULL MODEL built from your own
+data's own symbols. If your data compresses clearly *more* than random
+arrangements of the same symbols, it carries structure a random baseline does
+not — a rule, a template, a hub, a repetition. The threshold is drawn LIVE
+from the null model, so there is no magic number to hand-tune as your data
+grows. That self-calibration is the whole trick.
+
+WHAT IT IS GOOD FOR (graded honestly)
+* Corpus staleness / homogenization drift — its BEST fit. Snapshot the grain
+signature over time; a drift is a near-free staleness/homogenization alarm.
+No labels, no model, no training. (see: --drift)
+* "AI slop" smell — YES, as a SMELL, not a classifier.
+Machine-generated text trends more templated/redundant; rising structure
+against the null is a cheap smoke alarm. A smoke alarm, not an investigator.
+* Detecting a generating rule leaking into a published relation (hub / label
+reuse) — the original use this was extracted from. (see: --relation)
+
+WHAT IT IS *NOT* GOOD FOR
+* Data rot (dead links, broken references, bit-decay). Wrong tool — that is a
+reference-integrity problem; this measures structure, not reachability.
+* A proof of anything. It is a lower-bound SMELL. zlib is an upper bound on
+complexity, so a low ratio proves compressibility, not a specific cause; and
+it is WEAK on chain-shaped rules (a chain reuses each symbol ~twice, like a
+sparse random graph), so a clean reading is not a certificate of "no rule."
+
+Stdlib only. Deterministic (seeded). No dependencies. MIT licensed.
+
+Origin: extracted and generalized from the "non-compressibility gate" in the
+Loop MMT corpus-map builder. The specific application (generator-leak detection
+in a published edge graph) stayed home; this is the general kernel, given away.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import statistics
+import sys
+import zlib
+
+class GrainInputError(Exception):
+"""A clean, user-facing input error (bad path, unreadable baseline).
+
+Raised instead of letting an OSError traceback escape, so adversarial I/O
+fails with a one-line message and a nonzero exit (exit 2) rather than a
+stack trace."""
+
+# --- the one documented knob ------------------------------------------------
+Z_CUT = 2.0 # flag STRUCTURED when the real ratio is > Z sd below the
+# null MEAN — more compressible than random arrangements of
+# its own symbols, beyond normal variation. Self-calibrating
+# (mean+sd drawn live); no absolute number to drift.
+NULL_TRIALS = 64 # deterministic sample size of the random baseline
+NULL_SEED = 0xC0DE # fixed seed => folds-twice-identical (reproducible)
+MIN_SD = 1e-6 # sd-floor: below this the baseline is degenerate and the
+# z-cut is meaningless, so fall back to a coarse fraction.
+DEGENERATE_FRACTION = 0.5 # backstop only when the null baseline has ~no spread
+
+def _zlib_ratio(raw: bytes) -> float:
+"""rho = compressed_len / raw_len at max level. LOW rho => compressible => structure."""
+if not raw:
+return 1.0
+return len(zlib.compress(raw, 9)) / len(raw)
+
+def _serialize(tokens) -> bytes:
+"""
+Canonical bytes for a token sequence: newline-joined, real symbols kept.
+We keep the REAL tokens (never remap to a dense integer alphabet): structure
+manifests as repeated real tokens, and that reuse is exactly the compressible
+signal to catch. The null is serialized identically, so any per-token length
+effect cancels between actual and null.
+"""
+return "\n".join(tokens).encode("utf-8")
+
+def _null_stats(n_tokens, null_draw):
+"""
+zlib-ratio DISTRIBUTION of `NULL_TRIALS` size-matched RANDOM draws from the
+data's own alphabet — NOT a permutation of the same multiset. Drawing fresh
+from the alphabet is what lets a real rule stand out: the actual reuses a hub
+label (`x -> glossary` many times) far more than a uniform draw over the
+alphabet does, so the actual compresses more and its z_score drops. (A
+same-multiset permutation would hold that reuse INSIDE the null and detect
+nothing — the exact bug this replaced.) Deterministic (seeded). Returns
+(mean, population_sd) over the draws.
+
+`null_draw(rng, n)` returns one random size-n token list from the alphabet.
+"""
+if n_tokens < 2:
+return 1.0, 0.0
+rng = random.Random(NULL_SEED)
+ratios = [_zlib_ratio(_serialize(null_draw(rng, n_tokens)))
+for _ in range(NULL_TRIALS)]
+return statistics.mean(ratios), statistics.pstdev(ratios)
+
+def _alphabet_draw(alphabet):
+"""Default null: draw n symbols uniformly (with replacement) from `alphabet`.
+
+The pool is `sorted`, not a bare `list(alphabet)`: a set's iteration order is
+randomized per process (PYTHONHASHSEED), so an unsorted pool made the fixed
+PRNG seed index a differently-ordered pool in every process — same input, two
+processes, different z-score (GIFT-006). Determinism is a whole-pipeline
+property; the seed alone is not enough if upstream ordering is not canonical.
+The relation path already sorts its node pool; this brings the token path to
+the same footing.
+"""
+pool = sorted(alphabet)
+return lambda rng, n: [rng.choice(pool) for _ in range(n)]
+
+def signature(tokens, null_draw=None):
+"""
+The grain signature of a token sequence, self-calibrated against a size-matched
+uniform draw from its own alphabet. `z_score` is sigma below (negative) / above
+the null mean: strongly negative => structured (compresses more than a random
+draw of its size does). Pass `null_draw` to supply a domain-specific null (see
+the relation path); default is a uniform draw over the distinct tokens.
+"""
+tokens = list(tokens)
+if null_draw is None:
+null_draw = _alphabet_draw(set(tokens) or {""})
+rho_actual = _zlib_ratio(_serialize(tokens))
+mean_null, sd_null = _null_stats(len(tokens), null_draw)
+rel = (rho_actual / mean_null) if mean_null else 1.0
+z = ((rho_actual - mean_null) / sd_null) if sd_null > MIN_SD else 0.0
+degenerate = sd_null <= MIN_SD
+if not tokens:
+structured = False
+elif degenerate:
+structured = rho_actual < DEGENERATE_FRACTION * mean_null
+else:
+structured = z < -Z_CUT
+return {
+"tokens": len(tokens),
+"rho_actual": round(rho_actual, 4),
+"mean_null": round(mean_null, 4),
+"sd_null": round(sd_null, 4),
+"rel_to_null": round(rel, 4),
+"z_score": round(z, 3),
+"z_cut": Z_CUT,
+"null_trials": NULL_TRIALS,
+"degenerate_baseline": degenerate,
+"verdict": "STRUCTURED" if structured else "IDIOSYNCRATIC",
+}
+
+# --- input modes ------------------------------------------------------------
+
+def tokens_from_text(text, mode="lines"):
+if mode == "lines":
+return [ln for ln in text.splitlines() if ln.strip()]
+if mode == "words":
+return text.split()
+raise ValueError(f"unknown text mode: {mode}")
+
+def tokens_from_relation(text):
+"""Each non-empty line is an edge `a->b` or `a<TAB>b`; kept as a real token."""
+out = []
+for ln in text.splitlines():
+ln = ln.strip()
+if not ln:
+continue
+if "->" in ln:
+a, b = ln.split("->", 1)
+elif "\t" in ln:
+a, b = ln.split("\t", 1)
+else:
+a, b = ln, ""
+out.append(f"{a.strip()}->{b.strip()}")
+return sorted(out) # canonical order, like the original relation serializer
+
+def relation_null_draw(edge_tokens):
+"""
+Faithful relation null (from the original gate): the alphabet is the NODE set,
+and each null draw is `n` random DISTINCT directed pairs from it. A rule-leak
+(a hub reusing one target node across many edges) sits far below this uniform-
+pair baseline; a genuinely idiosyncratic dependency graph sits inside it.
+"""
+nodes = set()
+for tok in edge_tokens:
+if "->" in tok:
+a, b = tok.split("->", 1)
+nodes.add(a.strip())
+nodes.add(b.strip())
+nodes = sorted(nodes)
+all_pairs = [(a, b) for a in nodes for b in nodes if a!= b]
+
+def draw(rng, n):
+k = min(n, len(all_pairs))
+return [f"{a}->{b}" for a, b in sorted(rng.sample(all_pairs, k))] if k > 0 else []
+
+return draw
+
+def _read(path):
+if path == "-":
+return sys.stdin.read()
+try:
+with open(path, "r", encoding="utf-8", errors="replace") as fh:
+return fh.read()
+except (OSError, IOError) as exc:
+# A clean one-line refusal instead of a traceback: missing file,
+# a directory given as a file, permission denied, etc.
+raise GrainInputError("cannot read %r: %s" % (path, exc.strerror or exc))
+
+HONEST_CEILING = (
+"note: a lower-bound SMELL, never a proof. zlib is an upper bound on "
+"complexity, so a low ratio proves compressibility, not a specific cause; "
+"it is weak on chain-shaped rules; and it says nothing about data rot "
+"(broken references) — that is a different tool."
+)
+
+def main(argv=None):
+p = argparse.ArgumentParser(
+description="Self-calibrating structure & drift smell test for any corpus.",
+epilog=HONEST_CEILING,
+)
+p.add_argument("path", help="file to read, or '-' for stdin")
+p.add_argument("--relation", action="store_true",
+help="treat each line as an edge (a->b) instead of prose")
+p.add_argument("--words", action="store_true",
+help="tokenize prose by words instead of lines")
+p.add_argument("--drift", metavar="BASELINE.json",
+help="compare this input's signature against a saved baseline "
+"and report the change (the staleness alarm)")
+p.add_argument("--save", metavar="OUT.json",
+help="write this input's signature to OUT.json as a baseline")
+p.add_argument("--json", action="store_true", help="machine-readable output")
+args = p.parse_args(argv)
+
+try:
+return _run(args)
+except GrainInputError as exc:
+sys.stderr.write("grain: %s\n" % exc)
+return 2
+
+def _run(args):
+text = _read(args.path)
+if args.relation:
+toks = tokens_from_relation(text)
+sig = signature(toks, null_draw=relation_null_draw(toks))
+else:
+toks = tokens_from_text(text, "words" if args.words else "lines")
+sig = signature(toks)
+
+if args.save:
+try:
+with open(args.save, "w", encoding="utf-8") as fh:
+json.dump(sig, fh, indent=2, sort_keys=True)
+except (OSError, IOError) as exc:
+raise GrainInputError("cannot write %r: %s"
+% (args.save, exc.strerror or exc))
+
+if args.drift:
+try:
+with open(args.drift, "r", encoding="utf-8") as fh:
+base = json.load(fh)
+except (OSError, IOError) as exc:
+raise GrainInputError("cannot read baseline %r: %s"
+% (args.drift, exc.strerror or exc))
+except ValueError as exc:
+raise GrainInputError("baseline %r is not valid JSON: %s"
+% (args.drift, exc))
+delta_z = round(sig["z_score"] - base.get("z_score", 0.0), 3)
+delta_rel = round(sig["rel_to_null"] - base.get("rel_to_null", 1.0), 4)
+drift = {
+"baseline_z": base.get("z_score"),
+"current_z": sig["z_score"],
+"delta_z": delta_z,
+"delta_rel_to_null": delta_rel,
+# more structure than before => drift toward homogenization/staleness
+"reading": ("MORE STRUCTURED than baseline (homogenizing/staling)"
+if delta_z < -0.5 else
+"LESS STRUCTURED than baseline (diversifying)"
+if delta_z > 0.5 else
+"stable (within noise)"),
+}
+if args.json:
+print(json.dumps({"signature": sig, "drift": drift}, indent=2, sort_keys=True))
+else:
+print(f"grain drift: {drift['reading']} (delta_z={delta_z})")
+print(HONEST_CEILING)
+return 0
+
+if args.json:
+print(json.dumps(sig, indent=2, sort_keys=True))
+else:
+print(f"grain: {sig['verdict']} "
+f"(z={sig['z_score']} vs cut -{sig['z_cut']}; "
+f"{sig['tokens']} tokens; rho={sig['rho_actual']} vs null {sig['mean_null']})")
+print(HONEST_CEILING)
+return 0
+
+if __name__ == "__main__":
+sys.exit(main())
+
+test_grain.py 71 lines on GitHub →
+#!/usr/bin/env python3
+"""Tests for grain.py — the discrimination must be real, not a no-op."""
+import json
+import subprocess
+import sys
+import tempfile
+import os
+
+import grain
+
+def test_structured_vs_idiosyncratic():
+# A hub/template: every line reuses the same target token — a generator leak.
+structured = [f"class_{i}->glossary" for i in range(60)]
+# Idiosyncratic: distinct random-ish pairs, little reuse.
+import random
+rng = random.Random(1)
+nodes = [f"n{i}" for i in range(60)]
+idio = sorted({f"{rng.choice(nodes)}->{rng.choice(nodes)}" for _ in range(60)})
+s_struct = grain.signature(structured, null_draw=grain.relation_null_draw(structured))
+s_idio = grain.signature(idio, null_draw=grain.relation_null_draw(idio))
+# The structured set must read more compressible (lower z) than the idiosyncratic.
+assert s_struct["z_score"] < s_idio["z_score"], (s_struct, s_idio)
+assert s_struct["verdict"] == "STRUCTURED", s_struct
+
+def test_determinism():
+toks = [f"a{i}->b{i%7}" for i in range(50)]
+a = grain.signature(toks)
+b = grain.signature(toks)
+assert a == b, "signature must fold-twice-identical (seeded)"
+
+def test_empty_is_not_structured():
+s = grain.signature([])
+assert s["verdict"] == "IDIOSYNCRATIC", s
+
+def test_drift_detects_homogenization():
+diverse = [f"n{i}->m{i}" for i in range(60)] # low structure
+homogd = [f"n{i}->glossary" for i in range(60)] # high structure (hub)
+base = grain.signature(diverse, null_draw=grain.relation_null_draw(diverse))
+now = grain.signature(homogd, null_draw=grain.relation_null_draw(homogd))
+# Homogenized corpus is MORE structured => z drops.
+assert now["z_score"] < base["z_score"]
+
+def test_cli_json_and_honest_ceiling():
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+fh.write("\n".join(f"class_{i}->glossary" for i in range(40)))
+path = fh.name
+try:
+out = subprocess.run(
+[sys.executable, "grain.py", path, "--relation", "--json"],
+capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+)
+assert out.returncode == 0, out.stderr
+data = json.loads(out.stdout)
+assert "verdict" in data and "z_score" in data
+finally:
+os.unlink(path)
+
+if __name__ == "__main__":
+n = 0
+for name, fn in sorted(globals().items()):
+if name.startswith("test_") and callable(fn):
+fn()
+print(f"ok {name}")
+n += 1
+print(f"\n{n}/{n} passed")
+
+Take the whole folder →
+MIT
+Python stdlib only
+
+---
+
+# Grid-sink — a Loop MMT gift
+https://loopmmt.com/gifts/grid-sink/
+[coverage: optional · branch: gifts]
+
+Placed Blocks In, One Grid SVG Out render ← all gifts
+
+Grid-sink
+
+grid-sink places a stream of blocks {row,col,w,h} into a fixed grid and renders it as one standalone, deterministic SVG with zero dependencies — one <rect> per block, painted from a fixed palette by index. It renders no axes, labels, gridlines, or legend, and no text at all — numbers only. Its one distinguishing decision is the DECLARED overflow policy: when the grid is pinned and a block does not fit, the caller declares up front how it is handled — error (refuse the layout), clip (draw the in-grid portion), or skip (omit it) — so overflow is never handled silently by accident. Same blocks + grid + policy in -> byte-identical SVG out.
+
+The honest edge
+
+grid-sink is a grid-placement primitive, not a layout engine: one <rect> per block at integer (row,col) spanning (w,h) cells, painted from a fixed named palette by index, NUMBERS ONLY (no text-escaping surface), no axes/labels/gridlines/legend, no fonts/script. Its ONE distinguishing decision is the DECLARED OVERFLOW POLICY — a block that exceeds a pinned grid is handled the way the caller declared: error (default, Fit-by-Construction), clip, or skip; never silently. Blocks draw in input order (painter’s order). Bad coord/span, unknown palette, or unknown overflow policy -> hard error. Same blocks + grid + policy in -> byte-identical SVG out.
+
+Run it
+
+printf "[0,0,1,1]
+[1,1,2,1]
+" | node grid-sink.js # a grid SVG (--cols/--rows to pin · --overflow error|clip|skip · --cell N · --palette loop|mono|warm|cool)
+test_grid-sink.js (12/12, out-of-band hand-computed SVG oracle across all 3 overflow branches) + Plumb conformance GREEN (I1-I5, I3=closed-palette+no-text, signed, clock-independent)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+grid-sink.js 257 lines on GitHub →
 #!/usr/bin/env node
-/* input-event-router.js — a dependency-free, deterministic reducer that turns a
-raw input-event log into a validated, typed event stream.
+/*
+* grid-sink — place blocks into a FIXED grid and render it as a deterministic SVG, no deps.
+* MIT · zero-dependency · standalone gift · lane: sink (consumes placed blocks, emits an SVG).
+*
+* THE PRINTED EDGE (read before trusting the output):
+* This is a grid-placement primitive, not a layout engine. Each input is a block placed at an
+* integer (row,col) spanning (w,h) cells; the gift draws one <rect> per block into a fixed grid,
+* painting from a fixed named palette by block index. It renders NO axes, labels, gridlines,
+* legend, or text — NUMBERS ONLY, so there is no text-escaping surface. Its ONE distinguishing
+* decision is the DECLARED OVERFLOW POLICY: when the grid is pinned (fixed cols/rows) and a block
+* would extend past it, the caller declares up front how that is handled — "error" (the default:
+* refuse the layout, Fit-by-Construction), "clip" (draw only the in-grid portion), or "skip"
+* (omit the block). Overflow is never handled silently by accident; it is always the policy the
+* caller named. Blocks draw in INPUT ORDER (painter's order — a later block overlaps an earlier
+* one). A non-finite/negative/non-integer coordinate, a non-positive span, an unknown palette, or
+* an unknown overflow policy is a HARD ERROR. Same blocks + same grid + same policy in →
+* byte-identical SVG out.
+*
+* USAGE:
+* printf '[0,0,1,1]\n[1,1,2,1]\n' | node grid-sink.js # auto-fit grid
+* echo '{"blocks":[[0,0,3,1]],"cols":2,"rows":2,"overflow":"clip"}' | node grid-sink.js
+* node grid-sink.js --help
+*
+* INPUT (stdin): either
+* - JSONL — one block per line, each [row,col,w,h] or {"row":R,"col":C,"w":W,"h":H}
+* - a single JSON spec object { blocks, cols, rows, cell, pad, palette, overflow}
+* row,col are non-negative integers; w,h are positive integers.
+* CLI flags (--cols --rows --cell --pad --palette --overflow) OVERRIDE object fields.
+*
+* OUTPUT (stdout): one SVG document string (UTF-8), trailing newline. No blocks → an empty frame.
+*
+* DETERMINISM: integer cell coordinates (no float in the output), stable attribute order, blocks in
+* input order, fixed palette by index. Same blocks + grid + policy → same bytes, Node or browser.
+*/
+'use strict';
 
-WHY THIS EXISTS. Every interactive app re-hand-rolls the same first step: take
-raw, untrusted pointer/key input and turn it into something a reducer can
-safely fold. Hand-rolled, that step is where the bugs and the attack surface
-live — an unvalidated event coerced instead of rejected, a wall-clock read
-that breaks replay, a field the reducer trusts that the input never carried.
-This is that step done once, correctly, as a DETERMINISTIC REDUCER over an
-input-event log: raw events in, a typed schema-validated stream out, plus a
-tiny O(1) fold-state (sequence integrity + monotonic tick).
+// ---- palettes (the ONLY source of block color; no free-form color input) --------
+var PALETTES = {
+loop: ['#2f6f8f', '#c25b3a', '#4a8a52', '#8a6d3b', '#6d4a8a', '#3b6d8a'],
+mono: ['#111111', '#555555', '#999999', '#bbbbbb'],
+warm: ['#c25b3a', '#d98a3a', '#b23b3b', '#8a5a2b'],
+cool: ['#2f6f8f', '#4a8a8a', '#3b5a8a', '#5a6d8a']
+};
+var OVERFLOW = ['error', 'clip', 'skip']; // the DECLARED policy set (closed)
+var DEFAULTS = { cell: 20, pad: 2, palette: 'loop', overflow: 'error'};
 
-THE STRIP-CLEAN RULE (the whole reason to trust it). state_t is a pure fold of
-state_0 and the ordered event log up to t. Replaying the same log yields
-byte-identical state, stream, and render. The router holds NO clock, NO
-network, and NO entropy it did not receive as an event — logical time enters
-ONLY as the event field `t`, supplied by the caller as data. So the same log
-replays identically forever, in a browser or headless on Node.
+// ---- validation helpers --------------------------------------------------------
+function nonNegInt(v, i, name) {
+if (typeof v!== 'number' ||!isFinite(v) || Math.floor(v)!== v || v < 0) {
+throw new Error('block[' + i + '] ' + name + ' must be a non-negative integer, got ' + JSON.stringify(v));
+}
+return v;
+}
+function posInt(v, i, name) {
+if (typeof v!== 'number' ||!isFinite(v) || Math.floor(v)!== v || v <= 0) {
+throw new Error('block[' + i + '] ' + name + ' must be a positive integer, got ' + JSON.stringify(v));
+}
+return v;
+}
+function posIntOpt(v, dflt, name) {
+if (v == null) return dflt;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n <= 0) throw new Error(name + ' must be a positive integer, got ' + JSON.stringify(v));
+return n;
+}
+function nonNegIntOpt(v, name) {
+if (v == null) return null;
+var n = Number(v);
+if (!isFinite(n) || Math.floor(n)!== n || n < 0) throw new Error(name + ' must be a non-negative integer, got ' + JSON.stringify(v));
+return n;
+}
 
-THE ENVELOPE (this gift authors the interactive lane's event schema). One
-event per JSONL line:
-{ "seq": <int>=0, monotonic +1 >, "t": <int>=0, non-decreasing logical tick >,
-"type": <one of the declared accepted types>, "payload": <object>}
-seq is the total order (a gap or repeat is a rejection). t is logical time as
-DATA (never a clock read). type must be in the declared accepted set. payload
-is opaque cargo (checked to be an object; its contents are the downstream
-reducer's business, not this gift's).
+// ---- one block -> {row,col,w,h} (accepts [row,col,w,h] or {row,col,w,h}) --------
+function asBlock(raw, i) {
+var row, col, w, h;
+if (Array.isArray(raw)) {
+if (raw.length!== 4) throw new Error('block[' + i + '] array must be [row,col,w,h] (4 fields), got ' + JSON.stringify(raw));
+row = raw[0]; col = raw[1]; w = raw[2]; h = raw[3];
+} else if (raw && typeof raw === 'object') {
+if (!('row' in raw) ||!('col' in raw) ||!('w' in raw) ||!('h' in raw)) {
+throw new Error('block[' + i + '] object must have row,col,w,h, got ' + JSON.stringify(raw));
+}
+row = raw.row; col = raw.col; w = raw.w; h = raw.h;
+} else {
+throw new Error('block[' + i + '] must be [row,col,w,h] or {row,col,w,h}, got ' + JSON.stringify(raw));
+}
+nonNegInt(row, i, 'row'); nonNegInt(col, i, 'col'); posInt(w, i, 'w'); posInt(h, i, 'h');
+return { row: row, col: col, w: w, h: h};
+}
+
+// ---- input normalization -------------------------------------------------------
+function normalize(input, flags) {
+var spec = {};
+var blocksRaw;
+if (input &&!Array.isArray(input) && typeof input === 'object') {
+blocksRaw = input.blocks;
+if (input.cols!= null) spec.cols = input.cols;
+if (input.rows!= null) spec.rows = input.rows;
+if (input.cell!= null) spec.cell = input.cell;
+if (input.pad!= null) spec.pad = input.pad;
+if (input.palette!= null) spec.palette = input.palette;
+if (input.overflow!= null) spec.overflow = input.overflow;
+} else {
+blocksRaw = input;
+}
+flags = flags || {};
+for (var k in flags) if (flags[k]!= null) spec[k] = flags[k];
+
+if (blocksRaw == null) blocksRaw = [];
+if (!Array.isArray(blocksRaw)) throw new Error('input has no blocks (expected [[row,col,w,h],...] or a {blocks:...} object)');
+spec.blocks = blocksRaw.map(asBlock);
+spec.cell = posIntOpt(spec.cell, DEFAULTS.cell, 'cell');
+spec.pad = (spec.pad!= null)? nonNegIntOpt(spec.pad, 'pad'): DEFAULTS.pad;
+spec.palette = (spec.palette!= null)? String(spec.palette): DEFAULTS.palette;
+spec.overflow = (spec.overflow!= null)? String(spec.overflow): DEFAULTS.overflow;
+spec.cols = nonNegIntOpt(spec.cols, 'cols'); // null => auto-fit
+spec.rows = nonNegIntOpt(spec.rows, 'rows');
+if (!PALETTES[spec.palette]) throw new Error('unknown palette "' + spec.palette + '" (expected ' + Object.keys(PALETTES).join(' | ') + ')');
+if (OVERFLOW.indexOf(spec.overflow) === -1) throw new Error('unknown overflow policy "' + spec.overflow + '" (expected ' + OVERFLOW.join(' | ') + ')');
+return spec;
+}
+
+// ---- grid dimensions: pinned (declared) or auto-fit to the blocks ---------------
+function gridDims(spec) {
+var cols = spec.cols, rows = spec.rows;
+if (cols == null || rows == null) {
+var mc = 0, mr = 0;
+for (var i = 0; i < spec.blocks.length; i++) {
+var b = spec.blocks[i];
+if (b.col + b.w > mc) mc = b.col + b.w;
+if (b.row + b.h > mr) mr = b.row + b.h;
+}
+if (cols == null) cols = mc;
+if (rows == null) rows = mr;
+}
+return { cols: cols, rows: rows};
+}
+
+// ---- apply the DECLARED overflow policy to one block ----------------------------
+// returns a {row,col,w,h} to draw, or null to omit — or throws (policy "error").
+function fit(b, i, cols, rows, policy) {
+var overRight = b.col + b.w > cols;
+var overBottom = b.row + b.h > rows;
+var outside = b.col >= cols || b.row >= rows;
+if (!overRight &&!overBottom) return b; // fits — nothing to decide
+if (policy === 'error') {
+throw new Error('block[' + i + '] at (row ' + b.row + ', col ' + b.col + ') size ' + b.w + 'x' + b.h +
+' exceeds the fixed ' + cols + 'x' + rows + ' grid (overflow policy "error")');
+}
+if (policy === 'skip') return null; // omit the whole block
+// policy === 'clip': draw only the in-grid portion.
+if (outside) return null; // entirely outside -> nothing to draw
+var w = Math.min(b.w, cols - b.col);
+var h = Math.min(b.h, rows - b.row);
+if (w <= 0 || h <= 0) return null;
+return { row: b.row, col: b.col, w: w, h: h};
+}
+
+// ---- core: grid(input, flags) -> string (pure, the whole gift) -----------------
+function grid(input, flags) {
+var spec = normalize(input, flags);
+var cell = spec.cell, pad = spec.pad, pal = PALETTES[spec.palette];
+var dims = gridDims(spec);
+var W = 2 * pad + dims.cols * cell;
+var H = 2 * pad + dims.rows * cell;
+
+var body = [];
+for (var i = 0; i < spec.blocks.length; i++) { // painter's order = input order
+var drawn = fit(spec.blocks[i], i, dims.cols, dims.rows, spec.overflow);
+if (drawn == null) continue;
+var x = pad + drawn.col * cell, y = pad + drawn.row * cell;
+var w = drawn.w * cell, h = drawn.h * cell;
+var color = pal[i % pal.length];
+body.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" fill="' + color + '" />');
+}
+
+var open = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '">';
+return open + '\n' + (body.length? body.join('\n') + '\n': '') + '</svg>\n';
+}
+
+// ---- exports -------------------------------------------------------------------
+if (typeof window!== 'undefined') {
+window.LoopGifts = window.LoopGifts || {};
+window.LoopGifts['grid-sink'] = { grid: grid, PALETTES: PALETTES, OVERFLOW: OVERFLOW};
+}
+if (typeof module!== 'undefined' && module.exports) {
+module.exports = { grid: grid, normalize: normalize, gridDims: gridDims, fit: fit, PALETTES: PALETTES, OVERFLOW: OVERFLOW};
+}
+
+// ---- cli -----------------------------------------------------------------------
+var HELP =
+'grid-sink — place blocks into a FIXED grid -> a standalone, deterministic SVG, zero deps.\n\n' +
+" printf '[0,0,1,1]\\n[1,1,2,1]\\n' | node grid-sink.js\n" +
+" echo '{\"blocks\":[[0,0,3,1]],\"cols\":2,\"rows\":2,\"overflow\":\"clip\"}' | node grid-sink.js\n\n" +
+'INPUT (stdin): JSONL of [row,col,w,h] or {row,col,w,h} blocks (one per line), OR a {blocks,...}\n' +
+'spec object. Flags (override object fields): --cols N --rows N --cell N --pad N\n' +
+' --palette loop|mono|warm|cool --overflow error|clip|skip\n\n' +
+'One <rect> per block, painted from a fixed palette by index; NUMBERS ONLY (no text surface). With a\n' +
+'PINNED grid, a block that exceeds it is handled by the DECLARED overflow policy: error (default) |\n' +
+'clip | skip. Auto-fit grid (no --cols/--rows) never overflows. Bad coord/span, unknown palette, or\n' +
+'unknown overflow policy -> hard error.\n';
+
+function parseFlags(argv) {
+var f = {};
+for (var i = 0; i < argv.length; i++) {
+var a = argv[i];
+if (a === '--cols') f.cols = Number(argv[++i]);
+else if (a === '--rows') f.rows = Number(argv[++i]);
+else if (a === '--cell') f.cell = Number(argv[++i]);
+else if (a === '--pad') f.pad = Number(argv[++i]);
+else if (a === '--palette') f.palette = argv[++i];
+else if (a === '--overflow') f.overflow = argv[++i];
+}
+return f;
+}
+
+function parseStdin(raw) {
+var trimmed = raw.trim();
+if (trimmed === '') return { blocks: []};
+if (trimmed.charAt(0) === '{') {
+try {
+var obj = JSON.parse(trimmed);
+if (obj &&!Array.isArray(obj) && typeof obj === 'object' && 'blocks' in obj) return obj;
+} catch (e) { /* fall through to JSONL */}
+}
+var blocks = [];
+var lines = trimmed.split('\n');
+for (var i = 0; i < lines.length; i++) {
+var ln = lines[i].trim();
+if (ln === '') continue;
+var b;
+try { b = JSON.parse(ln);}
+catch (e) { throw new Error('line ' + (i + 1) + ' is not valid JSON: ' + e.message);}
+blocks.push(b);
+}
+return { blocks: blocks};
+}
+
+function main() {
+var argv = process.argv.slice(2);
+if (argv.indexOf('--help')!== -1 || argv.indexOf('-h')!== -1) { process.stdout.write(HELP); return;}
+var flags = parseFlags(argv);
+var chunks = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (d) { chunks += d;});
+process.stdin.on('end', function () {
+var input;
+try { input = parseStdin(chunks);}
+catch (e) { process.stderr.write('grid-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+var svg;
+try { svg = grid(input, flags);}
+catch (e) { process.stderr.write('grid-sink: ' + e.message + '\n'); process.exitCode = 1; return;}
+process.stdout.write(svg);
+});
+}
+if (typeof require!== 'undefined' && require.main === module) { main();}
+
+test_grid-sink.js 118 lines on GitHub →
+#!/usr/bin/env node
+/*
+* test_grid-sink.js — drift-check battery for the grid-sink gift.
+*
+* THE ORACLE IS OUT-OF-BAND BY CONSTRUCTION. The expected SVG documents below are hand-computed from
+* the documented geometry — a block at (row,col) spanning (w,h) draws a <rect> at (pad+col*cell,
+* pad+row*cell) sized (w*cell,h*cell); grid W=2*pad+cols*cell, H=2*pad+rows*cell (cell=20,pad=2);
+* fill = PALETTES.loop[blockIndex]; the DECLARED overflow policy (error|clip|skip) decides a block
+* that exceeds a pinned grid — written independently of the emitter. A build cannot certify itself.
+* The char-of-this-gift is the overflow policy, so the battery pins all three branches explicitly.
+*
+* Run: node test_grid-sink.js (exit 0 = all pass; nonzero = a named failure)
+*/
+'use strict';
+const assert = require('assert');
+const { grid, PALETTES} = require('./grid-sink.js');
+
+let n = 0, passed = 0;
+function check(name, fn) {
+n++;
+try { fn(); passed++; console.log(' ok ' + name);}
+catch (e) { console.log(' FAIL ' + name + ' — ' + e.message); process.exitCode = 1;}
+}
+
+const TWO =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 44" width="64" height="44">\n' +
+'<rect x="2" y="2" width="20" height="20" fill="#2f6f8f" />\n' +
+'<rect x="22" y="22" width="40" height="20" fill="#c25b3a" />\n' +
+'</svg>\n';
+
+// 1 — two blocks, auto-fit grid (cols=3,rows=2); rect per block, palette by index.
+check('two blocks, auto grid -> one rect each, palette by index', () => {
+assert.strictEqual(grid({ blocks: [[0,0,1,1],[1,1,2,1]]}), TWO);
+});
+
+// 2 — overflow "clip": a block wider than the pinned grid is drawn clipped to bounds.
+check('overflow clip: 3-wide block in a 2-wide grid -> clipped to 2 cells', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">\n' +
+'<rect x="2" y="2" width="40" height="20" fill="#2f6f8f" />\n' +
+'</svg>\n';
+assert.strictEqual(grid({ blocks: [[0,0,3,1]], cols: 2, rows: 2, overflow: 'clip'}), exp);
+});
+
+// 3 — overflow "skip": a block starting outside the grid is omitted entirely.
+check('overflow skip: block at col 3 in a 2-col grid -> omitted', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">\n' +
+'<rect x="2" y="2" width="20" height="20" fill="#2f6f8f" />\n' +
+'</svg>\n';
+assert.strictEqual(grid({ blocks: [[0,0,1,1],[0,3,1,1]], cols: 2, rows: 2, overflow: 'skip'}), exp);
+});
+
+// 4 — overflow "error" (the default): an overflowing block on a pinned grid THROWS.
+check('overflow error (default): overflowing block throws, naming the grid', () => {
+assert.throws(() => grid({ blocks: [[0,0,3,1]], cols: 2, rows: 2}),
+/block\[0\] at \(row 0, col 0\) size 3x1 exceeds the fixed 2x2 grid \(overflow policy "error"\)/);
+});
+
+// 5 — pinned empty grid -> an empty frame of the declared size.
+check('pinned empty grid -> empty 2x2 frame', () => {
+assert.strictEqual(grid({ blocks: [], cols: 2, rows: 2}),
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">\n</svg>\n');
+});
+
+// 6 — empty auto grid -> a minimal frame (cols=rows=0).
+check('empty auto grid -> minimal frame', () => {
+assert.strictEqual(grid({ blocks: []}),
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4" width="4" height="4">\n</svg>\n');
+});
+
+// 7 — object-form block + custom cell size render identically to the array form.
+check('object-form block + --cell 10', () => {
+const exp =
+'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">\n' +
+'<rect x="2" y="2" width="20" height="20" fill="#2f6f8f" />\n' +
+'</svg>\n';
+assert.strictEqual(grid({ blocks: [{ row:0, col:0, w:2, h:2}], cell: 10}), exp);
+});
+
+// 8 — I3 closed palette + no text: every fill is a palette color; no <text>/<script>.
+check('closed palette + no text', () => {
+const out = grid({ blocks: [[0,0,1,1],[1,0,1,1],[2,0,1,1]]});
+assert.ok(!/<text|<script|<style|font/.test(out), 'no text/script/style/font');
+const closed = new Set(Object.values(PALETTES).flat());
+const fills = (out.match(/fill="([^"]*)"/g) || []).map(s => s.slice(6, -1));
+assert.ok(fills.length === 3 && fills.every(f => closed.has(f)), 'every fill in the closed palette');
+});
+
+// 9 — determinism: same blocks + grid + policy -> byte-identical, twice.
+check('determinism: repeated render is byte-identical', () => {
+const s = { blocks: [[0,0,2,1],[1,0,1,2],[0,2,1,1]], cols: 3, rows: 3};
+assert.strictEqual(grid(s), grid(s));
+});
+
+// 10 — bad coordinate / span are hard, named errors.
+check('bad coord/span throws, naming the block', () => {
+assert.throws(() => grid({ blocks: [[0,-1,1,1]]}), /block\[0\] col must be a non-negative integer/);
+assert.throws(() => grid({ blocks: [[0,0,0,1]]}), /block\[0\] w must be a positive integer/);
+assert.throws(() => grid({ blocks: [[NaN,0,1,1]]}), /block\[0\] row must be a non-negative integer/);
+});
+
+// 11 — unknown palette / unknown overflow policy throw (never a silent fallback).
+check('unknown palette / overflow throws', () => {
+assert.throws(() => grid({ blocks: [[0,0,1,1]], palette: 'nope'}), /unknown palette/);
+assert.throws(() => grid({ blocks: [[0,0,1,1]], overflow: 'nope'}), /unknown overflow policy/);
+});
+
+// 12 — mutation bite (non-vacuity): a wrong-color SVG is rejected.
+check('mutation bite: a wrong-color SVG is rejected', () => {
+const wrong = TWO.replace('fill="#c25b3a"', 'fill="#4a8a52"');
+const got = grid({ blocks: [[0,0,1,1],[1,1,2,1]]});
+assert.strictEqual(got, TWO);
+assert.notStrictEqual(got, wrong);
+});
+
+console.log('\n' + passed + '/' + n + ' passed');
+if (passed!== n) process.exit(1);
+
+Take the whole folder →
+MIT
+Node / browser, no dependencies
+
+---
+
+# grid-source — a Loop MMT gift
+https://loopmmt.com/gifts/grid-source/
+[coverage: optional · branch: gifts]
+
+Generate a Bounded 2-D Grid as a Deterministic JSONL Stream source ← all gifts
+
+grid-source
+
+grid-source takes grid dimensions in and emits one JSON record per cell — {row,col}, plus a value under --index/--fill — in a stable, byte-identical ROW-MAJOR order on every machine. It is the bounded 2-D coordinate substrate the spatial apps (a sudoku board, a spreadsheet range, a graphing lattice, a game board) all lean on, and it has no supply in the corpus. Unlike a filesystem or stream source there is NO provider to inject: a grid is fully determined by its dimensions, so the pure core grid(opts) has no I/O at all — pure by construction, the stronger determinism guarantee. It fixes the three quiet failures of the hand-rolled nested loop: non-deterministic/ambiguous emission order (grid-source is stable row-major, --transpose for column-major), off-by-one/unbounded dimensions (positive integers required, fail-closed, 0x0 is the honest empty stream), and coordinate/value confusion (row/col are always position; value only under --index or --fill). It pairs with grid-sink: `grid-source --cells | grid-sink` renders a real SVG.
+
+The honest edge
+
+grid-source emits a bounded, stable ROW-MAJOR stream of {row,col} cells (value only under --index/--fill). It is a coordinate SOURCE, not a renderer (pipe --cells into grid-sink to draw), does NOT read stdin (dimensions are flags), does NOT do sparse grids, and does NOT carry data beyond a constant --fill or the row-major --index. Dimensions must be non-negative integers; 0x0 is the empty stream.
+
+Run it
+
+node grid-source.js --rows 3 --cols 4 # -> row-major JSONL of 12 {row,col} cells
+test_grid-source.js (96/96, independent flat-index div/mod oracle + --cells composition contract) + Plumb conformance GREEN (137/137, signed 2026-09-13, non-vacuous: a column-major mutant caught on a non-square grid + a bounds-guard-stripped mutant caught)
+Node / browser, no dependencies
+
+The code — every file that ships
+
+grid-source.js 245 lines on GitHub →
+#!/usr/bin/env node
+/* grid-source.js — generate a bounded 2-D grid as a deterministic JSONL stream of cells.
+Dependency-free, deterministic, MIT. Runs in Node (the CLI) or a browser (the pure core).
+
+WHAT IT IS. A SOURCE: it takes grid dimensions in and emits a JSONL stream out — one record
+per cell, in a stable row-major order — the front of a pipe that lets the fold/filter/
+transform/sink gifts work on a 2-D coordinate space:
+
+node grid-source.js --rows 3 --cols 3 | node grid-sink.js
+node grid-source.js --rows 9 --cols 9 --index | node schema-filter.js...
+
+Each record is a fixed, portable shape: {"row":0,"col":0} — plus "value" when a value mode
+is chosen. The coordinate shape is exactly what grid-sink consumes ({row,col,...}), so
+`grid-source | grid-sink` composes into a render pipe; it is the input substrate the spatial
+apps (a sudoku board, a spreadsheet range, a graphing lattice, a Mandelbrot plane, a game
+board) all lean on — a bounded, reproducible coordinate space with no supply in the corpus.
+
+THE QUIET FAILURES IT FIXES. Everyone hand-rolls a nested `for (r) for (c)` and everyone gets
+it wrong in ways that only bite on the input they didn't test:
+
+1. NON-DETERMINISTIC / AMBIGUOUS ORDER. Ad-hoc grid loops emit in whatever order the code
+happened to nest (row-major here, column-major there), so two callers' streams don't
+line up and can't be diffed or pinned. grid-source emits a STABLE ROW-MAJOR pre-order
+(row 0 left-to-right, then row 1,...), the same stream on every machine and every run.
+
+2. OFF-BY-ONE / UNBOUNDED DIMENSIONS. A grid built from an unchecked `--rows`/`--cols` (a
+float, a negative, a zero, a non-number) silently produces a wrong or infinite stream.
+grid-source requires POSITIVE INTEGER dimensions and fails CLOSED (exit 2, one-line
+message) on anything else — a 0×0 grid is the empty stream, not an error, but a
+fractional or negative dimension is refused up front.
+
+3. COORDINATE/VALUE CONFUSION. Hand loops mix the cell's POSITION with its CONTENT, so a
+downstream sink can't tell which field is which. grid-source keeps them separate and
+named: `row`/`col` are always the position; `value` (only when a value mode is asked
+for) is the content — a constant `--fill`, or the cell's row-major `--index`.
+
+THE MODEL. The PURE CORE is `grid(opts)`: it takes options (rows, cols, value mode) and returns
+the sorted, deterministic array of cell records. There is no I/O in the core — a grid is fully
+determined by its dimensions, so unlike a filesystem or a stream source there is no provider to
+inject; the core is pure by construction. The CLI parses argv into opts and renders JSONL; a
+browser calls `grid(opts)` directly.
+
+--rows R number of rows (positive integer; required unless --cols implies a square via --size)
+--cols C number of columns (positive integer; required unless --size)
+--size N shorthand for --rows N --cols N (a square grid)
+--index add a "value" field: the cell's 0-based row-major index (0..rows*cols-1)
+--fill V add a "value" field: the constant V (a JSON scalar: number, string, true/false/null)
+--origin-one number rows/cols from 1 instead of 0 (1..rows, 1..cols)
+--transpose emit in COLUMN-major order instead of row-major (col 0 top-to-bottom, then col 1)
+
+DETERMINISM. grid(opts) is a pure function of opts. Given the same opts, the output is byte-
+identical on every run and every machine: cells in stable row-major (or, with --transpose,
+column-major) order, coordinates and value separated, no clock, no randomness. --index and
+--fill are mutually exclusive (a cell has at most one value).
 
 USAGE
-node input-event-router.js < events.jsonl # fold a JSONL event log -> render + summary
-node input-event-router.js --help
+node grid-source.js --rows 3 --cols 4
+node grid-source.js --size 9 --index
+node grid-source.js --rows 2 --cols 2 --fill 0 | node grid-sink.js
+node grid-source.js --help
 
-Released under MIT. Its edge, printed in the README and --help: this
-NORMALIZES and VALIDATES input events against a declared schema, folding them
-into a deterministic typed stream. It does NOT sanitize application semantics,
-it does NOT persist, it holds NO clock/network/entropy, and it trusts no event
-it did not schema. (Retaining event history is the undo-stack-kernel's job,
-under its own declared bound — this gift deliberately keeps O(1) state.)
+Exit codes: 0 success (including an empty grid -> empty stream) · 2 usage error (unknown
+option, missing/duplicate/invalid dimension, --index with --fill, bad --fill scalar). A clean
+one-line message on stderr, never a stack trace.
+
+Released under MIT. Its edge is printed in the README: grid-source emits a bounded, row-major
+(or --transpose column-major) stream of {row,col[,value]} cells. It does NOT lay out or render
+(pipe into grid-sink for that), does NOT read any input (dimensions come from flags, not stdin),
+does NOT do sparse/irregular grids (every cell in the rectangle is emitted), and does NOT carry
+per-cell data (use --fill for a constant or pipe through a transform to attach real values).
 */
 "use strict";
 
-// The default accepted event-type vocabulary. The vocabulary is CONFIG, not
-// frozen (covenant §2/§5 U2 — sub-lanes/types by contract, not by a fixed list):
-// what the gift enforces is that the vocabulary is DECLARED and CLOSED, which is
-// the decidable security property. An app supplies its own set via cfg.acceptedTypes.
-var DEFAULT_ACCEPTED_TYPES = ["pointer", "key", "select", "edit", "commit"];
+/* ==================================================================
+THE PURE CORE — grid(opts) -> [cell,...]
+No I/O, no provider: a grid is fully determined by its dimensions.
+opts.rows / opts.cols — positive integers (0 allowed -> empty stream)
+opts.originOne — number from 1 instead of 0
+opts.transpose — column-major instead of row-major
+opts.valueMode — undefined | 'index' | 'fill'
+opts.fill — the constant value when valueMode === 'fill'
+Returns an array of { row, col [, value]} in stable order.
+================================================================== */
+function grid(opts) {
+opts = opts || {};
+var rows = opts.rows;
+var cols = opts.cols;
+if (!isNonNegInt(rows) ||!isNonNegInt(cols)) {
+throw new Error("grid: rows and cols must be non-negative integers");
+}
+var base = opts.originOne? 1: 0;
+var transpose =!!opts.transpose;
+var valueMode = opts.valueMode; // undefined | 'index' | 'fill'
+var fill = opts.fill;
 
-// The initial fold-state. O(1) by contract: three integers, never a buffer.
-function state0() {
-return { nextSeq: 0, lastTick: -1, count: 0};
+var out = [];
+// The row-major index is ALWAYS assigned in row-major order (r*cols + c), independent of
+// emission order, so --index is a stable property of the cell, not of the traversal. This
+// means --transpose changes the ORDER cells are emitted but NOT a cell's --index value.
+var asBlocks =!!opts.cells; // --cells: emit unit blocks {row,col,w,h} that grid-sink consumes
+function pushCell(r, c) {
+var rec = { row: base + r, col: base + c};
+if (asBlocks) { rec.w = 1; rec.h = 1;}
+if (valueMode === "index") rec.value = r * cols + c;
+else if (valueMode === "fill") rec.value = fill;
+out.push(rec);
 }
 
-// isPlainObject — an object, not null, not an array, not a scalar. payload must
-// be an object; we do NOT walk its contents (depth-1 check => bounded work,
-// resource-bounds clause §3.3).
-function isPlainObject(v) {
-return v!== null && typeof v === "object" &&!Array.isArray(v);
+if (!transpose) {
+for (var r = 0; r < rows; r++) {
+for (var c = 0; c < cols; c++) pushCell(r, c);
+}
+} else {
+for (var cc = 0; cc < cols; cc++) {
+for (var rr = 0; rr < rows; rr++) pushCell(rr, cc);
+}
+}
+return out;
 }
 
-function isInt(v) {
-return typeof v === "number" && isFinite(v) && Math.floor(v) === v;
+// A non-negative integer (0 allowed): the dimension guard.
+function isNonNegInt(n) {
+return typeof n === "number" && isFinite(n) && Math.floor(n) === n && n >= 0;
 }
 
-/* validate(state, event, cfg) -> { ok: true} | { ok: false, reason: <string>}
-Pure. Checks the envelope against the schema BEFORE the fold sees it. Every
-failure is a DECLARED rejection reason; nothing is coerced. */
-function validate(state, event, cfg) {
-var accepted = (cfg && cfg.acceptedTypes) || DEFAULT_ACCEPTED_TYPES;
-
-if (!isPlainObject(event)) return { ok: false, reason: "event-not-object"};
-
-// seq: present, int >= 0, exactly the next expected (total order, no gap/repeat).
-if (!isInt(event.seq) || event.seq < 0) return { ok: false, reason: "seq-not-int"};
-if (event.seq < state.nextSeq) return { ok: false, reason: "seq-repeat"};
-if (event.seq > state.nextSeq) return { ok: false, reason: "seq-gap"};
-
-// t: present, int >= 0, non-decreasing (logical tick as data; never a clock).
-if (!isInt(event.t) || event.t < 0) return { ok: false, reason: "tick-not-int"};
-if (event.t < state.lastTick) return { ok: false, reason: "tick-decrease"};
-
-// type: non-empty string in the declared accepted set.
-if (typeof event.type!== "string" || event.type.length === 0) {
-return { ok: false, reason: "type-not-string"};
-}
-if (accepted.indexOf(event.type) === -1) return { ok: false, reason: "type-not-accepted"};
-
-// payload: an object (opaque cargo). A scalar/null/array payload is rejected.
-if (!isPlainObject(event.payload)) return { ok: false, reason: "payload-not-object"};
-
-return { ok: true};
+// Render cell records as JSONL text (one JSON object per line, trailing newline per record).
+function toJSONL(records) {
+var s = "";
+for (var i = 0; i < records.length; i++) s += JSON.stringify(records[i]) + "\n";
+return s;
 }
 
-/* route(state, event, cfg) -> { state, emit, reject}
-The pure reducer. On a valid event: emit the normalized typed event and
-advance state. On an invalid event: emit null, record the rejection, and DO
-NOT advance the fold into a corrupt place. The whole log is folded by reduce. */
-function route(state, event, cfg) {
-var v = validate(state, event, cfg);
-if (!v.ok) {
-// A rejected event does not advance nextSeq/lastTick — the fold's integrity
-// point is preserved. reject carries the offending seq when it was an int.
-var seq = isInt(event && event.seq)? event.seq: null;
-return { state: state, emit: null, reject: { seq: seq, reason: v.reason}};
-}
-// Build the normalized typed event WITHOUT trusting the raw object's prototype
-// or extra keys: copy only the four envelope fields onto a null-proto object,
-// so a hostile __proto__/constructor payload key cannot pollute anything.
-var payloadCopy = Object.create(null);
-var keys = Object.keys(event.payload);
-for (var i = 0; i < keys.length; i++) {
-var k = keys[i];
-if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
-payloadCopy[k] = event.payload[k];
-}
-var emit = { seq: event.seq, t: event.t, type: event.type, payload: payloadCopy};
-var next = { nextSeq: state.nextSeq + 1, lastTick: event.t, count: state.count + 1};
-return { state: next, emit: emit, reject: null};
-}
-
-/* foldLog(events, cfg) -> { state, stream, rejections, halted}
-Folds an ordered array of raw events. reject-policy default is HALT: a hostile
-or corrupt log STOPS at the first integrity violation rather than silently
-dropping bad events and continuing into an ambiguous stream. cfg.rejectPolicy
-= "skip" is available for genuinely best-effort input. */
-function foldLog(events, cfg) {
-var policy = (cfg && cfg.rejectPolicy) || "halt";
-var state = state0();
-var stream = [];
-var rejections = [];
-var halted = false;
-for (var i = 0; i < events.length; i++) {
-var r = route(state, events[i], cfg);
-if (r.reject) {
-rejections.push(r.reject);
-if (policy === "halt") { halted = true; break;}
-// skip: record the rejection, do not advance, continue to the next event.
-continue;
-}
-state = r.state;
-stream.push(r.emit);
-}
-return { state: state, stream: stream, rejections: rejections, halted: halted};
-}
-
-/* render(state) -> string. Pure state -> frame projection. An interactive gift
-is still pipe-testable headless: the frame is deterministic text, never a live
-canvas. */
-function render(state) {
-return (
-"accepted=" + state.count +
-" next-seq=" + state.nextSeq +
-" last-tick=" + state.lastTick
-);
-}
-
-var API = {
-DEFAULT_ACCEPTED_TYPES: DEFAULT_ACCEPTED_TYPES,
-ACCEPTED_TYPES: DEFAULT_ACCEPTED_TYPES,
-state0: state0,
-validate: validate,
-route: route,
-foldLog: foldLog,
-render: render
-};
-
-// Browser attach.
+/* ==================================================================
+EXPORTS (browser + Node)
+================================================================== */
 if (typeof window!== "undefined") {
 window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.inputEventRouter = API;
+window.ForestGifts.gridSource = { grid: grid, toJSONL: toJSONL};
 }
-
-// Node require.
 if (typeof module!== "undefined" && module.exports) {
-module.exports = API;
+module.exports = { grid: grid, toJSONL: toJSONL, isNonNegInt: isNonNegInt};
 }
 
-// CLI.
+/* ==================================================================
+CLI (runs only when invoked directly, never on require)
+================================================================== */
+
+// Parse a --fill value as a JSON scalar (number, string, true/false/null). A bare token that
+// isn't valid JSON is treated as a string (so `--fill x` -> "x"), but an explicitly malformed
+// JSON literal (`--fill [1,`) is a usage error — we only accept SCALARS, never structures.
+function parseFillScalar(tok) {
+var v;
+try { v = JSON.parse(tok);}
+catch (e) { return tok;} // not JSON -> a plain string
+if (v === null || typeof v === "number" || typeof v === "boolean" || typeof v === "string") return v;
+throw new Error("--fill must be a scalar (number, string, true, false, or null), not a structure");
+}
+
+function parseIntStrict(v, name) {
+var n = Number(v);
+if (String(v).trim() === "" ||!isFinite(n) || Math.floor(n)!== n || n < 0) {
+throw new Error(name + " must be a non-negative integer");
+}
+return n;
+}
+
+function parseArgs(args) {
+var opts = {};
+var rows, cols, size;
+var i = 0;
+while (i < args.length) {
+var a = args[i];
+if (a === "--rows") { rows = parseIntStrict(args[i + 1], "--rows"); i += 2;}
+else if (a === "--cols") { cols = parseIntStrict(args[i + 1], "--cols"); i += 2;}
+else if (a === "--size") { size = parseIntStrict(args[i + 1], "--size"); i += 2;}
+else if (a === "--index") { opts.__indexSeen = true; i++;}
+else if (a === "--fill") {
+if (args[i + 1] === undefined) throw new Error("--fill requires a value");
+opts.__fillTok = args[i + 1]; i += 2;
+}
+else if (a === "--origin-one") { opts.originOne = true; i++;}
+else if (a === "--transpose") { opts.transpose = true; i++;}
+else if (a === "--cells") { opts.cells = true; i++;}
+else if (a.charAt(0) === "-") { throw new Error("unknown option " + a);}
+else { throw new Error("unexpected argument " + JSON.stringify(a) + " (grid-source takes flags, not positionals)");}
+}
+// --size is shorthand for a square; it must not be combined with --rows/--cols
+if (size!== undefined) {
+if (rows!== undefined || cols!== undefined) throw new Error("--size cannot be combined with --rows/--cols");
+rows = size; cols = size;
+}
+if (rows === undefined || cols === undefined) throw new Error("both --rows and --cols are required (or use --size N)");
+// Resolve the value mode from the independently-tracked flags, guarding mutual exclusion in
+// EITHER order (--index --fill or --fill --index both refused).
+var indexSeen =!!opts.__indexSeen, fillSeen = opts.__fillTok!== undefined;
+if (indexSeen && fillSeen) throw new Error("--index and --fill are mutually exclusive");
+if (indexSeen) opts.valueMode = "index";
+else if (fillSeen) { opts.valueMode = "fill"; opts.fill = parseFillScalar(opts.__fillTok);}
+delete opts.__indexSeen; delete opts.__fillTok;
+opts.rows = rows; opts.cols = cols;
+return opts;
+}
+
+var HELP =
+"grid-source.js — generate a bounded 2-D grid as a deterministic JSONL stream of cells.\n\n" +
+" node grid-source.js --rows 3 --cols 4\n" +
+" node grid-source.js --size 9 --index\n" +
+" node grid-source.js --rows 2 --cols 2 --fill 0 | node grid-sink.js\n" +
+" node grid-source.js --help\n\n" +
+" --rows R number of rows (non-negative integer)\n" +
+" --cols C number of columns (non-negative integer)\n" +
+" --size N shorthand for --rows N --cols N (a square)\n" +
+" --index add a \"value\" field: the cell's 0-based row-major index\n" +
+" --fill V add a \"value\" field: the constant JSON scalar V\n" +
+" --origin-one number rows/cols from 1 instead of 0\n" +
+" --transpose emit in column-major order instead of row-major\n" +
+" --cells emit each cell as a unit block {row,col,w:1,h:1} (grid-sink input)\n\n" +
+"Emits one JSON object per cell: { row, col[, value]}, cells in stable ROW-MAJOR order\n" +
+"(or column-major with --transpose). The {row,col} shape is what grid-sink consumes, so\n" +
+"`grid-source --cells | grid-sink` composes. --index and --fill are mutually exclusive.\n\n" +
+"Edge: grid-source does NOT render (pipe into grid-sink), does NOT read stdin (dimensions\n" +
+"are flags), does NOT do sparse/irregular grids (every cell is emitted), and carries no\n" +
+"per-cell data (use --fill or a downstream transform).\n";
+
 function main(argv) {
 var args = argv.slice(2);
 if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"input-event-router.js — deterministic reducer: raw input-event log -> validated typed stream.\n\n" +
-" node input-event-router.js < events.jsonl fold a JSONL event log -> render + summary\n" +
-" node input-event-router.js --help\n\n" +
-"Envelope (one JSON object per line):\n" +
-" { \"seq\": <int, monotonic +1>, \"t\": <int, non-decreasing logical tick>,\n" +
-" \"type\": <accepted type>, \"payload\": <object>}\n\n" +
-"Edge: this normalizes and validates input events against a declared schema,\n" +
-"folding them into a deterministic typed stream. It does not sanitize\n" +
-"application semantics, does not persist, holds no clock/network/entropy, and\n" +
-"trusts no event it did not schema.\n"
-);
+process.stdout.write(HELP);
 return 0;
 }
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-var text = Buffer.concat(chunks).toString("utf8");
-var lines = text.split("\n");
-var events = [];
-for (var i = 0; i < lines.length; i++) {
-var line = lines[i].trim();
-if (line.length === 0) continue;
-try {
-events.push(JSON.parse(line));
-} catch (e) {
-// A non-JSON line is itself a rejectable event: push a sentinel the
-// schema will reject as event-not-object (a string is not an object).
-events.push(line);
-}
-}
-var out = foldLog(events);
-process.stdout.write(render(out.state) + "\n");
-process.stdout.write(
-"emitted=" + out.stream.length +
-" rejected=" + out.rejections.length +
-(out.halted? " HALTED": "") + "\n"
-);
-for (var j = 0; j < out.rejections.length; j++) {
-var rj = out.rejections[j];
-process.stdout.write(" reject seq=" + rj.seq + " reason=" + rj.reason + "\n");
-}
-});
+var opts;
+try { opts = parseArgs(args);}
+catch (e) { process.stderr.write("grid-source: " + e.message + "\n"); return 2;}
+
+var records;
+try { records = grid(opts);}
+catch (e) { process.stderr.write("grid-source: " + e.message + "\n"); return 2;}
+
+process.stdout.write(toJSONL(records));
 return 0;
 }
 
@@ -260,919 +1081,358 @@ if (typeof require!== "undefined" && require.main === module) {
 process.exitCode = main(process.argv);
 }
 
-test_input-event-router.js 146 lines on GitHub →
+test_grid-source.js 135 lines on GitHub →
 #!/usr/bin/env node
-/* test_input-event-router.js — the golden event-log corpus.
+/* test_grid-source.js — battery for the grid-source gift.
+node test_grid-source.js -> exit 0 PASS / non-zero FAIL.
 
-The battery drift-checks the gift against an OUT-OF-BAND oracle: expected final
-states and emitted streams authored independently (by hand, from the envelope
-rules), not by running the gift. Plus replay-determinism (the canonicalizer
-self-test), the mandatory hostile-event known-bad vectors (§3 security check),
-a state-bounds assertion, and a mutation bite so a no-op harness cannot pass.
+The oracle is INDEPENDENT: the gift walks two nested loops (for row / for col); the oracle
+generates cells from a FLAT index (0..rows*cols-1) and maps each index back to (row,col) by
+division/modulo — a different route to the same set, so agreement proves the gift's ordering
+and coordinates rather than re-running its own logic. Plus frozen hand goldens for each of the
+three quiet failures and the fail-closed dimension edges.
 */
 "use strict";
-
-var R = require("./input-event-router.js");
-var assert = require("assert");
+var G = require("./grid-source.js");
+var grid = G.grid, toJSONL = G.toJSONL;
 
 var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;}
-else { fail++; console.error("FAIL: " + name);}
+function ok(name, cond) { if (cond) { pass++;} else { fail++; console.log(" FAIL " + name);}}
+function eq(name, a, b) { ok(name, JSON.stringify(a) === JSON.stringify(b));}
+
+/* ---- INDEPENDENT ORACLE: flat-index -> (row,col), a different route than nested loops ---- */
+function oracle(opts) {
+var rows = opts.rows, cols = opts.cols;
+var base = opts.originOne? 1: 0;
+var n = rows * cols;
+var cells = [];
+for (var k = 0; k < n; k++) {
+// row-major flat index -> coordinates
+var r = Math.floor(k / cols);
+var c = k % cols;
+var rec = { row: base + r, col: base + c};
+if (opts.valueMode === "index") rec.value = r * cols + c; // == k in row-major
+else if (opts.valueMode === "fill") rec.value = opts.fill;
+cells.push(rec);
 }
-function eq(name, a, b) {
-var ja = JSON.stringify(a), jb = JSON.stringify(b);
-if (ja === jb) { pass++;}
-else { fail++; console.error("FAIL: " + name + "\n got: " + ja + "\n want: " + jb);}
+if (opts.transpose) {
+// re-sort into column-major order WITHOUT recomputing index (index stays row-major)
+cells.sort(function (a, b) {
+var ac = a.col, bc = b.col, ar = a.row, br = b.row;
+if (ac!== bc) return ac - bc;
+return ar - br;
+});
+}
+return cells;
 }
 
-// ---------------------------------------------------------------------------
-// 1. Golden valid log -> expected final state + emitted stream (out-of-band).
-// Expected values hand-computed from the envelope rules, NOT from the gift.
-// ---------------------------------------------------------------------------
-var validLog = [
-{ seq: 0, t: 0, type: "pointer", payload: { x: 10, y: 20}},
-{ seq: 1, t: 0, type: "select", payload: { region: "A1"}},
-{ seq: 2, t: 3, type: "edit", payload: { cell: "A1", value: 7}},
-{ seq: 3, t: 3, type: "commit", payload: {}}
+/* ---- grid == oracle across a dimension grid ---------------------------- */
+var DIMS = [[1, 1], [1, 5], [5, 1], [3, 3], [3, 4], [9, 9], [2, 7], [0, 0], [0, 3], [4, 0]];
+var MODES = [
+{},
+{ valueMode: "index"},
+{ valueMode: "fill", fill: 0},
+{ valueMode: "fill", fill: "x"},
+{ originOne: true},
+{ transpose: true},
+{ transpose: true, valueMode: "index"},
+{ originOne: true, valueMode: "index", transpose: true}
 ];
-// Hand-authored oracle: 4 accepted, nextSeq ends at 4, lastTick is 3, count 4.
-var expectedState = { nextSeq: 4, lastTick: 3, count: 4};
-// Emitted stream = the same four events, payloads copied field-for-field.
-var expectedStream = [
-{ seq: 0, t: 0, type: "pointer", payload: { x: 10, y: 20}},
-{ seq: 1, t: 0, type: "select", payload: { region: "A1"}},
-{ seq: 2, t: 3, type: "edit", payload: { cell: "A1", value: 7}},
-{ seq: 3, t: 3, type: "commit", payload: {}}
-];
-var g = R.foldLog(validLog);
-eq("golden final state", g.state, expectedState);
-eq("golden emitted stream", g.stream, expectedStream);
-ok("golden: no rejections", g.rejections.length === 0);
-ok("golden: not halted", g.halted === false);
-eq("golden render", R.render(g.state), "accepted=4 next-seq=4 last-tick=3");
-
-// ---------------------------------------------------------------------------
-// 2. Replay-determinism (the canonicalizer self-test) — fold N times ->
-// byte-identical state, stream, render each time.
-// ---------------------------------------------------------------------------
-var r1 = R.foldLog(validLog);
-var r2 = R.foldLog(validLog);
-var r3 = R.foldLog(validLog);
-eq("replay: state identical", JSON.stringify(r1.state), JSON.stringify(r3.state));
-eq("replay: stream identical", JSON.stringify(r1.stream), JSON.stringify(r2.stream));
-eq("replay: render identical", R.render(r1.state), R.render(r3.state));
-
-// ---------------------------------------------------------------------------
-// 3. Hostile-event known-bad vectors (§3.1) — each MUST produce its declared
-// rejection reason, never a corruption/crash/coercion. Default policy=halt.
-// ---------------------------------------------------------------------------
-function firstReject(log) {
-var out = R.foldLog(log);
-return out.rejections.length? out.rejections[0].reason: "(none)";
+for (var d = 0; d < DIMS.length; d++) {
+for (var m = 0; m < MODES.length; m++) {
+var opts = Object.assign({ rows: DIMS[d][0], cols: DIMS[d][1]}, MODES[m]);
+var got = grid(opts);
+var want = oracle(opts);
+eq("grid==oracle dims=" + DIMS[d] + " mode#" + m, got, want);
 }
-eq("hostile: seq gap -> seq-gap",
-firstReject([{ seq: 0, t: 0, type: "key", payload: {}},
-{ seq: 1, t: 0, type: "key", payload: {}},
-{ seq: 3, t: 0, type: "key", payload: {}}]),
-"seq-gap");
-eq("hostile: seq repeat -> seq-repeat",
-firstReject([{ seq: 0, t: 0, type: "key", payload: {}},
-{ seq: 1, t: 0, type: "key", payload: {}},
-{ seq: 1, t: 0, type: "key", payload: {}}]),
-"seq-repeat");
-eq("hostile: decreasing tick -> tick-decrease",
-firstReject([{ seq: 0, t: 5, type: "key", payload: {}},
-{ seq: 1, t: 2, type: "key", payload: {}}]),
-"tick-decrease");
-eq("hostile: unknown type -> type-not-accepted",
-firstReject([{ seq: 0, t: 0, type: "no-such-type", payload: {}}]),
-"type-not-accepted");
-eq("hostile: scalar payload -> payload-not-object",
-firstReject([{ seq: 0, t: 0, type: "key", payload: 42}]),
-"payload-not-object");
-eq("hostile: null payload -> payload-not-object",
-firstReject([{ seq: 0, t: 0, type: "key", payload: null}]),
-"payload-not-object");
-eq("hostile: array payload -> payload-not-object",
-firstReject([{ seq: 0, t: 0, type: "key", payload: [1, 2]}]),
-"payload-not-object");
-eq("hostile: non-object event -> event-not-object",
-firstReject(["this is not an object"]),
-"event-not-object");
+}
 
-// 3b. Prototype-pollution known-bad twin: a __proto__ payload key must NOT
-// pollute Object.prototype, and must be dropped from the emitted payload.
-var poll = R.foldLog([{ seq: 0, t: 0, type: "edit",
-payload: JSON.parse('{"__proto__":{"polluted":true},"safe":1}')}]);
-ok("proto-pollution: Object.prototype not polluted", ({}).polluted === undefined);
-ok("proto-pollution: emitted, not rejected", poll.stream.length === 1 && poll.rejections.length === 0);
-eq("proto-pollution: dangerous key dropped, safe key kept",
-poll.stream[0].payload, { safe: 1});
+/* ---- QUIET FAILURE 1: stable row-major order (not column-major by accident) ---- */
+(function () {
+var g = grid({ rows: 2, cols: 3});
+// row-major: (0,0)(0,1)(0,2)(1,0)(1,1)(1,2)
+eq("QF1 row-major order", g.map(function (x) { return [x.row, x.col];}),
+[[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]);
+var t = grid({ rows: 2, cols: 3, transpose: true});
+// column-major: (0,0)(1,0)(0,1)(1,1)(0,2)(1,2)
+eq("QF1 --transpose column-major order", t.map(function (x) { return [x.row, x.col];}),
+[[0, 0], [1, 0], [0, 1], [1, 1], [0, 2], [1, 2]]);
+})();
 
-// 3c. halt vs skip policy.
-var halted = R.foldLog([{ seq: 0, t: 0, type: "key", payload: {}},
-{ seq: 2, t: 0, type: "key", payload: {}}, // gap -> halt here
-{ seq: 3, t: 0, type: "key", payload: {}}]);
-ok("halt: stops at first violation", halted.halted === true && halted.stream.length === 1);
-var skipped = R.foldLog([{ seq: 0, t: 0, type: "key", payload: {}},
-{ seq: 2, t: 0, type: "key", payload: {}}, // gap, skipped
-{ seq: 1, t: 0, type: "key", payload: {}}], // now valid (nextSeq still 1)
-{ rejectPolicy: "skip"});
-ok("skip: continues past a rejection", skipped.halted === false &&
-skipped.stream.length === 2 && skipped.rejections.length === 1);
+/* ---- QUIET FAILURE 2: bounded/valid dimensions (guard is in the CLI; core guards too) ---- */
+(function () {
+var threw = false;
+try { grid({ rows: 2.5, cols: 2});} catch (e) { threw = true;}
+ok("QF2 core throws on fractional rows", threw);
+threw = false;
+try { grid({ rows: -1, cols: 2});} catch (e) { threw = true;}
+ok("QF2 core throws on negative rows", threw);
+// 0x0 is the empty stream, NOT an error
+eq("QF2 0x0 is the empty grid", grid({ rows: 0, cols: 0}), []);
+eq("QF2 0xN is empty", grid({ rows: 0, cols: 5}), []);
+})();
 
-// ---------------------------------------------------------------------------
-// 4. State-bounds (§3.2) — over a large synthetic log the state stays exactly
-// three integers; no retained buffer. Assert structurally + by memory shape.
-// ---------------------------------------------------------------------------
-var N = 100000;
-var big = [];
-for (var i = 0; i < N; i++) big.push({ seq: i, t: i, type: "key", payload: {}});
-var bigOut = R.foldLog(big);
-eq("state-bounds: state keys are exactly {nextSeq,lastTick,count}",
-Object.keys(bigOut.state).sort(), ["count", "lastTick", "nextSeq"]);
-ok("state-bounds: count == N", bigOut.state.count === N);
-ok("state-bounds: state carries no array/buffer field",
-Object.keys(bigOut.state).every(function (k) { return typeof bigOut.state[k] === "number";}));
+/* ---- QUIET FAILURE 3: coordinate/value separation ---- */
+(function () {
+var plain = grid({ rows: 1, cols: 2});
+ok("QF3 no value field when no value mode", plain.every(function (x) { return x.value === undefined;}));
+var idx = grid({ rows: 2, cols: 2, valueMode: "index"});
+eq("QF3 --index is row-major 0-based", idx.map(function (x) { return x.value;}), [0, 1, 2, 3]);
+var idxT = grid({ rows: 2, cols: 2, valueMode: "index", transpose: true});
+// transpose changes ORDER but index stays row-major property: (0,0)=0 (1,0)=2 (0,1)=1 (1,1)=3
+eq("QF3 --index stable under --transpose (order changes, value does not)",
+idxT.map(function (x) { return [x.row, x.col, x.value];}),
+[[0, 0, 0], [1, 0, 2], [0, 1, 1], [1, 1, 3]]);
+var fill = grid({ rows: 1, cols: 3, valueMode: "fill", fill: 7});
+ok("QF3 --fill is the constant", fill.every(function (x) { return x.value === 7;}));
+})();
 
-// ---------------------------------------------------------------------------
-// 5. Mutation bite — a deliberately-wrong expected state MUST be caught, so a
-// no-op harness cannot pass green.
-// ---------------------------------------------------------------------------
-var wrongExpected = { nextSeq: 999, lastTick: 3, count: 4};
-ok("mutation bite: wrong expected state is detected",
-JSON.stringify(g.state)!== JSON.stringify(wrongExpected));
+/* ---- composition: {row,col} shape, and --cells emits grid-sink's {row,col,w,h} block ---- */
+(function () {
+var g = grid({ rows: 2, cols: 2});
+ok("composition: every record has row and col (coordinate substrate)",
+g.every(function (x) { return typeof x.row === "number" && typeof x.col === "number";}));
+var cells = grid({ rows: 2, cols: 2, cells: true});
+ok("composition: --cells emits unit blocks {row,col,w:1,h:1} (grid-sink input)",
+cells.every(function (x) { return x.w === 1 && x.h === 1 && typeof x.row === "number" && typeof x.col === "number";}));
+eq("composition: --cells first block", cells[0], { row: 0, col: 0, w: 1, h: 1});
+})();
 
-// ---------------------------------------------------------------------------
-console.log((fail === 0? "OK": "FAILED") + " — " + pass + " passed, " + fail + " failed");
+/* ---- --origin-one ---- */
+(function () {
+var g = grid({ rows: 2, cols: 2, originOne: true});
+eq("--origin-one numbers from 1", g.map(function (x) { return [x.row, x.col];}),
+[[1, 1], [1, 2], [2, 1], [2, 2]]);
+})();
+
+/* ---- determinism: two calls byte-identical ---- */
+ok("deterministic across two grid() calls",
+toJSONL(grid({ rows: 5, cols: 5, valueMode: "index"})) === toJSONL(grid({ rows: 5, cols: 5, valueMode: "index"})));
+
+/* ---- toJSONL surface ---- */
+eq("toJSONL renders one line per cell with trailing newline",
+toJSONL([{ row: 0, col: 0}, { row: 0, col: 1}]),
+'{"row":0,"col":0}\n{"row":0,"col":1}\n');
+
+/* ---- report ---- */
+console.log("grid-source battery: " + pass + " passed, " + fail + " failed");
 process.exitCode = fail === 0? 0: 1;
 
 Take the whole folder →
 MIT
-Zero dependencies, Node or browser, deterministic
+Node / browser, no dependencies
 
 ---
 
-# Interval-math — a Loop MMT gift
-https://loopmmt.com/gifts/interval-math/
+# harness-fold — a Loop MMT gift
+https://loopmmt.com/gifts/harness-fold/
 [coverage: optional · branch: gifts]
 
-Ranges In, A Bound You Can Trust Out transform ← all gifts
+Fold Ordered Stages into the Wiring Topology plan-harness ← all gifts
 
-Interval-math
+harness-fold
 
-Point it at a JSONL stream of operations — each a {op, a:[lo,hi], b:[lo,hi]} pairing two intervals with + - * or / — and it computes the resulting interval, emitting {"lo":L,"hi":H} one per record in input order. An interval [lo,hi] means 'some real number in this range'; the result is GUARANTEED to contain every (x op y) for x in a, y in b (the containment property). Multiply uses all FOUR corner products, so [-2,3]*[-5,4] is [-15,12], not the naive [10,12]. Division by an interval strictly on one side of zero multiplies by the reciprocal interval; dividing by an interval that SPANS zero is refused (unbounded result). It drops into a pipe anywhere ranges/tolerances/error-bars need combining with an honest bound, without an interval-arithmetic library.
+harness-fold folds the ordered pipe stages into the harness edge-list (the ∘ sequencing edges) plus the one ⊗ fork/join — the wiring topology expressed as data.
 
 The honest edge
 
-Does the four arithmetic ops (+ - * /) on real intervals. NOT a full interval library — no power/exponent, roots, or transcendental functions (sin/exp/log), no interval union/intersection/hull. NO outward-directed rounding: bounds are plain IEEE-754 doubles (a result whose true endpoint is not exactly representable is the nearest double, which may be a hair inside the guaranteed bound) — for certified soundness use a rational/directed-rounding library. Division by an interval containing zero is refused, not split.
+Extracted verbatim from compile_recipe_spine.py::compile_spine and proven byte-identical to the compiler's inline logic on all 9 spines (roundtrip_selfhost.py 9/9, including the compiler's own Schematic). The served page documents the fold; the byte-truth is the Python fold + its passing selftest. A full standalone JS port is a later beat — the fold logic is what the fixed-point gate covers.
 
 Run it
 
-printf '%s\n' '{"op":"*","a":[-1,2],"b":[3,4]}' | node interval-math.js # op + - * /; exit 0 ok | 2 input error
-test_interval-math.js (28/28: the CONTAINMENT invariant as a self-witnessing oracle (sample a 20-pt grid of x in a, y in b; every x op y must lie in the returned [lo,hi]) + TIGHTNESS (bounds == sampled extremes) over 10 op/interval cases + frozen hand goldens (all-four-corner sign-crossing multiply == [-15,12], subtraction flip, reciprocal division) + division-by-interval-spanning-zero refusals + input-honesty hard errors (unknown/missing op, mis-shaped/non-finite/lo>hi interval, non-JSON) + the naive-two-corner-multiply mutation bite) + out-of-band conformance conform_interval-math.cjs (18/18 GREEN, subprocess-driven, signed b77c4b3dbc9d8798)
-Zero dependencies, Node or browser, deterministic
+printf '{"pipe_stages": [{"primitive": "s0"}, {"primitive": "s1"}], "fork": null}' | python3 harness_fold.py # -> [[s0 to s1], null]
+smoke_test.py runs the in-module selftest: sequential edge-list (n-1), fork/join feeds declared target, degenerate None cases, folds-twice-identical
+Python 3 stdlib, no dependencies (pure fold)
 
 The code — every file that ships
 
-interval-math.js 238 lines on GitHub →
-#!/usr/bin/env node
-/* interval-math.js — interval arithmetic (+ - * /) over a JSONL stream of operations.
-Dependency-free, deterministic. Runs in Node or a browser. MIT.
+harness_fold.py 166 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""harness-fold -- compute a pipeline's wiring topology as data, as a standalone gift.
 
-WHAT IT IS. Give it a stream of operations — one JSON record per line (JSONL),
-each naming two intervals and an operator — and it computes the resulting interval
-and emits it. An interval [lo, hi] stands for "some real number between lo and hi,
-inclusive"; interval arithmetic computes the tightest interval GUARANTEED to
-contain the true result whatever the inputs actually were. Same stream in,
-byte-identical stream out, on every machine and every run. It is a TRANSFORM: one
-record in, one record out, in the same order.
+Give it an ordered list of pipe stages (and, optionally, one parallel fork), and
+it emits the wiring topology: the sequential (∘) edge-list connecting consecutive
+stages, plus the one parallel (⊗) fork/join describing which sources run
+independently and where they rejoin the chain. It's the "how does this pipeline
+actually wire together" step, computed rather than drawn.
 
-THE OPERATION RECORD. Each non-blank line is one JSON object:
-
-{"op": "+", "a": [1, 2], "b": [3, 4]} -> {"lo":4,"hi":6}
-{"op": "*", "a": [-1, 2], "b": [3, 4]} -> {"lo":-4,"hi":8}
-{"op": "/", "a": [1, 1], "b": [2, 4]} -> {"lo":0.25,"hi":0.5}
-
-"op" is one of "+", "-", "*", "/". "a" and "b" are each a two-element array
-[lo, hi] of finite JSON numbers with lo <= hi. The output is {"lo":L, "hi":H}.
-
-THE CONTAINMENT GUARANTEE (the whole point). For every operation the result [L,H]
-is computed so that for ALL x in a and ALL y in b, (x op y) lies in [L, H]. This
-is the load-bearing invariant: interval arithmetic is only correct if it never
-loses a possible result.
-
-+ [a,b] + [c,d] = [a+c, b+d]
-- [a,b] - [c,d] = [a-d, b-c] (subtract the OTHER interval flipped)
-* [a,b] * [c,d] = [min(P), max(P)] where P = {a*c, a*d, b*c, b*d}
-(ALL FOUR corner products — a naive
-[a*c, b*d] is WRONG whenever a sign
-crosses zero)
-/ [a,b] / [c,d] = [a,b] * [1/d, 1/c] (multiply by the reciprocal interval)
-ONLY when [c,d] does NOT contain 0 —
-
-DIVISION BY AN INTERVAL SPANNING ZERO IS A HARD ERROR. If b = [c,d] has c <= 0 <= d
-the reciprocal interval is unbounded (the result would be (-inf, +inf) or a split),
-so this gift REFUSES it (exit 2) rather than emit a bound it cannot honor. Dividing
-by an interval strictly on one side of zero (c>0 or d<0) is fine.
-
-NUMERIC HONESTY. Bounds are IEEE-754 doubles. Every endpoint must be a FINITE JSON
-number; a NaN/Infinity/overflow (e.g. 1e999 -> Infinity) or an interval with
-lo > hi is a HARD ERROR (exit 2) naming the line — never a silent skip. See the
-printed edge for the rounding caveat: this is EXACT for representable endpoints and
-representable results, but does NOT do outward-directed rounding, so a result whose
-true endpoint is not exactly representable in a double is stored as the nearest
-double (which may be a hair inside the mathematically-guaranteed bound). For
-verified/certified interval arithmetic use a rational or a directed-rounding
-library; this gift is the honest zero-dep representation, not a proof engine.
+printf '{"pipe_stages": [...], "fork": {...}|null}' | python3 harness_fold.py
 
 USAGE
-printf '%s\n' '{"op":"+","a":[1,2],"b":[3,4]}' | node interval-math.js
-printf '%s\n' '{"op":"*","a":[-1,2],"b":[3,4]}' | node interval-math.js
-node interval-math.js ops.jsonl
-node interval-math.js --help
+printf '<json>' | python3 harness_fold.py (stdin -> stdout)
+python3 harness_fold.py --help
+python3 harness_fold.py --selftest
 
-Each non-blank line is one operation record; blank lines are skipped; a trailing
-\r (CRLF files) is trimmed. Output is one compact JSON object ({"lo":L,"hi":H})
-per record, one per line, in input order.
+INPUT CONTRACT
+One JSON object on stdin whose keys are the fold's keyword arguments:
+pipe_stages [{"primitive": <id>},...] ordered, in data-flow order
+fork {"members": [{"primitive": <id>},...], "reason": <s?>,
+"feeds": <id?>} -- or null for a pipeline with no fork
 
-Exit codes: 0 success · 2 input error (a line that is not a valid operation record,
-an unknown op, a non-finite or mis-ordered interval, or a division by an interval
-spanning zero). Always a clean one-line message on stderr, never a stack trace.
+OUTPUT
+A JSON array [harness_edges, fork_join]:
+harness_edges the ∘ chain: {"from","to","op":"∘"} for each consecutive pair
+fork_join the one ⊗ fork, or null when there's no fork (or no chain to
+feed). A fork feeds its declared "feeds" target, falling back
+to the pipe head only when none is declared.
 
-Released under MIT. Its edge is printed in the README: this does the four
-arithmetic ops (+ - * /) on real intervals. It is NOT a full interval library — no
-power/exponent, roots, or transcendental functions (sin/exp/log), no interval
-union/intersection/hull, and NO outward-directed rounding (bounds are plain
-doubles). Division by an interval containing zero is refused, not split.
-*/
-"use strict";
+EDGE (printed, honest)
+It computes the topology it is HANDED -- it does not check that the stage
+order is correct or that a declared "feeds" target exists in the chain. Give
+it a wrong order and it faithfully wires the wrong pipeline. It renders the
+graph, it does not validate the plan.
 
-var OPS = { "+": true, "-": true, "*": true, "/": true};
+PROVENANCE
+The fold body is extracted verbatim from a recipe-compiler's harness-plan
+block. This gift wraps that pure fold in a stdin->stdout CLI; the wrapper adds
+only I/O, so the gift's determinism is exactly the fold's.
 
-// Validate an interval value: a 2-element array of finite numbers with lo <= hi.
-function checkInterval(v, which, lineNo) {
-if (!Array.isArray(v) || v.length!== 2) {
-throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
-" must be a two-element [lo,hi] array");
-}
-var lo = v[0], hi = v[1];
-if (typeof lo!== "number" || typeof hi!== "number" ||!isFinite(lo) ||!isFinite(hi)) {
-throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
-" endpoints must be finite numbers");
-}
-if (lo > hi) {
-throw new Error("line " + lineNo + " field " + JSON.stringify(which) +
-" has lo > hi (" + lo + " > " + hi + ")");
-}
-return [lo, hi];
-}
+Zero dependencies (Python 3 stdlib only), offline, deterministic.
+"""
 
-// Compute one interval operation. Throws (clean, line-named) on divide-by-spanning-0.
-function apply(op, a, b, lineNo) {
-var al = a[0], ah = a[1], bl = b[0], bh = b[1];
-switch (op) {
-case "+":
-return [al + bl, ah + bh];
-case "-":
-return [al - bh, ah - bl];
-case "*": {
-var p = [al * bl, al * bh, ah * bl, ah * bh];
-return [Math.min(p[0], p[1], p[2], p[3]), Math.max(p[0], p[1], p[2], p[3])];
-}
-case "/": {
-if (bl <= 0 && bh >= 0) {
-throw new Error("line " + lineNo +
-" divides by an interval spanning zero [" + bl + "," + bh + "] (unbounded result; refused)");
-}
-// reciprocal of [bl,bh] (which does not contain 0) is [1/bh, 1/bl]
-var rl = 1 / bh, rh = 1 / bl;
-var q = [al * rl, al * rh, ah * rl, ah * rh];
-return [Math.min(q[0], q[1], q[2], q[3]), Math.max(q[0], q[1], q[2], q[3])];
-}
-default:
-throw new Error("line " + lineNo + " unknown op " + JSON.stringify(op) +
-" (expected + - * /)");
-}
-}
+import argparse
+import json
+import sys
 
-// Convert one parsed record -> {lo,hi}. Throws on a malformed record.
-function computeRecord(rec, lineNo) {
-if (rec === null || typeof rec!== "object" || Array.isArray(rec)) {
-throw new Error("line " + lineNo + " is not an operation object");
+def harness_fold(pipe_stages, fork):
+"""ordered pipe_stages (+ optional ⊗ fork) -> (harness_edges[], fork_join)."""
+harness_edges = []
+for i in range(len(pipe_stages) - 1):
+harness_edges.append({
+"from": pipe_stages[i]["primitive"],
+"to": pipe_stages[i + 1]["primitive"],
+"op": "\u2218",
+})
+fork_join = None
+if fork and pipe_stages:
+# feeds: the spine's DECLARED join target (threaded in via fork["feeds"]),
+# falling back to the pipe head only when a fork declares none. The head
+# is right for a head-feeding fork (photoshop's pixel stream) and WRONG
+# for a fork that rejoins deeper (the compiler's fork -> harness-plan).
+feeds = fork.get("feeds") or pipe_stages[0]["primitive"]
+note = (
+"parallel-independent reads: none of the \u2297 sources consumes another's "
+f"output, so they run independently and rejoin the \u2218 chain at {feeds}. "
+"Order-independent (a trivial braid)."
+)
+fork_join = {
+"op": "\u2297",
+"sources": [st["primitive"] for st in fork["members"]],
+"feeds": feeds,
+# the spine's own ⊗-justification, carried verbatim (honest, per-spine).
+"reason": fork.get("reason", ""),
+"note": note,
 }
-var op = rec.op;
-if (typeof op!== "string" ||!OPS[op]) {
-throw new Error("line " + lineNo + " has a missing or unknown op " +
-JSON.stringify(op) + " (expected + - * /)");
-}
-var a = checkInterval(rec.a, "a", lineNo);
-var b = checkInterval(rec.b, "b", lineNo);
-var r = apply(op, a, b, lineNo);
-return { lo: r[0], hi: r[1]};
-}
+return harness_edges, fork_join
 
-// The public transform: JSONL text -> { lines: [json per record..], count}.
-function transform(text) {
-var rawLines = String(text).split("\n");
-var out = [];
-var i, line, rec, result;
-for (i = 0; i < rawLines.length; i++) {
-line = rawLines[i];
-if (line.charCodeAt(line.length - 1) === 0x0d) line = line.slice(0, -1); // trim \r
-if (line.length === 0) continue; // blank line
+def _die(msg, code=2):
+sys.stderr.write("harness-fold: " + msg + "\n")
+sys.exit(code)
 
-try { rec = JSON.parse(line);}
-catch (e) {
-throw new Error("line " + (i + 1) + " is not valid JSON: " + JSON.stringify(line.slice(0, 40)));
-}
-result = computeRecord(rec, i + 1);
-out.push(JSON.stringify(result));
-}
-return { lines: out, count: out.length};
-}
+def _read_stdin_object():
+"""Read one JSON object from stdin -> a dict of kwargs. Crash-clean on bad
+or empty input: a nonzero exit and a one-line message, never a traceback."""
+data = sys.stdin.read()
+if not data.strip():
+_die("no input on stdin -- pipe a JSON object with keys pipe_stages, fork", 2)
+try:
+obj = json.loads(data)
+except json.JSONDecodeError as e:
+_die("stdin is not valid JSON: %s" % e, 2)
+if not isinstance(obj, dict):
+_die("stdin JSON must be an object mapping kwargs "
+"(pipe_stages, fork), got a %s" % type(obj).__name__, 2)
+return obj
 
-/* ---- exports (browser + Node) ------------------------------------ */
-if (typeof window!== "undefined") {
-window.ForestGifts = window.ForestGifts || {};
-window.ForestGifts.intervalMath = transform;
-window.ForestGifts.intervalOp = function (op, a, b) { return apply(op, checkInterval(a, "a", 1), checkInterval(b, "b", 1), 1);};
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { transform: transform, apply: apply, computeRecord: computeRecord, checkInterval: checkInterval};
-}
+def main(argv=None):
+argv = list(sys.argv[1:] if argv is None else argv)
+if "--selftest" in argv:
+return 0 if _selftest() else 1
 
-/* ---- CLI (runs only when invoked directly, never on require) ------ */
-function run(text) {
-var r = transform(text);
-var body = r.lines.length? r.lines.join("\n") + "\n": "";
-return { out: body, count: r.count};
-}
+p = argparse.ArgumentParser(
+prog="harness_fold.py", add_help=True,
+description="Compute a pipeline's wiring topology (\u2218 edge-list + one \u2297 "
+"fork/join). Reads a JSON object {\"pipe_stages\":[...], \"fork\":{...}|null} "
+"from stdin.",
+epilog="example: printf '{\"pipe_stages\": [{\"primitive\": \"s0\"}, "
+"{\"primitive\": \"s1\"}], \"fork\": null}' | python3 harness_fold.py")
+p.parse_args(argv)
 
-function main(argv) {
-var args = argv.slice(2);
-if (args.indexOf("--help")!== -1 || args.indexOf("-h")!== -1) {
-process.stdout.write(
-"interval-math.js — interval arithmetic (+ - * /) over a JSONL stream.\n\n" +
-" printf '%s\\n' '{\"op\":\"+\",\"a\":[1,2],\"b\":[3,4]}' | node interval-math.js -> {\"lo\":4,\"hi\":6}\n" +
-" printf '%s\\n' '{\"op\":\"*\",\"a\":[-1,2],\"b\":[3,4]}' | node interval-math.js -> {\"lo\":-4,\"hi\":8}\n" +
-" node interval-math.js ops.jsonl\n" +
-" node interval-math.js --help\n\n" +
-"Each non-blank line is one operation object {op, a:[lo,hi], b:[lo,hi]}. The\n" +
-"result [L,H] is guaranteed to contain every (x op y) for x in a, y in b. Output\n" +
-"is one {\"lo\":L,\"hi\":H} per record, in input order.\n\n" +
-"Edge: the four arithmetic ops on real intervals. NOT a full interval library\n" +
-"(no powers/roots/transcendentals, no union/intersection, no outward rounding).\n" +
-"Division by an interval spanning zero is a hard error, not split.\n"
-);
-return 0;
-}
+obj = _read_stdin_object()
+try:
+result = harness_fold(**obj)
+except TypeError as e:
+_die("stdin object keys must be exactly the fold's args "
+"(pipe_stages, fork): %s" % e, 2)
+except (KeyError, AttributeError) as e:
+_die("malformed input structure: %s" % e, 2)
+sys.stdout.write(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+return 0
 
-var files = [];
-var i;
-try {
-for (i = 0; i < args.length; i++) {
-if (args[i].charAt(0) === "-" && args[i]!== "-") { throw new Error("unknown option " + args[i]);}
-else { files.push(args[i]);}
-}
-} catch (e) {
-process.stderr.write("interval-math: " + e.message + "\n");
-return 2;
-}
+def _selftest():
+"""Prove: ∘ edge-list is n-1 consecutive edges; fork_join feeds the chain
+head; fork_join=None with no fork or no chain; folds-twice-identical."""
+stages = [{"primitive": "s0"}, {"primitive": "s1"}, {"primitive": "s2"}]
+fork = {"op": "\u2297", "members": [{"primitive": "f0"}, {"primitive": "f1"}], "reason": "r"}
 
-function emit(text) {
-try {
-var r = run(text);
-process.stdout.write(r.out);
-return 0;
-} catch (e) {
-process.stderr.write("interval-math: " + e.message + "\n");
-return 2;
-}
-}
+edges, fj = harness_fold(stages, fork)
+assert [(e["from"], e["to"]) for e in edges] == [("s0", "s1"), ("s1", "s2")], edges
+assert all(e["op"] == "\u2218" for e in edges)
+# no declared feeds -> fall back to the pipe head (s0)
+assert fj["sources"] == ["f0", "f1"] and fj["feeds"] == "s0", fj
+assert "s0" in fj["note"], fj # the note names the real join target
+# folds-twice-identical
+assert harness_fold(stages, fork) == (edges, fj)
 
-if (files.length > 0) {
-var fs = require("fs");
-var text;
-try { text = fs.readFileSync(files[0], "utf8");}
-catch (e) {
-process.stderr.write("interval-math: cannot read " + files[0] +
-" (" + (e.code === "EISDIR"? "is a directory": (e.code || "read error")) + ")\n");
-return 2;
-}
-return emit(text);
-}
+# DECLARED join target: fork["feeds"] overrides the pipe-head fallback.
+fork_declared = {"op": "\u2297", "members": [{"primitive": "f0"}], "reason": "r2", "feeds": "s2"}
+_, fjd = harness_fold(stages, fork_declared)
+assert fjd["feeds"] == "s2", fjd # declared target wins, NOT head s0
+assert fjd["reason"] == "r2", fjd # spine's ⊗-reason carried verbatim
 
-var chunks = [];
-process.stdin.on("data", function (d) { chunks.push(d);});
-process.stdin.on("end", function () {
-process.exitCode = emit(Buffer.concat(chunks).toString("utf8"));
-});
-return 0;
-}
+# no fork -> fork_join None, edges still computed
+e2, fj2 = harness_fold(stages, None)
+assert fj2 is None and len(e2) == 2, (e2, fj2)
+# fork but empty chain -> fork_join None (nothing to feed), no edges
+e3, fj3 = harness_fold([], fork)
+assert e3 == [] and fj3 is None, (e3, fj3)
+# single stage -> 0 edges
+e4, _ = harness_fold([{"primitive": "only"}], None)
+assert e4 == [], e4
+print("harness-fold selftest: \u2218 edge-list (n-1); \u2297 fork/join feeds declared "
+"target (falls back to head), reason carried; degenerate None cases; "
+"folds-twice-identical.")
+return True
 
-if (typeof require!== "undefined" && require.main === module) {
-process.exitCode = main(process.argv);
-}
+if __name__ == "__main__":
+sys.exit(main())
 
-test_interval-math.js 171 lines on GitHub →
-#!/usr/bin/env node
-/* test_interval-math.js — golden battery for the interval-math gift.
+smoke_test.py 23 lines on GitHub →
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""smoke_test.py -- harness-fold's shipped smoke check. Runs the in-module --selftest
+battery and exits non-zero on any failure, so a stranger can prove the gift works
+in their tree with one command:
 
-Out-of-band and self-verifying. The oracle here is not an external library — it is
-the CONTAINMENT INVARIANT, which is self-witnessing:
+python3 smoke_test.py
+"""
+import os
+import subprocess
+import sys
 
-(1) CONTAINMENT. For each op and interval pair, sample a dense grid of x in a and
-y in b, compute (x op y) directly, and assert EVERY sampled result lies
-within the gift's returned [lo,hi]. A correct interval result cannot fail
-this; an under-wide (buggy) result will. This needs no external authority —
-the definition of interval arithmetic IS the test.
+HERE = os.path.dirname(os.path.abspath(__file__))
 
-(2) TIGHTNESS (a companion, so containment isn't passed by returning [-inf,inf]).
-For + - * / on continuous inputs the true result range endpoints are attained
-at interval corners, so the gift's [lo,hi] must EQUAL [min,max] of the sampled
-direct results to within a small epsilon — i.e. the interval is not just
-containing but tight.
+def main():
+r = subprocess.run([sys.executable,
+os.path.join(HERE, "harness_fold.py"), "--selftest"])
+sys.exit(r.returncode)
 
-(3) FROZEN hand goldens — the sign-crossing multiply (the corner case), the
-subtraction flip, reciprocal division, and the division-spanning-zero refusal.
-
-A planted mutation (the bite, §BITE) MUST be caught: the naive multiply
-[a*c, b*d] (only two corners) is WRONG on a sign-crossing interval; the oracle
-(containment) must reject it.
-
-Run: node test_interval-math.js -> exit 0 GREEN / non-zero RED
-*/
-"use strict";
-var im = require("./interval-math.js");
-
-var pass = 0, fail = 0;
-function ok(name, cond) {
-if (cond) { pass++;}
-else { fail++; console.log(" FAIL " + name);}
-}
-function J(v) { return JSON.stringify(v);}
-function giftOp(op, a, b) {
-var r = im.transform(J({ op: op, a: a, b: b}) + "\n");
-return JSON.parse(r.lines[0]); // {lo,hi}
-}
-
-// direct scalar op
-function scalar(op, x, y) {
-if (op === "+") return x + y;
-if (op === "-") return x - y;
-if (op === "*") return x * y;
-if (op === "/") return x / y;
-throw new Error("bad op");
-}
-// sample N points across [lo,hi] inclusive
-function grid(lo, hi, n) {
-if (lo === hi) return [lo];
-var out = [];
-for (var i = 0; i <= n; i++) out.push(lo + (hi - lo) * i / n);
-return out;
-}
-
-/* ---- (1)+(2) containment AND tightness over a spread of ops+intervals ----- */
-(function () {
-var cases = [
-["+", [1, 2], [3, 4]],
-["-", [1, 2], [3, 4]],
-["*", [-1, 2], [3, 4]], // sign-crossing a
-["*", [-3, -1], [-4, -2]], // both negative
-["*", [-2, 3], [-5, 4]], // both sign-crossing (the hard corner case)
-["*", [0, 5], [2, 3]],
-["/", [1, 1], [2, 4]],
-["/", [-6, 6], [2, 3]], // numerator spans 0, denom positive
-["/", [1, 2], [-4, -2]], // denom strictly negative
-["+", [-5, -5], [5, 5]], // degenerate (points)
-];
-var containFail = 0, tightFail = 0;
-cases.forEach(function (c) {
-var op = c[0], a = c[1], b = c[2];
-var got = giftOp(op, a, b);
-var xs = grid(a[0], a[1], 20), ys = grid(b[0], b[1], 20);
-var minR = Infinity, maxR = -Infinity, allIn = true;
-for (var i = 0; i < xs.length; i++) for (var j = 0; j < ys.length; j++) {
-var v = scalar(op, xs[i], ys[j]);
-if (v < minR) minR = v;
-if (v > maxR) maxR = v;
-if (v < got.lo - 1e-9 || v > got.hi + 1e-9) allIn = false;
-}
-if (!allIn) { containFail++; console.log(" CONTAIN " + op + " " + J(a) + J(b) + " -> " + J(got));}
-// tightness: the gift's bounds equal the sampled extremes to epsilon
-if (Math.abs(got.lo - minR) > 1e-6 || Math.abs(got.hi - maxR) > 1e-6) {
-tightFail++; console.log(" TIGHT " + op + " " + J(a) + J(b) + " gift=" + J(got) + " sampled=[" + minR + "," + maxR + "]");
-}
-});
-ok("containment: every sampled x∘y lies in the gift interval (" + cases.length + " cases)", containFail === 0);
-ok("tightness: gift bounds == sampled extremes (" + cases.length + " cases)", tightFail === 0);
-})();
-
-/* ---- (3) frozen hand goldens --------------------------------------------- */
-function G(name, op, a, b, lo, hi) {
-var g = giftOp(op, a, b);
-ok(name, g.lo === lo && g.hi === hi);
-}
-G("add", "+", [1, 2], [3, 4], 4, 6);
-G("sub flips the other interval", "-", [1, 2], [3, 4], -3, -1);
-G("mul sign-crossing (all four corners)", "*", [-1, 2], [3, 4], -4, 8);
-G("mul both negative", "*", [-3, -1], [-4, -2], 2, 12);
-G("mul both sign-crossing", "*", [-2, 3], [-5, 4], -15, 12);
-G("div by positive interval", "/", [1, 1], [2, 4], 0.25, 0.5);
-G("div numerator spans zero", "/", [-6, 6], [2, 3], -3, 3);
-G("div by strictly-negative interval", "/", [1, 2], [-4, -2], -1, -0.25);
-
-/* ---- (4) division-by-spanning-zero is a HARD ERROR ------------------------ */
-function throws(name, fn) {
-var t = false;
-try { fn();} catch (e) { t = true;}
-ok(name, t);
-}
-throws("div by [-1,1] (spans 0) refused", function () { giftOp("/", [1, 2], [-1, 1]);});
-throws("div by [0,2] (touches 0 at lo) refused", function () { giftOp("/", [1, 2], [0, 2]);});
-throws("div by [-2,0] (touches 0 at hi) refused", function () { giftOp("/", [1, 2], [-2, 0]);});
-throws("div by [0,0] refused", function () { giftOp("/", [1, 2], [0, 0]);});
-
-/* ---- (5) transform shape + input honesty --------------------------------- */
-(function () {
-var text = '{"op":"+","a":[1,2],"b":[3,4]}\n{"op":"*","a":[0,1],"b":[2,2]}\n';
-var r = im.transform(text);
-ok("one output per input, in order", J(r.lines) === J(['{"lo":4,"hi":6}', '{"lo":0,"hi":2}']));
-ok("count == records", r.count === 2);
-})();
-ok("blank lines skipped", im.transform('{"op":"+","a":[1,1],"b":[1,1]}\n\n').count === 1);
-ok("CRLF trimmed", J(im.transform('{"op":"+","a":[1,1],"b":[2,2]}\r\n').lines) === J(['{"lo":3,"hi":3}']));
-(function () {
-var t = '{"op":"*","a":[-2,3],"b":[-5,4]}\n';
-ok("determinism: two runs identical", im.transform(t).lines.join() === im.transform(t).lines.join());
-})();
-
-throws("unknown op is a hard error", function () { giftOp("^", [1, 2], [3, 4]);});
-throws("missing op is a hard error", function () { im.transform('{"a":[1,2],"b":[3,4]}\n');});
-throws("interval not a 2-array", function () { im.transform('{"op":"+","a":[1,2,3],"b":[3,4]}\n');});
-throws("interval lo>hi is a hard error", function () { im.transform('{"op":"+","a":[2,1],"b":[3,4]}\n');});
-throws("non-finite endpoint (1e999->Infinity) is a hard error", function () { im.transform('{"op":"+","a":[1e999,1e999],"b":[3,4]}\n');});
-throws("non-object record is a hard error", function () { im.transform('[1,2]\n');});
-throws("non-JSON line is a hard error", function () { im.transform('not json\n');});
-ok("hard error names the line", (function () {
-try { im.transform('{"op":"+","a":[1,1],"b":[2,2]}\n{"op":"?","a":[1,1],"b":[2,2]}\n'); return false;}
-catch (e) { return /line 2/.test(e.message);}
-})());
-
-/* ---- §BITE — the naive-multiply mutation must be caught ------------------- */
-/* The classic wrong build is mul = [a*c, b*d] (only 2 corners). It agrees with the
-correct gift when signs don't cross, but is WRONG on a sign-crossing interval. We
-build that mutant and assert containment (the oracle) rejects it on a crossing
-case — so a regression to naive-corners fails test (1). */
-(function () {
-function naiveMul(a, b) { return { lo: a[0] * b[0], hi: a[1] * b[1]};}
-var a = [-2, 3], b = [-5, 4];
-var gift = giftOp("*", a, b); // correct: [-15, 12]
-var mutant = naiveMul(a, b); // naive: [10, 12] (WRONG, misses -15 and lower)
-// containment check on the mutant: does a sampled product escape it?
-var xs = grid(a[0], a[1], 20), ys = grid(b[0], b[1], 20);
-var mutantEscapes = false, giftContains = true;
-for (var i = 0; i < xs.length; i++) for (var j = 0; j < ys.length; j++) {
-var v = xs[i] * ys[j];
-if (v < mutant.lo - 1e-9 || v > mutant.hi + 1e-9) mutantEscapes = true;
-if (v < gift.lo - 1e-9 || v > gift.hi + 1e-9) giftContains = false;
-}
-ok("BITE: naive-corners mutant fails containment where the gift holds",
-mutantEscapes === true && giftContains === true &&
-gift.lo === -15 && gift.hi === 12);
-})();
-
-/* ---- report --------------------------------------------------------------- */
-console.log("");
-console.log("interval-math battery: " + pass + " passed, " + fail + " failed");
-process.exit(fail === 0? 0: 1);
+if __name__ == "__main__":
+main()
 
 Take the whole folder →
 MIT
-Zero dependencies, Node or browser, deterministic
-
----
-
-# Isvalidcsscolor — a Loop MMT gift
-https://loopmmt.com/gifts/isvalidcsscolor/
-[coverage: optional · branch: gifts]
-
-Is This String A CSS Color? validate ← all gifts
-
-Isvalidcsscolor
-
-A pure, dependency-free isValidCSSColor(str) that runs identically in a browser and in Node (no DOM) and decides whether a string is a valid CSS color across a documented subset of the spec — named colors, transparent/currentColor, hex 3/4/6/8, and rgb()/rgba()/hsl()/hsla() in both legacy comma and modern space syntax, including angle hues and out-of-range channels that CSS clamps.
-
-The honest edge
-
-It validates a DEFINED subset — the colors people actually type. It deliberately does not accept hwb()/lab()/lch()/oklab()/oklch()/color()/color-mix()/relative-color syntax/system colors, and it rejects the CSS-wide keywords inherit/initial/unset/revert (which are not colors). In a browser, CSS.supports('color', str) is the full ground truth; this trades that breadth for a tiny DOM-free core you can read in one sitting.
-
-Run it
-
-node isvalidcsscolor.js "rebeccapurple"
-test_isvalidcsscolor.js (83/83: 38 valid + 34 invalid spec vectors, coercion, determinism, mutation-bite)
-Node, no dependencies
-
-The code — every file that ships
-
-isvalidcsscolor.js 195 lines on GitHub →
-#!/usr/bin/env node
-/* isvalidcsscolor.js — a pure, dependency-free "is this string a valid CSS color?"
-checker that returns a boolean and runs identically in a browser and in Node.
-
-WHY THIS EXISTS. You take a color from a human — a theme field, a config file,
-a query param — and before you write it into a stylesheet or a canvas you want
-to know: is this actually a color? The browser's honest oracle,
-CSS.supports('color', str), only exists in a browser and needs the DOM. On a
-Node server, in a build step, or in a test, there is no built-in answer. This
-is a small, pure function of its input — no DOM, no dependencies — that decides
-the question against a DEFINED, DOCUMENTED SUBSET of the CSS Color spec: the
-colors people actually type.
-
-WHAT IT ACCEPTS (the whole contract — a validator that hides its scope lies):
-• named colors — the 148 CSS Color Module Level 4 names, plus `transparent`
-and the `currentColor` keyword (case-insensitive).
-• hex — #RGB, #RGBA, #RRGGBB, #RRGGBBAA (3/4/6/8 hex digits).
-• rgb() / rgba() — both the legacy comma form `rgb(255, 0, 0)` /
-`rgba(255,0,0,.5)` (all-number OR all-percent, no mixing; optional alpha)
-AND the modern space form `rgb(255 0 0 / 50%)` (number|percent|none per
-channel, mixing allowed, optional `/ alpha`).
-• hsl() / hsla() — legacy `hsl(120, 50%, 50%)` (hue then two percentages,
-optional alpha) AND modern `hsl(120deg 50% 50% /.5)`. Hue may be a bare
-number (degrees) or an <angle> (deg/grad/rad/turn).
-Out-of-range numeric channels are ACCEPTED, because CSS accepts and clamps them
-(`rgb(300 -10 0)` is a valid color that renders as red) — validity is about
-grammar, not range.
-
-WHAT IT DOES NOT ACCEPT (stated on purpose — see the README's "edge"):
-hwb(), lab(), lch(), oklab(), oklch(), color(), color-mix(), the relative-
-color syntax (`rgb(from …)`), and system colors (Canvas, ButtonText, …). The
-CSS-wide keywords `inherit`, `initial`, `unset`, `revert` are NOT colors and
-are rejected. If you need the newer color functions, use a browser's
-CSS.supports — this gift trades breadth for a tiny, dependency-free core you
-can read in one sitting.
-
-Pure function of its input. Same code in a browser (window.LoopGifts.isValidCSSColor)
-or Node (this CLI / require()).
-
-USAGE
-node isvalidcsscolor.js "rebeccapurple" # prints "true" or "false", exits 0/1
-node isvalidcsscolor.js "#0f0" "not-a-color" # one verdict per argument
-node isvalidcsscolor.js --help
-
-Released under MIT.
-*/
-"use strict";
-
-// The 148 CSS Color Module Level 4 named colors, plus `transparent` and the
-// `currentcolor` keyword. All lowercase; input is lowercased before lookup.
-var NAMED = ("aliceblue antiquewhite aqua aquamarine azure beige bisque black " +
-"blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate " +
-"coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod " +
-"darkgray darkgreen darkgrey darkkhaki darkmagenta darkolivegreen darkorange " +
-"darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray " +
-"darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey " +
-"dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite gold " +
-"goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory " +
-"khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral " +
-"lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey lightpink " +
-"lightsalmon lightseagreen lightskyblue lightslategray lightslategrey " +
-"lightsteelblue lightyellow lime limegreen linen magenta maroon mediumaquamarine " +
-"mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue " +
-"mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream " +
-"mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered " +
-"orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff " +
-"peru pink plum powderblue purple rebeccapurple red rosybrown royalblue " +
-"saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue " +
-"slategray slategrey snow springgreen steelblue tan teal thistle tomato " +
-"turquoise violet wheat white whitesmoke yellow yellowgreen " +
-"transparent currentcolor").split(/\s+/);
-
-var NAMED_SET = Object.create(null);
-for (var n = 0; n < NAMED.length; n++) { NAMED_SET[NAMED[n]] = true;}
-
-// A CSS <number>: optional sign, digits with an optional fractional part, or a
-// leading-dot fraction, with optional scientific notation. Rejects a trailing
-// bare dot ("5." is NOT a valid CSS number).
-var NUMBER = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
-var PERCENT = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?%$/;
-var ANGLE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?(?:deg|grad|rad|turn)$/;
-var HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/;
-
-function isNumber(t) { return NUMBER.test(t);}
-function isPercent(t) { return PERCENT.test(t);}
-function isHue(t) { return NUMBER.test(t) || ANGLE.test(t);} // bare number = degrees
-function isAlphaLegacy(t) { return NUMBER.test(t) || PERCENT.test(t);}
-function isAlphaModern(t) { return NUMBER.test(t) || PERCENT.test(t) || t === "none";}
-
-// Validate an rgb()/rgba()/hsl()/hsla() body. `fn` is one of rgb|rgba|hsl|hsla,
-// `inner` is the text between the parentheses (already lowercased).
-function validFunction(fn, inner) {
-inner = inner.trim();
-if (inner === "") { return false;}
-var isRgb = (fn === "rgb" || fn === "rgba");
-
-if (inner.indexOf(",")!== -1) {
-// ---- Legacy comma syntax: no `none`, no `/`, exactly 3 or 4 parts --------
-if (inner.indexOf("/")!== -1) { return false;}
-var parts = inner.split(",");
-for (var i = 0; i < parts.length; i++) { parts[i] = parts[i].trim();}
-if (parts.length!== 3 && parts.length!== 4) { return false;}
-var c = [parts[0], parts[1], parts[2]];
-if (c[0] === "none" || c[1] === "none" || c[2] === "none") { return false;}
-if (isRgb) {
-var allNum = isNumber(c[0]) && isNumber(c[1]) && isNumber(c[2]);
-var allPct = isPercent(c[0]) && isPercent(c[1]) && isPercent(c[2]);
-if (!(allNum || allPct)) { return false;}
-} else {
-if (!isHue(c[0])) { return false;}
-if (!(isPercent(c[1]) && isPercent(c[2]))) { return false;}
-}
-if (parts.length === 4) {
-if (parts[3] === "none" ||!isAlphaLegacy(parts[3])) { return false;}
-}
-return true;
-}
-
-// ---- Modern space syntax: `none` allowed, optional `/ alpha`, mixing ok -----
-var slash = inner.split("/");
-if (slash.length > 2) { return false;}
-var comps = slash[0].trim().split(/\s+/).filter(Boolean);
-var alpha = slash.length === 2? slash[1].trim(): null;
-if (comps.length!== 3) { return false;}
-if (isRgb) {
-for (var j = 0; j < 3; j++) {
-var v = comps[j];
-if (!(isNumber(v) || isPercent(v) || v === "none")) { return false;}
-}
-} else {
-if (!(isHue(comps[0]) || comps[0] === "none")) { return false;}
-for (var k = 1; k < 3; k++) {
-var w = comps[k];
-if (!(isPercent(w) || isNumber(w) || w === "none")) { return false;}
-}
-}
-if (alpha!== null) {
-if (alpha === "" ||!isAlphaModern(alpha)) { return false;}
-}
-return true;
-}
-
-/**
-* isValidCSSColor(input) -> boolean
-* True iff `input` is a string naming a color in this gift's supported subset of
-* the CSS Color spec (see the file header for the exact contract). Non-strings
-* return false — a color is a string token, not a number or object. Surrounding
-* whitespace is trimmed before checking.
-*/
-function isValidCSSColor(input) {
-if (typeof input!== "string") { return false;}
-var s = input.trim();
-if (s === "") { return false;}
-var lower = s.toLowerCase();
-
-if (NAMED_SET[lower] === true) { return true;}
-if (HEX.test(lower)) { return true;}
-
-var m = /^(rgba?|hsla?)\((.*)\)$/.exec(lower);
-if (m) { return validFunction(m[1], m[2]);}
-
-return false;
-}
-
-// ---- Dual-runtime export: browser namespace + Node module ------------------
-if (typeof window!== "undefined") {
-window.LoopGifts = window.LoopGifts || {};
-window.LoopGifts.isValidCSSColor = isValidCSSColor;
-}
-if (typeof module!== "undefined" && module.exports) {
-module.exports = { isValidCSSColor: isValidCSSColor};
-}
-
-// ---- CLI: one verdict per argument; exit 0 iff every argument is valid -------
-if (typeof require!== "undefined" && require.main === module) {
-var args = process.argv.slice(2);
-if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
-process.stdout.write(
-"isvalidcsscolor — is a string a valid CSS color? (defined subset)\n\n" +
-" node isvalidcsscolor.js \"rebeccapurple\" one verdict, exit 0 if valid\n" +
-" node isvalidcsscolor.js \"#0f0\" \"nope\" one line per argument\n\n" +
-"Accepts: named colors, transparent, currentColor, hex 3/4/6/8,\n" +
-"rgb()/rgba() and hsl()/hsla() in legacy and modern syntax.\n" +
-"Does NOT accept hwb()/lab()/lch()/oklab()/oklch()/color()/color-mix()/\n" +
-"relative-color syntax/system colors. See the README for the full edge.\n");
-process.exit(args.length === 0? 1: 0);
-}
-var allValid = true;
-for (var a = 0; a < args.length; a++) {
-var ok = isValidCSSColor(args[a]);
-if (!ok) { allValid = false;}
-process.stdout.write((args.length > 1? args[a] + "\t": "") + (ok? "true": "false") + "\n");
-}
-process.exit(allValid? 0: 1);
-}
-
-test_isvalidcsscolor.js 95 lines on GitHub →
-#!/usr/bin/env node
-/* test_isvalidcsscolor.js — proves the validator implements its stated CSS-color
-subset correctly.
-
-THE ORACLE. sha256 could check itself against Node's crypto — a live reference
-implementation. CSS-color validity has no Node stdlib oracle (CSS.supports is
-browser-only and needs the DOM). So the oracle here is the CSS Color spec
-expressed as CURATED VECTORS: a VALID set (every one must pass) and an INVALID
-set (every one must fail), chosen to exercise every branch of the grammar —
-named / hex(3,4,6,8) / rgb legacy+modern / hsl legacy+modern / angles /
-out-of-range-clamps / the documented exclusions. Plus determinism, non-string
-coercion, and a mutation-bite so a degenerate core (constant true/false) can't
-pass green. Exit 0 = all pass; exit 1 = a failure (loud). stdlib only. */
-"use strict";
-var isValidCSSColor = require("./isvalidcsscolor.js").isValidCSSColor;
-
-var pass = 0, fail = 0;
-function expect(input, want) {
-var got = isValidCSSColor(input);
-if (got === want) { pass++;}
-else {
-fail++;
-console.error("FAIL isValidCSSColor(" + JSON.stringify(input) + ")\n" +
-" got: " + got + "\n want: " + want);
-}
-}
-
-// ---- VALID: every one must return true --------------------------------------
-var VALID = [
-// named + keywords (case-insensitive, trimmed)
-"red", "RebeccaPurple", "AliceBlue", "transparent", "currentColor", " teal ",
-// hex 3/4/6/8
-"#000", "#0f0", "#ABCDEF", "#00ff00", "#0f08", "#00ff0080",
-// rgb legacy — numbers, percents, out-of-range (clamps), optional alpha
-"rgb(255, 0, 0)", "rgb(0,0,0)", "rgb( 12, 34, 56)", "rgb(100%, 0%, 50%)",
-"rgb(300, -10, 0)", "rgba(0,0,0,0.5)", "rgba(0,0,0,50%)", "rgb(0,0,0,0.5)",
-// rgb modern — space form, mixing, none, /alpha with and without spaces
-"rgb(255 0 0)", "rgb(255 0 0 / 0.5)", "rgb(255 0 0 / 50%)",
-"rgb(100% 0% 0% / none)", "rgb(none 0 0)", "rgb(255 0 0/.5)",
-// hsl legacy — number hue, angle hue, negative hue, optional alpha
-"hsl(120, 50%, 50%)", "hsla(120, 50%, 50%, 0.3)", "hsl(120deg, 50%, 50%)",
-"hsl(-30, 100%, 50%)",
-// hsl modern — angles, number S/L, none, /alpha
-"hsl(120 50% 50%)", "hsl(120deg 50% 50% /.5)", "hsl(0.5turn 50% 50%)",
-"hsl(200grad 50% 50%)", "hsl(3.14rad 50% 50%)", "hsl(120 50 50)",
-"hsl(none 50% 50%)", "hsl(120 50% 50% / none)"
-];
-
-// ---- INVALID: every one must return false -----------------------------------
-var INVALID = [
-// empties & nonsense
-"", " ", "notacolor", "reddish",
-// CSS-wide keywords are NOT colors
-"inherit", "initial", "unset", "revert",
-// malformed hex
-"#12", "#12345", "#1234567", "#gggggg", "#",
-// arity / structure
-"rgb()", "rgb(1,2)", "rgb(1,2,3,4,5)", "rgb(1 2)", "rgb(1 2 3 4)",
-// legacy channel-type mixing (number + percent) is illegal
-"rgb(1, 2, 50%)",
-// comma + slash mixed, none in legacy, empty/missing alpha
-"rgb(1,2,3 /.5)", "rgb(none, 0, 0)", "rgb(1,2,3,)", "rgb(1 2 3 /)",
-"rgb(1 2 3 / /.5)",
-// hsl: hue can't be a percent; legacy S/L must be percent
-"hsl(50%, 50%, 50%)", "hsl(120, 50, 50)",
-// spacing / number-shape faults
-"rgb (1,2,3)", "rgb(5., 0, 0)",
-// documented exclusions (out of this gift's scope, on purpose)
-"hwb(0 0% 0%)", "lab(50% 40 59)", "oklch(0.7 0.15 30)",
-"color(display-p3 1 0 0)", "rgb(from red r g b)", "Canvas"
-];
-
-for (var i = 0; i < VALID.length; i++) { expect(VALID[i], true);}
-for (var j = 0; j < INVALID.length; j++) { expect(INVALID[j], false);}
-
-// ---- Non-string coercion: a color is a string; nothing else is --------------
-var NON_STRINGS = [42, 0, true, false, null, undefined, {}, ["red"], NaN];
-for (var k = 0; k < NON_STRINGS.length; k++) { expect(NON_STRINGS[k], false);}
-
-// ---- Determinism: same input, same verdict, twice ---------------------------
-if (isValidCSSColor("rgb(1 2 3 /.5)") === isValidCSSColor("rgb(1 2 3 /.5)")) { pass++;}
-else { fail++; console.error("FAIL determinism: same input gave two verdicts");}
-
-// ---- Mutation-bite: the core must actually discriminate ---------------------
-// A degenerate `return true` fails every INVALID case above; a degenerate
-// `return false` fails every VALID case. This explicit bite additionally catches
-// a core that ignores its input entirely: a valid and an invalid string must not
-// share a verdict.
-if (isValidCSSColor("red")!== isValidCSSColor("zzz-not-a-color")) { pass++;}
-else { fail++; console.error("FAIL mutation-bite: core did not distinguish valid from invalid");}
-
-console.log("\nisvalidcsscolor: " + pass + " passed, " + fail + " failed" +
-" (" + VALID.length + " valid + " + INVALID.length + " invalid vectors, " +
-"plus coercion, determinism, mutation-bite)");
-process.exit(fail === 0? 0: 1);
-
-Take the whole folder →
-MIT
-Node, no dependencies
+Python 3 stdlib, no dependencies (pure fold)
 
 ---

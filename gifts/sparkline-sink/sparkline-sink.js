@@ -124,6 +124,45 @@ if (typeof window !== 'undefined') {
 }
 
 // ---- CLI ------------------------------------------------------------------------
+/* >>> gift-block full-write · a shared block, stamped verbatim from the house's block source; edit the source, never this copy >>> */
+/* full-write: write a whole answer to stdout, all of it or none of it. Node reports a write to a regular file that
+   only partly fit (a full disk, a file-size limit, a quota) as a success and drops the count, so into a regular file
+   the bytes are counted here, and an answer that did not all fit is taken back out, but only when the file grew by
+   exactly what this run wrote: then nothing that was there before and nothing another writer added is removed.
+   Into a pipe or a terminal the answer is one write. A reader that has gone away (EPIPE) is not an error. Any other
+   failure to write sets process.exitCode to failCode and says so in one line on stderr, prefixed with name.
+   Never throws. The shape is cosine-fold's emit() (the cosine-fold Gift, Plumb v2).
+   Joins: cosine-fold's emit() (the same logic, left in place: its bytes are the blessed ones). */
+function fullWrite(text, failCode, name) {
+  var fs = require("fs"), st = null, said = false;
+  function failed(e, kept) {
+    if (said || (e && e.code === "EPIPE")) return;
+    said = true;
+    var what = kept === 0 ? ": nothing was kept" : (kept > 0 ? ": a partial file may remain" : "");
+    try { process.stderr.write(name + ": cannot write the whole output (" + ((e && e.code) || "error") + ")" + what + "\n"); } catch (x) {}
+    process.exitCode = failCode;
+  }
+  try { st = fs.fstatSync(1); } catch (x) {}
+  if (st && st.isFile()) {
+    var buf = Buffer.from(String(text), "utf8"), off = 0;
+    try {
+      while (off < buf.length) {
+        var n = fs.writeSync(1, buf, off, buf.length - off);
+        if (!(n > 0)) { var short = new Error("short write"); short.code = "EIO"; throw short; }
+        off += n;
+      }
+    } catch (e) {
+      var kept = off;
+      try { if (off > 0 && fs.fstatSync(1).size === st.size + off) { fs.ftruncateSync(1, st.size); kept = 0; } } catch (x) {}
+      failed(e, kept);
+    }
+    return;
+  }
+  process.stdout.on("error", function (e) { failed(e); });
+  process.stdout.write(String(text), function (e) { if (e) failed(e); });
+}
+/* <<< gift-block full-write <<< */
+
 function main() {
   var argv = process.argv.slice(2);
   if (argv.indexOf('--help') !== -1 || argv.indexOf('-h') !== -1) {
@@ -149,8 +188,10 @@ function main() {
     var input;
     try { input = JSON.parse(raw); }
     catch (e) { process.stderr.write('sparkline-sink: input is not valid JSON: ' + e.message + '\n'); process.exit(1); }
-    try { process.stdout.write(sparkline(input, flags)); }
+    var out;
+    try { out = sparkline(input, flags); }
     catch (e) { process.stderr.write('sparkline-sink: ' + e.message + '\n'); process.exit(1); }
+    fullWrite(out, 1, 'sparkline-sink');
   });
 }
 if (typeof require !== 'undefined' && require.main === module) { main(); }

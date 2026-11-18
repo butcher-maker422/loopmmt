@@ -206,5 +206,93 @@ class TestVerbs(unittest.TestCase):
                          ["source", "transform", "filter", "fold", "sink"])
 
 
+# --- bounded loops (the trace): slug*N tokens and JSON "loop" objects ------------------------------------------
+SEED = "%s -c \"print('{\\\"n\\\": 0}')\"" % PY
+STEP = ("%s -c \"import sys,json\nfor l in sys.stdin:\n  l=l.strip()\n  if l:\n    r=json.loads(l); "
+        "r['n']=min(r['n']+1,3); print(json.dumps(r,sort_keys=True))\"" % PY)
+
+
+def loop_records(ledger, index):
+    return [r for r in read_ledger(ledger) if r.get("index") == index and r["kind"] in ("stage", "loop-end")]
+
+
+class TestLoops(TmpCase):
+    def test_a_token_loop_feeds_each_pass_the_last_output(self):
+        code, out, _ = run(["run", "--stage", "seed:source:" + SEED, "--stage", "step*2:transform:" + STEP,
+                            "--ledger", self.ledger, "--trace", "L1"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out[-1], {"n": 2})
+        recs = loop_records(self.ledger, 1)
+        self.assertEqual([r.get("pass") for r in recs], [1, 2, None])
+        self.assertEqual((recs[-1]["kind"], recs[-1]["stopped"], recs[-1]["passes"]), ("loop-end", "bound", 2))
+
+    def test_until_fixed_stops_at_the_first_repeat_and_says_settled(self):
+        stdin = json.dumps({"slug": "step", "port_verb": "transform", "cmd": cd.shlex.split(STEP),
+                            "loop": {"passes": 50, "until": "fixed"}})
+        seed = os.path.join(self.d, "seed.jsonl")
+        with open(seed, "w") as f:
+            f.write('{"n": 0}\n')
+        code, out, _ = run(["run", "--stdin", "--input", seed, "--ledger", self.ledger, "--trace", "L2"],
+                           stdin_text=stdin)
+        self.assertEqual(code, 0)
+        self.assertEqual(out[-1], {"n": 3})
+        end = loop_records(self.ledger, 0)[-1]
+        self.assertEqual((end["stopped"], end["passes"], end["settled"]), ("fixed", 4, True))
+
+    def test_until_fixed_that_hits_the_bound_is_recorded_unsettled_not_failed(self):
+        stdin = json.dumps({"slug": "step", "port_verb": "transform", "cmd": cd.shlex.split(STEP),
+                            "loop": {"passes": 2, "until": "fixed"}})
+        seed = os.path.join(self.d, "seed.jsonl")
+        with open(seed, "w") as f:
+            f.write('{"n": 0}\n')
+        code, out, _ = run(["run", "--stdin", "--input", seed, "--ledger", self.ledger, "--trace", "L3"],
+                           stdin_text=stdin)
+        self.assertEqual(code, 0)
+        end = loop_records(self.ledger, 0)[-1]
+        self.assertEqual((end["stopped"], end["settled"]), ("bound", False))
+
+    def test_a_zero_or_oversized_bound_is_refused_before_any_stage_runs(self):
+        for bad in ("step*0", "step*1000001"):
+            code, out, _ = run(["run", "--stage", "seed:source:" + SEED, "--stage", bad + ":transform:" + STEP,
+                                "--ledger", self.ledger, "--trace", "L4"])
+            self.assertEqual(code, 3, bad)
+            self.assertEqual(out[0]["reason"], "loop refused")
+        self.assertEqual([r for r in read_ledger(self.ledger) if r["kind"] == "stage"], [])
+
+    def test_a_malformed_bound_is_a_usage_error(self):
+        code, _, _ = run(["check", "--stage", "step*two:transform:" + STEP])
+        self.assertEqual(code, 2)
+
+    def test_a_source_or_sink_can_never_be_looped(self):
+        code, _, _ = run(["check", "--stage", "seed*2:source:" + SEED, "--stage", "s:sink:" + SINK])
+        self.assertEqual(code, 3)
+        code, _, _ = run(["check", "--stage", "seed:source:" + SEED, "--stage", "s*2:sink:" + SINK])
+        self.assertEqual(code, 3)
+
+    def test_a_fold_loops_only_when_declared_closed(self):
+        open_fold = json.dumps({"slug": "c", "port_verb": "fold", "cmd": cd.shlex.split(COUNT), "loop": {"passes": 2}})
+        code, _, _ = run(["check", "--stdin"], stdin_text=open_fold)
+        self.assertEqual(code, 3)
+        closed = json.dumps({"slug": "c", "port_verb": "fold", "cmd": cd.shlex.split(COUNT),
+                             "loop": {"passes": 2, "closed": True}})
+        code, _, _ = run(["check", "--stdin"], stdin_text=closed)
+        self.assertEqual(code, 0)
+
+    def test_a_malformed_loop_object_is_a_usage_error(self):
+        for bad in ({"passes": "2"}, {"passes": 2, "until": "forever"}, "loop"):
+            stdin = json.dumps({"slug": "x", "port_verb": "transform", "cmd": cd.shlex.split(PASS), "loop": bad})
+            code, _, _ = run(["check", "--stdin"], stdin_text=stdin)
+            self.assertEqual(code, 2, bad)
+
+    def test_a_failing_pass_stops_the_loop_and_skips_later_stages(self):
+        code, _, err = run(["run", "--stage", "seed:source:" + SEED, "--stage", "boom*3:transform:" + BOOM,
+                            "--stage", "s:sink:" + SINK, "--ledger", self.ledger, "--trace", "L5"])
+        self.assertEqual(code, 5)
+        recs = loop_records(self.ledger, 1)
+        self.assertEqual((recs[0]["pass"], recs[0]["verdict"], recs[-1]["stopped"]), (1, "failed", "failed"))
+        later = [r for r in read_ledger(self.ledger) if r.get("index") == 2]
+        self.assertEqual(later[0]["verdict"], "skipped")
+
+
 if __name__ == "__main__":
     unittest.main()
